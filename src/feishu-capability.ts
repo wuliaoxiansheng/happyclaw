@@ -347,7 +347,7 @@ async function assertMessageInCurrentChat(
 ): Promise<Record<string, unknown>> {
   const response = await client.im.v1.message.get({
     path: { message_id: messageId },
-    params: { user_id_type: 'open_id', with_sender_name: true },
+    params: { user_id_type: 'open_id' as const, with_sender_name: true } as never,
   });
   assertApiSuccess('get_message', response);
   const items = Array.isArray(response.data?.items) ? response.data.items : [];
@@ -605,13 +605,13 @@ export async function executeFeishuCapability(
         params: {
           container_id_type: threadId ? 'thread' : 'chat',
           container_id: threadId || chatId,
-          sort_type: 'ByCreateTimeDesc',
+          sort_type: 'ByCreateTimeDesc' as const,
           page_size: boundedInt(params.pageSize, 20, 1, 50),
           page_token: optionalString(params.pageToken),
           start_time: optionalString(params.startTime),
           end_time: optionalString(params.endTime),
           with_sender_name: true,
-        },
+        } as never,
       });
       assertApiSuccess('get_history', response);
       let items = response.data?.items || [];

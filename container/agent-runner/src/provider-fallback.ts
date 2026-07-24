@@ -8,7 +8,7 @@ export type ProviderLimitScope = 'account' | 'model';
 
 export type ProviderRateLimitType = NonNullable<
   SDKRateLimitInfo['rateLimitType']
->;
+> | 'seven_day_overage_included';
 
 const MODEL_LIMIT_LABELS = new Set(['opus', 'sonnet', 'fable 5']);
 const ACCOUNT_LIMIT_LABELS = new Set([
