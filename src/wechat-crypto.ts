@@ -4,6 +4,7 @@ import path from 'path';
 import { fetch as undiciFetch, type Dispatcher } from 'undici';
 
 import { logger } from './logger.js';
+import { fetchWeChatDirect } from './wechat-direct-fetch.js';
 
 // CDN Base URL
 const DEFAULT_CDN_BASE = 'https://novac2c.cdn.weixin.qq.com/c2c';
@@ -90,10 +91,7 @@ export async function downloadAndDecryptMedia(
     'Downloading encrypted media from CDN',
   );
 
-  const resp = await undiciFetch(url, {
-    signal: AbortSignal.timeout(60_000),
-    dispatcher,
-  });
+  const resp = await fetchWeChatDirect(url, { signal: AbortSignal.timeout(60_000) });
   if (!resp.ok) {
     throw new Error(`CDN download failed: ${resp.status} ${resp.statusText}`);
   }
@@ -121,7 +119,7 @@ export async function uploadBufferToCdn(params: {
   let lastError: Error | undefined;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const resp = await undiciFetch(url, {
+      const resp = await fetchWeChatDirect(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: new Uint8Array(encrypted),
@@ -186,7 +184,7 @@ export async function getUploadUrl(params: {
   };
 
   const xWechatUin = crypto.randomBytes(16).toString('base64');
-  const resp = await undiciFetch(url, {
+  const resp = await fetchWeChatDirect(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

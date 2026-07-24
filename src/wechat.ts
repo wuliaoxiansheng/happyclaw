@@ -29,6 +29,7 @@ import {
 import { weChatIlinkHeaders } from './wechat-onboarding.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
 import { createWeChatHttpDispatcher } from './wechat-http.js';
+import { fetchWeChatDirect } from './wechat-direct-fetch.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -550,7 +551,7 @@ export function createWeChatConnection(
       : undefined;
 
     try {
-      const res = await fetchImpl(url.toString(), {
+      const res = await fetchWeChatDirect(url.toString(), {
         method: 'POST',
         headers: {
           ...headers,
