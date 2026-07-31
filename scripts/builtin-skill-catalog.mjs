@@ -3,9 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export const CATALOG_SCHEMA_VERSION = 1;
-export const FEISHU_CLI_VERSION = 'v1.35.0';
+export const FEISHU_CLI_VERSION = 'v1.37.1';
 export const FEISHU_CLI_SOURCE_SHA256 =
-  '91b5575833f003527c7b60a26f08703ebfdb348098deecfa9ceed1dcf230f253';
+  'c52e2e6c17d6a21421e19aed4d5f507d1549be948dfd702f4e9ed7fa9468f42b';
 
 const MARKER_NAME = '.catalog.json';
 const IGNORED = new Set([

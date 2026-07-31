@@ -15,8 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DATA_DIR="$PROJECT_ROOT/data"
 BUILTIN_SKILLS_DIR="$DATA_DIR/builtin-skills"
-FEISHU_CLI_VERSION="v1.35.0"
-FEISHU_CLI_SOURCE_SHA256="91b5575833f003527c7b60a26f08703ebfdb348098deecfa9ceed1dcf230f253"
+FEISHU_CLI_VERSION="v1.37.1"
+FEISHU_CLI_SOURCE_SHA256="c52e2e6c17d6a21421e19aed4d5f507d1549be948dfd702f4e9ed7fa9468f42b"
 
 # ── Helpers ──────────────────────────────────────────────────
 
