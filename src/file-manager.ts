@@ -115,8 +115,7 @@ export function isSystemPath(relativePath: string): boolean {
     const firstSegmentLower = segments[0].toLowerCase();
     const normalizedLower = normalized.toLowerCase();
     return SYSTEM_PATHS_LOWER.some(
-      (sysPath) =>
-        firstSegmentLower === sysPath || normalizedLower === sysPath,
+      (sysPath) => firstSegmentLower === sysPath || normalizedLower === sysPath,
     );
   }
   // case-sensitive 平台保持 strict 比较
@@ -281,10 +280,10 @@ export function createDirectory(
   }
 
   fs.mkdirSync(absolutePath, { recursive: true });
-  // chmod 0o777 确保容器（node/1000）与宿主机用户均可读写
-  // 与 container-runner.ts 的 mkdirForContainer() 行为一致
+  // Host-created writable roots stay owner-only. The container entrypoint
+  // applies the selected direct/rootless/Desktop identity bridge.
   try {
-    fs.chmodSync(absolutePath, 0o777);
+    fs.chmodSync(absolutePath, 0o700);
   } catch {
     /* 忽略只读文件系统 */
   }
@@ -357,9 +356,21 @@ function calculateDirSize(dirPath: string, depth = 0): number {
 /** Remove all runtime artifacts for a group folder (workspace, sessions, ipc, env, memory). */
 export function removeFlowArtifacts(folder: string): void {
   fs.rmSync(path.join(GROUPS_DIR, folder), { recursive: true, force: true });
-  fs.rmSync(path.join(DATA_DIR, 'sessions', folder), { recursive: true, force: true });
-  fs.rmSync(path.join(DATA_DIR, 'ipc', folder), { recursive: true, force: true });
-  fs.rmSync(path.join(DATA_DIR, 'env', folder), { recursive: true, force: true });
-  fs.rmSync(path.join(DATA_DIR, 'memory', folder), { recursive: true, force: true });
+  fs.rmSync(path.join(DATA_DIR, 'sessions', folder), {
+    recursive: true,
+    force: true,
+  });
+  fs.rmSync(path.join(DATA_DIR, 'ipc', folder), {
+    recursive: true,
+    force: true,
+  });
+  fs.rmSync(path.join(DATA_DIR, 'env', folder), {
+    recursive: true,
+    force: true,
+  });
+  fs.rmSync(path.join(DATA_DIR, 'memory', folder), {
+    recursive: true,
+    force: true,
+  });
   deleteContainerEnvConfig(folder);
 }

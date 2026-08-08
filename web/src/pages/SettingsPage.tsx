@@ -136,7 +136,7 @@ export function SettingsPage() {
   );
 
   const sectionTitle: Record<SettingsTab, string> = {
-    claude: '模型与提供商',
+    claude: '模型配置',
     registration: '注册策略',
     appearance: '常规与品牌',
     system: '运行与容量',

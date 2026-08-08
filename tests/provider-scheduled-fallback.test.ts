@@ -23,6 +23,7 @@ vi.mock('../src/runtime-config.js', async () => {
   return {
     ...actual,
     getEnabledProviders: () => mocks.enabledProviders,
+    getDefaultProviderId: () => null,
   };
 });
 
@@ -38,6 +39,45 @@ const group = {
 } as never;
 
 describe('scheduled provider fallback', () => {
+  test('does not retry a scheduled prompt on another model when the Agent is pinned', async () => {
+    const runFn = vi.fn(
+      async (): Promise<ContainerOutput> => ({
+        status: 'success',
+        result: null,
+        providerFailure: true,
+        providerFailureTerminal: false,
+      }),
+    );
+
+    const output = await runAgentWithModelFallback(
+      runFn as unknown as AgentRunner,
+      group,
+      {
+        prompt: 'stay on the selected gateway',
+        groupFolder: group.folder,
+        chatJid: group.jid,
+        isMain: false,
+        isHome: false,
+        isAdminHome: false,
+        isScheduledTask: true,
+        agentProfile: {
+          id: 'agent-pinned',
+          name: 'Pinned Agent',
+          version: 1,
+          isDefault: false,
+          identityHash: 'identity',
+          identityPrompt: '',
+          includeClaudePreset: true,
+          modelConfigId: 'provider-a',
+        },
+      },
+      () => {},
+    );
+
+    expect(runFn).toHaveBeenCalledTimes(1);
+    expect(output).toMatchObject({ providerFailure: true });
+  });
+
   test('does not replay a scheduled prompt after its durable input completed', async () => {
     const projected: ContainerOutput[] = [];
     const runFn = vi.fn(

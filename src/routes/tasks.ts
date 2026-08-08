@@ -49,6 +49,7 @@ import {
   getScriptTaskHostExecutionError,
   SCRIPT_TASK_HOST_REQUIRED_ERROR,
 } from '../script-task-policy.js';
+import { getSystemSettings } from '../runtime-config.js';
 
 const tasksRoutes = new Hono<{ Variables: Variables }>();
 
@@ -246,8 +247,23 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
   // - Source is container: default container; explicit host request rejected
   //   even for admins, to keep task execution consistent with its workspace.
   const sourceIsHost = isHostExecutionGroup(group);
+  const adminHostOnlyMode =
+    authUser.role === 'admin' &&
+    authUser.status === 'active' &&
+    getSystemSettings().adminHostOnlyMode;
+  if (adminHostOnlyMode && validation.data.execution_mode === 'container') {
+    return c.json(
+      {
+        error: '管理员纯宿主机模式已开启，任务不能使用 Docker 执行',
+        code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+      },
+      409,
+    );
+  }
   let taskExecutionMode: 'host' | 'container';
-  if (validation.data.execution_mode === 'host') {
+  if (adminHostOnlyMode) {
+    taskExecutionMode = 'host';
+  } else if (validation.data.execution_mode === 'host') {
     if (!sourceIsHost) {
       return c.json(
         { error: '当前工作区运行在容器模式，任务不能使用宿主机执行模式' },
@@ -510,6 +526,20 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
   // must match the source workspace's capabilities.
   const finalExecutionMode =
     patchData.execution_mode ?? existing.execution_mode;
+  if (
+    finalExecutionMode === 'container' &&
+    authUser.role === 'admin' &&
+    authUser.status === 'active' &&
+    getSystemSettings().adminHostOnlyMode
+  ) {
+    return c.json(
+      {
+        error: '管理员纯宿主机模式已开启，任务不能使用 Docker 执行',
+        code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+      },
+      409,
+    );
+  }
   if (
     finalExecutionMode === 'host' &&
     effectiveTargetGroup &&
@@ -1054,14 +1084,26 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
 
   const taskId = crypto.randomUUID();
   const now = new Date().toISOString();
+  const adminHostOnlyMode =
+    authUser.role === 'admin' &&
+    authUser.status === 'active' &&
+    getSystemSettings().adminHostOnlyMode;
+  if (adminHostOnlyMode && !sourceIsHost) {
+    return c.json(
+      {
+        error: '管理员纯宿主机模式已开启，请刷新工作区状态后重试',
+        code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+      },
+      409,
+    );
+  }
 
   // Inherit execution_mode from the resolved source workspace (same rule as
   // POST /api/tasks). Previously hard-coded to admin=host / member=container,
   // which would misattribute tasks whose target workspace is container-mode
   // even for admin, or vice-versa.
-  const taskExecutionMode: 'host' | 'container' = sourceIsHost
-    ? 'host'
-    : 'container';
+  const taskExecutionMode: 'host' | 'container' =
+    adminHostOnlyMode || sourceIsHost ? 'host' : 'container';
 
   // Create immediately with a parsing status so the asynchronous model result
   // can be committed with the same revision contract as manual edits.

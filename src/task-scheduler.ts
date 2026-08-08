@@ -209,6 +209,7 @@ function toRunnerAgentProfile(profile: AgentProfile | undefined) {
     identityHash: profile.identity_hash,
     identityPrompt: buildAgentProfilePrompt(profile),
     includeClaudePreset: profile.prompt_mode === 'append',
+    modelConfigId: profile.model_config_id,
     runtimePolicy: profile.runtime_policy,
   };
 }

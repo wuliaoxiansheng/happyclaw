@@ -35,11 +35,42 @@ if [ -n "$EXPECTED_ARCHITECTURE" ]; then
   fi
 fi
 
+# GitHub's native Linux runners use a rootful Docker daemon, so the process
+# invoking docker is the authoritative host identity for this no-bind-mount
+# smoke. Pass the same explicit contract as the production container runner:
+# align node to a non-root host uid/gid, or use host-root when the caller is
+# actually root. Leaving the mode unset must remain fail-closed in entrypoint.
+smoke_host_uid="$(id -u)"
+smoke_host_gid="$(id -g)"
+case "$smoke_host_uid:$smoke_host_gid" in
+  *[!0-9:]* | *:*:*)
+    echo "Could not determine a numeric smoke host uid/gid" >&2
+    exit 1
+    ;;
+esac
+
+if [ "$smoke_host_uid" -eq 0 ]; then
+  smoke_identity_args=(
+    --env HAPPYCLAW_HOST_IDENTITY_MODE=host-root
+  )
+else
+  smoke_identity_args=(
+    --env HAPPYCLAW_HOST_IDENTITY_MODE=direct
+    --env "HAPPYCLAW_HOST_UID=$smoke_host_uid"
+    --env "HAPPYCLAW_HOST_GID=$smoke_host_gid"
+  )
+fi
+
 # -i keeps stdin open while detached. The production entrypoint starts Chromium
 # first and then waits for the task JSON on stdin, giving the probe a stable
 # window without bypassing any real startup behavior.
 docker run --detach --interactive \
   --name "$SMOKE_CONTAINER_NAME" \
+  "${smoke_identity_args[@]}" \
+  --tmpfs /home/node/.claude:rw,nosuid,nodev,noexec \
+  --tmpfs /workspace/ipc:rw,nosuid,nodev,noexec \
+  --tmpfs /workspace/group:rw,nosuid,nodev \
+  --tmpfs /workspace/extra:rw,nosuid,nodev \
   "$IMAGE_REF" >/dev/null
 
 for ((attempt = 1; attempt <= SMOKE_TIMEOUT_SECONDS; attempt++)); do

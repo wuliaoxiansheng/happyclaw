@@ -124,6 +124,14 @@ async function deleteProvider(providerId: string): Promise<Response> {
   });
 }
 
+async function setDefaultProvider(providerId: string): Promise<Response> {
+  return app.request('/api/config/claude/default', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ providerId }),
+  });
+}
+
 beforeAll(() => {
   fs.mkdirSync(path.join(tmpDir, 'db'), { recursive: true });
   fs.mkdirSync(path.join(tmpDir, 'groups'), { recursive: true });
@@ -150,6 +158,92 @@ afterAll(() => {
 });
 
 describe('provider runtime apply is a lossless configuration mutation', () => {
+  test('sets the system default model configuration through HTTP', async () => {
+    bindDeps(
+      {},
+      {
+        listDescendantJids: () => [],
+        pauseGroupsForMutation: () => ({ id: 10 }),
+        resumeGroupsAfterMutation: vi.fn(),
+        stopGroup: vi.fn(async () => {}),
+      },
+    );
+    const initial = runtimeConfig.createProvider({
+      name: unique('initial-default'),
+      type: 'official',
+      anthropicApiKey: 'initial-key',
+      enabled: true,
+    });
+    const replacement = runtimeConfig.createProvider({
+      name: unique('replacement-default'),
+      type: 'third_party',
+      anthropicBaseUrl: 'https://replacement.example.test',
+      anthropicAuthToken: 'replacement-token',
+      anthropicModel: 'replacement-model',
+      enabled: true,
+    });
+    expect(runtimeConfig.getDefaultProviderId()).toBe(initial.id);
+
+    const response = await setDefaultProvider(replacement.id);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      defaultProviderId: replacement.id,
+      provider: { id: replacement.id, anthropicModel: 'replacement-model' },
+      applied: { success: true, persisted: true },
+    });
+    expect(runtimeConfig.getDefaultProviderId()).toBe(replacement.id);
+  });
+
+  test('allows disabling an Agent model but still blocks deleting it', async () => {
+    bindDeps(
+      {},
+      {
+        listDescendantJids: () => [],
+        pauseGroupsForMutation: () => ({ id: 11 }),
+        resumeGroupsAfterMutation: vi.fn(),
+        stopGroup: vi.fn(async () => {}),
+      },
+    );
+    const target = runtimeConfig.createProvider({
+      name: unique('agent-model-target'),
+      type: 'official',
+      anthropicApiKey: 'target-key',
+      enabled: true,
+    });
+    const fallback = runtimeConfig.createProvider({
+      name: unique('agent-model-fallback'),
+      type: 'official',
+      anthropicApiKey: 'fallback-key',
+      enabled: true,
+    });
+    runtimeConfig.setDefaultProvider(fallback.id);
+    const profile = db.createAgentProfile({
+      ownerUserId: 'provider-runtime-admin',
+      name: unique('bound-agent'),
+      modelConfigId: target.id,
+    });
+
+    const disableResponse = await setProviderEnabled(target.id, false);
+    expect(disableResponse.status).toBe(200);
+    expect(await disableResponse.json()).toMatchObject({
+      provider: { id: target.id, enabled: false },
+    });
+    const deleteResponse = await deleteProvider(target.id);
+    expect(deleteResponse.status).toBe(400);
+    expect(await deleteResponse.json()).toMatchObject({
+      error: expect.stringContaining('智能体'),
+    });
+    expect(
+      runtimeConfig
+        .getProviders()
+        .find((provider) => provider.id === target.id),
+    ).toMatchObject({ enabled: false });
+
+    expect(db.archiveAgentProfile(profile.id, 'provider-runtime-admin')).toBe(
+      'ok',
+    );
+  });
+
   test('keeps a capacity-queued descendant task instead of dropping it', async () => {
     const folder = unique('queued-work');
     const jid = `web:${folder}`;
@@ -414,12 +508,13 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       anthropicApiKey: 'target-key',
       enabled: true,
     });
-    runtimeConfig.createProvider({
+    const fallback = runtimeConfig.createProvider({
       name: unique('toggle-fallback'),
       type: 'official',
       anthropicApiKey: 'fallback-key',
       enabled: true,
     });
+    runtimeConfig.setDefaultProvider(fallback.id);
 
     const firstResponse = await setProviderEnabled(target.id, false);
     expect(firstResponse.status).toBe(503);
@@ -471,12 +566,13 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       anthropicModel: 'old-model',
       enabled: true,
     });
-    runtimeConfig.createProvider({
+    const fallback = runtimeConfig.createProvider({
       name: unique('disabled-repair-fallback'),
       type: 'official',
       anthropicApiKey: 'fallback-key',
       enabled: true,
     });
+    runtimeConfig.setDefaultProvider(fallback.id);
     db.setSession(folder, unique('disabled-repair-initial-session'));
     db.setSessionProviderId(folder, '', target.id);
 
@@ -534,12 +630,13 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       anthropicModel: 'old-model',
       enabled: true,
     });
-    runtimeConfig.createProvider({
+    const fallback = runtimeConfig.createProvider({
       name: unique('delete-fallback'),
       type: 'official',
       anthropicApiKey: 'fallback-key',
       enabled: true,
     });
+    runtimeConfig.setDefaultProvider(fallback.id);
     db.setSession(folder, unique('delete-initial-session'));
     db.setSessionProviderId(folder, '', target.id);
 
@@ -906,7 +1003,7 @@ describe('provider session invalidation only removes attributable sessions', () 
     expect(db.getSession(folder)).toBeUndefined();
   });
 
-  test('keeps a bound third-party session for a model-only change', async () => {
+  test('clears a bound third-party session for a model-only change', async () => {
     const folder = unique('third-party-model');
     const jid = `web:${folder}`;
     const sessionId = unique('bound-session');
@@ -927,8 +1024,8 @@ describe('provider session invalidation only removes attributable sessions', () 
     });
 
     expect(response.status).toBe(200);
-    expect(db.getSession(folder)).toBe(sessionId);
-    expect(db.getSessionProviderId(folder)).toBe(provider.id);
+    expect(db.getSession(folder)).toBeUndefined();
+    expect(db.getSessionProviderId(folder)).toBeUndefined();
   });
 
   test('does not clear a provider session when the requested config is invalid', async () => {

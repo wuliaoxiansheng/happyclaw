@@ -297,6 +297,8 @@ export interface AgentProfile {
   avatar_emoji: string | null;
   avatar_color: string | null;
   avatar_url: string | null;
+  /** Null means inherit the system default model configuration. */
+  model_config_id: string | null;
   runtime_policy: AgentProfileRuntimePolicy;
   identity_hash: string;
   version: number;
@@ -307,6 +309,14 @@ export interface AgentProfile {
 }
 
 export type AgentProfilePromptMode = 'append' | 'replace';
+
+export type AgentEffortLevel =
+  | 'inherit'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max';
 
 export interface AgentProfilePrompts {
   identity_prompt: string;
@@ -337,6 +347,10 @@ export interface WorkspaceAgentProfileBinding {
 }
 
 export interface AgentProfileRuntimePolicy {
+  reasoning: {
+    /** Inherit Provider customEnv first, then the SDK model-aware default. */
+    effort: AgentEffortLevel;
+  };
   context: {
     source: 'managed' | 'host_claude';
     auto_compact_window: number;

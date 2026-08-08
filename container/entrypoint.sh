@@ -1,30 +1,30 @@
 #!/bin/bash
 set -e
 
-# Set permissive umask so files created by the container (node user, uid 1000)
-# are writable by the host backend (agent user, uid 1002).
-# Without this, the host cannot delete/modify files created by the container.
-umask 0000
+# Default to owner-only creation. Rootless mode switches to 0007 after its
+# owner-root/group-node bridge is ready; no mode grants access to "other".
+umask 0077
 
-# Fix ownership on mounted volumes.
-# Host uid may differ from container node user (uid 1000), especially in
-# rootless podman where uid remapping causes EACCES on bind mounts.
-# Running as root here so chown works regardless of host uid.
-chown -R node:node /home/node/.claude 2>/dev/null || true
-chown -R node:node /home/node/.feishu-cli 2>/dev/null || true
-chown -R node:node /workspace/group /workspace/ipc 2>/dev/null || true
+# This root-owned helper accepts no runtime-configurable path.
+# shellcheck source=session-permissions.sh
+source /app/session-permissions.sh
+happyclaw_configure_node_identity
+
+# Prepare only explicit writable roots. Direct mode touches roots and performs
+# a separate one-time legacy migration below; rootless defers to its verified
+# bridge; host-root/Desktop preserve owner-only modes.
+happyclaw_prepare_mounted_paths
+happyclaw_migrate_direct_managed_paths
 
 # Mark mounted directories as safe for git (CVE-2022-24765 ownership check).
 # Host uid may differ from container node user, causing git to refuse operations.
 # 使用通配符 '*' 因为挂载路径动态（extra mounts、customCwd），无法枚举具体目录。
-git config --global --add safe.directory '*' 2>/dev/null || true
+runuser -u node -- env HOME=/home/node /usr/bin/git \
+  config --global --add safe.directory '*'
 
-# Source environment variables from mounted env file
-if [ -f /workspace/env-dir/env ]; then
-  set -a
-  source /workspace/env-dir/env
-  set +a
-fi
+# Source ordinary runtime variables while locally shadowing every root-control
+# variable, including stale values persisted before the host-side denylist.
+happyclaw_source_runtime_env
 
 # Prepend agent-runner 的本地 node_modules/.bin 到 PATH。
 # agent-runner/package.json 声明了 @anthropic-ai/claude-code 依赖，npm install
@@ -52,8 +52,8 @@ export IS_SANDBOX=1
 # 把 npm prefix 指向已挂载的 /workspace/extra/.npm-global（host 端
 # data/extra/{folder}/.npm-global/，per-user 隔离）即可让全局包持久化。
 NPM_GLOBAL_DIR=/workspace/extra/.npm-global
-mkdir -p "$NPM_GLOBAL_DIR/bin" "$NPM_GLOBAL_DIR/lib"
-chown -R node:node "$NPM_GLOBAL_DIR" 2>/dev/null || true
+/usr/local/bin/node /app/session-generated-paths.mjs --ensure-npm-global
+happyclaw_prepare_generated_path npm-global
 # 写到 node user 的 ~/.npmrc 让 npm 全局命令默认走该 prefix。
 # 镜像每次启动重置 /home/node，所以 entrypoint 每次都重写一遍是稳妥做法。
 cat > /home/node/.npmrc <<EOF
@@ -67,23 +67,25 @@ export PATH="$PATH:$NPM_GLOBAL_DIR/bin"
 # Skill is mounted read-only below /workspace/effective-skills. Completely
 # rebuilding the directory prevents a real Skill directory created by an
 # earlier Agent run from surviving a container restart.
-mkdir -p /home/node/.claude/skills
-find /home/node/.claude/skills -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+/usr/local/bin/node /app/session-generated-paths.mjs --reset-skills
 if [ -d /workspace/effective-skills ]; then
   for skill in /workspace/effective-skills/*/; do
     if [ -f "${skill}SKILL.md" ]; then
       name=$(basename "$skill")
-      ln -sfn "$skill" "/home/node/.claude/skills/$name"
+      /usr/local/bin/node /app/session-generated-paths.mjs \
+        "--link-skill=$name"
     fi
   done
 fi
-chown -R node:node /home/node/.claude/skills 2>/dev/null || true
+happyclaw_prepare_generated_path skills
 
-# Compile TypeScript (agent-runner source may be hot-mounted from host)
-cd /app && npx tsc --outDir /tmp/dist 2>&1 >&2
+# Compile TypeScript (agent-runner source may be hot-mounted from host). The
+# image build leaves /app/dist/.tsbuildinfo behind; disable incremental mode so
+# changing only outDir cannot incorrectly reuse that cache and emit no files.
+cd /app && npx tsc --outDir /tmp/dist --incremental false 2>&1 >&2
+happyclaw_prepare_generated_path dist
 ln -s /app/node_modules /tmp/dist/node_modules
-ln -s /app/prompts /tmp/prompts
-chmod -R a-w /tmp/dist
+/usr/local/bin/node /app/session-prompts-copy.mjs
 
 # Fix permissions on exit: Claude Code creates some files with mode 0600
 # (e.g. settings.json), which the host backend (agent user) cannot read.
@@ -91,6 +93,8 @@ chmod -R a-w /tmp/dist
 # Chromium process so no browser child survives a cancelled run.
 CHROMIUM_PID=
 cleanup() {
+  local cleanup_status=0
+  happyclaw_stop_session_permission_watcher || cleanup_status=$?
   if [ -n "$CHROMIUM_PID" ] && kill -0 "$CHROMIUM_PID" 2>/dev/null; then
     kill "$CHROMIUM_PID" 2>/dev/null || true
     for ((attempt = 0; attempt < 20; attempt++)); do
@@ -102,10 +106,16 @@ cleanup() {
     fi
     wait "$CHROMIUM_PID" 2>/dev/null || true
   fi
-  chmod -R a+rwX /home/node/.claude 2>/dev/null || true
-  chmod -R a+rwX /workspace/group 2>/dev/null || true
+  return "$cleanup_status"
 }
 trap cleanup EXIT
+
+# Rootless bind mounts require a live owner-root/group-node bridge for files
+# that applications explicitly create as 0600. Other modes need no watcher.
+happyclaw_start_session_permission_watcher
+if [ "$HAPPYCLAW_INTERNAL_IDENTITY_MODE" = rootless ]; then
+  umask 0007
+fi
 
 # Start one deterministic browser for this task container. Binding to loopback
 # keeps the raw Chrome DevTools Protocol private to the container; a future Web
@@ -116,7 +126,7 @@ HAPPYCLAW_CHROMIUM_CDP_PORT="${HAPPYCLAW_CHROMIUM_CDP_PORT:-9222}"
 CHROMIUM_PROFILE_DIR=/tmp/happyclaw-chromium-profile
 CHROMIUM_LOG=/tmp/happyclaw-chromium.log
 mkdir -p "$CHROMIUM_PROFILE_DIR"
-chown -R node:node "$CHROMIUM_PROFILE_DIR"
+happyclaw_prepare_generated_path chromium
 
 # agent-browser reads this value when its daemon starts, so it attaches to the
 # managed browser instead of creating another Chromium with a random CDP port.

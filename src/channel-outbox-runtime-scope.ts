@@ -11,6 +11,8 @@ export interface ActiveChannelOutboxScope extends ChannelRouteSnapshot {
   turnRunId: string;
   /** External input correlation id used by runner-side MCP output. */
   inputTurnId?: string;
+  /** Logical workspace/session base captured when this input turn was admitted. */
+  logicalBaseChatJid?: string;
   owner: string;
   token: string;
 }

@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
-import { createPortal } from 'react-dom';
 import {
   Folder,
   FolderOpen,
@@ -27,7 +26,7 @@ import {
 import { useFileStore, FileEntry, toBase64Url } from '../../stores/files';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
-import { useEscapeKey } from '../../hooks/useEscapeKey';
+import { useScrollIsolation } from '../../hooks/useScrollIsolation';
 import { api } from '../../api/client';
 import { withBasePath } from '../../utils/url';
 import { downloadFromUrl } from '../../utils/download';
@@ -47,6 +46,8 @@ import { Badge } from '@/components/ui/badge';
 import { Label } from '@/components/ui/label';
 import { FileUploadZone } from './FileUploadZone';
 import { MarkdownRenderer } from './MarkdownRenderer';
+import { PreviewDialog } from './PreviewDialog';
+import { ScrollEdgeAffordance } from '../common/ScrollEdgeAffordance';
 
 interface FilePanelProps {
   groupJid: string;
@@ -219,26 +220,25 @@ function MediaOverlay({
   fileName: string;
   bgOpacity?: string;
 }) {
-  useEscapeKey(onClose);
-
-  return createPortal(
-    <div
-      className={`fixed inset-0 z-50 bg-black/${bgOpacity} flex items-center justify-center p-4`}
-      onClick={onClose}
+  return (
+    <PreviewDialog
+      title={fileName}
+      onClose={onClose}
+      overlayClassName={bgOpacity === '90' ? 'bg-black/90' : 'bg-black/80'}
+      className="left-1/2 top-1/2 max-h-[calc(100dvh-2rem)] max-w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2"
     >
       <button
-        className="absolute top-4 right-4 text-white/70 hover:text-white transition-colors p-2 cursor-pointer z-10"
+        className="fixed top-4 right-4 text-white/70 hover:text-white transition-colors p-2 cursor-pointer z-10"
         onClick={onClose}
         aria-label="关闭预览"
       >
         <X className="w-8 h-8" />
       </button>
-      <div className="absolute bottom-4 left-1/2 -translate-x-1/2 text-white/70 text-sm bg-black/50 px-3 py-1 rounded-full">
+      <div className="fixed bottom-4 left-1/2 -translate-x-1/2 text-white/70 text-sm bg-black/50 px-3 py-1 rounded-full">
         {fileName}
       </div>
       {children}
-    </div>,
-    document.body,
+    </PreviewDialog>
   );
 }
 
@@ -258,7 +258,7 @@ function ImagePreview({
       <img
         src={buildPreviewUrl(groupJid, file.path)}
         alt={file.name}
-        className="max-w-full max-h-full object-contain rounded-lg"
+        className="max-h-[calc(100dvh-2rem)] max-w-[calc(100vw-2rem)] object-contain rounded-lg"
         onClick={(e) => e.stopPropagation()}
       />
     </MediaOverlay>
@@ -281,9 +281,9 @@ function TextEditor({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const overlayRef = useRef<HTMLDivElement>(null);
 
-  useEscapeKey(onClose);
-
+  useScrollIsolation(overlayRef);
   useEffect(() => {
     const handleSave = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 's') {
@@ -319,15 +319,15 @@ function TextEditor({
     if (ok) setDirty(false);
   };
 
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-3 lg:p-6"
-      onClick={onClose}
+  return (
+    <PreviewDialog
+      ref={overlayRef}
+      title={`编辑 ${file.name}`}
+      onClose={onClose}
+      overlayClassName="bg-black/50"
+      className="left-1/2 top-1/2 h-[85vh] w-[calc(100vw-1.5rem)] max-w-4xl -translate-x-1/2 -translate-y-1/2 supports-[height:100dvh]:h-[85dvh]"
     >
-      <div
-        className="bg-surface rounded-xl shadow-xl w-full max-w-4xl h-[85vh] supports-[height:100dvh]:h-[85dvh] flex flex-col animate-in zoom-in-95 duration-200"
-        onClick={(e) => e.stopPropagation()}
-      >
+      <div className="bg-surface rounded-xl shadow-xl w-full h-full flex flex-col animate-in zoom-in-95 duration-200">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-border flex-shrink-0">
           <div className="flex items-center gap-2 min-w-0">
@@ -381,8 +381,7 @@ function TextEditor({
           Ctrl/Cmd+S 保存 · Esc 关闭
         </div>
       </div>
-    </div>,
-    document.body,
+    </PreviewDialog>
   );
 }
 
@@ -405,18 +404,10 @@ function MarkdownFileViewer({
   const [dirty, setDirty] = useState(false);
   const [mode, setMode] = useState<'preview' | 'edit'>('preview');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const previewScrollRef = useRef<HTMLDivElement>(null);
 
-  // Lock body scroll on mount, restore on unmount (critical for iOS)
-  useEffect(() => {
-    const prev = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = prev;
-    };
-  }, []);
-
-  useEscapeKey(onClose);
+  useScrollIsolation(overlayRef);
 
   useEffect(() => {
     const handleSaveKey = (e: KeyboardEvent) => {
@@ -470,24 +461,15 @@ function MarkdownFileViewer({
     setMode('preview');
   };
 
-  // Only close on backdrop click (not on touch-scroll that ends on backdrop)
-  const handleBackdropClick = useCallback(
-    (e: React.MouseEvent) => {
-      if (e.target === e.currentTarget) onClose();
-    },
-    [onClose],
-  );
-
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 bg-black/50 sm:flex sm:items-center sm:justify-center sm:p-4 lg:p-6"
-      onClick={handleBackdropClick}
-      style={{ touchAction: 'none' }}
+  return (
+    <PreviewDialog
+      ref={overlayRef}
+      title={`预览 ${file.name}`}
+      onClose={onClose}
+      overlayClassName="bg-black/50"
+      className="inset-0 h-[100dvh] w-screen sm:left-1/2 sm:top-1/2 sm:h-[90vh] sm:w-[calc(100vw-2rem)] sm:max-w-4xl sm:-translate-x-1/2 sm:-translate-y-1/2 sm:supports-[height:100dvh]:h-[90dvh]"
     >
-      <div
-        className="bg-surface w-full h-full sm:rounded-xl sm:shadow-xl sm:max-w-4xl sm:h-[90vh] sm:supports-[height:100dvh]:h-[90dvh] flex flex-col sm:animate-in sm:zoom-in-95 sm:duration-200"
-        style={{ maxHeight: '100dvh' }}
-      >
+      <div className="bg-surface w-full h-full sm:rounded-xl sm:shadow-xl flex flex-col sm:animate-in sm:zoom-in-95 sm:duration-200">
         {/* Header */}
         <div className="flex items-center justify-between px-3 sm:px-4 py-2.5 border-b border-border flex-shrink-0">
           <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -506,6 +488,7 @@ function MarkdownFileViewer({
             <div className="flex items-center bg-muted rounded-lg p-0.5">
               <button
                 onClick={switchToPreview}
+                aria-label="预览"
                 className={`flex items-center gap-1 px-2.5 py-1.5 sm:px-2 sm:py-1 rounded-md text-xs font-medium transition-colors touch-manipulation ${
                   mode === 'preview'
                     ? 'bg-background text-foreground shadow-sm'
@@ -517,6 +500,7 @@ function MarkdownFileViewer({
               </button>
               <button
                 onClick={switchToEdit}
+                aria-label="编辑"
                 className={`flex items-center gap-1 px-2.5 py-1.5 sm:px-2 sm:py-1 rounded-md text-xs font-medium transition-colors touch-manipulation ${
                   mode === 'edit'
                     ? 'bg-background text-foreground shadow-sm'
@@ -557,8 +541,9 @@ function MarkdownFileViewer({
             </div>
           ) : mode === 'preview' ? (
             <div
-              ref={scrollRef}
-              className="absolute inset-0 overflow-y-auto overscroll-y-contain px-4 sm:px-6 py-4 [&_table_td]:!whitespace-normal [&_table_th]:!whitespace-normal"
+              ref={previewScrollRef}
+              className="hc-scroll-pane absolute inset-0 overflow-y-auto overscroll-y-contain px-4 sm:px-6 py-4 [&_table_td]:!whitespace-normal [&_table_th]:!whitespace-normal"
+              data-testid="markdown-preview-scroll"
               style={{ WebkitOverflowScrolling: 'touch', touchAction: 'pan-y' }}
             >
               <MarkdownRenderer
@@ -585,6 +570,9 @@ function MarkdownFileViewer({
               />
             </div>
           )}
+          {!loading && mode === 'preview' && (
+            <ScrollEdgeAffordance scrollRef={previewScrollRef} />
+          )}
         </div>
 
         {/* Footer */}
@@ -594,8 +582,7 @@ function MarkdownFileViewer({
             : '点击「编辑」修改内容 · Esc 关闭'}
         </div>
       </div>
-    </div>,
-    document.body,
+    </PreviewDialog>
   );
 }
 
@@ -610,13 +597,45 @@ function PdfPreview({
   file: FileEntry;
   onClose: () => void;
 }) {
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const [viewerLoadVersion, setViewerLoadVersion] = useState(0);
+
+  useEffect(() => {
+    const iframe = iframeRef.current;
+    if (!iframe || viewerLoadVersion === 0) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      onClose();
+    };
+    const embeddedWindow = iframe.contentWindow;
+
+    try {
+      embeddedWindow?.addEventListener('keydown', handleKeyDown);
+      iframe.dataset.escapeBridge = 'ready';
+    } catch {
+      // Some browser PDF viewers move their controls into an extension
+      // process. The dialog close control remains available in that case.
+    }
+    return () => {
+      try {
+        embeddedWindow?.removeEventListener('keydown', handleKeyDown);
+      } catch {
+        // The embedded viewer may have navigated across origins while closing.
+      }
+    };
+  }, [onClose, viewerLoadVersion]);
+
   return (
     <MediaOverlay onClose={onClose} fileName={file.name}>
       <iframe
+        ref={iframeRef}
         src={buildPreviewUrl(groupJid, file.path)}
         title={file.name}
-        className="w-full h-full max-w-[90vw] max-h-[90vh] rounded-lg bg-white"
-        onClick={(e) => e.stopPropagation()}
+        className="h-[90dvh] w-[90vw] rounded-lg bg-white"
+        tabIndex={0}
+        onLoad={() => setViewerLoadVersion((version) => version + 1)}
       />
     </MediaOverlay>
   );
@@ -640,7 +659,7 @@ function VideoPreview({
         controls
         autoPlay
         className="max-w-[90vw] max-h-[90vh] rounded-lg"
-        onClick={(e) => e.stopPropagation()}
+        tabIndex={0}
       />
     </MediaOverlay>
   );
@@ -657,17 +676,13 @@ function AudioPreview({
   file: FileEntry;
   onClose: () => void;
 }) {
-  useEscapeKey(onClose);
-
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
-      onClick={onClose}
+  return (
+    <PreviewDialog
+      title={`播放 ${file.name}`}
+      onClose={onClose}
+      className="left-1/2 top-1/2 w-[calc(100vw-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 rounded-xl bg-surface p-6 shadow-xl"
     >
-      <div
-        className="bg-surface rounded-xl shadow-xl w-full max-w-lg p-6 flex flex-col items-center gap-4"
-        onClick={(e) => e.stopPropagation()}
-      >
+      <div className="flex flex-col items-center gap-4">
         <div className="flex items-center gap-3 w-full">
           <Music className="w-10 h-10 text-cyan-500 flex-shrink-0" />
           <div className="flex-1 min-w-0">
@@ -689,10 +704,10 @@ function AudioPreview({
           controls
           autoPlay
           className="w-full"
+          tabIndex={0}
         />
       </div>
-    </div>,
-    document.body,
+    </PreviewDialog>
   );
 }
 
@@ -711,9 +726,10 @@ function GenericTextPreview({
   const [content, setContent] = useState('');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const contentScrollRef = useRef<HTMLDivElement>(null);
 
-  useEscapeKey(onClose);
-
+  useScrollIsolation(overlayRef);
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -734,15 +750,15 @@ function GenericTextPreview({
     };
   }, [groupJid, file.path, getFileContent]);
 
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-3 lg:p-6"
-      onClick={onClose}
+  return (
+    <PreviewDialog
+      ref={overlayRef}
+      title={`预览 ${file.name}`}
+      onClose={onClose}
+      overlayClassName="bg-black/50"
+      className="left-1/2 top-1/2 h-[85vh] w-[calc(100vw-1.5rem)] max-w-4xl -translate-x-1/2 -translate-y-1/2 supports-[height:100dvh]:h-[85dvh]"
     >
-      <div
-        className="bg-surface rounded-xl shadow-xl w-full max-w-4xl h-[85vh] supports-[height:100dvh]:h-[85vh] flex flex-col animate-in zoom-in-95 duration-200"
-        onClick={(e) => e.stopPropagation()}
-      >
+      <div className="bg-surface rounded-xl shadow-xl w-full h-full flex flex-col animate-in zoom-in-95 duration-200">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-border flex-shrink-0">
           <div className="flex items-center gap-2 min-w-0">
@@ -761,21 +777,28 @@ function GenericTextPreview({
         </div>
 
         {/* Content */}
-        <div className="flex-1 p-4 overflow-auto">
-          {loading ? (
-            <div className="flex items-center justify-center h-full">
-              <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
-            </div>
-          ) : loadError ? (
-            <div className="flex flex-col items-center justify-center h-full gap-3 text-muted-foreground">
-              <AlertCircle className="w-10 h-10" />
-              <p className="text-sm">此文件类型不支持预览</p>
-            </div>
-          ) : (
-            <pre className="text-sm text-foreground whitespace-pre-wrap break-all font-mono">
-              {content}
-            </pre>
-          )}
+        <div className="relative min-h-0 flex-1">
+          <div
+            ref={contentScrollRef}
+            className="hc-scroll-pane h-full overflow-auto p-4"
+            data-testid="text-preview-scroll"
+          >
+            {loading ? (
+              <div className="flex items-center justify-center h-full">
+                <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+              </div>
+            ) : loadError ? (
+              <div className="flex flex-col items-center justify-center h-full gap-3 text-muted-foreground">
+                <AlertCircle className="w-10 h-10" />
+                <p className="text-sm">此文件类型不支持预览</p>
+              </div>
+            ) : (
+              <pre className="text-sm text-foreground whitespace-pre-wrap break-all font-mono">
+                {content}
+              </pre>
+            )}
+          </div>
+          <ScrollEdgeAffordance scrollRef={contentScrollRef} />
         </div>
 
         {/* Footer hint */}
@@ -783,8 +806,7 @@ function GenericTextPreview({
           Esc 关闭
         </div>
       </div>
-    </div>,
-    document.body,
+    </PreviewDialog>
   );
 }
 
@@ -821,6 +843,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
   const isStreaming = useChatStore((s) => !!s.streaming[groupJid]);
   const canOpenLocalFolder = useAuthStore((s) => s.user?.role === 'admin');
   const prevStreamingRef = useRef(false);
+  const fileListScrollRef = useRef<HTMLDivElement>(null);
 
   const fileList = files[groupJid] || [];
   const currentDir = currentPath[groupJid] || '';
@@ -1057,129 +1080,149 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
       )}
 
       {/* File List */}
-      <div className="flex-1 overflow-y-auto px-2 py-2">
-        {loading && fileList.length === 0 ? (
-          <div className="flex items-center justify-center h-32">
-            <p className="text-sm text-muted-foreground">加载中...</p>
-          </div>
-        ) : sortedFiles.length === 0 ? (
-          <div className="flex items-center justify-center h-32">
-            <p className="text-sm text-muted-foreground">暂无文件</p>
-          </div>
-        ) : (
-          <div className="space-y-0.5">
-            {sortedFiles.map((item) => {
-              const clickable =
-                item.type === 'directory' ||
-                isPreviewableFile(item.name, !!item.isSystem);
-              return (
-                <div
-                  key={item.path}
-                  className={`flex items-center gap-2 px-2 py-1.5 rounded-lg transition-colors ${
-                    clickable
-                      ? 'hover:bg-muted cursor-pointer'
-                      : item.isSystem
-                        ? 'bg-muted/60'
-                        : 'hover:bg-muted/50'
-                  }`}
-                  onClick={() => handleItemClick(item)}
-                >
-                  {/* Icon */}
-                  <div className="flex-shrink-0 w-5 flex items-center justify-center">
-                    {item.type === 'directory' ? (
-                      <Folder className="w-4.5 h-4.5 text-primary" />
-                    ) : (
-                      <FileIcon name={item.name} />
-                    )}
-                  </div>
-
-                  {/* Name + meta */}
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-1.5">
-                      <span
-                        className={`text-sm truncate ${
-                          item.isSystem
-                            ? 'text-muted-foreground'
-                            : 'text-foreground'
-                        }`}
-                      >
-                        {item.name}
-                      </span>
-                      {item.isSystem && <Badge variant="neutral">系统</Badge>}
+      <div className="relative min-h-0 flex-1">
+        <div
+          ref={fileListScrollRef}
+          className="hc-scroll-pane h-full overflow-y-auto px-2 py-2"
+          data-testid="file-list-scroll"
+        >
+          {loading && fileList.length === 0 ? (
+            <div className="flex items-center justify-center h-32">
+              <p className="text-sm text-muted-foreground">加载中...</p>
+            </div>
+          ) : sortedFiles.length === 0 ? (
+            <div className="flex items-center justify-center h-32">
+              <p className="text-sm text-muted-foreground">暂无文件</p>
+            </div>
+          ) : (
+            <div className="space-y-0.5">
+              {sortedFiles.map((item) => {
+                const clickable =
+                  item.type === 'directory' ||
+                  isPreviewableFile(item.name, !!item.isSystem);
+                const summary = (
+                  <>
+                    <div className="flex-shrink-0 w-5 flex items-center justify-center">
+                      {item.type === 'directory' ? (
+                        <Folder className="w-4.5 h-4.5 text-primary" />
+                      ) : (
+                        <FileIcon name={item.name} />
+                      )}
                     </div>
-                    {item.type === 'file' && (
-                      <p className="text-[11px] text-muted-foreground leading-tight">
-                        {formatSize(item.size)}
-                      </p>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className={`text-sm truncate ${
+                            item.isSystem
+                              ? 'text-muted-foreground'
+                              : 'text-foreground'
+                          }`}
+                        >
+                          {item.name}
+                        </span>
+                        {item.isSystem && <Badge variant="neutral">系统</Badge>}
+                      </div>
+                      {item.type === 'file' && (
+                        <p className="text-[11px] text-muted-foreground leading-tight">
+                          {formatSize(item.size)}
+                        </p>
+                      )}
+                    </div>
+                  </>
+                );
+                return (
+                  <div
+                    key={item.path}
+                    className={`flex items-center gap-2 px-2 py-1.5 rounded-lg transition-colors ${
+                      clickable
+                        ? 'hover:bg-muted'
+                        : item.isSystem
+                          ? 'bg-muted/60'
+                          : 'hover:bg-muted/50'
+                    }`}
+                  >
+                    {clickable ? (
+                      <button
+                        type="button"
+                        onClick={() => handleItemClick(item)}
+                        className="flex min-w-0 flex-1 items-center gap-2 rounded text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
+                      >
+                        {summary}
+                      </button>
+                    ) : (
+                      <div className="flex min-w-0 flex-1 items-center gap-2">
+                        {summary}
+                      </div>
                     )}
-                  </div>
 
-                  {/* Actions */}
-                  <div className="flex-shrink-0 flex items-center gap-0.5">
-                    {/* Copy absolute path (always available) */}
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleCopyPath(item);
-                      }}
-                      className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-                      title={
-                        item.absolutePath
-                          ? `复制路径：${item.absolutePath}`
-                          : '复制路径'
-                      }
-                      aria-label="复制绝对路径"
-                    >
-                      <Copy className="w-3.5 h-3.5" />
-                    </button>
-                    {/* Edit button for non-system text files */}
-                    {!item.isSystem &&
-                      item.type === 'file' &&
-                      TEXT_EXTENSIONS.has(getFileExt(item.name)) && (
+                    {/* Actions */}
+                    <div className="flex-shrink-0 flex items-center gap-0.5">
+                      {/* Copy absolute path (always available) */}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleCopyPath(item);
+                        }}
+                        className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                        title={
+                          item.absolutePath
+                            ? `复制路径：${item.absolutePath}`
+                            : '复制路径'
+                        }
+                        aria-label="复制绝对路径"
+                      >
+                        <Copy className="w-3.5 h-3.5" />
+                      </button>
+                      {/* Edit button for non-system text files */}
+                      {!item.isSystem &&
+                        item.type === 'file' &&
+                        TEXT_EXTENSIONS.has(getFileExt(item.name)) && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setPreview({ kind: 'edit', file: item });
+                            }}
+                            className="p-2.5 rounded hover:bg-brand-100 text-muted-foreground hover:text-primary transition-colors cursor-pointer"
+                            title="编辑"
+                            aria-label="编辑文件"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      {item.type === 'file' && (
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            setPreview({ kind: 'edit', file: item });
+                            handleDownload(item);
                           }}
-                          className="p-2.5 rounded hover:bg-brand-100 text-muted-foreground hover:text-primary transition-colors cursor-pointer"
-                          title="编辑"
-                          aria-label="编辑文件"
+                          className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                          title="下载"
+                          aria-label="下载文件"
                         >
-                          <Pencil className="w-3.5 h-3.5" />
+                          <Download className="w-3.5 h-3.5" />
                         </button>
                       )}
-                    {item.type === 'file' && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleDownload(item);
-                        }}
-                        className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-                        title="下载"
-                        aria-label="下载文件"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                    {!item.isSystem && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleDeleteClick(item);
-                        }}
-                        className="p-2.5 rounded hover:bg-red-100 dark:hover:bg-red-950/40 text-muted-foreground hover:text-red-600 dark:hover:text-red-400 transition-colors cursor-pointer"
-                        title="删除"
-                        aria-label="删除文件"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    )}
+                      {!item.isSystem && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDeleteClick(item);
+                          }}
+                          className="p-2.5 rounded hover:bg-red-100 dark:hover:bg-red-950/40 text-muted-foreground hover:text-red-600 dark:hover:text-red-400 transition-colors cursor-pointer"
+                          title="删除"
+                          aria-label="删除文件"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
+                );
+              })}
+            </div>
+          )}
+        </div>
+        <ScrollEdgeAffordance scrollRef={fileListScrollRef} />
       </div>
 
       {/* Footer */}

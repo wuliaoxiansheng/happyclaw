@@ -248,6 +248,61 @@ afterAll(() => {
 });
 
 describe('scheduled task workspace/session contract', () => {
+  test('forwards Agent effort to isolated container and host scheduled runs', async () => {
+    const ownerId = 'task-effort-owner';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: ownerId,
+      username: ownerId,
+      password_hash: 'hash',
+      display_name: ownerId,
+      role: 'admin',
+      status: 'active',
+      must_change_password: false,
+      created_at: now,
+      updated_at: now,
+    });
+    db.setRegisteredGroup(GROUP_JID, {
+      name: 'Task Effort Workspace',
+      folder: GROUP_FOLDER,
+      added_at: now,
+      executionMode: 'container',
+      is_home: false,
+      created_by: ownerId,
+    } as any);
+    const defaultProfile = db.getOrCreateDefaultAgentProfile(ownerId);
+    const profile = db.updateAgentProfile(defaultProfile.id, ownerId, {
+      runtimePolicy: { reasoning: { effort: 'xhigh' } },
+    })!;
+    db.assignWorkspaceAgentProfile(GROUP_FOLDER, profile.id);
+    const groups = { [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)! };
+
+    const containerTaskId = createTask({
+      id: 'task-effort-container',
+      execution_mode: 'container',
+    });
+    const containerRun = makeDeps(groups);
+    expect(triggerTaskNow(containerTaskId, containerRun.deps).success).toBe(
+      true,
+    );
+    await containerRun.waitForRun();
+    expect(
+      runContainerAgentMock.mock.calls[0][1].agentProfile.runtimePolicy
+        .reasoning,
+    ).toEqual({ effort: 'xhigh' });
+
+    const hostTaskId = createTask({
+      id: 'task-effort-host',
+      execution_mode: 'host',
+    });
+    const hostRun = makeDeps(groups);
+    expect(triggerTaskNow(hostTaskId, hostRun.deps).success).toBe(true);
+    await hostRun.waitForRun();
+    expect(
+      runHostAgentMock.mock.calls[0][1].agentProfile.runtimePolicy.reasoning,
+    ).toEqual({ effort: 'xhigh' });
+  });
+
   test('finalizes only at a durable scheduled-input boundary', () => {
     expect(
       shouldFinalizeScheduledRunOutput({

@@ -69,6 +69,7 @@ import {
   getRunContextSnapshot,
   hashRuntimePolicy,
 } from '../run-context-snapshot.js';
+import { getDefaultProviderId, getProviders } from '../runtime-config.js';
 
 const agentProfileRoutes = new Hono<{ Variables: Variables }>();
 const AVATARS_DIR = path.join(DATA_DIR, 'avatars');
@@ -107,6 +108,7 @@ function usesFourPartPromptPayload(input: {
 agentProfileRoutes.get('/', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const profiles = listAgentProfilesForUser(user.id);
+  const defaultModelConfigId = getDefaultProviderId();
   return c.json({
     profiles: profiles.map((profile) => ({
       ...profile,
@@ -116,8 +118,21 @@ agentProfileRoutes.get('/', authMiddleware, (c) => {
         resolveEffectiveAgentProfile(profile)?.runtime_policy ??
         profile.runtime_policy,
     })),
+    model_configs: getProviders().map((provider) => ({
+      id: provider.id,
+      name: provider.name,
+      type: provider.type,
+      enabled: provider.enabled,
+      anthropic_model: provider.anthropicModel,
+      is_default: provider.id === defaultModelConfigId,
+    })),
+    default_model_config_id: defaultModelConfigId,
   });
 });
+
+function modelConfigExists(modelConfigId: string): boolean {
+  return getProviders().some((provider) => provider.id === modelConfigId);
+}
 
 agentProfileRoutes.post('/', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
@@ -131,6 +146,12 @@ agentProfileRoutes.post('/', authMiddleware, async (c) => {
   }
   if (isUnauthorizedHostSkills(user, parsed.data.runtime_policy)) {
     return c.json({ error: 'host skills require an admin role' }, 403);
+  }
+  if (
+    parsed.data.model_config_id &&
+    !modelConfigExists(parsed.data.model_config_id)
+  ) {
+    return c.json({ error: '所选模型配置不存在' }, 400);
   }
   const runtimePolicy = normalizeAgentProfileRuntimePolicy(
     parsed.data.runtime_policy,
@@ -180,6 +201,7 @@ agentProfileRoutes.post('/', authMiddleware, async (c) => {
           promptModeFromLegacyPreset(parsed.data.include_claude_preset),
         avatarEmoji: parsed.data.avatar_emoji,
         avatarColor: parsed.data.avatar_color,
+        modelConfigId: parsed.data.model_config_id,
         runtimePolicy,
       });
       return c.json({ profile }, 201);
@@ -445,6 +467,7 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
     parsed.data.include_claude_preset === undefined &&
     parsed.data.avatar_emoji === undefined &&
     parsed.data.avatar_color === undefined &&
+    parsed.data.model_config_id === undefined &&
     parsed.data.runtime_policy === undefined
   ) {
     return c.json({ error: 'No changes provided' }, 400);
@@ -458,6 +481,12 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
         // from being published between snapshot and post-commit cleanup.
         const existing = getAgentProfileForUser(id, user.id);
         if (!existing) return c.json({ error: '智能体配置不存在' }, 404);
+        if (
+          parsed.data.model_config_id &&
+          !modelConfigExists(parsed.data.model_config_id)
+        ) {
+          return c.json({ error: '所选模型配置不存在' }, 400);
+        }
 
         const effectiveRuntimePolicy =
           parsed.data.runtime_policy === undefined
@@ -527,7 +556,9 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
             JSON.stringify(effectiveRuntimePolicy) !==
               JSON.stringify(
                 normalizeAgentProfileRuntimePolicy(existing.runtime_policy),
-              ));
+              )) ||
+          (parsed.data.model_config_id !== undefined &&
+            parsed.data.model_config_id !== existing.model_config_id);
 
         let invalidatedRuntimeJids = 0;
         const fourPartPromptPayload = usesFourPartPromptPayload(parsed.data);
@@ -556,6 +587,7 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
                   )),
             avatarEmoji: parsed.data.avatar_emoji,
             avatarColor: parsed.data.avatar_color,
+            modelConfigId: parsed.data.model_config_id,
             runtimePolicy: parsed.data.runtime_policy,
           });
         };

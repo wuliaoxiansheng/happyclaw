@@ -33,8 +33,10 @@ import {
   clearInheritedClaudeProviderEnv,
   getClaudeProviderConfig,
   getContainerEnvConfig,
+  getDefaultProviderId,
   getEnabledProviders,
   getBalancingConfig,
+  getProviders,
   getSystemSettings,
   getEffectiveExternalDir,
   mergeClaudeEnvConfig,
@@ -115,6 +117,10 @@ import {
 } from './feishu-cli-runtime.js';
 import { assertValidWorkspaceFolderName } from './workspace-folder.js';
 import { resolveRunnerLivenessTimeouts } from './runner-liveness.js';
+import {
+  removeProviderEffortEnv,
+  resolveAgentSdkEffort,
+} from './agent-effort.js';
 
 /**
  * 宿主机的 ~/.claude.json 路径。
@@ -381,6 +387,8 @@ export interface ContainerInput {
     identityHash: string;
     identityPrompt: string;
     includeClaudePreset: boolean;
+    /** Null means inherit the system default model configuration. */
+    modelConfigId?: string | null;
     runtimePolicy?: AgentProfileRuntimePolicy;
   };
   /**
@@ -472,13 +480,16 @@ export interface ContainerOutput {
 function applyProviderFailureDisposition(
   output: ContainerOutput,
   selectedProfileId: string | null,
+  allowFailover = true,
 ): boolean {
   providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
   providerPool.refreshRecoveryState();
-  const disposition = resolveProviderFailureDisposition(
-    selectedProfileId,
-    providerPool.getHealthStatuses(),
-  );
+  const disposition = allowFailover
+    ? resolveProviderFailureDisposition(
+        selectedProfileId,
+        providerPool.getHealthStatuses(),
+      )
+    : { terminal: true };
   applyKnownProviderFailureDisposition(output, disposition.terminal);
   return disposition.terminal;
 }
@@ -494,21 +505,21 @@ function applyKnownProviderFailureDisposition(
   output.inputTurnCompleted = terminal;
 }
 
-interface VolumeMount {
+export interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
 }
 
 /**
- * Create directory with 0o777 permissions for container volume mounts.
- * Fixes uid mismatch between host user and container node user (uid 1000),
- * especially in rootless podman where uid remapping causes permission denied.
+ * Create an owner-only directory for a writable container mount. The container
+ * entrypoint applies the selected identity bridge; host code must never make
+ * these data roots world-accessible as a uid-mismatch workaround.
  */
 function mkdirForContainer(dirPath: string): void {
   fs.mkdirSync(dirPath, { recursive: true });
   try {
-    fs.chmodSync(dirPath, 0o777);
+    fs.chmodSync(dirPath, 0o700);
   } catch {
     // Ignore — may fail on read-only filesystem or special mounts
   }
@@ -743,24 +754,11 @@ function getAgentProfileMcpPolicyMode(
 }
 
 /**
- * One-time provider overrides per group folder.
- * Set by switchProvider(), consumed (and deleted) by trySelectPoolProvider().
- */
-const providerOverrides = new Map<string, string>();
-
-export function setProviderOverride(
-  groupFolder: string,
-  providerId: string,
-): void {
-  providerOverrides.set(groupFolder, providerId);
-}
-
-/**
  * Read-only prediction of whether the next provider selection will *clear* the
  * resumable Claude session because it has to switch away from the bound
- * provider (the binding is unhealthy or no longer enabled, or a one-time
- * override targets a different provider). Mirrors the `resetSession` conditions
- * in trySelectPoolProvider without mutating sticky bindings.
+ * provider (the binding is unhealthy or no longer enabled). Mirrors the
+ * `resetSession` conditions in trySelectPoolProvider without mutating sticky
+ * bindings.
  *
  * The orchestration layer calls this *before* building the prompt so a
  * proactive provider switch injects recent conversation history into the fresh
@@ -773,7 +771,14 @@ export function setProviderOverride(
 export function willClearSessionOnProviderSwitch(
   groupFolder: string,
   agentId?: string | null,
+  modelConfigId?: string | null,
 ): boolean {
+  const selectedModelConfigId = modelConfigId ?? getDefaultProviderId();
+  const boundId = getSessionProviderId(groupFolder, agentId);
+  if (selectedModelConfigId) {
+    return !!boundId && boundId !== selectedModelConfigId;
+  }
+
   // Env-level provider override means the pool is bypassed entirely — no
   // pool-driven switch, so the session is never cleared on this account.
   const override = getContainerEnvConfig(groupFolder);
@@ -785,15 +790,7 @@ export function willClearSessionOnProviderSwitch(
     return false;
   }
 
-  const boundId = getSessionProviderId(groupFolder, agentId);
   if (!boundId) return false;
-
-  // One-time override (from switchProvider) targeting a different provider will
-  // reset. Peek without consuming — trySelectPoolProvider consumes it later.
-  const overrideProviderId = providerOverrides.get(groupFolder);
-  if (overrideProviderId) {
-    return overrideProviderId !== boundId;
-  }
 
   const enabledProviders = getEnabledProviders();
   if (enabledProviders.length === 0) return false;
@@ -819,8 +816,6 @@ export function willClearSessionOnProviderSwitch(
  * Try to select a provider from the pool. Returns profileId + resolved config,
  * or null if no providers are enabled / group has env-level provider override / selection fails.
  * For single-provider setups, returns the provider for display without pool balancing.
- * One-time overrides (from switchProvider) are consumed on use.
- *
  * Session-sticky binding (when groupFolder + agentId identifies a resumable Claude
  * session): if the session has a previously-bound provider that is still enabled,
  * prefer it over load-balancing. This prevents "Invalid signature in thinking
@@ -832,48 +827,48 @@ export function willClearSessionOnProviderSwitch(
 export function trySelectPoolProvider(
   groupFolder: string,
   agentId?: string | null,
+  modelConfigId?: string | null,
 ): {
   profileId: string;
   resolved: ResolvedProvider;
   previousProviderId?: string;
   resetSession?: boolean;
 } | null {
+  const selectedModelConfigId = modelConfigId ?? getDefaultProviderId();
+  const existingBoundId = getSessionProviderId(groupFolder, agentId);
+  if (selectedModelConfigId) {
+    // Agent/default selection is authoritative. Workspace credentials must
+    // never move a Workspace away from the model configuration selected for
+    // its top-level Agent. `enabled` only controls the global automatic pool;
+    // an Agent may explicitly bind any saved model configuration.
+    const providers = getProviders();
+    const selected = providers.find(
+      (provider) => provider.id === selectedModelConfigId,
+    );
+    if (!selected) {
+      throw new Error(
+        `agent_model_unavailable: model configuration ${selectedModelConfigId} is missing`,
+      );
+    }
+    providerPool.refreshFromConfig(providers, getBalancingConfig());
+    const resolved = resolveProviderById(selected.id);
+    providerPool.acquireSession(selected.id);
+    setSessionProviderId(groupFolder, agentId, selected.id);
+    return {
+      profileId: selected.id,
+      resolved: { config: resolved.config, customEnv: resolved.customEnv },
+      previousProviderId: existingBoundId,
+      resetSession: !!existingBoundId && existingBoundId !== selected.id,
+    };
+  }
+
   const override = getContainerEnvConfig(groupFolder);
   const hasOverride = !!(
     override.anthropicApiKey ||
     override.anthropicAuthToken ||
     override.anthropicBaseUrl
   );
-  const existingBoundId = getSessionProviderId(groupFolder, agentId);
   if (hasOverride) return null;
-
-  // Check one-time override (consumed on use)
-  const overrideProviderId = providerOverrides.get(groupFolder);
-  if (overrideProviderId) {
-    providerOverrides.delete(groupFolder);
-    try {
-      const resolved = resolveProviderById(overrideProviderId);
-      providerPool.acquireSession(overrideProviderId);
-      // Override path also updates sticky binding so subsequent runs follow.
-      setSessionProviderId(groupFolder, agentId, overrideProviderId);
-      logger.info(
-        { groupFolder, providerId: overrideProviderId },
-        'Using one-time provider override',
-      );
-      return {
-        profileId: overrideProviderId,
-        resolved: { config: resolved.config, customEnv: resolved.customEnv },
-        previousProviderId: existingBoundId,
-        resetSession:
-          !!existingBoundId && existingBoundId !== overrideProviderId,
-      };
-    } catch (err) {
-      logger.warn(
-        { err, providerId: overrideProviderId },
-        'Provider override failed, falling back to pool',
-      );
-    }
-  }
 
   // Refresh pool state from V4 config
   const enabledProviders = getEnabledProviders();
@@ -1338,7 +1333,7 @@ export function buildVolumeMounts(
   // Per-group IPC namespace: each group gets its own IPC directory
   // Sub-agents get their own IPC subdirectory under agents/{agentId}/
   // Isolated tasks get their own IPC subdirectory under tasks-run/{taskRunId}/
-  // Use 0o777 so container (node/1000) and host (agent/1002) can both read/write.
+  // Keep host IPC roots owner-only; the entrypoint applies the selected bridge.
   const groupIpcDir = ipcAgentId
     ? path.join(DATA_DIR, 'ipc', group.folder, 'agents', ipcAgentId)
     : taskRunId
@@ -1346,12 +1341,11 @@ export function buildVolumeMounts(
       : path.join(DATA_DIR, 'ipc', group.folder);
   mkdirForContainer(groupIpcDir);
   // All agents (main + sub/conversation) get agents/ subdir for spawn/message IPC
-  // Use chmod 777 so both host (agent/1002) and container (node/1000) can write
   for (const sub of ['messages', 'tasks', 'input', 'agents'] as const) {
     const subDir = path.join(groupIpcDir, sub);
     fs.mkdirSync(subDir, { recursive: true });
     try {
-      fs.chmodSync(subDir, 0o777);
+      fs.chmodSync(subDir, 0o700);
     } catch {
       /* ignore if already correct */
     }
@@ -1375,11 +1369,16 @@ export function buildVolumeMounts(
   fs.mkdirSync(envDir, { recursive: true });
   const globalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
   const containerOverride = getContainerEnvConfig(group.folder);
+  const effectiveContainerOverride = resolvedProvider
+    ? { customEnv: containerOverride.customEnv }
+    : containerOverride;
   const envLines = buildContainerEnvLines(
     globalConfig,
-    containerOverride,
+    effectiveContainerOverride,
     resolvedProvider?.customEnv,
   );
+  const agentEffort = resolveAgentSdkEffort(agentProfile?.runtimePolicy);
+  removeProviderEffortEnv(envLines, agentEffort);
   // Agent policy is authoritative; do not inherit global/custom runtime env.
   for (let index = envLines.length - 1; index >= 0; index -= 1) {
     if (
@@ -1534,15 +1533,126 @@ export function buildVolumeMounts(
   return mounts;
 }
 
-function buildContainerArgs(
+export type ContainerHostIdentityMode =
+  | 'direct'
+  | 'rootless'
+  | 'userns'
+  | 'virtualized'
+  | 'host-root'
+  | 'unknown';
+
+export interface ContainerHostIdentity {
+  mode: ContainerHostIdentityMode;
+  uid?: number;
+  gid?: number;
+}
+
+export interface ContainerHostIdentityProbe {
+  platform: NodeJS.Platform;
+  uid?: number;
+  gid?: number;
+  securityOptions: readonly string[] | null;
+}
+
+function isPositiveUnixId(value: number | undefined): value is number {
+  return Number.isSafeInteger(value) && value !== undefined && value > 0;
+}
+
+/**
+ * Decide whether container ids share the host's numeric id namespace.
+ *
+ * Numeric remapping is safe only for a rootful Linux daemon without userns.
+ * Rootless Docker/Podman and userns-remap deliberately translate ids, while
+ * Docker Desktop virtualizes bind-mount ownership. Unknown probes fail closed
+ * to the entrypoint's permission reconciler instead of guessing.
+ */
+export function resolveContainerHostIdentity(
+  probe: ContainerHostIdentityProbe,
+): ContainerHostIdentity {
+  if (probe.platform === 'darwin' || probe.platform === 'win32') {
+    return { mode: 'virtualized' };
+  }
+  if (probe.platform !== 'linux') return { mode: 'unknown' };
+
+  if (probe.securityOptions === null) return { mode: 'unknown' };
+
+  const normalizedSecurityOptions = probe.securityOptions.map((option) =>
+    option.toLowerCase(),
+  );
+  if (normalizedSecurityOptions.some((option) => option.includes('rootless'))) {
+    return { mode: 'rootless' };
+  }
+  if (normalizedSecurityOptions.some((option) => option.includes('userns'))) {
+    return { mode: 'userns' };
+  }
+
+  if (probe.uid === 0) return { mode: 'host-root' };
+  if (!isPositiveUnixId(probe.uid)) return { mode: 'unknown' };
+
+  return {
+    mode: 'direct',
+    uid: probe.uid,
+    ...(isPositiveUnixId(probe.gid) ? { gid: probe.gid } : {}),
+  };
+}
+
+function probeContainerSecurityOptions(): readonly string[] | null {
+  let securityOptions: readonly string[] | null = null;
+  try {
+    const raw = execFileSync(
+      'docker',
+      ['info', '--format', '{{json .SecurityOptions}}'],
+      { encoding: 'utf8', timeout: 3_000 },
+    ).trim();
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      Array.isArray(parsed) &&
+      parsed.every((option) => typeof option === 'string')
+    ) {
+      securityOptions = parsed;
+    }
+  } catch {
+    // A missing/unsupported probe must not enable numeric id remapping.
+  }
+  return securityOptions;
+}
+
+export function detectContainerHostIdentity(
+  readSecurityOptions: () =>
+    | readonly string[]
+    | null = probeContainerSecurityOptions,
+): ContainerHostIdentity {
+  // Probe every launch. Docker context/daemon security options can change
+  // while HappyClaw is running; reusing an earlier direct result could bypass
+  // rootless/userns fail-closed handling, while caching unknown blocks recovery.
+  const securityOptions = readSecurityOptions();
+  return resolveContainerHostIdentity({
+    platform: process.platform,
+    uid: process.getuid?.(),
+    gid: process.getgid?.(),
+    securityOptions,
+  });
+}
+
+export function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   tz: string,
+  hostIdentity: ContainerHostIdentity = detectContainerHostIdentity(),
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Set timezone so container Node.js processes use local time (Asia/Shanghai)
   args.push('-e', `TZ=${tz}`);
+  args.push('-e', `HAPPYCLAW_HOST_IDENTITY_MODE=${hostIdentity.mode}`);
+  if (hostIdentity.mode === 'direct') {
+    if (isPositiveUnixId(hostIdentity.uid)) {
+      args.push('-e', `HAPPYCLAW_HOST_UID=${hostIdentity.uid}`);
+    }
+    if (isPositiveUnixId(hostIdentity.gid)) {
+      args.push('-e', `HAPPYCLAW_HOST_GID=${hostIdentity.gid}`);
+    }
+  }
 
   // Docker: -v with :ro suffix for readonly
   for (const mount of mounts) {
@@ -1576,9 +1686,16 @@ export async function runContainerAgent(
   mkdirForContainer(groupDir);
 
   // ─── Provider Pool selection ───
-  const poolResult = trySelectPoolProvider(group.folder, sessionAgentId);
+  const poolResult = trySelectPoolProvider(
+    group.folder,
+    sessionAgentId,
+    input.agentProfile?.modelConfigId,
+  );
   const selectedProfileId = poolResult?.profileId ?? null;
   const resolvedProvider = poolResult?.resolved;
+  const modelSelectionPinned = !!(
+    input.agentProfile?.modelConfigId ?? getDefaultProviderId()
+  );
   let providerFailureReported = false;
   let providerFailureTerminal: boolean | undefined;
   let providerFailureMaintenance = false;
@@ -1905,6 +2022,7 @@ export async function runContainerAgent(
               const terminal = applyProviderFailureDisposition(
                 output,
                 selectedProfileId,
+                !modelSelectionPinned,
               );
               providerFailureTerminal = terminal;
               logger.warn(
@@ -2043,6 +2161,7 @@ export async function runContainerAgent(
         providerFailureTerminal = applyProviderFailureDisposition(
           result,
           selectedProfileId,
+          !modelSelectionPinned,
         );
       } else {
         applyKnownProviderFailureDisposition(result, providerFailureTerminal);
@@ -2398,8 +2517,15 @@ export async function runHostAgent(
 
   // ─── Provider Pool selection (host mode) ───
   const containerOverride = getContainerEnvConfig(group.folder);
-  const hostPoolResult = trySelectPoolProvider(group.folder, sessionAgentId);
+  const hostPoolResult = trySelectPoolProvider(
+    group.folder,
+    sessionAgentId,
+    input.agentProfile?.modelConfigId,
+  );
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
+  const hostModelSelectionPinned = !!(
+    input.agentProfile?.modelConfigId ?? getDefaultProviderId()
+  );
   const globalConfig =
     hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
   let hostProviderFailureReported = false;
@@ -2442,9 +2568,15 @@ export async function runHostAgent(
     // 配置层环境变量
     const envLines = buildContainerEnvLines(
       globalConfig,
-      containerOverride,
+      hostSelectedProfileId
+        ? { customEnv: containerOverride.customEnv }
+        : containerOverride,
       hostPoolResult?.resolved.customEnv,
     );
+    const agentEffort = resolveAgentSdkEffort(
+      input.agentProfile?.runtimePolicy,
+    );
+    removeProviderEffortEnv(envLines, agentEffort);
     const injectsAnthropicAuthToken = envLines.some((line) =>
       line.startsWith('ANTHROPIC_AUTH_TOKEN='),
     );
@@ -2831,6 +2963,7 @@ export async function runHostAgent(
               const terminal = applyProviderFailureDisposition(
                 output,
                 hostSelectedProfileId,
+                !hostModelSelectionPinned,
               );
               hostProviderFailureTerminal = terminal;
               logger.warn(
@@ -2958,6 +3091,7 @@ export async function runHostAgent(
         hostProviderFailureTerminal = applyProviderFailureDisposition(
           hostResult,
           hostSelectedProfileId,
+          !hostModelSelectionPinned,
         );
       } else {
         applyKnownProviderFailureDisposition(
@@ -3010,9 +3144,15 @@ export async function runAgentWithModelFallback(
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
-  const maxAttempts = input.isScheduledTask
-    ? Math.max(1, getEnabledProviders().length)
-    : 1;
+  // A top-level Agent owns exactly one complete model configuration. Retrying
+  // through other enabled configurations would violate that contract and can
+  // send a Workspace to a different gateway or official subscription. Keep
+  // the old pool fallback only for an unmigrated/no-model installation.
+  const selectedModelConfigId =
+    input.agentProfile?.modelConfigId ?? getDefaultProviderId();
+  const maxAttempts = selectedModelConfigId
+    ? 1
+    : Math.max(1, getEnabledProviders().length);
   let lastOutput: ContainerOutput | undefined;
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {

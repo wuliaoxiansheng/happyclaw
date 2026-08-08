@@ -178,87 +178,110 @@ export function MonitorPage() {
             </Card>
 
             {/* Docker 镜像状态 */}
-            <Card>
-              <CardContent>
-                <h2 className="text-lg font-semibold text-foreground mb-4">
-                  Docker 镜像
-                </h2>
-                <div className="flex items-center justify-between">
+            {status.dockerRequired === false ? (
+              <Card>
+                <CardContent>
+                  <h2 className="text-lg font-semibold text-foreground mb-2">
+                    Docker 镜像
+                  </h2>
                   <div className="flex items-center gap-3">
-                    {status.dockerImageExists ? (
-                      <>
-                        <CheckCircle className="w-5 h-5 text-success" />
-                        <span className="text-sm text-success font-medium">
-                          镜像已就绪
-                        </span>
-                      </>
-                    ) : (
-                      <>
-                        <AlertTriangle className="w-5 h-5 text-error" />
-                        <span className="text-sm text-error font-medium">
-                          镜像不存在，Docker 模式的工作区将无法运行
-                        </span>
-                      </>
-                    )}
+                    <CheckCircle className="w-5 h-5 text-success" />
+                    <span className="text-sm text-muted-foreground">
+                      {status.adminHostOnlyMode
+                        ? '管理员纯宿主机模式已开启，当前工作区无需 Docker。'
+                        : '当前没有 Docker 模式的工作区，无需检查镜像。'}
+                    </span>
                   </div>
-                  <Button
-                    onClick={handlePull}
-                    disabled={pulling || !canManageSystem}
-                    title={!canManageSystem ? '需要系统配置权限' : undefined}
-                  >
-                    {pulling ? (
-                      <>
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        拉取中...
-                      </>
-                    ) : (
-                      <>
-                        <Download className="w-4 h-4" />
-                        {status.dockerImageExists ? '拉取最新镜像' : '拉取镜像'}
-                      </>
-                    )}
-                  </Button>
-                </div>
-
-                {/* Pull logs */}
-                {pulling && pullLogs.length > 0 && (
-                  <div className="mt-4">
-                    <div className="bg-[#0f172a] dark:bg-[#0a0f1a] rounded-lg p-3 max-h-64 overflow-y-auto font-mono text-xs text-green-400">
-                      {pullLogs.map((line, i) => (
-                        <div key={i} className="whitespace-pre-wrap break-all">
-                          {line}
-                        </div>
-                      ))}
-                      <div ref={logEndRef} />
-                    </div>
-                  </div>
-                )}
-
-                {pullResult && (
-                  <div
-                    className={`mt-4 p-4 rounded-lg border ${pullResult.success ? 'bg-success-bg border-success/20' : 'bg-error-bg border-error/20'}`}
-                  >
-                    <div className="flex items-center gap-2 mb-2">
-                      {pullResult.success ? (
-                        <CheckCircle className="w-4 h-4 text-success" />
+                </CardContent>
+              </Card>
+            ) : (
+              <Card>
+                <CardContent>
+                  <h2 className="text-lg font-semibold text-foreground mb-4">
+                    Docker 镜像
+                  </h2>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      {status.dockerImageExists ? (
+                        <>
+                          <CheckCircle className="w-5 h-5 text-success" />
+                          <span className="text-sm text-success font-medium">
+                            镜像已就绪
+                          </span>
+                        </>
                       ) : (
-                        <AlertTriangle className="w-4 h-4 text-error" />
+                        <>
+                          <AlertTriangle className="w-5 h-5 text-error" />
+                          <span className="text-sm text-error font-medium">
+                            镜像不存在，Docker 模式的工作区将无法运行
+                          </span>
+                        </>
                       )}
-                      <span
-                        className={`text-sm font-medium ${pullResult.success ? 'text-success' : 'text-error'}`}
-                      >
-                        {pullResult.success ? '镜像拉取成功' : '镜像拉取失败'}
-                      </span>
                     </div>
-                    {pullResult.error && (
-                      <pre className="text-xs text-error bg-error-bg rounded p-3 mt-2 overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">
-                        {pullResult.error}
-                      </pre>
-                    )}
+                    <Button
+                      onClick={handlePull}
+                      disabled={pulling || !canManageSystem}
+                      title={!canManageSystem ? '需要系统配置权限' : undefined}
+                    >
+                      {pulling ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          拉取中...
+                        </>
+                      ) : (
+                        <>
+                          <Download className="w-4 h-4" />
+                          {status.dockerImageExists
+                            ? '拉取最新镜像'
+                            : '拉取镜像'}
+                        </>
+                      )}
+                    </Button>
                   </div>
-                )}
-              </CardContent>
-            </Card>
+
+                  {/* Pull logs */}
+                  {pulling && pullLogs.length > 0 && (
+                    <div className="mt-4">
+                      <div className="bg-[#0f172a] dark:bg-[#0a0f1a] rounded-lg p-3 max-h-64 overflow-y-auto font-mono text-xs text-green-400">
+                        {pullLogs.map((line, i) => (
+                          <div
+                            key={i}
+                            className="whitespace-pre-wrap break-all"
+                          >
+                            {line}
+                          </div>
+                        ))}
+                        <div ref={logEndRef} />
+                      </div>
+                    </div>
+                  )}
+
+                  {pullResult && (
+                    <div
+                      className={`mt-4 p-4 rounded-lg border ${pullResult.success ? 'bg-success-bg border-success/20' : 'bg-error-bg border-error/20'}`}
+                    >
+                      <div className="flex items-center gap-2 mb-2">
+                        {pullResult.success ? (
+                          <CheckCircle className="w-4 h-4 text-success" />
+                        ) : (
+                          <AlertTriangle className="w-4 h-4 text-error" />
+                        )}
+                        <span
+                          className={`text-sm font-medium ${pullResult.success ? 'text-success' : 'text-error'}`}
+                        >
+                          {pullResult.success ? '镜像拉取成功' : '镜像拉取失败'}
+                        </span>
+                      </div>
+                      {pullResult.error && (
+                        <pre className="text-xs text-error bg-error-bg rounded p-3 mt-2 overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">
+                          {pullResult.error}
+                        </pre>
+                      )}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )}
 
             {/* 统计卡片 */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">

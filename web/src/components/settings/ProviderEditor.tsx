@@ -97,8 +97,6 @@ interface ProviderEditorProps {
   open: boolean;
   /** null 表示创建模式 */
   provider: ProviderWithHealth | null;
-  /** 当前负载均衡策略，影响权重字段的展示和提示 */
-  balancingStrategy?: 'round-robin' | 'weighted-round-robin' | 'failover';
   onSave: () => void;
   onCancel: () => void;
   setNotice: (msg: string | null) => void;
@@ -108,7 +106,6 @@ interface ProviderEditorProps {
 export function ProviderEditor({
   open,
   provider,
-  balancingStrategy,
   onSave,
   onCancel,
   setNotice,
@@ -122,7 +119,6 @@ export function ProviderEditor({
   const [baseUrl, setBaseUrl] = useState('');
   const [model, setModel] = useState('');
   const [oneMillionContext, setOneMillionContext] = useState(false);
-  const [weight, setWeight] = useState(1);
 
   // 官方认证
   const [authTab, setAuthTab] = useState<OfficialAuthTab>('oauth');
@@ -165,7 +161,6 @@ export function ProviderEditor({
       setBaseUrl('');
       setModel('');
       setOneMillionContext(false);
-      setWeight(1);
       setAuthTab('oauth');
       setSetupToken('');
       setApiKey('');
@@ -183,7 +178,6 @@ export function ProviderEditor({
       const modelSelection = parseProviderModel(provider.anthropicModel || '');
       setModel(modelSelection.model);
       setOneMillionContext(modelSelection.oneMillionContext);
-      setWeight(provider.weight);
       setAuthTab('oauth');
       setSetupToken('');
       setApiKey('');
@@ -319,7 +313,7 @@ export function ProviderEditor({
         ? parseProviderModel(normalizedModel).model
         : '');
     if (!trimmedName) {
-      setError('请填写提供商名称');
+      setError('请填写模型配置名称');
       return;
     }
 
@@ -352,13 +346,12 @@ export function ProviderEditor({
           name: trimmedName,
           type: providerType,
           customEnv: savedCustomEnv,
-          weight,
         };
 
         if (providerType === 'third_party') {
           const trimmedToken = authToken.trim();
           if (!trimmedToken) {
-            setError('新建第三方提供商时必须填写 API 密钥');
+            setError('新建第三方模型配置时必须填写 API 密钥');
             setSaving(false);
             return;
           }
@@ -415,13 +408,12 @@ export function ProviderEditor({
         if (normalizedModel) createBody.anthropicModel = normalizedModel;
 
         await api.post('/api/config/claude/providers', createBody);
-        setNotice('提供商已创建。');
+        setNotice('模型配置已创建。');
       } else {
         // ── 编辑模式 ──
         const patchBody: Record<string, unknown> = {
           name: trimmedName,
           customEnv: savedCustomEnv,
-          weight,
         };
 
         if (providerType === 'third_party') {
@@ -496,13 +488,16 @@ export function ProviderEditor({
           );
         }
 
-        setNotice('提供商配置已保存。');
+        setNotice('模型配置已保存。');
       }
 
       onSave();
     } catch (err) {
       setError(
-        getErrorMessage(err, isCreate ? '创建提供商失败' : '保存提供商失败'),
+        getErrorMessage(
+          err,
+          isCreate ? '创建模型配置失败' : '保存模型配置失败',
+        ),
       );
     } finally {
       setSaving(false);
@@ -521,7 +516,7 @@ export function ProviderEditor({
       <DialogContent className="z-[10001] max-h-[calc(100dvh-1rem)] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>
-            {isCreate ? '添加提供商' : `编辑提供商：${provider?.name}`}
+            {isCreate ? '添加模型配置' : `编辑模型配置：${provider?.name}`}
           </DialogTitle>
           <DialogDescription className="text-left text-xs leading-5">
             {providerType === 'third_party'
@@ -535,7 +530,7 @@ export function ProviderEditor({
           {isCreate && (
             <div>
               <label className="block text-xs text-muted-foreground mb-1">
-                提供商类型
+                模型配置类型
               </label>
               <div className="inline-flex rounded-lg border border-border p-1 bg-muted">
                 <button
@@ -1146,35 +1141,6 @@ export function ProviderEditor({
               </section>
             </div>
           </details>
-
-          {/* ─── 权重：仅加权轮询策略使用 ─── */}
-          {balancingStrategy === 'weighted-round-robin' && (
-            <div className="border-t border-border pt-3">
-              <div className="flex items-center gap-2 mb-1">
-                <label className="block text-sm font-medium">权重</label>
-                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium bg-teal-100 text-teal-800">
-                  当前策略生效中
-                </span>
-              </div>
-              <Input
-                type="number"
-                min={1}
-                max={100}
-                value={weight}
-                onChange={(e) =>
-                  setWeight(
-                    Math.max(1, Math.min(100, parseInt(e.target.value) || 1)),
-                  )
-                }
-                disabled={saving}
-                className="w-24"
-              />
-              <p className="text-xs text-muted-foreground mt-1">
-                值越大分配到的请求越多。例如三家分别设 5/3/2，流量比例就是
-                5:3:2。
-              </p>
-            </div>
-          )}
 
           {/* ─── 操作按钮 ─── */}
           <div className="sticky -bottom-4 z-10 -mx-4 flex justify-end gap-2 border-t border-border bg-background/95 px-4 pb-4 pt-3 backdrop-blur supports-[backdrop-filter]:bg-background/85">

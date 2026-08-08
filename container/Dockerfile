@@ -203,15 +203,20 @@ RUN set -eu && \
 # Copy source code
 COPY agent-runner/ ./
 
-# Build TypeScript
-RUN npm run build
+# Build TypeScript. Docker COPY preserves restrictive source-worktree modes;
+# hand immutable prompt assets to node explicitly instead of relying on the
+# checkout umask used by CI or a local builder.
+RUN npm run build \
+    && chown -R root:root /app/prompts \
+    && find /app/prompts -type d -exec chmod 0555 {} + \
+    && find /app/prompts -type f -exec chmod 0444 {} +
 
 # Create workspace directories. Long-term memory is host-managed and workspace
 # scoped; legacy global/memory filesystem roots must not exist in the runtime.
 RUN mkdir -p /workspace/group /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
-# Copy entrypoint script (runs as root, drops to node user via runuser)
-COPY entrypoint.sh /app/entrypoint.sh
+# Copy entrypoint scripts (run as root, then drop to node via runuser)
+COPY entrypoint.sh session-permissions.sh session-permissions-mount.mjs session-permissions-watcher.mjs session-generated-paths.mjs session-prompts-copy.mjs /app/
 RUN chmod +x /app/entrypoint.sh
 
 # Set ownership to node user (non-root) for writable directories

@@ -9,6 +9,7 @@ const tmpDir = fs.mkdtempSync(
 );
 process.env.CONTAINER_TIMEOUT = '-5';
 process.env.MAX_CONCURRENT_CONTAINERS = '999';
+process.env.ADMIN_HOST_ONLY_MODE = 'true';
 
 vi.mock('../src/config.js', () => ({
   ASSISTANT_NAME: 'HappyClaw',
@@ -25,6 +26,7 @@ const runtime = await import('../src/runtime-config.js');
 afterAll(() => {
   delete process.env.CONTAINER_TIMEOUT;
   delete process.env.MAX_CONCURRENT_CONTAINERS;
+  delete process.env.ADMIN_HOST_ONLY_MODE;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -33,6 +35,7 @@ describe('system settings normalization', () => {
     const fromEnv = runtime.getSystemSettings();
     expect(fromEnv.containerTimeout).toBe(60_000);
     expect(fromEnv.maxConcurrentContainers).toBe(100);
+    expect(fromEnv.adminHostOnlyMode).toBe(true);
 
     const saved = runtime.saveSystemSettings({
       mainAgentAutoCompactPercentage: 95,

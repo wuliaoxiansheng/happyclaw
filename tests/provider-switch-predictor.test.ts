@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
     anthropicBaseUrl?: string;
   },
   boundId: undefined as string | undefined,
+  defaultProviderId: null as string | null,
 }));
 
 vi.mock('../src/logger.js', () => ({
@@ -31,6 +32,7 @@ vi.mock('../src/runtime-config.js', async () => {
   return {
     ...actual,
     getEnabledProviders: () => mocks.enabledProviders,
+    getDefaultProviderId: () => mocks.defaultProviderId,
     getContainerEnvConfig: () => mocks.envOverride,
     getBalancingConfig: () => ({
       strategy: 'round-robin' as const,
@@ -67,6 +69,7 @@ beforeEach(() => {
   mocks.enabledProviders = [];
   mocks.envOverride = {};
   mocks.boundId = undefined;
+  mocks.defaultProviderId = null;
 });
 
 /**
@@ -125,5 +128,22 @@ describe('willClearSessionOnProviderSwitch', () => {
     mocks.enabledProviders = [];
     mocks.boundId = 'A';
     expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
+  });
+
+  test('uses the Agent model configuration instead of pool health', () => {
+    setProviders('A', 'B');
+    mocks.boundId = 'A';
+    providerPool.reportFailure('A', true);
+
+    expect(willClearSessionOnProviderSwitch('grp', null, 'A')).toBe(false);
+    expect(willClearSessionOnProviderSwitch('grp', null, 'B')).toBe(true);
+  });
+
+  test('uses the system default when the Agent inherits its model', () => {
+    setProviders('A', 'B');
+    mocks.boundId = 'A';
+    mocks.defaultProviderId = 'B';
+
+    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
   });
 });

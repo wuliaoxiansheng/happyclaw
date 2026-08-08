@@ -110,6 +110,21 @@ describe('Docker image distribution contract', () => {
 
     expect(smoke).toContain('docker run --detach --interactive');
     expect(smoke).not.toContain('--entrypoint');
+    expect(smoke).toContain('--env HAPPYCLAW_HOST_IDENTITY_MODE=host-root');
+    expect(smoke).toContain('--env HAPPYCLAW_HOST_IDENTITY_MODE=direct');
+    expect(smoke).toContain('--env "HAPPYCLAW_HOST_UID=$smoke_host_uid"');
+    expect(smoke).toContain('--env "HAPPYCLAW_HOST_GID=$smoke_host_gid"');
+    expect(smoke).toContain('"${smoke_identity_args[@]}"');
+    expect(smoke).not.toContain(
+      '--env HAPPYCLAW_HOST_IDENTITY_MODE=virtualized',
+    );
+    expect(smoke).not.toContain('--env HAPPYCLAW_HOST_IDENTITY_MODE=rootless');
+    expect(smoke).toContain(
+      '--tmpfs /home/node/.claude:rw,nosuid,nodev,noexec',
+    );
+    expect(smoke).toContain('--tmpfs /workspace/ipc:rw,nosuid,nodev,noexec');
+    expect(smoke).toContain('--tmpfs /workspace/group:rw,nosuid,nodev');
+    expect(smoke).toContain('--tmpfs /workspace/extra:rw,nosuid,nodev');
     expect(smoke).toContain(
       "docker image inspect --format '{{.Architecture}}'",
     );

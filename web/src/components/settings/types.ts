@@ -45,6 +45,7 @@ export interface ProvidersListResponse {
   providers: ProviderWithHealth[];
   balancing: BalancingConfig;
   enabledCount: number;
+  defaultProviderId: string | null;
 }
 
 export interface ClaudeApplyResult {
@@ -98,6 +99,7 @@ export interface SystemSettings {
 }
 
 export interface HostIntegrationSettings {
+  adminHostOnlyMode: boolean;
   mainAgentContextSource: 'managed' | 'host_claude';
   mainAgentAutoCompactWindow: number;
   mainAgentAutoCompactPercentage: number;

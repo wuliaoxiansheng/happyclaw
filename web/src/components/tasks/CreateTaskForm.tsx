@@ -81,6 +81,7 @@ export function CreateTaskForm({
   const groupNames = useTasksStore((s) => s.groupNames);
   const loadTasks = useTasksStore((s) => s.loadTasks);
   const groups = useGroupsStore((s) => s.groups);
+  const adminHostOnlyMode = useGroupsStore((s) => s.adminHostOnlyMode);
   const loadGroups = useGroupsStore((s) => s.loadGroups);
 
   useEffect(() => {
@@ -96,6 +97,16 @@ export function CreateTaskForm({
   // Sync executionMode from selected workspace when user hasn't manually overridden.
   // For the "default" option (empty chatJid), fall back to a role-based placeholder
   // that matches what the backend infers for the user's own home workspace.
+  useEffect(() => {
+    if (!isAdmin || !adminHostOnlyMode) return;
+    setExecutionModeExplicit(true);
+    setFormData((previous) =>
+      previous.executionMode === 'host'
+        ? previous
+        : { ...previous, executionMode: 'host' },
+    );
+  }, [isAdmin, adminHostOnlyMode]);
+
   useEffect(() => {
     if (executionModeExplicit) return;
     const sourceMode = chatJid ? groups[chatJid]?.execution_mode : undefined;
@@ -508,7 +519,7 @@ export function CreateTaskForm({
                 </label>
                 <Select
                   value={formData.executionMode}
-                  disabled={isScript}
+                  disabled={isScript || adminHostOnlyMode}
                   onValueChange={(value) => {
                     setExecutionModeExplicit(true);
                     setFormData({
@@ -522,17 +533,19 @@ export function CreateTaskForm({
                   </SelectTrigger>
                   <SelectContent className={MODAL_SELECT_CONTENT_CLASS}>
                     <SelectItem value="host">宿主机</SelectItem>
-                    {!isScript && (
+                    {!isScript && !adminHostOnlyMode && (
                       <SelectItem value="container">Docker 容器</SelectItem>
                     )}
                   </SelectContent>
                 </Select>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {isScript
-                    ? '脚本固定使用宿主机模式；Docker 容器脚本不会被执行。'
-                    : executionModeExplicit
-                      ? '已手动指定执行模式，不再跟随源工作区'
-                      : '默认继承源工作区的执行模式，选择后将锁定不再自动同步'}
+                  {adminHostOnlyMode
+                    ? '管理员纯宿主机模式已开启，任务固定在宿主机执行。'
+                    : isScript
+                      ? '脚本固定使用宿主机模式；Docker 容器脚本不会被执行。'
+                      : executionModeExplicit
+                        ? '已手动指定执行模式，不再跟随源工作区'
+                        : '默认继承源工作区的执行模式，选择后将锁定不再自动同步'}
                 </p>
                 {errors.executionMode && (
                   <p className="mt-1 text-sm text-red-600 dark:text-red-400">

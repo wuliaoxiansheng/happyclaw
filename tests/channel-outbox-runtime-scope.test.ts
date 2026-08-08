@@ -54,6 +54,7 @@ describe('active channel outbox scope', () => {
       ...base,
       turnRunId: 'turn-current',
       inputTurnId: 'input-current',
+      logicalBaseChatJid: 'web:workspace-at-admission',
       owner: 'owner-current',
     });
 
@@ -71,6 +72,10 @@ describe('active channel outbox scope', () => {
       registry.resolveInput('workspace', 'input-current', base.sourceJid)
         ?.token,
     ).toBe(current.token);
+    expect(
+      registry.resolveInput('workspace', 'input-current', base.sourceJid)
+        ?.logicalBaseChatJid,
+    ).toBe('web:workspace-at-admission');
     expect(
       registry.resolveInput('workspace', 'input-missing', base.sourceJid),
     ).toBeNull();

@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+
 import { describe, expect, test, vi } from 'vitest';
 
 import {
@@ -82,6 +84,99 @@ describe('agent-runner SDK control requests', () => {
       }
     },
   );
+
+  test('allows a long compaction and clears its deadline on the real response', async () => {
+    vi.useFakeTimers();
+    try {
+      const onTimeout = vi.fn();
+      const watchdog = new SdkFirstResponseWatchdog(60_000, onTimeout);
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      watchdog.beginCompaction(10 * 60_000);
+
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      expect(onTimeout).not.toHaveBeenCalled();
+
+      watchdog.observe('assistant');
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(onTimeout).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('retains a bounded deadline when the post-compaction response stalls', async () => {
+    vi.useFakeTimers();
+    try {
+      const onTimeout = vi.fn();
+      const watchdog = new SdkFirstResponseWatchdog(60_000, onTimeout);
+
+      watchdog.beginCompaction(10 * 60_000);
+      // Treat the first two minutes as a completed summarization round-trip.
+      // The SDK has no PostCompact callback, so the same absolute deadline must
+      // also bound a provider that never emits the subsequent model response.
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      expect(onTimeout).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(8 * 60_000 - 1);
+      expect(onTimeout).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(onTimeout).toHaveBeenCalledOnce();
+      expect(onTimeout).toHaveBeenCalledWith('compaction', 10 * 60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('does not let repeated compactions extend the hard deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const onTimeout = vi.fn();
+      const watchdog = new SdkFirstResponseWatchdog(60_000, onTimeout);
+
+      watchdog.beginCompaction(10 * 60_000);
+      await vi.advanceTimersByTimeAsync(9 * 60_000);
+      watchdog.beginCompaction(10 * 60_000);
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(onTimeout).toHaveBeenCalledOnce();
+      expect(onTimeout).toHaveBeenCalledWith('compaction', 10 * 60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('arms a fresh bounded deadline for compaction after an earlier response', async () => {
+    vi.useFakeTimers();
+    try {
+      const onTimeout = vi.fn();
+      const watchdog = new SdkFirstResponseWatchdog(60_000, onTimeout);
+
+      watchdog.observe('stream_event');
+      watchdog.beginCompaction(10 * 60_000);
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+      expect(onTimeout).toHaveBeenCalledOnce();
+      expect(onTimeout).toHaveBeenCalledWith('compaction', 10 * 60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('does not arm the main watchdog for a sub-agent compaction', () => {
+    const source = fs.readFileSync(
+      new URL('../container/agent-runner/src/index.ts', import.meta.url),
+      'utf8',
+    );
+    const hookStart = source.indexOf('function createPreCompactHook');
+    const subAgentGuard = source.indexOf('if (preCompact.agent_id)', hookStart);
+    const watchdogArm = source.indexOf('deps.onCompactionStart?.()', hookStart);
+
+    expect(hookStart).toBeGreaterThanOrEqual(0);
+    expect(subAgentGuard).toBeGreaterThan(hookStart);
+    expect(watchdogArm).toBeGreaterThan(subAgentGuard);
+  });
 
   test('does not treat a non-terminal rate-limit warning as a model response', () => {
     vi.useFakeTimers();

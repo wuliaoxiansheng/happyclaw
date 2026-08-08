@@ -123,6 +123,7 @@ export function CreateContainerDialog({
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
   const createFlow = useChatStore((s) => s.createFlow);
+  const adminHostOnlyMode = useChatStore((s) => s.adminHostOnlyMode);
   const canHostExec = useAuthStore((s) => s.user?.role === 'admin');
   const profiles = useAgentProfilesStore((s) => s.profiles);
   const profilesLoading = useAgentProfilesStore((s) => s.loading);
@@ -159,6 +160,17 @@ export function CreateContainerDialog({
   }, [canHostExec, executionMode]);
 
   useEffect(() => {
+    if (!open || !canHostExec || !adminHostOnlyMode) return;
+    setExecutionMode('host');
+    setInitMode('empty');
+    setInitSourcePath('');
+    setInitGitUrl('');
+    setHostMounts([]);
+    setFieldErrors({});
+    setSubmitError(null);
+  }, [open, canHostExec, adminHostOnlyMode]);
+
+  useEffect(() => {
     if (canHostExec && executionMode === 'container') return;
     setHostMounts([]);
     setFieldErrors({});
@@ -182,7 +194,7 @@ export function CreateContainerDialog({
   const reset = () => {
     setName('');
     setAdvancedOpen(false);
-    setExecutionMode('container');
+    setExecutionMode(canHostExec && adminHostOnlyMode ? 'host' : 'container');
     setCustomCwd('');
     setInitMode('empty');
     setInitSourcePath('');
@@ -434,34 +446,36 @@ export function CreateContainerDialog({
                     运行位置
                   </label>
                   <div className="space-y-2">
-                    <label className="flex items-start gap-3 p-2 rounded-lg border cursor-pointer hover:bg-accent/50 transition-colors">
-                      <input
-                        type="radio"
-                        name="execution_mode"
-                        value="container"
-                        checked={executionMode === 'container'}
-                        onChange={() => {
-                          setExecutionMode('container');
-                          setCustomCwd('');
-                          clearSubmissionErrors();
-                        }}
-                        className="mt-0.5 accent-primary"
-                      />
-                      <div>
-                        <div className="flex items-center gap-1.5">
-                          <Box className="w-4 h-4 text-muted-foreground" />
-                          <span className="text-sm font-medium">
-                            Docker 模式
-                          </span>
-                          <span className="text-xs text-primary font-medium">
-                            推荐
-                          </span>
+                    {!adminHostOnlyMode && (
+                      <label className="flex items-start gap-3 p-2 rounded-lg border cursor-pointer hover:bg-accent/50 transition-colors">
+                        <input
+                          type="radio"
+                          name="execution_mode"
+                          value="container"
+                          checked={executionMode === 'container'}
+                          onChange={() => {
+                            setExecutionMode('container');
+                            setCustomCwd('');
+                            clearSubmissionErrors();
+                          }}
+                          className="mt-0.5 accent-primary"
+                        />
+                        <div>
+                          <div className="flex items-center gap-1.5">
+                            <Box className="w-4 h-4 text-muted-foreground" />
+                            <span className="text-sm font-medium">
+                              Docker 模式
+                            </span>
+                            <span className="text-xs text-primary font-medium">
+                              推荐
+                            </span>
+                          </div>
+                          <p className="text-xs text-muted-foreground mt-0.5">
+                            在隔离的 Docker 环境中执行
+                          </p>
                         </div>
-                        <p className="text-xs text-muted-foreground mt-0.5">
-                          在隔离的 Docker 环境中执行
-                        </p>
-                      </div>
-                    </label>
+                      </label>
+                    )}
                     {canHostExec && (
                       <label className="flex cursor-pointer items-start gap-3 rounded-lg border p-2 transition-colors hover:bg-accent/50">
                         <input
@@ -491,6 +505,11 @@ export function CreateContainerDialog({
                           </p>
                         </div>
                       </label>
+                    )}
+                    {canHostExec && adminHostOnlyMode && (
+                      <p className="rounded-md border border-warning/30 bg-warning-bg px-3 py-2 text-xs leading-5 text-warning">
+                        管理员纯宿主机模式已开启，新工作区固定直接在服务器上运行。
+                      </p>
                     )}
                   </div>
                 </div>

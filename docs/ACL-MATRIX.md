@@ -289,6 +289,9 @@ Agent MCP 调用没有 Cookie，但必须携带由主进程创建的运行上下
 
 - Agent 任务继承创建者、Workspace 和 Agent 身份。
 - Script 任务仅允许 admin 的 Host Workspace。
+- `adminHostOnlyMode` 仅允许 admin 配置；开启后 active admin 拥有的 Workspace
+  与任务强制使用 Host，所有 Container 写入入口都会拒绝。member 始终保留
+  Container 隔离。
 - `group` 模式注入主 Session；`isolated` 使用独立 Session、IPC 和运行记录。
 - 立即运行使用 idempotency key；取消只影响对应 Run。
 

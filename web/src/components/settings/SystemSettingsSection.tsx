@@ -5,6 +5,9 @@ import { toast } from 'sonner';
 
 import { api } from '../../api/client';
 import { useAuthStore } from '../../stores/auth';
+import { useChatStore } from '../../stores/chat';
+import { useGroupsStore } from '../../stores/groups';
+import { useTasksStore } from '../../stores/tasks';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -556,7 +559,8 @@ export function HostIntegrationSettingsSection({
         draft.mainAgentAutoCompactPercentage !==
           settings.mainAgentAutoCompactPercentage
       : draft.externalClaudeDir !== settings.externalClaudeDir ||
-        draft.pluginAutoScan !== settings.pluginAutoScan;
+        draft.pluginAutoScan !== settings.pluginAutoScan ||
+        draft.adminHostOnlyMode !== settings.adminHostOnlyMode;
 
   const mainAutoCompactError = (() => {
     if (
@@ -581,10 +585,19 @@ export function HostIntegrationSettingsSection({
   const handleSave = async () => {
     setSaving(true);
     try {
+      const adminHostOnlyModeChanged =
+        draft.adminHostOnlyMode !== settings.adminHostOnlyMode;
       const data = await api.put<HostIntegrationSettings>(
         '/api/config/host-integration',
         draft,
       );
+      if (adminHostOnlyModeChanged) {
+        await Promise.allSettled([
+          useChatStore.getState().loadGroups(),
+          useGroupsStore.getState().loadGroups(),
+          useTasksStore.getState().loadTasks(),
+        ]);
+      }
       setSettings(data);
       setDraft(data);
       setMainAutoCompactPercentage(
@@ -797,6 +810,33 @@ export function HostIntegrationSettingsSection({
 
         {scope === 'host' && (
           <>
+            <div className="flex min-h-16 items-start justify-between gap-6">
+              <div className="min-w-0">
+                <Label htmlFor="admin-host-only-mode">管理员纯宿主机模式</Label>
+                <p
+                  id="admin-host-only-mode-description"
+                  className="mt-1 text-xs leading-5 text-muted-foreground"
+                >
+                  开启后，管理员拥有的工作区和定时任务会统一迁移到宿主机，并禁止再选择
+                  Docker；普通成员仍固定使用
+                  Docker。关闭后不会自动把已有工作区迁回
+                  Docker。宿主机工作区暂不支持网页终端。
+                </p>
+              </div>
+              <Switch
+                id="admin-host-only-mode"
+                checked={draft.adminHostOnlyMode}
+                onCheckedChange={(checked) =>
+                  setDraft((current) =>
+                    current
+                      ? { ...current, adminHostOnlyMode: checked }
+                      : current,
+                  )
+                }
+                aria-describedby="admin-host-only-mode-description"
+              />
+            </div>
+
             <div className="border-t border-border pt-6">
               <Label htmlFor="host-integration-claude-dir">
                 宿主机 Claude 目录

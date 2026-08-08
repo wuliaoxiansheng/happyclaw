@@ -16,20 +16,40 @@ export interface HostIpcOutputRouteInput {
   interactionMode?: 'assistant' | 'proactive';
 }
 
+/**
+ * Resolve the logical chat JID an IPC output should be persisted and broadcast
+ * under.
+ *
+ * `sourceChatJid` is the runner's `channelContext.sourceJid`, i.e. the raw IM
+ * JID (`qq:c2c:...`). Inbound routing already folds that JID to the bound
+ * workspace before the turn runs, so without the symmetric fold here a
+ * proactive `send_message` would be stored against the IM row — whose
+ * `folder`/`created_by` still belong to the channel account owner, not to the
+ * workspace that produced the reply. `resolveWorkspaceJid` supplies that fold;
+ * when it is absent or returns null the raw JID is kept, preserving behaviour
+ * for unbound chats.
+ */
 export function resolveHostIpcLogicalChatJid(input: {
   sourceChatJid: string;
   agentId?: string | null;
   agentChatJid?: string | null;
   taskRunId?: string | null;
   scheduledTask: boolean;
+  /** Immutable logical base captured when the input turn was admitted. */
+  runtimeChatJid?: string | null;
+  resolveWorkspaceJid?: (chatJid: string) => string | null;
 }): string {
+  const baseChatJid =
+    input.runtimeChatJid ||
+    input.resolveWorkspaceJid?.(input.sourceChatJid) ||
+    input.sourceChatJid;
   if (input.agentId) {
-    return `${input.agentChatJid || input.sourceChatJid}#agent:${input.agentId}`;
+    return `${input.agentChatJid || baseChatJid}#agent:${input.agentId}`;
   }
   if (input.taskRunId && input.scheduledTask) {
-    return `${input.sourceChatJid}#task:${input.taskRunId}`;
+    return `${baseChatJid}#task:${input.taskRunId}`;
   }
-  return input.sourceChatJid;
+  return baseChatJid;
 }
 
 export type HostIpcOutputRoute =

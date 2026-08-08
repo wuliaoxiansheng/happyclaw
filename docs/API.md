@@ -288,7 +288,9 @@ Provider：
 系统：
 
 - `GET|PUT /api/config/system`
-- `GET|PUT /api/config/host-integration`
+- `GET|PUT /api/config/host-integration`，仅 admin；包含
+  `adminHostOnlyMode`。从 `false` 切到 `true` 时会停稳管理员工作区运行器，并把
+  active admin 拥有的工作区和定时任务持久迁移为 Host；普通成员数据不变
 - `GET /api/config/external-resources`
 - `GET /api/config/external-resources/rule`
 - `GET|PUT /api/config/registration`

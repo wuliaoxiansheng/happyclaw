@@ -1,6 +1,7 @@
 // Zod schemas and validation types for API requests
 
 import { z } from 'zod';
+import { AGENT_EFFORT_LEVELS } from './agent-effort.js';
 import { ALL_PERMISSIONS } from './permissions.js';
 import type { Permission } from './types.js';
 import { MAX_GROUP_NAME_LEN } from './web-context.js';
@@ -303,6 +304,11 @@ const AgentProfileRuntimePolicyModeSchema = z.enum([
 
 export const AgentProfileRuntimePolicySchema = z
   .object({
+    reasoning: z
+      .object({
+        effort: z.enum(AGENT_EFFORT_LEVELS).optional(),
+      })
+      .optional(),
     context: z
       .object({
         source: z.enum(['managed', 'host_claude']).optional(),
@@ -391,6 +397,7 @@ export const AgentProfileCreateSchema = z
       .regex(/^#[0-9a-fA-F]{6}$/)
       .nullable()
       .optional(),
+    model_config_id: z.string().trim().min(1).max(128).nullable().optional(),
     runtime_policy: AgentProfileRuntimePolicySchema.optional(),
   })
   .superRefine(validatePromptModeCompatibility);
@@ -412,6 +419,7 @@ export const AgentProfilePatchSchema = z
       .regex(/^#[0-9a-fA-F]{6}$/)
       .nullable()
       .optional(),
+    model_config_id: z.string().trim().min(1).max(128).nullable().optional(),
     runtime_policy: AgentProfileRuntimePolicySchema.optional(),
   })
   .superRefine(validatePromptModeCompatibility);
@@ -720,6 +728,7 @@ export const HostIntegrationSettingsSchema = z
   .object({
     externalClaudeDir: z.string().max(512).optional(),
     pluginAutoScan: z.boolean().optional(),
+    adminHostOnlyMode: z.boolean().optional(),
     mainAgentContextSource: z.enum(['managed', 'host_claude']).optional(),
     mainAgentAutoCompactWindow: z
       .number()

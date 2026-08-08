@@ -64,6 +64,6 @@ describe('task run status contract', () => {
     const createForm = read('web/src/components/tasks/CreateTaskForm.tsx');
     expect(createForm).toContain('Docker 容器脚本不会被执行');
     expect(createForm).toContain("groups[jid]?.execution_mode === 'host'");
-    expect(createForm).toContain('disabled={isScript}');
+    expect(createForm).toContain('disabled={isScript || adminHostOnlyMode}');
   });
 });

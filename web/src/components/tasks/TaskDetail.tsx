@@ -143,6 +143,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
   );
   const isAdmin = executionRole === 'admin';
   const groups = useGroupsStore((state) => state.groups);
+  const adminHostOnlyMode = useGroupsStore((state) => state.adminHostOnlyMode);
   const groupsLoading = useGroupsStore((state) => state.loading);
   const groupsError = useGroupsStore((state) => state.error);
   const loadGroups = useGroupsStore((state) => state.loadGroups);
@@ -610,7 +611,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
             <>
               <select
                 value={editForm.execution_mode}
-                disabled={task.execution_type === 'script'}
+                disabled={task.execution_type === 'script' || adminHostOnlyMode}
                 onChange={(event) =>
                   setEditForm({
                     ...editForm,
@@ -620,14 +621,16 @@ export function TaskDetail({ task }: TaskDetailProps) {
                 className="w-full text-sm text-foreground bg-card px-2 py-1 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary"
               >
                 <option value="host">宿主机</option>
-                {task.execution_type !== 'script' && (
+                {task.execution_type !== 'script' && !adminHostOnlyMode && (
                   <option value="container">Docker 容器</option>
                 )}
               </select>
               <p className="mt-1 text-xs text-muted-foreground">
-                {task.execution_type === 'script'
-                  ? '脚本固定为宿主机模式；必须同时选择管理员宿主机工作区。'
-                  : '切换工作区时会自动继承目标工作区模式，也可在保存前手动调整。'}
+                {adminHostOnlyMode
+                  ? '管理员纯宿主机模式已开启，任务固定在宿主机执行。'
+                  : task.execution_type === 'script'
+                    ? '脚本固定为宿主机模式；必须同时选择管理员宿主机工作区。'
+                    : '切换工作区时会自动继承目标工作区模式，也可在保存前手动调整。'}
               </p>
             </>
           ) : (

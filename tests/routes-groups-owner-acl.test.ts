@@ -58,6 +58,7 @@ vi.mock('../src/middleware/auth.ts', () => ({
       id: process.env.HAPPYCLAW_TEST_USER_ID ?? 'alice',
       username: 'alice',
       role: process.env.HAPPYCLAW_TEST_USER_ROLE ?? 'member',
+      status: 'active',
       permissions: [],
     });
     return next();
@@ -77,6 +78,7 @@ const agentProfileRoutesModule =
 const db = await import('../src/db.js');
 const webContext = await import('../src/web-context.js');
 const agentProfileRuntime = await import('../src/agent-profile-runtime.js');
+const runtimeConfig = await import('../src/runtime-config.js');
 const { GroupQueue } = await import('../src/group-queue.js');
 
 const groupRoutes = groupRoutesModule.default;
@@ -217,6 +219,41 @@ describe('PATCH /:jid preserves owner fields on rename (regression)', () => {
 });
 
 describe('PATCH /:jid execution mode runtime boundary', () => {
+  test('admin host-only mode rejects switching a workspace to Docker', async () => {
+    const jid = 'web:host-only-policy';
+    db.setRegisteredGroup(jid, {
+      name: 'Host-only policy',
+      folder: 'host-only-policy',
+      added_at: new Date().toISOString(),
+      executionMode: 'host',
+      created_by: ADMIN_ID,
+      is_home: false,
+    });
+    webDepsCache[jid] = db.getRegisteredGroup(jid)!;
+    runtimeConfig.saveSystemSettings({ adminHostOnlyMode: true });
+    asUser(ADMIN_ID, 'admin');
+
+    try {
+      const response = await groupRoutes.request(
+        `/${encodeURIComponent(jid)}`,
+        {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ execution_mode: 'container' }),
+        },
+      );
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+      });
+      expect(db.getRegisteredGroup(jid)?.executionMode).toBe('host');
+    } finally {
+      runtimeConfig.saveSystemSettings({ adminHostOnlyMode: false });
+      delete webDepsCache[jid];
+      db.deleteRegisteredGroup(jid);
+    }
+  });
+
   test('quiesces the old runtime and invalidates SDK resume state before switching', async () => {
     const jid = 'web:mode-switch';
     const folder = 'mode-switch';

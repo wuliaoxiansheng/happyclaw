@@ -64,6 +64,7 @@ import {
 } from '../utils/mcp-servers';
 import {
   getAgentContextSource,
+  type AgentEffortLevel,
   type AgentProfilePromptMode,
   type AgentContextSource,
   type AgentProfileRuntimePolicy,
@@ -84,6 +85,7 @@ import {
 } from '../utils/agent-runtime-policy';
 
 const DEFAULT_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
+  reasoning: { effort: 'inherit' },
   context: {
     source: 'managed',
     auto_compact_window: 0,
@@ -97,10 +99,33 @@ const DEFAULT_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
   mcp: { mode: 'inherit', ids: [] },
 };
 
+const AGENT_EFFORT_OPTIONS: Array<{
+  value: AgentEffortLevel;
+  label: string;
+}> = [
+  { value: 'inherit', label: '跟随模型配置' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'XHigh' },
+  { value: 'max', label: 'Max' },
+];
+
+const AGENT_EFFORT_VALUES = new Set<AgentEffortLevel>(
+  AGENT_EFFORT_OPTIONS.map((option) => option.value),
+);
+
 function normalizeRuntimePolicy(
   policy?: Partial<AgentProfileRuntimePolicy> | null,
 ): AgentProfileRuntimePolicy {
   return {
+    reasoning: {
+      effort: AGENT_EFFORT_VALUES.has(
+        policy?.reasoning?.effort as AgentEffortLevel,
+      )
+        ? (policy?.reasoning?.effort as AgentEffortLevel)
+        : 'inherit',
+    },
     context: {
       source: getAgentContextSource(policy),
       auto_compact_window:
@@ -184,6 +209,8 @@ export function AgentProfilesPage() {
   const requestedProfileId = searchParams.get('agent');
   const {
     profiles,
+    modelConfigs = [],
+    defaultModelConfigId = null,
     loading,
     profilesError,
     loadProfiles,
@@ -213,6 +240,8 @@ export function AgentProfilesPage() {
   const [toolsPrompt, setToolsPrompt] = useState('');
   const [promptMode, setPromptMode] =
     useState<AgentProfilePromptMode>('append');
+  const [modelConfigId, setModelConfigId] = useState('inherit');
+  const [effort, setEffort] = useState<AgentEffortLevel>('inherit');
   const [assistantSection, setAssistantSection] =
     useState<AgentPromptSection>('identity');
   const [avatarEmoji, setAvatarEmoji] = useState<string | null>(null);
@@ -356,6 +385,7 @@ export function AgentProfilesPage() {
     policy?: AgentProfileRuntimePolicy | null,
   ) => {
     const normalized = normalizeRuntimePolicy(policy);
+    setEffort(normalized.reasoning.effort);
     setSkillsMode(normalized.skills.mode);
     setSkillIds(normalized.skills.ids);
     const hostPolicy = normalized.skills.host ?? {
@@ -421,6 +451,7 @@ export function AgentProfilesPage() {
   const currentRuntimePolicy = useMemo(
     () =>
       normalizeRuntimePolicy({
+        reasoning: { effort },
         context: {
           source: contextSource,
           auto_compact_window: useSdkCompactDefault
@@ -444,6 +475,7 @@ export function AgentProfilesPage() {
     [
       autoCompactPercentage,
       contextSource,
+      effort,
       hostSkillIds,
       hostSkillsMode,
       legacyAutoCompactWindow,
@@ -466,6 +498,7 @@ export function AgentProfilesPage() {
         tools_prompt: '',
       });
       setPromptMode('append');
+      setModelConfigId('inherit');
       setAvatarEmoji(null);
       setAvatarColor(null);
       setAvatarUrl(null);
@@ -481,6 +514,7 @@ export function AgentProfilesPage() {
       tools_prompt: selected.tools_prompt,
     });
     setPromptMode(selected.prompt_mode);
+    setModelConfigId(selected.model_config_id ?? 'inherit');
     setAvatarEmoji(selected.avatar_emoji);
     setAvatarColor(selected.avatar_color);
     setAvatarUrl(selected.avatar_url);
@@ -504,6 +538,8 @@ export function AgentProfilesPage() {
       agentsPrompt !== selected.agents_prompt ||
       toolsPrompt !== selected.tools_prompt ||
       promptMode !== selected.prompt_mode ||
+      (modelConfigId === 'inherit' ? null : modelConfigId) !==
+        selected.model_config_id ||
       avatarEmoji !== selected.avatar_emoji ||
       avatarColor !== selected.avatar_color ||
       !sameRuntimePolicy(currentRuntimePolicy, selected.runtime_policy));
@@ -516,6 +552,7 @@ export function AgentProfilesPage() {
       !!agentsPrompt.trim() ||
       !!toolsPrompt.trim() ||
       promptMode !== 'append' ||
+      modelConfigId !== 'inherit' ||
       avatarEmoji !== null ||
       avatarColor !== null ||
       !sameRuntimePolicy(currentRuntimePolicy, DEFAULT_RUNTIME_POLICY));
@@ -696,6 +733,7 @@ export function AgentProfilesPage() {
         tools_prompt: draft.tools_prompt,
       });
       setPromptMode(draft.prompt_mode);
+      setModelConfigId('inherit');
       setAvatarEmoji(null);
       setAvatarColor(null);
       setAvatarUrl(null);
@@ -724,6 +762,7 @@ export function AgentProfilesPage() {
       tools_prompt: '',
     });
     setPromptMode('append');
+    setModelConfigId('inherit');
     setAvatarEmoji(null);
     setAvatarColor(null);
     setAvatarUrl(null);
@@ -752,6 +791,7 @@ export function AgentProfilesPage() {
         prompt_mode: promptMode,
         avatar_emoji: avatarEmoji,
         avatar_color: avatarColor,
+        model_config_id: modelConfigId === 'inherit' ? null : modelConfigId,
         runtime_policy: currentRuntimePolicy,
       });
       setCreateDescription('');
@@ -789,6 +829,11 @@ export function AgentProfilesPage() {
       }
       if (avatarColor !== selected.avatar_color) {
         changes.avatar_color = avatarColor;
+      }
+      const persistedModelConfigId =
+        modelConfigId === 'inherit' ? null : modelConfigId;
+      if (persistedModelConfigId !== selected.model_config_id) {
+        changes.model_config_id = persistedModelConfigId;
       }
       if (!sameRuntimePolicy(currentRuntimePolicy, selected.runtime_policy)) {
         changes.runtime_policy = currentRuntimePolicy;
@@ -1478,6 +1523,71 @@ export function AgentProfilesPage() {
                           onChange={(event) => setName(event.target.value)}
                         />
                       </div>
+                      <div>
+                        <label className="mb-2 block text-sm font-medium">
+                          模型配置
+                        </label>
+                        <Select
+                          value={modelConfigId}
+                          onValueChange={setModelConfigId}
+                        >
+                          <SelectTrigger aria-label="智能体模型配置">
+                            <SelectValue placeholder="选择模型配置" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="inherit">
+                              跟随系统默认
+                              {defaultModelConfigId
+                                ? `（${modelConfigs.find((item) => item.id === defaultModelConfigId)?.name ?? '当前默认'}）`
+                                : '（尚未配置）'}
+                            </SelectItem>
+                            {modelConfigs.map((model) => (
+                              <SelectItem key={model.id} value={model.id}>
+                                {model.name}
+                                {model.anthropic_model
+                                  ? ` · ${model.anthropic_model}`
+                                  : ''}
+                                {!model.enabled ? '（仅显式使用）' : ''}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
+                          该智能体所属的所有工作区、会话和定时任务都会使用这里解析出的完整模型网关环境。未启用的配置不会参与系统自动选择，但仍可由智能体显式使用。
+                        </p>
+                      </div>
+                      <div>
+                        <label className="mb-2 block text-sm font-medium">
+                          推理努力档位
+                        </label>
+                        <Select
+                          value={effort}
+                          onValueChange={(value) =>
+                            setEffort(value as AgentEffortLevel)
+                          }
+                        >
+                          <SelectTrigger aria-label="智能体推理努力档位">
+                            <SelectValue placeholder="选择推理努力档位" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {AGENT_EFFORT_OPTIONS.map((option) => (
+                              <SelectItem
+                                key={option.value}
+                                value={option.value}
+                              >
+                                {option.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
+                          “跟随模型配置”保留 Provider 高级设置中的
+                          CLAUDE_CODE_EFFORT_LEVEL；显式档位通过 Agent SDK
+                          传入并覆盖该环境变量。不支持所选档位的模型会由 Claude
+                          静默降级，实际值可在会话的 CLAUDE_EFFORT
+                          环境变量中查看。
+                        </p>
+                      </div>
                       <div className="space-y-3 rounded-lg border bg-muted/20 p-4">
                         <div className="flex flex-wrap items-center gap-4">
                           <EmojiAvatar
@@ -1739,6 +1849,24 @@ export function AgentProfilesPage() {
                           label="Claude 默认提示词"
                           value={
                             promptMode === 'append' ? '保留并追加' : '完全替换'
+                          }
+                        />
+                        <SummaryItem
+                          label="模型配置"
+                          value={
+                            modelConfigId === 'inherit'
+                              ? `跟随系统默认${defaultModelConfigId ? `：${modelConfigs.find((item) => item.id === defaultModelConfigId)?.name ?? '当前默认'}` : ''}`
+                              : (modelConfigs.find(
+                                  (item) => item.id === modelConfigId,
+                                )?.name ?? '不可用模型配置')
+                          }
+                        />
+                        <SummaryItem
+                          label="推理努力档位"
+                          value={
+                            AGENT_EFFORT_OPTIONS.find(
+                              (option) => option.value === effort,
+                            )?.label ?? '跟随模型配置'
                           }
                         />
                         <SummaryItem

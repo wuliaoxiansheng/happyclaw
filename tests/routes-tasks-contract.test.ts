@@ -50,6 +50,7 @@ vi.mock('../src/middleware/auth.ts', async (importOriginal) => {
         id: process.env.HAPPYCLAW_TEST_USER_ID ?? 'alice',
         username: process.env.HAPPYCLAW_TEST_USER_ID ?? 'alice',
         role: process.env.HAPPYCLAW_TEST_USER_ROLE ?? 'member',
+        status: 'active',
         permissions: [],
       });
       return next();
@@ -60,6 +61,7 @@ vi.mock('../src/middleware/auth.ts', async (importOriginal) => {
 const tasksRoutesModule = await import('../src/routes/tasks.js');
 const db = await import('../src/db.js');
 const { MAX_TASK_PROMPT_LENGTH } = await import('../src/schemas.js');
+const runtimeConfig = await import('../src/runtime-config.js');
 const webContext = await import('../src/web-context.js');
 const { enqueueIsolatedScheduledTask, getRunningTaskIds } =
   await import('../src/task-scheduler.js');
@@ -215,6 +217,44 @@ afterAll(() => {
 });
 
 describe('tasks route ownership and cleanup contract', () => {
+  test('admin host-only mode rejects explicit Docker task creation', async () => {
+    runtimeConfig.saveSystemSettings({ adminHostOnlyMode: true });
+    asUser(OWNER_ID, 'admin');
+    try {
+      const response = await tasksRoutes.request('/', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          group_folder: GROUP_FOLDER,
+          chat_jid: GROUP_JID,
+          prompt: 'must stay on host',
+          schedule_type: 'cron',
+          schedule_value: '0 9 * * *',
+          execution_mode: 'container',
+        }),
+      });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+      });
+
+      const aiResponse = await tasksRoutes.request('/ai', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          description: 'AI task must also stay on host',
+          chat_jid: GROUP_JID,
+        }),
+      });
+      expect(aiResponse.status).toBe(409);
+      expect(await aiResponse.json()).toMatchObject({
+        code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+      });
+    } finally {
+      runtimeConfig.saveSystemSettings({ adminHostOnlyMode: false });
+    }
+  });
+
   test('create and patch reject cron schedules faster than once per minute', async () => {
     asUser(OWNER_ID);
     for (const scheduleValue of ['* * * * * *', '0,30 0 * * * *']) {

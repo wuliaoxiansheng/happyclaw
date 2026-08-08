@@ -111,6 +111,10 @@ HappyClaw 使用统一的 `智能体 → Workspace → Runtime Session` 层级�
 
 普通成员不能把容器工作区降级为宿主机执行。Script 定时任务也只允许管理员在有权限的 Host 工作区运行。
 
+管理员可在 **设置 → 宿主机集成** 开启“管理员纯宿主机模式”。开启时，当前管理员拥有的
+工作区和定时任务会统一迁移为 Host，后续也不能再选择 Docker；普通成员继续使用 Docker
+隔离。关闭开关只恢复混合模式的选择能力，不会自动迁回已有工作区。
+
 ## 智能体与能力治理
 
 ### 智能体配置（Agent Profile）
@@ -295,7 +299,7 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | **设置 → 消息渠道**     | 渠道账号、扫码登录、连接状态、默认工作区和会话绑定    |
 | **设置 → 主 HappyClaw** | 默认智能体的 Skills 与 MCP                            |
 | **设置 → 执行与容量**   | 超时、并发、上下文窗口和运行限制                      |
-| **设置 → 宿主机集成**   | 管理员 Host 目录与 Claude 上下文来源                  |
+| **设置 → 宿主机集成**   | 管理员纯宿主机模式、Host 目录与 Claude 上下文来源     |
 | **设置 → 注册策略**     | 开放注册、邀请码注册或关闭注册                        |
 | **设置 → 用户与访问**   | 用户、权限、邀请码与审计日志                          |
 
@@ -308,6 +312,7 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | `CONTAINER_IMAGE`           | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                     |
 | `CONTAINER_TIMEOUT`         | `1800000`                         | 容器硬超时，毫秒                   |
 | `IDLE_TIMEOUT`              | `1800000`                         | 容器空闲保活时间，毫秒             |
+| `ADMIN_HOST_ONLY_MODE`      | `false`                           | 管理员工作区与任务强制使用宿主机   |
 | `MAX_CONCURRENT_CONTAINERS` | `20`                              | 最大并发容器数                     |
 | `MAX_FILE_SIZE_MB`          | `50`                              | Web 和 IM 入站文件大小上限         |
 | `CORS_ALLOWED_ORIGINS`      | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单 |

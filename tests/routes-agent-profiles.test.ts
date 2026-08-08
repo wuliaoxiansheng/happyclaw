@@ -53,6 +53,7 @@ vi.mock('../src/middleware/auth.ts', () => ({
 }));
 
 const db = await import('../src/db.js');
+const runtimeConfig = await import('../src/runtime-config.js');
 const webContext = await import('../src/web-context.js');
 const agentProfileRuntime = await import('../src/agent-profile-runtime.js');
 const routeModule = await import('../src/routes/agent-profiles.js');
@@ -138,6 +139,9 @@ describe('/api/agent-profiles routes', () => {
     const body = await res.json();
     expect(body.profiles).toHaveLength(1);
     expect(body.profiles[0].is_default).toBe(true);
+    expect(body.profiles[0].runtime_policy.reasoning).toEqual({
+      effort: 'inherit',
+    });
     expect(body.profiles[0].runtime_policy.context).toEqual({
       source: 'managed',
       auto_compact_window: 0,
@@ -146,6 +150,74 @@ describe('/api/agent-profiles routes', () => {
     expect(body.profiles[0].effective_runtime_policy).toEqual(
       body.profiles[0].runtime_policy,
     );
+  });
+
+  test('lists model configurations and persists an Agent selection', async () => {
+    const inheritedDefault = runtimeConfig.createProvider({
+      name: 'Default model config',
+      type: 'official',
+      anthropicApiKey: 'default-test-key',
+      anthropicModel: 'claude-default-test',
+      enabled: true,
+    });
+    const selectedModel = runtimeConfig.createProvider({
+      name: 'Research model config',
+      type: 'third_party',
+      anthropicBaseUrl: 'https://models.example.test',
+      anthropicAuthToken: 'research-test-token',
+      anthropicModel: 'research-model',
+      enabled: false,
+    });
+    runtimeConfig.setDefaultProvider(inheritedDefault.id);
+
+    const listRes = await routes.request('/', { method: 'GET' });
+    const listBody = await listRes.json();
+    expect(listBody.default_model_config_id).toBe(inheritedDefault.id);
+    expect(listBody.model_configs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: inheritedDefault.id,
+          name: 'Default model config',
+          is_default: true,
+        }),
+        expect.objectContaining({
+          id: selectedModel.id,
+          name: 'Research model config',
+          enabled: false,
+          is_default: false,
+        }),
+      ]),
+    );
+
+    const createRes = await routes.request('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Pinned Research Agent',
+        model_config_id: selectedModel.id,
+      }),
+    });
+    expect(createRes.status).toBe(201);
+    const created = (await createRes.json()).profile;
+    expect(created.model_config_id).toBe(selectedModel.id);
+
+    const inheritRes = await routes.request(`/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model_config_id: null }),
+    });
+    expect(inheritRes.status).toBe(200);
+    expect((await inheritRes.json()).profile).toMatchObject({
+      model_config_id: null,
+      version: created.version + 1,
+    });
+
+    const invalidRes = await routes.request(`/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model_config_id: 'missing-model-config' }),
+    });
+    expect(invalidRes.status).toBe(400);
   });
 
   test('POST creates and PATCH updates an AgentProfile', async () => {
@@ -204,6 +276,78 @@ describe('/api/agent-profiles routes', () => {
       mcp: { mode: 'custom', ids: ['github'] },
     });
     expect(patchedBody.profile.version).toBe(2);
+  });
+
+  test('creates, patches, inherits, and validates Agent effort', async () => {
+    const defaultProfile = db
+      .listAgentProfilesForUser('routes-agent-user')
+      .find((profile) => profile.is_default);
+    expect(defaultProfile).toBeDefined();
+    const defaultPatchRes = await routes.request(`/${defaultProfile!.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runtime_policy: { reasoning: { effort: 'medium' } },
+      }),
+    });
+    expect(defaultPatchRes.status).toBe(200);
+    expect(
+      (await defaultPatchRes.json()).profile.runtime_policy.reasoning,
+    ).toEqual({ effort: 'medium' });
+
+    const createdRes = await routes.request('/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Effort Agent',
+        runtime_policy: { reasoning: { effort: 'high' } },
+      }),
+    });
+    expect(createdRes.status).toBe(201);
+    const created = (await createdRes.json()).profile;
+    expect(created.runtime_policy.reasoning).toEqual({ effort: 'high' });
+
+    const patchedRes = await routes.request(`/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runtime_policy: { reasoning: { effort: 'xhigh' } },
+      }),
+    });
+    expect(patchedRes.status).toBe(200);
+    const patched = (await patchedRes.json()).profile;
+    expect(patched.runtime_policy.reasoning).toEqual({ effort: 'xhigh' });
+    expect(patched.version).toBe(created.version + 1);
+
+    const inheritedRes = await routes.request(`/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runtime_policy: { reasoning: { effort: 'inherit' } },
+      }),
+    });
+    expect(inheritedRes.status).toBe(200);
+    expect(
+      (await inheritedRes.json()).profile.runtime_policy.reasoning,
+    ).toEqual({ effort: 'inherit' });
+
+    const invalidRes = await routes.request(`/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runtime_policy: { reasoning: { effort: 'turbo' } },
+      }),
+    });
+    expect(invalidRes.status).toBe(400);
+
+    const restoreDefaultRes = await routes.request(`/${defaultProfile!.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runtime_policy: { reasoning: { effort: 'inherit' } },
+      }),
+    });
+    expect(restoreDefaultRes.status).toBe(200);
   });
 
   test('keeps legacy all-in-one prompt payloads compatible while complete payloads use IDENTITY', async () => {
@@ -401,6 +545,7 @@ describe('/api/agent-profiles routes', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.profile.runtime_policy).toEqual({
+      reasoning: { effort: 'inherit' },
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -1173,6 +1318,57 @@ describe('/api/agent-profiles routes', () => {
     expect(noOpResponse.status).toBe(200);
     expect((await noOpResponse.json()).profile.version).toBe(profile.version);
     expect(stopGroup).not.toHaveBeenCalled();
+  });
+
+  test('effort PATCH invalidates warm workspaces and advances runtime identity', async () => {
+    const profile = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: 'Warm Effort Agent',
+      runtimePolicy: { reasoning: { effort: 'low' } },
+    });
+    const folder = 'warm-effort-workspace';
+    db.setRegisteredGroup('web:warm-effort-workspace', {
+      name: 'Warm Effort Workspace',
+      folder,
+      added_at: '2026-08-01T00:00:00.000Z',
+      created_by: 'routes-agent-user',
+    });
+    db.assignWorkspaceAgentProfile(folder, profile.id);
+    db.setSession(folder, 'sdk-warm-effort', '', {
+      agentProfileId: profile.id,
+      agentProfileVersion: profile.version,
+      identityHash: profile.identity_hash,
+    });
+
+    const stopGroup = vi.fn(async () => {});
+    webContext.setWebDeps({
+      queue: {
+        pauseGroupsForMutation: () => ({ id: 1 }),
+        resumeGroupsAfterMutation: () => {},
+        listDescendantJids: () => [],
+        stopGroup,
+      },
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    const response = await routes.request(`/${profile.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runtime_policy: { reasoning: { effort: 'max' } },
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      invalidated_runtime_jids: 1,
+      profile: {
+        version: profile.version + 1,
+        runtime_policy: { reasoning: { effort: 'max' } },
+      },
+    });
+    expect(body.profile.identity_hash).not.toBe(profile.identity_hash);
+    expect(stopGroup).toHaveBeenCalledTimes(2);
   });
 
   test('name-only PATCH bumps identity version/hash, quiesces twice, and leaves the old session hash mismatched', async () => {

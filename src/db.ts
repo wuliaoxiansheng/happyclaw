@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { STORE_DIR, GROUPS_DIR } from './config.js';
+import { normalizeAgentEffort } from './agent-effort.js';
 import { logger } from './logger.js';
 import {
   AgentProfile,
@@ -102,7 +103,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 67;
+export const CURRENT_SCHEMA_VERSION = 69;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -928,6 +929,7 @@ export function initDatabase(): void {
       avatar_emoji TEXT,
       avatar_color TEXT,
       avatar_url TEXT,
+      model_config_id TEXT,
       runtime_policy TEXT NOT NULL DEFAULT '{}',
       identity_hash TEXT NOT NULL DEFAULT '',
       version INTEGER NOT NULL DEFAULT 1,
@@ -1983,6 +1985,24 @@ export function initDatabase(): void {
   ensureColumn('agent_profiles', 'avatar_emoji', 'TEXT');
   ensureColumn('agent_profiles', 'avatar_color', 'TEXT');
   ensureColumn('agent_profiles', 'avatar_url', 'TEXT');
+  // v67 -> v68: a top-level Agent can pin one complete model/Provider
+  // configuration. Null deliberately means "follow the system default".
+  ensureColumn('agent_profiles', 'model_config_id', 'TEXT');
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_agent_profiles_model_config
+      ON agent_profiles(model_config_id)
+      WHERE model_config_id IS NOT NULL;
+  `);
+  // v68 -> v69: make reasoning effort an explicit Agent runtime policy. The
+  // inherited default preserves every existing Provider/SDK behavior, so this
+  // migration normalizes JSON only and deliberately does not bump Agent
+  // identity/version metadata.
+  if (
+    rawSchemaVersionBeforeInit !== null &&
+    Number(rawSchemaVersionBeforeInit) < 69
+  ) {
+    migrateAgentProfileEffortPolicy();
+  }
 
   // v47 → v48: split the legacy all-in-one Agent prompt into the four
   // IDENTITY / SOUL / AGENTS / TOOLS sections. The legacy prompt represented
@@ -7911,6 +7931,7 @@ export function getSessionAgentIdentity(
 }
 
 const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
+  reasoning: { effort: 'inherit' },
   context: {
     source: 'managed',
     auto_compact_window: 0,
@@ -7921,6 +7942,7 @@ const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
 };
 
 type RuntimePolicyInput = Partial<{
+  reasoning: Partial<AgentProfileRuntimePolicy['reasoning']> | null;
   context: Partial<AgentProfileRuntimePolicy['context']> | null;
   skills:
     | (Partial<Omit<AgentProfileRuntimePolicy['skills'], 'host'>> & {
@@ -7959,6 +7981,9 @@ export function normalizeAgentProfileRuntimePolicy(
 ): AgentProfileRuntimePolicy {
   const raw = (input ?? {}) as RuntimePolicyInput | AgentProfileRuntimePolicy;
   const normalized: AgentProfileRuntimePolicy = {
+    reasoning: {
+      effort: normalizeAgentEffort(raw.reasoning?.effort),
+    },
     context: {
       source: normalizeMode(
         raw.context?.source,
@@ -8055,6 +8080,13 @@ export function mergeAgentProfileRuntimePolicy(
   };
 
   return normalizeAgentProfileRuntimePolicy({
+    reasoning: has('reasoning')
+      ? patch.reasoning === null
+        ? DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.reasoning
+        : {
+            effort: patch.reasoning?.effort ?? current.reasoning.effort,
+          }
+      : current.reasoning,
     context: has('context')
       ? patch.context === null
         ? DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context
@@ -8077,6 +8109,53 @@ export function serializeAgentProfileRuntimePolicy(
   input?: RuntimePolicyInput | AgentProfileRuntimePolicy | null,
 ): string {
   return JSON.stringify(normalizeAgentProfileRuntimePolicy(input));
+}
+
+/** Persist the v69 inherited effort default into legacy runtime-policy JSON. */
+export function migrateAgentProfileEffortPolicy(): number {
+  const rows = db
+    .prepare('SELECT id, runtime_policy FROM agent_profiles')
+    .all() as Array<{ id: string; runtime_policy: unknown }>;
+  const update = db.prepare(
+    'UPDATE agent_profiles SET runtime_policy = ? WHERE id = ?',
+  );
+  let migrated = 0;
+  db.transaction(() => {
+    for (const row of rows) {
+      let next: Record<string, unknown> | AgentProfileRuntimePolicy;
+      try {
+        const parsed =
+          typeof row.runtime_policy === 'string'
+            ? JSON.parse(row.runtime_policy)
+            : row.runtime_policy;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new Error('Legacy Agent runtime policy is not an object');
+        }
+        const raw = parsed as Record<string, unknown>;
+        const rawReasoning =
+          raw.reasoning &&
+          typeof raw.reasoning === 'object' &&
+          !Array.isArray(raw.reasoning)
+            ? (raw.reasoning as Record<string, unknown>)
+            : {};
+        next = {
+          ...raw,
+          reasoning: {
+            ...rawReasoning,
+            effort: normalizeAgentEffort(rawReasoning.effort),
+          },
+        };
+      } catch {
+        // Invalid legacy JSON is normalized to the safe inherited default.
+        next = normalizeAgentProfileRuntimePolicy();
+      }
+      const serialized = JSON.stringify(next);
+      if (serialized === row.runtime_policy) continue;
+      update.run(serialized, row.id);
+      migrated += 1;
+    }
+  })();
+  return migrated;
 }
 
 /**
@@ -8257,6 +8336,9 @@ export function computeAgentProfileIdentityHash(
     name?: string;
   } = { prompts };
   const identityPolicy = {
+    ...(normalizedPolicy.reasoning.effort === 'inherit'
+      ? {}
+      : { reasoning: normalizedPolicy.reasoning }),
     context: { source: normalizedPolicy.context.source },
     skills: normalizedPolicy.skills,
     mcp: normalizedPolicy.mcp,
@@ -8397,6 +8479,10 @@ function mapAgentProfileRow(row: Record<string, unknown>): AgentProfile {
     avatar_color:
       typeof row.avatar_color === 'string' ? row.avatar_color : null,
     avatar_url: typeof row.avatar_url === 'string' ? row.avatar_url : null,
+    model_config_id:
+      typeof row.model_config_id === 'string' && row.model_config_id
+        ? row.model_config_id
+        : null,
     runtime_policy: runtimePolicy,
     identity_hash: String(
       row.identity_hash ??
@@ -8746,6 +8832,7 @@ export function createAgentProfile(input: {
   includeClaudePreset?: boolean;
   avatarEmoji?: string | null;
   avatarColor?: string | null;
+  modelConfigId?: string | null;
   runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
 }): AgentProfile {
   const now = new Date().toISOString();
@@ -8771,9 +8858,9 @@ export function createAgentProfile(input: {
       `INSERT INTO agent_profiles (
         id, owner_user_id, name,
         identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
-        include_claude_preset, avatar_emoji, avatar_color, runtime_policy, identity_hash, version,
+        include_claude_preset, avatar_emoji, avatar_color, model_config_id, runtime_policy, identity_hash, version,
         is_default, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`,
     ).run(
       id,
       input.ownerUserId,
@@ -8786,6 +8873,7 @@ export function createAgentProfile(input: {
       includeClaudePresetForMode(prompts.prompt_mode) ? 1 : 0,
       input.avatarEmoji ?? null,
       input.avatarColor ?? null,
+      input.modelConfigId ?? null,
       runtimePolicyJson,
       identityHash,
       now,
@@ -8818,6 +8906,7 @@ export function updateAgentProfile(
     avatarEmoji?: string | null;
     avatarColor?: string | null;
     avatarUrl?: string | null;
+    modelConfigId?: string | null;
     runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
     changeSource?: AgentProfilePromptVersion['change_source'];
     restoredFromVersion?: number | null;
@@ -8855,6 +8944,11 @@ export function updateAgentProfile(
       : updates.avatarColor;
   const nextAvatarUrl =
     updates.avatarUrl === undefined ? existing.avatar_url : updates.avatarUrl;
+  const nextModelConfigId =
+    updates.modelConfigId === undefined
+      ? existing.model_config_id
+      : updates.modelConfigId;
+  const modelConfigChanged = nextModelConfigId !== existing.model_config_id;
   const nextHash = computeAgentProfileIdentityHash(
     nextPrompts,
     nextRuntimePolicy,
@@ -8867,13 +8961,16 @@ export function updateAgentProfile(
     nextPrompts.agents_prompt !== existing.agents_prompt ||
     nextPrompts.tools_prompt !== existing.tools_prompt ||
     nextPrompts.prompt_mode !== existing.prompt_mode;
-  const nextVersion = identityChanged ? existing.version + 1 : existing.version;
+  const nextVersion =
+    identityChanged || modelConfigChanged
+      ? existing.version + 1
+      : existing.version;
   const now = new Date().toISOString();
   db.transaction(() => {
     db.prepare(
       `UPDATE agent_profiles
        SET name = ?, identity_prompt = ?, soul_prompt = ?, agents_prompt = ?, tools_prompt = ?,
-           prompt_mode = ?, include_claude_preset = ?, avatar_emoji = ?, avatar_color = ?, avatar_url = ?,
+           prompt_mode = ?, include_claude_preset = ?, avatar_emoji = ?, avatar_color = ?, avatar_url = ?, model_config_id = ?,
            runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
        WHERE id = ? AND owner_user_id = ? AND status = 'active'`,
     ).run(
@@ -8887,6 +8984,7 @@ export function updateAgentProfile(
       nextAvatarEmoji,
       nextAvatarColor,
       nextAvatarUrl,
+      nextModelConfigId,
       serializeAgentProfileRuntimePolicy(nextRuntimePolicy),
       nextHash,
       nextVersion,
@@ -8913,6 +9011,19 @@ export function updateAgentProfile(
     }
   })();
   return getAgentProfile(profileId);
+}
+
+export function countAgentProfilesByModelConfigId(
+  modelConfigId: string,
+): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM agent_profiles
+       WHERE model_config_id = ? AND status = 'active'`,
+    )
+    .get(modelConfigId) as { count: number };
+  return Number(row.count ?? 0);
 }
 
 export function archiveAgentProfile(
@@ -10481,6 +10592,86 @@ export function hasContainerModeGroups(): boolean {
   return row !== undefined;
 }
 
+export interface AdminHostOnlyMigrationResult {
+  affectedGroups: Array<{ jid: string; folder: string }>;
+  affectedFolders: string[];
+  migratedTaskIds: string[];
+}
+
+function forceRuntimesToHostForFolderQuery(
+  folderQuery: string,
+  params: unknown[] = [],
+): AdminHostOnlyMigrationResult {
+  const affectedGroups = db
+    .prepare(
+      `SELECT jid, folder
+       FROM registered_groups
+       WHERE folder IN (${folderQuery})
+         AND COALESCE(execution_mode, 'container') <> 'host'
+       ORDER BY jid`,
+    )
+    .all(...params) as Array<{ jid: string; folder: string }>;
+  const affectedTasks = db
+    .prepare(
+      `SELECT id, group_folder
+       FROM scheduled_tasks
+       WHERE group_folder IN (${folderQuery})
+         AND COALESCE(execution_mode, 'container') <> 'host'
+       ORDER BY id`,
+    )
+    .all(...params) as Array<{ id: string; group_folder: string }>;
+  const migratedTaskIds = affectedTasks.map((row) => row.id);
+  const affectedFolders = Array.from(
+    new Set([
+      ...affectedGroups.map((group) => group.folder),
+      ...affectedTasks.map((task) => task.group_folder),
+    ]),
+  ).sort();
+
+  db.prepare(
+    `UPDATE registered_groups
+     SET execution_mode = 'host'
+     WHERE folder IN (${folderQuery})
+       AND COALESCE(execution_mode, 'container') <> 'host'`,
+  ).run(...params);
+
+  if (migratedTaskIds.length > 0) {
+    db.prepare(
+      `UPDATE scheduled_tasks
+       SET execution_mode = 'host',
+           revision = revision + 1,
+           updated_at = ?
+       WHERE group_folder IN (${folderQuery})
+         AND COALESCE(execution_mode, 'container') <> 'host'`,
+    ).run(new Date().toISOString(), ...params);
+  }
+
+  return { affectedGroups, affectedFolders, migratedTaskIds };
+}
+
+/**
+ * Persist the admin host-only policy across every runtime record owned by an
+ * active administrator. Folder matching intentionally includes legacy IM rows
+ * without created_by when they share an administrator-owned Workspace folder.
+ *
+ * The setting itself lives in system-settings.json; callers must quiesce the
+ * returned folders before invoking this mutation and save the setting in the
+ * same commit callback.
+ */
+export function forceActiveAdminRuntimesToHost(): AdminHostOnlyMigrationResult {
+  return db
+    .transaction((): AdminHostOnlyMigrationResult => {
+      const adminFolderSql = `
+        SELECT DISTINCT rg.folder
+        FROM registered_groups rg
+        JOIN users u ON u.id = rg.created_by
+        WHERE u.role = 'admin' AND u.status = 'active'
+      `;
+      return forceRuntimesToHostForFolderQuery(adminFolderSql);
+    })
+    .immediate();
+}
+
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
   const rows = db
     .prepare('SELECT * FROM registered_groups')
@@ -11914,33 +12105,32 @@ export function getActiveAdminCount(): number {
   return row.count;
 }
 
-export function updateUserFields(
-  id: string,
-  updates: Partial<
-    Pick<
-      User,
-      | 'username'
-      | 'display_name'
-      | 'role'
-      | 'status'
-      | 'password_hash'
-      | 'last_login_at'
-      | 'permissions'
-      | 'must_change_password'
-      | 'disable_reason'
-      | 'notes'
-      | 'avatar_emoji'
-      | 'avatar_color'
-      | 'avatar_url'
-      | 'ai_name'
-      | 'ai_avatar_emoji'
-      | 'ai_avatar_color'
-      | 'ai_avatar_url'
-      | 'default_require_mention'
-      | 'deleted_at'
-    >
-  >,
-): void {
+export type UserFieldUpdates = Partial<
+  Pick<
+    User,
+    | 'username'
+    | 'display_name'
+    | 'role'
+    | 'status'
+    | 'password_hash'
+    | 'last_login_at'
+    | 'permissions'
+    | 'must_change_password'
+    | 'disable_reason'
+    | 'notes'
+    | 'avatar_emoji'
+    | 'avatar_color'
+    | 'avatar_url'
+    | 'ai_name'
+    | 'ai_avatar_emoji'
+    | 'ai_avatar_color'
+    | 'ai_avatar_url'
+    | 'default_require_mention'
+    | 'deleted_at'
+  >
+>;
+
+export function updateUserFields(id: string, updates: UserFieldUpdates): void {
   const fields: string[] = [];
   const values: unknown[] = [];
 
@@ -12030,6 +12220,33 @@ export function updateUserFields(
   db.prepare(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`).run(
     ...values,
   );
+}
+
+/**
+ * Promote/reactivate a user and enforce the admin host-only runtime projection
+ * in one SQLite transaction. The caller still owns runner quiescing and the
+ * system-settings policy check.
+ */
+export function updateUserFieldsAndForceRuntimesToHost(
+  id: string,
+  updates: UserFieldUpdates,
+): AdminHostOnlyMigrationResult {
+  return db
+    .transaction(() => {
+      updateUserFields(id, updates);
+      const folderQuery =
+        'SELECT DISTINCT folder FROM registered_groups WHERE created_by = ?';
+      const migration = forceRuntimesToHostForFolderQuery(folderQuery, [id]);
+      db.prepare(
+        `DELETE FROM sessions WHERE group_folder IN (${folderQuery})`,
+      ).run(id);
+      db.prepare(
+        `DELETE FROM workspace_runtime_sessions
+         WHERE group_folder IN (${folderQuery})`,
+      ).run(id);
+      return migration;
+    })
+    .immediate();
 }
 
 export function deleteUser(id: string): void {

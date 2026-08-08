@@ -2278,6 +2278,18 @@ Returns null if the current chat is a DM (DMs do not belong to a server). Only w
         .default(null),
       runtime_policy: z
         .object({
+          reasoning: z
+            .object({
+              effort: z.enum([
+                'inherit',
+                'low',
+                'medium',
+                'high',
+                'xhigh',
+                'max',
+              ]),
+            })
+            .optional(),
           context: z
             .object({
               source: z.enum(['managed', 'host_claude']),

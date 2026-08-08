@@ -64,6 +64,7 @@ describe('retired Agent tool policy migration', () => {
     db.initDatabase();
     const migrated = db.getAgentProfile(profile.id)!;
     expect(migrated.runtime_policy).toEqual({
+      reasoning: { effort: 'inherit' },
       context: {
         source: 'managed',
         auto_compact_window: 0,

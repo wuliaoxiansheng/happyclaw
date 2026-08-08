@@ -3,6 +3,7 @@ import { Loader2, Save, Plus, X, RefreshCw, Trash2 } from 'lucide-react';
 import { useContainerEnvStore } from '../../stores/container-env';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
+import { ScrollEdgeAffordance } from '../common/ScrollEdgeAffordance';
 
 interface ContainerEnvPanelProps {
   groupJid: string;
@@ -32,6 +33,7 @@ export function ContainerEnvPanel({
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [clearing, setClearing] = useState(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const contentScrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (groupJid) loadConfig(groupJid);
@@ -187,75 +189,86 @@ export function ContainerEnvPanel({
       </div>
 
       {/* Content */}
-      <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-4">
-        <p className="text-[11px] text-muted-foreground leading-relaxed">
-          这里保存项目运行需要的环境变量，仅对当前工作区生效。Provider
-          地址和凭据由系统管理员统一管理；保存后工作区会自动重建。
-        </p>
-        {error && (
-          <p
-            role="alert"
-            className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px] leading-5 text-destructive"
-          >
-            保存失败：{error}
+      <div className="relative min-h-0 flex-1">
+        <div
+          ref={contentScrollRef}
+          className="hc-scroll-pane h-full overflow-y-auto px-4 py-3 space-y-4"
+          data-testid="environment-scroll"
+        >
+          <p className="text-[11px] text-muted-foreground leading-relaxed">
+            这里保存项目运行需要的环境变量，仅对当前工作区生效。Provider
+            地址和凭据由系统管理员统一管理；保存后工作区会自动重建。
           </p>
-        )}
-        {hasLegacySystemOverride && (
-          <p className="rounded-md border border-warning/30 bg-warning-bg px-3 py-2 text-[11px] leading-5 text-warning">
-            该工作区包含旧版模型或 Provider
-            覆盖。为兼容现有运行暂时保留，但不再允许在工作区编辑；请迁移到系统“模型与提供商”设置。
-          </p>
-        )}
-
-        {/* Custom Env Vars */}
-        <div>
-          <div className="flex items-center justify-between mb-2">
-            <label className="text-xs font-medium text-muted-foreground">
-              自定义环境变量
-            </label>
-            <button
-              onClick={addCustomEnv}
-              className="flex-shrink-0 flex items-center gap-1 text-[11px] text-primary hover:text-primary cursor-pointer"
+          {error && (
+            <p
+              role="alert"
+              className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px] leading-5 text-destructive"
             >
-              <Plus className="w-3 h-3" />
-              添加
-            </button>
-          </div>
-
-          {customEnv.length === 0 ? (
-            <p className="text-[11px] text-muted-foreground">暂无自定义变量</p>
-          ) : (
-            <div className="space-y-1.5">
-              {customEnv.map((item, i) => (
-                <div key={i} className="flex items-center gap-1.5">
-                  <Input
-                    type="text"
-                    value={item.key}
-                    onChange={(e) => updateCustomEnv(i, 'key', e.target.value)}
-                    placeholder="KEY"
-                    className="w-[40%] px-2 py-1 text-[11px] font-mono h-auto"
-                  />
-                  <span className="text-muted-foreground/50 text-xs">=</span>
-                  <Input
-                    type="text"
-                    value={item.value}
-                    onChange={(e) =>
-                      updateCustomEnv(i, 'value', e.target.value)
-                    }
-                    placeholder="value"
-                    className="flex-1 px-2 py-1 text-[11px] font-mono h-auto"
-                  />
-                  <button
-                    onClick={() => removeCustomEnv(i)}
-                    className="flex-shrink-0 p-1 text-muted-foreground hover:text-red-500 cursor-pointer"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              ))}
-            </div>
+              保存失败：{error}
+            </p>
           )}
+          {hasLegacySystemOverride && (
+            <p className="rounded-md border border-warning/30 bg-warning-bg px-3 py-2 text-[11px] leading-5 text-warning">
+              该工作区包含旧版模型或 Provider
+              覆盖。为兼容现有运行暂时保留，但不再允许在工作区编辑；请迁移到系统“模型配置”设置。
+            </p>
+          )}
+
+          {/* Custom Env Vars */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="text-xs font-medium text-muted-foreground">
+                自定义环境变量
+              </label>
+              <button
+                onClick={addCustomEnv}
+                className="flex-shrink-0 flex items-center gap-1 text-[11px] text-primary hover:text-primary cursor-pointer"
+              >
+                <Plus className="w-3 h-3" />
+                添加
+              </button>
+            </div>
+
+            {customEnv.length === 0 ? (
+              <p className="text-[11px] text-muted-foreground">
+                暂无自定义变量
+              </p>
+            ) : (
+              <div className="space-y-1.5">
+                {customEnv.map((item, i) => (
+                  <div key={i} className="flex items-center gap-1.5">
+                    <Input
+                      type="text"
+                      value={item.key}
+                      onChange={(e) =>
+                        updateCustomEnv(i, 'key', e.target.value)
+                      }
+                      placeholder="KEY"
+                      className="w-[40%] px-2 py-1 text-[11px] font-mono h-auto"
+                    />
+                    <span className="text-muted-foreground/50 text-xs">=</span>
+                    <Input
+                      type="text"
+                      value={item.value}
+                      onChange={(e) =>
+                        updateCustomEnv(i, 'value', e.target.value)
+                      }
+                      placeholder="value"
+                      className="flex-1 px-2 py-1 text-[11px] font-mono h-auto"
+                    />
+                    <button
+                      onClick={() => removeCustomEnv(i)}
+                      className="flex-shrink-0 p-1 text-muted-foreground hover:text-red-500 cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
+        <ScrollEdgeAffordance scrollRef={contentScrollRef} />
       </div>
 
       {/* Footer */}

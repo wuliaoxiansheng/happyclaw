@@ -36,6 +36,7 @@ import {
   getUserByUsername,
   createUser,
   updateUserFields,
+  updateUserFieldsAndForceRuntimesToHost,
   deleteUser,
   restoreUser,
   deleteUserSessionsByUserId,
@@ -48,6 +49,7 @@ import {
   createInviteCode as dbCreateInviteCode,
   deleteInviteCode,
   queryAuthAuditLogs,
+  getRegisteredGroup,
 } from '../db.js';
 import {
   validateUsername,
@@ -77,6 +79,19 @@ import {
 } from '../host-execution-policy.js';
 import { terminateScriptsForOwner } from '../script-runner.js';
 import { logger } from '../logger.js';
+import {
+  SYSTEM_CAPABILITY_LOCK_KEY,
+  userCapabilityLockKey,
+  withCapabilityScopeLocks,
+} from '../capability-lock.js';
+import {
+  ADMIN_HOST_ONLY_RUNTIME_SAFETY_SOURCE,
+  clearAdminHostOnlyCleanupPending,
+  getPendingAdminHostOnlyCleanupFolders,
+  markAdminHostOnlyCleanupPending,
+} from '../admin-host-only-runtime.js';
+import { getSystemSettings } from '../runtime-config.js';
+import { notifyTaskSchedulerChanged } from '../task-scheduler.js';
 
 const adminRoutes = new Hono<{ Variables: Variables }>();
 function getUserWorkspaceRuntimeTargets(userId: string) {
@@ -144,6 +159,63 @@ async function commitHostPrivilegeRevocation<T>(
   } finally {
     endHostPrivilegeRevocation(userId);
   }
+}
+
+async function commitActiveAdminHostOnlyGrant(
+  userId: string,
+  updates: Parameters<typeof updateUserFields>[1],
+  reason: string,
+): Promise<void> {
+  const targets = getUserWorkspaceRuntimeTargets(userId);
+  const folders = targets.map((target) => target.folder);
+  const deps = getWebDeps();
+  if (targets.length > 0 && !deps) {
+    throw new WorkspaceRuntimeQuiesceError('pre_commit', [
+      { jid: userId, err: new Error('Runtime dependencies unavailable') },
+    ]);
+  }
+
+  const commit = () => {
+    const migration = updateUserFieldsAndForceRuntimesToHost(userId, updates);
+    if (deps) {
+      const liveGroups = deps.getRegisteredGroups();
+      for (const { jid } of migration.affectedGroups) {
+        const fresh = getRegisteredGroup(jid);
+        if (fresh) liveGroups[jid] = fresh;
+      }
+      for (const folder of folders) delete deps.sessions[folder];
+    }
+    if (migration.migratedTaskIds.length > 0) {
+      notifyTaskSchedulerChanged();
+    }
+  };
+
+  if (!deps || targets.length === 0) {
+    commit();
+    return;
+  }
+
+  const result = await quiesceWorkspaceRunnersAroundCommit(
+    deps,
+    targets,
+    {
+      reason,
+      onPostCommitFailure: (runtimeJids) => {
+        markAdminHostOnlyCleanupPending(folders);
+        deps.queue.blockGroupsForRuntimeSafety?.(
+          runtimeJids,
+          `${reason}: post-commit runtime cleanup failed`,
+          ADMIN_HOST_ONLY_RUNTIME_SAFETY_SOURCE,
+        );
+      },
+    },
+    commit,
+  );
+  clearAdminHostOnlyCleanupPending(folders);
+  deps.queue.unblockGroupsForRuntimeSafety?.(
+    result.runtimeJids,
+    ADMIN_HOST_ONLY_RUNTIME_SAFETY_SOURCE,
+  );
 }
 
 // ISO 8601 日期格式验证正则（审计日志查询 from/to 参数）
@@ -339,341 +411,395 @@ adminRoutes.patch(
       );
     }
 
-    const target = getUserById(id);
-    if (!target) return c.json({ error: 'User not found' }, 404);
+    return withCapabilityScopeLocks(
+      [SYSTEM_CAPABILITY_LOCK_KEY, userCapabilityLockKey(id)],
+      async () => {
+        const target = getUserById(id);
+        if (!target) return c.json({ error: 'User not found' }, 404);
 
-    const actor = c.get('user') as AuthUser;
-    if (actor.role !== 'admin' && target.role === 'admin') {
-      return c.json(
-        { error: 'Forbidden: only admin can manage admin users' },
-        403,
-      );
-    }
-    // 防止特权升级：非 admin 不能对持有自己未持有权限的目标做 destructive 操作
-    // （改密码、改状态、改/撤 session、删除 / 恢复、改权限）。否则一个仅持
-    // `manage_users` 的账号可重置密码登录目标账号、继承目标的权限（典型路径：
-    // user_admin → 持有 manage_system_config 的 member → 全套 provider 配置）。
-    //
-    // 注意 permissions 也必须纳入 trigger：否则两步绕过 (1) PATCH permissions=[]
-    // 把 target 权限抹平 → (2) PATCH password=X 此时 target.permissions 已为空
-    // → denyEscalationToTarget 通过 → 接管账号。
-    const triggersPrivCheck =
-      validation.data.password !== undefined ||
-      validation.data.status !== undefined ||
-      validation.data.permissions !== undefined;
-    if (triggersPrivCheck) {
-      const denial = denyEscalationToTarget(c, actor, target, 'modify');
-      if (denial) return denial;
-    }
-    if (
-      actor.role !== 'admin' &&
-      validation.data.role !== undefined &&
-      validation.data.role !== target.role
-    ) {
-      return c.json({ error: 'Forbidden: only admin can change roles' }, 403);
-    }
-    if (target.id === actor.id) {
-      if (validation.data.role && validation.data.role !== 'admin') {
-        return c.json({ error: 'Cannot remove your own admin role' }, 400);
-      }
-      if (
-        validation.data.status === 'disabled' ||
-        validation.data.status === 'deleted'
-      ) {
-        return c.json({ error: 'Cannot disable your own account' }, 400);
-      }
-    }
-
-    const nextRole = validation.data.role ?? target.role;
-    const nextStatus = validation.data.status ?? target.status;
-    const targetIsActiveAdmin =
-      target.role === 'admin' && target.status === 'active';
-    const targetRemainsActiveAdmin =
-      nextRole === 'admin' && nextStatus === 'active';
-    if (
-      targetIsActiveAdmin &&
-      !targetRemainsActiveAdmin &&
-      getActiveAdminCount() <= 1
-    ) {
-      return c.json({ error: 'Cannot remove the last active admin' }, 400);
-    }
-
-    const postCommitActions: Array<() => void> = [];
-    let postCommitActionsRan = false;
-    const runPostCommitActions = () => {
-      if (postCommitActionsRan) return;
-      postCommitActionsRan = true;
-      for (const action of postCommitActions) action();
-    };
-    const updates: Parameters<typeof updateUserFields>[1] = {};
-
-    if (validation.data.role !== undefined) {
-      updates.role = validation.data.role;
-      if (
-        validation.data.permissions === undefined &&
-        validation.data.role !== target.role
-      ) {
-        updates.permissions =
-          validation.data.role === 'admin' ? [...ALL_PERMISSIONS] : [];
-      }
-      if (validation.data.role !== target.role) {
-        postCommitActions.push(() => {
-          invalidateUserSessions(id);
-          logAuthEvent({
-            event_type: 'role_changed',
-            username: target.username,
-            actor_username: actor.username,
-            ip_address: getClientIp(c),
-            details: { from: target.role, to: validation.data.role },
-          });
-          logAuthEvent({
-            event_type: 'session_revoked',
-            username: target.username,
-            actor_username: actor.username,
-            ip_address: getClientIp(c),
-            details: { action: 'role_change' },
-          });
-        });
-      }
-    }
-
-    if (validation.data.permissions !== undefined) {
-      const nextPermissions = normalizePermissions(validation.data.permissions);
-      if (actor.role !== 'admin') {
-        const allowed = new Set(actor.permissions);
-        // 不能赋予 actor 自己没有的权限（grant 上限）。
-        const forbidden = nextPermissions.filter((perm) => !allowed.has(perm));
-        if (forbidden.length > 0) {
+        const actor = c.get('user') as AuthUser;
+        if (actor.role !== 'admin' && target.role === 'admin') {
           return c.json(
-            {
-              error: `Forbidden: cannot assign permissions [${forbidden.join(', ')}]`,
-            },
+            { error: 'Forbidden: only admin can manage admin users' },
             403,
           );
         }
-        // 也不能撤掉 actor 自己没有的权限（remove 对称约束）。否则可以
-        // 二步走绕过 denyEscalationToTarget：先 PATCH permissions=[]
-        // 把目标权限抹平，再 PATCH password=X 接管账号。
-        const targetPerms = target.permissions ?? [];
-        const removed = targetPerms.filter((p) => !nextPermissions.includes(p));
-        const removedForbidden = removed.filter((p) => !allowed.has(p));
-        if (removedForbidden.length > 0) {
+        // 防止特权升级：非 admin 不能对持有自己未持有权限的目标做 destructive 操作
+        // （改密码、改状态、改/撤 session、删除 / 恢复、改权限）。否则一个仅持
+        // `manage_users` 的账号可重置密码登录目标账号、继承目标的权限（典型路径：
+        // user_admin → 持有 manage_system_config 的 member → 全套 provider 配置）。
+        //
+        // 注意 permissions 也必须纳入 trigger：否则两步绕过 (1) PATCH permissions=[]
+        // 把 target 权限抹平 → (2) PATCH password=X 此时 target.permissions 已为空
+        // → denyEscalationToTarget 通过 → 接管账号。
+        const triggersPrivCheck =
+          validation.data.password !== undefined ||
+          validation.data.status !== undefined ||
+          validation.data.permissions !== undefined;
+        if (triggersPrivCheck) {
+          const denial = denyEscalationToTarget(c, actor, target, 'modify');
+          if (denial) return denial;
+        }
+        if (
+          actor.role !== 'admin' &&
+          validation.data.role !== undefined &&
+          validation.data.role !== target.role
+        ) {
           return c.json(
-            {
-              error: `Forbidden: cannot remove permissions [${removedForbidden.join(', ')}] you don't hold`,
-            },
+            { error: 'Forbidden: only admin can change roles' },
             403,
           );
         }
-      }
-      updates.permissions = nextPermissions;
-      // 权限变更也走作废逻辑，与角色变更对齐。比较使用规范化后的 permissions
-      // 排序+JSON 字符串比对，避免顺序差异误判为变更。
-      const prevSorted = JSON.stringify([...(target.permissions ?? [])].sort());
-      const nextSorted = JSON.stringify([...nextPermissions].sort());
-      if (prevSorted !== nextSorted) {
-        postCommitActions.push(() => {
-          invalidateUserSessions(id);
-          logAuthEvent({
-            event_type: 'session_revoked',
-            username: target.username,
-            actor_username: actor.username,
-            ip_address: getClientIp(c),
-            details: { action: 'permissions_change' },
-          });
-        });
-      }
-    }
+        if (target.id === actor.id) {
+          if (validation.data.role && validation.data.role !== 'admin') {
+            return c.json({ error: 'Cannot remove your own admin role' }, 400);
+          }
+          if (
+            validation.data.status === 'disabled' ||
+            validation.data.status === 'deleted'
+          ) {
+            return c.json({ error: 'Cannot disable your own account' }, 400);
+          }
+        }
 
-    if (validation.data.notes !== undefined) {
-      updates.notes = validation.data.notes;
-    }
+        const nextRole = validation.data.role ?? target.role;
+        const nextStatus = validation.data.status ?? target.status;
+        const targetIsActiveAdmin =
+          target.role === 'admin' && target.status === 'active';
+        const targetRemainsActiveAdmin =
+          nextRole === 'admin' && nextStatus === 'active';
+        if (
+          targetIsActiveAdmin &&
+          !targetRemainsActiveAdmin &&
+          getActiveAdminCount() <= 1
+        ) {
+          return c.json({ error: 'Cannot remove the last active admin' }, 400);
+        }
 
-    if (validation.data.status !== undefined) {
-      if (validation.data.status === 'deleted') {
-        updates.status = 'deleted';
-        updates.deleted_at = new Date().toISOString();
-        updates.disable_reason =
-          validation.data.disable_reason ??
-          target.disable_reason ??
-          'deleted_by_admin';
-        postCommitActions.push(() => {
-          invalidateUserSessions(id);
-          deleteUserSessionsByUserId(id);
-          void imManager.disconnectAllUserChannels(id).catch(() => undefined);
-          logAuthEvent({
-            event_type: 'user_deleted',
-            username: target.username,
-            actor_username: actor.username,
-            ip_address: getClientIp(c),
-          });
-        });
-      } else if (validation.data.status === 'disabled') {
-        updates.status = 'disabled';
-        updates.disable_reason =
-          validation.data.disable_reason ?? 'disabled_by_admin';
-        postCommitActions.push(() => {
-          invalidateUserSessions(id);
-          deleteUserSessionsByUserId(id);
-          void imManager.disconnectAllUserChannels(id).catch(() => undefined);
-          logAuthEvent({
-            event_type: 'user_disabled',
-            username: target.username,
-            actor_username: actor.username,
-            ip_address: getClientIp(c),
-          });
-        });
-      } else if (validation.data.status === 'active') {
-        updates.status = 'active';
-        updates.disable_reason = null;
-        if (target.status === 'disabled') {
+        const postCommitActions: Array<() => void> = [];
+        let postCommitActionsRan = false;
+        const runPostCommitActions = () => {
+          if (postCommitActionsRan) return;
+          postCommitActionsRan = true;
+          for (const action of postCommitActions) action();
+        };
+        const updates: Parameters<typeof updateUserFields>[1] = {};
+
+        if (validation.data.role !== undefined) {
+          updates.role = validation.data.role;
+          if (
+            validation.data.permissions === undefined &&
+            validation.data.role !== target.role
+          ) {
+            updates.permissions =
+              validation.data.role === 'admin' ? [...ALL_PERMISSIONS] : [];
+          }
+          if (validation.data.role !== target.role) {
+            postCommitActions.push(() => {
+              invalidateUserSessions(id);
+              logAuthEvent({
+                event_type: 'role_changed',
+                username: target.username,
+                actor_username: actor.username,
+                ip_address: getClientIp(c),
+                details: { from: target.role, to: validation.data.role },
+              });
+              logAuthEvent({
+                event_type: 'session_revoked',
+                username: target.username,
+                actor_username: actor.username,
+                ip_address: getClientIp(c),
+                details: { action: 'role_change' },
+              });
+            });
+          }
+        }
+
+        if (validation.data.permissions !== undefined) {
+          const nextPermissions = normalizePermissions(
+            validation.data.permissions,
+          );
+          if (actor.role !== 'admin') {
+            const allowed = new Set(actor.permissions);
+            // 不能赋予 actor 自己没有的权限（grant 上限）。
+            const forbidden = nextPermissions.filter(
+              (perm) => !allowed.has(perm),
+            );
+            if (forbidden.length > 0) {
+              return c.json(
+                {
+                  error: `Forbidden: cannot assign permissions [${forbidden.join(', ')}]`,
+                },
+                403,
+              );
+            }
+            // 也不能撤掉 actor 自己没有的权限（remove 对称约束）。否则可以
+            // 二步走绕过 denyEscalationToTarget：先 PATCH permissions=[]
+            // 把目标权限抹平，再 PATCH password=X 接管账号。
+            const targetPerms = target.permissions ?? [];
+            const removed = targetPerms.filter(
+              (p) => !nextPermissions.includes(p),
+            );
+            const removedForbidden = removed.filter((p) => !allowed.has(p));
+            if (removedForbidden.length > 0) {
+              return c.json(
+                {
+                  error: `Forbidden: cannot remove permissions [${removedForbidden.join(', ')}] you don't hold`,
+                },
+                403,
+              );
+            }
+          }
+          updates.permissions = nextPermissions;
+          // 权限变更也走作废逻辑，与角色变更对齐。比较使用规范化后的 permissions
+          // 排序+JSON 字符串比对，避免顺序差异误判为变更。
+          const prevSorted = JSON.stringify(
+            [...(target.permissions ?? [])].sort(),
+          );
+          const nextSorted = JSON.stringify([...nextPermissions].sort());
+          if (prevSorted !== nextSorted) {
+            postCommitActions.push(() => {
+              invalidateUserSessions(id);
+              logAuthEvent({
+                event_type: 'session_revoked',
+                username: target.username,
+                actor_username: actor.username,
+                ip_address: getClientIp(c),
+                details: { action: 'permissions_change' },
+              });
+            });
+          }
+        }
+
+        if (validation.data.notes !== undefined) {
+          updates.notes = validation.data.notes;
+        }
+
+        if (validation.data.status !== undefined) {
+          if (validation.data.status === 'deleted') {
+            updates.status = 'deleted';
+            updates.deleted_at = new Date().toISOString();
+            updates.disable_reason =
+              validation.data.disable_reason ??
+              target.disable_reason ??
+              'deleted_by_admin';
+            postCommitActions.push(() => {
+              invalidateUserSessions(id);
+              deleteUserSessionsByUserId(id);
+              void imManager
+                .disconnectAllUserChannels(id)
+                .catch(() => undefined);
+              logAuthEvent({
+                event_type: 'user_deleted',
+                username: target.username,
+                actor_username: actor.username,
+                ip_address: getClientIp(c),
+              });
+            });
+          } else if (validation.data.status === 'disabled') {
+            updates.status = 'disabled';
+            updates.disable_reason =
+              validation.data.disable_reason ?? 'disabled_by_admin';
+            postCommitActions.push(() => {
+              invalidateUserSessions(id);
+              deleteUserSessionsByUserId(id);
+              void imManager
+                .disconnectAllUserChannels(id)
+                .catch(() => undefined);
+              logAuthEvent({
+                event_type: 'user_disabled',
+                username: target.username,
+                actor_username: actor.username,
+                ip_address: getClientIp(c),
+              });
+            });
+          } else if (validation.data.status === 'active') {
+            updates.status = 'active';
+            updates.disable_reason = null;
+            if (target.status === 'disabled' || target.status === 'deleted') {
+              // Keep reconnection in the idempotent post-commit set so it also
+              // runs when the account update persisted but runtime teardown
+              // returns a retryable 503.
+              postCommitActions.push(() => {
+                void getWebDeps()
+                  ?.reconnectUserIMChannels?.(id)
+                  .catch(() => undefined);
+              });
+            }
+            if (target.status === 'disabled') {
+              postCommitActions.push(() => {
+                logAuthEvent({
+                  event_type: 'user_enabled',
+                  username: target.username,
+                  actor_username: actor.username,
+                  ip_address: getClientIp(c),
+                });
+              });
+            }
+            if (target.status === 'deleted') {
+              updates.deleted_at = null;
+              postCommitActions.push(() => {
+                logAuthEvent({
+                  event_type: 'user_restored',
+                  username: target.username,
+                  actor_username: actor.username,
+                  ip_address: getClientIp(c),
+                });
+              });
+            }
+          }
+        }
+        if (validation.data.display_name !== undefined)
+          updates.display_name = validation.data.display_name;
+        if (
+          validation.data.disable_reason !== undefined &&
+          validation.data.status !== 'disabled'
+        ) {
+          updates.disable_reason = validation.data.disable_reason;
+        }
+
+        const isSelfPasswordReset =
+          validation.data.password !== undefined && id === actor.id;
+        if (validation.data.password !== undefined) {
+          updates.password_hash = await hashPassword(validation.data.password);
+          // Only force password change when resetting OTHER user's password
+          // Admin resetting their own password should not trigger forced change
+          if (id !== actor.id) {
+            updates.must_change_password = true;
+          }
           postCommitActions.push(() => {
+            invalidateUserSessions(id);
+            deleteUserSessionsByUserId(id);
             logAuthEvent({
-              event_type: 'user_enabled',
+              event_type: 'password_changed',
               username: target.username,
               actor_username: actor.username,
               ip_address: getClientIp(c),
+              details: { admin_reset: true },
             });
-          });
-        }
-        if (target.status === 'deleted') {
-          updates.deleted_at = null;
-          postCommitActions.push(() => {
             logAuthEvent({
-              event_type: 'user_restored',
+              event_type: 'session_revoked',
               username: target.username,
               actor_username: actor.username,
               ip_address: getClientIp(c),
+              details: { action: 'password_reset_revoke_all' },
             });
           });
         }
-      }
-    }
-    if (validation.data.display_name !== undefined)
-      updates.display_name = validation.data.display_name;
-    if (
-      validation.data.disable_reason !== undefined &&
-      validation.data.status !== 'disabled'
-    ) {
-      updates.disable_reason = validation.data.disable_reason;
-    }
 
-    const isSelfPasswordReset =
-      validation.data.password !== undefined && id === actor.id;
-    if (validation.data.password !== undefined) {
-      updates.password_hash = await hashPassword(validation.data.password);
-      // Only force password change when resetting OTHER user's password
-      // Admin resetting their own password should not trigger forced change
-      if (id !== actor.id) {
-        updates.must_change_password = true;
-      }
-      postCommitActions.push(() => {
-        invalidateUserSessions(id);
-        deleteUserSessionsByUserId(id);
-        logAuthEvent({
-          event_type: 'password_changed',
-          username: target.username,
-          actor_username: actor.username,
-          ip_address: getClientIp(c),
-          details: { admin_reset: true },
-        });
-        logAuthEvent({
-          event_type: 'session_revoked',
-          username: target.username,
-          actor_username: actor.username,
-          ip_address: getClientIp(c),
-          details: { action: 'password_reset_revoke_all' },
-        });
-      });
-    }
+        if (Object.keys(updates).length > 0) {
+          postCommitActions.push(() => {
+            logAuthEvent({
+              event_type: 'user_updated',
+              username: target.username,
+              actor_username: actor.username,
+              ip_address: getClientIp(c),
+              details: { fields: Object.keys(updates) },
+            });
+          });
+        }
 
-    if (Object.keys(updates).length > 0) {
-      postCommitActions.push(() => {
-        logAuthEvent({
-          event_type: 'user_updated',
-          username: target.username,
-          actor_username: actor.username,
-          ip_address: getClientIp(c),
-          details: { fields: Object.keys(updates) },
-        });
-      });
-    }
-
-    let updateAlreadyCommitted = false;
-    const revokesHostPrivilege =
-      targetIsActiveAdmin && !targetRemainsActiveAdmin;
-    if (revokesHostPrivilege) {
-      try {
-        await commitHostPrivilegeRevocation(
-          id,
-          `Administrator ${id} lost active host privileges`,
-          () => updateUserFields(id, updates),
+        let updateAlreadyCommitted = false;
+        const revokesHostPrivilege =
+          targetIsActiveAdmin && !targetRemainsActiveAdmin;
+        const userRuntimeFolders = new Set(
+          getUserWorkspaceRuntimeTargets(id).map((item) => item.folder),
         );
-        updateAlreadyCommitted = true;
-      } catch (err) {
-        if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
-        logger.error(
-          { err, userId: id, persisted: err.persisted },
-          'Failed to revoke active administrator host privileges',
-        );
-        if (err.persisted) runPostCommitActions();
-        return c.json(
-          {
-            error: err.persisted
-              ? 'Account changed, but one or more host runtimes could not be stopped'
-              : 'Could not stop active runtimes; account was not changed',
-            persisted: err.persisted,
-            retryable: true,
-          },
-          503,
-        );
-      }
-    }
-    if (!updateAlreadyCommitted) updateUserFields(id, updates);
-    runPostCommitActions();
-    const updated = getUserById(id)!;
+        const hasPendingHostOnlyCleanup =
+          getPendingAdminHostOnlyCleanupFolders().some((folder) =>
+            userRuntimeFolders.has(folder),
+          );
+        const grantsHostOnlyAdminRuntime =
+          targetRemainsActiveAdmin &&
+          getSystemSettings().adminHostOnlyMode &&
+          (!targetIsActiveAdmin || hasPendingHostOnlyCleanup);
+        if (grantsHostOnlyAdminRuntime) {
+          try {
+            await commitActiveAdminHostOnlyGrant(
+              id,
+              updates,
+              `Administrator ${id} gained active host-only privileges`,
+            );
+            updateAlreadyCommitted = true;
+          } catch (err) {
+            if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+            logger.error(
+              { err, userId: id, persisted: err.persisted },
+              'Failed to apply active administrator host-only runtime policy',
+            );
+            if (err.persisted) runPostCommitActions();
+            return c.json(
+              {
+                error: err.persisted
+                  ? 'Account changed, but one or more previous runtimes could not be stopped; retry the same request'
+                  : 'Could not stop active runtimes; account was not changed',
+                persisted: err.persisted,
+                retryable: true,
+              },
+              503,
+            );
+          }
+        } else if (revokesHostPrivilege) {
+          try {
+            await commitHostPrivilegeRevocation(
+              id,
+              `Administrator ${id} lost active host privileges`,
+              () => updateUserFields(id, updates),
+            );
+            updateAlreadyCommitted = true;
+          } catch (err) {
+            if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+            logger.error(
+              { err, userId: id, persisted: err.persisted },
+              'Failed to revoke active administrator host privileges',
+            );
+            if (err.persisted) runPostCommitActions();
+            return c.json(
+              {
+                error: err.persisted
+                  ? 'Account changed, but one or more host runtimes could not be stopped'
+                  : 'Could not stop active runtimes; account was not changed',
+                persisted: err.persisted,
+                retryable: true,
+              },
+              503,
+            );
+          }
+        }
+        if (!updateAlreadyCommitted) updateUserFields(id, updates);
+        runPostCommitActions();
+        const updated = getUserById(id)!;
 
-    // Symmetric to the disconnect-on-disable/delete above: when a user is
-    // re-enabled or restored (was disabled/deleted, now active), bring their
-    // IM channels back without a service restart. Fire-and-forget; only
-    // enabled channels with valid credentials actually reconnect.
-    if (
-      validation.data.status === 'active' &&
-      (target.status === 'disabled' || target.status === 'deleted')
-    ) {
-      void getWebDeps()
-        ?.reconnectUserIMChannels?.(id)
-        .catch(() => undefined);
-    }
+        // When admin resets their own password, recreate session to avoid logout
+        if (isSelfPasswordReset) {
+          const now = new Date().toISOString();
+          const ip = getClientIp(c);
+          const ua = c.req.header('user-agent') || null;
+          const newToken = generateSessionToken();
+          createUserSession({
+            id: newToken,
+            user_id: actor.id,
+            ip_address: ip,
+            user_agent: ua,
+            created_at: now,
+            expires_at: sessionExpiresAt(),
+            last_active_at: now,
+          });
+          return new Response(
+            JSON.stringify({ success: true, user: toUserPublic(updated) }),
+            {
+              status: 200,
+              headers: {
+                'Content-Type': 'application/json',
+                'Set-Cookie': setSessionCookie(c, newToken),
+              },
+            },
+          );
+        }
 
-    // When admin resets their own password, recreate session to avoid logout
-    if (isSelfPasswordReset) {
-      const now = new Date().toISOString();
-      const ip = getClientIp(c);
-      const ua = c.req.header('user-agent') || null;
-      const newToken = generateSessionToken();
-      createUserSession({
-        id: newToken,
-        user_id: actor.id,
-        ip_address: ip,
-        user_agent: ua,
-        created_at: now,
-        expires_at: sessionExpiresAt(),
-        last_active_at: now,
-      });
-      return new Response(
-        JSON.stringify({ success: true, user: toUserPublic(updated) }),
-        {
-          status: 200,
-          headers: {
-            'Content-Type': 'application/json',
-            'Set-Cookie': setSessionCookie(c, newToken),
-          },
-        },
-      );
-    }
-
-    return c.json({ success: true, user: toUserPublic(updated) });
+        return c.json({ success: true, user: toUserPublic(updated) });
+      },
+    );
   },
 );
 

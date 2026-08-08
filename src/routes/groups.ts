@@ -2,6 +2,10 @@ import { Hono } from 'hono';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import {
+  hasBoundWorkspaceReference,
+  resolveBoundWorkspaceJid,
+} from '../workspace-attribution.js';
+import {
   GroupAgentProfilePatchSchema,
   GroupCreateSchema,
   GroupPatchSchema,
@@ -33,6 +37,7 @@ import {
   getAllRegisteredGroups,
   getAllChats,
   getJidsByFolder,
+  getChannelMount,
   updateChatName,
   deleteSession,
   deleteWorkspaceSessions,
@@ -68,6 +73,7 @@ import {
   getWorkspaceAgentProfileId,
   getWorkspaceInteractionMode,
   setWorkspaceInteractionMode,
+  getUserById,
 } from '../db.js';
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
@@ -79,6 +85,7 @@ import {
 } from '../agent-profile-runtime.js';
 import {
   getContainerEnvConfig,
+  getSystemSettings,
   saveContainerEnvConfig,
   toPublicContainerEnvConfig,
 } from '../runtime-config.js';
@@ -111,6 +118,10 @@ import {
   buildPinnedGitEnvironment,
   startPinnedHttpsProxy,
 } from '../safe-git-proxy.js';
+import {
+  SYSTEM_CAPABILITY_LOCK_KEY,
+  withCapabilityScopeLocks,
+} from '../capability-lock.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -120,6 +131,7 @@ const execFileAsync = promisify(execFile);
  * persisted — a client-correctable conflict, never a server fault.
  */
 class WorkspaceAgentProfileMissingError extends Error {}
+class AdminHostOnlyModeConflictError extends Error {}
 
 /**
  * 检查 hostname 是否为内网地址（SSRF 防护）。
@@ -524,7 +536,11 @@ function toPublicContainerEnvForUser(
 groupRoutes.get('/', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const groups = buildGroupsPayload(user);
-  return c.json({ groups });
+  return c.json({
+    groups,
+    admin_host_only_mode:
+      user.role === 'admin' && getSystemSettings().adminHostOnlyMode,
+  });
 });
 
 // POST /api/groups - 创建新群组
@@ -560,15 +576,33 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     return c.json({ error: 'Group name is required' }, 400);
   }
 
-  // If user didn't specify execution mode, pick based on Docker availability
-  const executionMode =
-    validation.data.execution_mode ||
-    ((await isDockerAvailable()) ? 'container' : 'host');
+  const authUser = c.get('user') as AuthUser;
+  const adminHostOnlyMode =
+    authUser.role === 'admin' &&
+    authUser.status === 'active' &&
+    getSystemSettings().adminHostOnlyMode;
+  if (adminHostOnlyMode && validation.data.execution_mode === 'container') {
+    return c.json(
+      {
+        error: '管理员纯宿主机模式已开启，不能创建 Docker 工作区',
+        code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+      },
+      409,
+    );
+  }
+
+  // Members always stay container-isolated. Administrators in hybrid mode
+  // retain the existing Docker-availability fallback.
+  const executionMode = adminHostOnlyMode
+    ? 'host'
+    : validation.data.execution_mode ||
+      (authUser.role === 'admin' && !(await isDockerAvailable())
+        ? 'host'
+        : 'container');
   const interactionMode = validation.data.interaction_mode ?? 'assistant';
   const customCwd = validation.data.custom_cwd; // Schema already trims and converts empty to undefined
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
-  const authUser = c.get('user') as AuthUser;
   const requestedAdditionalMounts = validation.data.additional_mounts ?? [];
   const agentProfile = validation.data.agent_profile_id
     ? getAgentProfileForUser(validation.data.agent_profile_id, authUser.id)
@@ -948,46 +982,74 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   }
 
   let publishedAgentProfile;
+  let hostOnlyPolicyChangedDuringCreate = false;
   try {
-    publishedAgentProfile = await withAgentProfileLocks(
-      [agentProfile.id],
-      () => {
-        // The target may have been archived while the request performed its
-        // filesystem/network validation. Recheck under the same lock used by
-        // Agent DELETE/PATCH and workspace migration.
-        const lockedProfile = getAgentProfileForUser(
-          agentProfile.id,
-          authUser.id,
-        );
-        if (!lockedProfile) return undefined;
-
-        try {
-          // Mapping first and registered-group publication immediately after
-          // it occur in one synchronous critical section. Agent PATCH cannot
-          // snapshot between them: it holds this same profile lock.
-          assignWorkspaceAgentProfile(
-            folder,
-            lockedProfile.id,
-            interactionMode,
+    publishedAgentProfile = await withCapabilityScopeLocks(
+      [SYSTEM_CAPABILITY_LOCK_KEY],
+      async () => {
+        const profile = await withAgentProfileLocks([agentProfile.id], () => {
+          // The target may have been archived while the request performed its
+          // filesystem/network validation. Recheck under the same lock used by
+          // Agent DELETE/PATCH and workspace migration.
+          const lockedProfile = getAgentProfileForUser(
+            agentProfile.id,
+            authUser.id,
           );
-          setRegisteredGroup(jid, group);
-          updateChatName(jid, name);
-          deps.getRegisteredGroups()[jid] = group;
-          return lockedProfile;
-        } catch (err) {
-          // setRegisteredGroup may fail after the mapping write. Clear both
-          // sides before releasing the profile lock so no partial membership
-          // can become visible to the next mutation.
-          try {
-            deleteRegisteredGroup(jid);
-          } catch {
-            /* best-effort cleanup continues below */
+          if (!lockedProfile) return undefined;
+          const currentOwner = getUserById(authUser.id);
+          if (
+            group.executionMode !== 'host' &&
+            currentOwner?.role === 'admin' &&
+            currentOwner.status === 'active' &&
+            getSystemSettings().adminHostOnlyMode
+          ) {
+            hostOnlyPolicyChangedDuringCreate = true;
+            return undefined;
           }
-          deleteWorkspaceAgentProfile(folder);
-          deleteChatHistory(jid);
-          delete deps.getRegisteredGroups()[jid];
-          throw err;
+
+          try {
+            // Mapping first and registered-group publication immediately after
+            // it occur in one synchronous critical section. Agent PATCH cannot
+            // snapshot between them: it holds this same profile lock.
+            assignWorkspaceAgentProfile(
+              folder,
+              lockedProfile.id,
+              interactionMode,
+            );
+            setRegisteredGroup(jid, group);
+            updateChatName(jid, name);
+            deps.getRegisteredGroups()[jid] = group;
+            return lockedProfile;
+          } catch (err) {
+            // setRegisteredGroup may fail after the mapping write. Clear both
+            // sides before releasing the profile lock so no partial membership
+            // can become visible to the next mutation.
+            try {
+              deleteRegisteredGroup(jid);
+            } catch {
+              /* best-effort cleanup continues below */
+            }
+            deleteWorkspaceAgentProfile(folder);
+            deleteChatHistory(jid);
+            delete deps.getRegisteredGroups()[jid];
+            throw err;
+          }
+        });
+        // Hold the system policy lock through container prewarm. If host-only
+        // mode is enabled concurrently, its snapshot can only run after this
+        // workspace is fully published and will therefore quiesce the new
+        // container before committing the policy.
+        if (profile && executionMode === 'container') {
+          try {
+            deps.ensureTerminalContainerStarted(jid);
+          } catch (err) {
+            logger.warn(
+              { err, jid },
+              'Workspace created but container prewarm could not be started',
+            );
+          }
         }
+        return profile;
       },
     );
   } catch (err) {
@@ -997,12 +1059,16 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   }
   if (!publishedAgentProfile) {
     fs.rmSync(groupDir, { recursive: true, force: true });
+    if (hostOnlyPolicyChangedDuringCreate) {
+      return c.json(
+        {
+          error: '管理员纯宿主机模式已开启，请按宿主机模式重新创建工作区',
+          code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+        },
+        409,
+      );
+    }
     return c.json({ error: '该智能体配置已失效；请选择其他智能体' }, 409);
-  }
-
-  // 容器模式工作区创建后立即启动容器预热，避免用户打开终端时还需等待
-  if (executionMode === 'container') {
-    deps.ensureTerminalContainerStarted(jid);
   }
 
   // Mirror buildGroupsPayload ACL shape so the frontend doesn't need to
@@ -1091,6 +1157,20 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     return c.json(
       { error: 'Insufficient permissions for host execution mode' },
       403,
+    );
+  }
+  if (
+    execution_mode === 'container' &&
+    authUser.role === 'admin' &&
+    authUser.status === 'active' &&
+    getSystemSettings().adminHostOnlyMode
+  ) {
+    return c.json(
+      {
+        error: '管理员纯宿主机模式已开启，不能切换到 Docker 执行',
+        code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+      },
+      409,
     );
   }
 
@@ -1198,6 +1278,14 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
 
     const commitUpdate = () => {
       if (
+        execution_mode === 'container' &&
+        authUser.role === 'admin' &&
+        authUser.status === 'active' &&
+        getSystemSettings().adminHostOnlyMode
+      ) {
+        throw new AdminHostOnlyModeConflictError();
+      }
+      if (
         name ||
         activation_mode !== undefined ||
         execution_mode !== undefined
@@ -1259,6 +1347,15 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         );
         deps.queue?.unblockGroupsForRuntimeSafety?.(runtimeJids);
       } catch (err) {
+        if (err instanceof AdminHostOnlyModeConflictError) {
+          return c.json(
+            {
+              error: '管理员纯宿主机模式已开启，不能切换到 Docker 执行',
+              code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+            },
+            409,
+          );
+        }
         if (err instanceof WorkspaceAgentProfileMissingError) {
           deps.queue?.unblockGroupsForRuntimeSafety?.(runtimeJids);
           return c.json(
@@ -1291,6 +1388,15 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
       try {
         commitUpdate();
       } catch (err) {
+        if (err instanceof AdminHostOnlyModeConflictError) {
+          return c.json(
+            {
+              error: '管理员纯宿主机模式已开启，不能切换到 Docker 执行',
+              code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+            },
+            409,
+          );
+        }
         if (!(err instanceof WorkspaceAgentProfileMissingError)) throw err;
         return c.json(
           {
@@ -2263,6 +2369,9 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   }
 
   // is_home 群组合并查询：将同一 owner、同 folder 下的 Web 与 IM 消息合并展示。
+  // 已绑定到其它工作区的 IM 会话必须排除：它的 folder/created_by 仍停留在渠道
+  // 账号归属人，若只按 folder + owner 合并，别的工作区的对话会出现在账号归属人
+  // 的 Home 历史里。
   const queryJids = [jid];
   if (group.is_home) {
     const siblingJids = getJidsByFolder(group.folder);
@@ -2272,9 +2381,21 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
       if (!siblingGroup) continue;
       const ownerMatch =
         group.created_by && siblingGroup.created_by === group.created_by;
-      if (ownerMatch) {
-        queryJids.push(siblingJid);
+      if (!ownerMatch) continue;
+      const attributionDeps = {
+        getRegisteredGroup,
+        getAgent,
+        getJidsByFolder,
+        getChannelMount,
+      };
+      const boundJid = resolveBoundWorkspaceJid(siblingJid, attributionDeps);
+      if (
+        (boundJid && boundJid !== jid) ||
+        (!boundJid && hasBoundWorkspaceReference(siblingJid, attributionDeps))
+      ) {
+        continue;
       }
+      queryJids.push(siblingJid);
     }
   }
 

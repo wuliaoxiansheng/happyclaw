@@ -73,7 +73,9 @@ describe('AgentProfile DB model', () => {
     expect(profiles[0].name).toBe('HappyClaw');
     expect(profiles[0].identity_prompt).toBe('');
     expect(profiles[0].include_claude_preset).toBe(true);
+    expect(profiles[0].model_config_id).toBeNull();
     expect(profiles[0].runtime_policy).toEqual({
+      reasoning: { effort: 'inherit' },
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -178,6 +180,7 @@ describe('AgentProfile DB model', () => {
         tools: { mode: 'readonly' },
       } as any),
     ).toEqual({
+      reasoning: { effort: 'inherit' },
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -311,6 +314,34 @@ describe('AgentProfile DB model', () => {
     );
   });
 
+  test('persists and versions Agent model configuration changes', () => {
+    const userId = 'agent-profile-model-config';
+    seedUser(userId);
+    const profile = createAgentProfile({
+      ownerUserId: userId,
+      name: 'Model-bound Agent',
+      modelConfigId: 'provider-a',
+    });
+
+    expect(profile.model_config_id).toBe('provider-a');
+    const same = updateAgentProfile(profile.id, userId, {
+      modelConfigId: 'provider-a',
+    });
+    expect(same?.version).toBe(profile.version);
+
+    const switched = updateAgentProfile(profile.id, userId, {
+      modelConfigId: 'provider-b',
+    });
+    expect(switched?.model_config_id).toBe('provider-b');
+    expect(switched?.version).toBe(profile.version + 1);
+
+    const inherited = updateAgentProfile(profile.id, userId, {
+      modelConfigId: null,
+    });
+    expect(inherited?.model_config_id).toBeNull();
+    expect(inherited?.version).toBe(profile.version + 2);
+  });
+
   test('stores avatar overrides without changing runtime identity version', () => {
     seedUser('agent-profile-avatar-user');
     const profile = createAgentProfile({
@@ -350,6 +381,7 @@ describe('AgentProfile DB model', () => {
     });
 
     expect(profile.runtime_policy).toEqual({
+      reasoning: { effort: 'inherit' },
       context: {
         source: 'managed',
         auto_compact_window: 0,
@@ -389,6 +421,7 @@ describe('AgentProfile DB model', () => {
     );
     expect(updated?.version).toBe(profile.version + 1);
     expect(updated?.runtime_policy).toEqual({
+      reasoning: { effort: 'inherit' },
       context: {
         source: 'host_claude',
         auto_compact_window: 0,
@@ -478,6 +511,7 @@ describe('AgentProfile DB model', () => {
     );
 
     expect(updated?.runtime_policy).toEqual({
+      reasoning: { effort: 'inherit' },
       context: {
         source: 'host_claude',
         auto_compact_window: 0,

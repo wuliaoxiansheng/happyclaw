@@ -9,6 +9,7 @@ import type {
   AgentProfileRuntimePolicy,
   AgentProfileRuntimePolicyPatch,
   GroupInfo,
+  ModelConfigOption,
 } from '../types';
 import { useChatStore } from './chat';
 import { useGroupsStore } from './groups';
@@ -35,6 +36,8 @@ export interface AgentPromptRefinement extends Omit<
 
 interface AgentProfilesState {
   profiles: AgentProfile[];
+  modelConfigs: ModelConfigOption[];
+  defaultModelConfigId: string | null;
   governanceByProfile: Record<string, AgentProfileGovernance | undefined>;
   governanceLoading: Record<string, boolean | undefined>;
   governanceErrors: Record<string, string | undefined>;
@@ -72,6 +75,7 @@ interface AgentProfilesState {
     include_claude_preset?: boolean;
     avatar_emoji?: string | null;
     avatar_color?: string | null;
+    model_config_id?: string | null;
     runtime_policy?: AgentProfileRuntimePolicy;
   }) => Promise<AgentProfile>;
   updateProfile: (
@@ -87,6 +91,7 @@ interface AgentProfilesState {
       include_claude_preset?: boolean;
       avatar_emoji?: string | null;
       avatar_color?: string | null;
+      model_config_id?: string | null;
       runtime_policy?: AgentProfileRuntimePolicyPatch;
     },
   ) => Promise<AgentProfile>;
@@ -98,6 +103,8 @@ interface AgentProfilesState {
 
 export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
   profiles: [],
+  modelConfigs: [],
+  defaultModelConfigId: null,
   governanceByProfile: {},
   governanceLoading: {},
   governanceErrors: {},
@@ -109,15 +116,19 @@ export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
   loadProfiles: async () => {
     set({ loading: true });
     try {
-      const data = await api.get<{ profiles: AgentProfile[] }>(
-        '/api/agent-profiles',
-      );
+      const data = await api.get<{
+        profiles: AgentProfile[];
+        model_configs: ModelConfigOption[];
+        default_model_config_id: string | null;
+      }>('/api/agent-profiles');
       set({
         profiles: data.profiles.map((profile) =>
           profile.is_default
             ? { ...profile, name: getAgentProfileDisplayName(profile.name) }
             : profile,
         ),
+        modelConfigs: data.model_configs ?? [],
+        defaultModelConfigId: data.default_model_config_id ?? null,
         loading: false,
         profilesError: null,
         error: null,
@@ -133,15 +144,19 @@ export const useAgentProfilesStore = create<AgentProfilesState>((set, get) => ({
   },
 
   refreshProfile: async (id) => {
-    const data = await api.get<{ profiles: AgentProfile[] }>(
-      '/api/agent-profiles',
-    );
+    const data = await api.get<{
+      profiles: AgentProfile[];
+      model_configs: ModelConfigOption[];
+      default_model_config_id: string | null;
+    }>('/api/agent-profiles');
     const profile = data.profiles.find((candidate) => candidate.id === id);
     if (!profile) throw new Error('智能体配置不存在');
     set((state) => ({
       profiles: state.profiles.map((candidate) =>
         candidate.id === id ? profile : candidate,
       ),
+      modelConfigs: data.model_configs ?? [],
+      defaultModelConfigId: data.default_model_config_id ?? null,
       governanceByProfile: {
         ...state.governanceByProfile,
         [id]: state.governanceByProfile[id]

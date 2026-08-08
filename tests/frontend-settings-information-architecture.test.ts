@@ -116,6 +116,9 @@ describe('settings information architecture', () => {
     expect(system).toMatch(
       /当前目录同时作为提示词、Rules、Skills、MCP 与 Plugin\s+Marketplace\s+的来源/,
     );
+    expect(system).toMatch(
+      /管理员纯宿主机模式[\s\S]*普通成员仍固定使用\s+Docker/,
+    );
     expect(page).toContain("currentUser?.role !== 'admin'");
   });
 
@@ -123,6 +126,7 @@ describe('settings information architecture', () => {
     const bindings = read('web/src/components/settings/BindingsSection.tsx');
     const bindingRow = read('web/src/components/settings/ImBindingRow.tsx');
     const provider = read('web/src/components/settings/ProviderEditor.tsx');
+    const providerList = read('web/src/components/settings/ProviderList.tsx');
     const providerModel = read('web/src/utils/provider-model.ts');
     const settings = read('web/src/pages/SettingsPage.tsx');
 
@@ -137,7 +141,9 @@ describe('settings information architecture', () => {
     expect(providerModel).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW');
     expect(provider).toContain('1M 上下文');
     expect(provider).toContain('系统预填 Claude Code 运行环境');
-    expect(provider).toContain("balancingStrategy === 'weighted-round-robin'");
+    expect(providerList).toContain('设为默认');
+    expect(providerList).toContain('系统默认');
+    expect(providerList).not.toContain('权重');
     expect(settings).toContain('toast.success(message)');
     expect(settings).toContain('toast.error(message)');
   });

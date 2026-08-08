@@ -1109,18 +1109,3 @@ describe('queued follow-up cards', () => {
     expect(countTag(card, 'button')).toBe(0);
   });
 });
-
-// ─── feishu.ts:buildInteractiveCard backward-compat ─────────────
-
-describe('feishu.ts wrapper uses new builder', () => {
-  test('buildInteractiveCard delegates to buildAgentReplyCard without default header', async () => {
-    const { buildInteractiveCard } =
-      (await import('../src/feishu.js')) as unknown as {
-        buildInteractiveCard?: (t: string) => object;
-      };
-    // buildInteractiveCard is module-private; skip silently if not exported.
-    if (!buildInteractiveCard) return;
-    const card = buildInteractiveCard('hi') as Record<string, unknown>;
-    expect(card.header).toBeUndefined();
-  });
-});

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import { Copy, Check, Maximize2, X } from 'lucide-react';
 import DOMPurify from 'dompurify';
+import { PreviewDialog } from './PreviewDialog';
 
 /** 对 mermaid 渲染的 SVG 进行消毒，防止 XSS */
 function sanitizeSvg(raw: string): string {
@@ -16,12 +16,15 @@ let mermaidPromise: Promise<typeof import('mermaid')> | null = null;
 let idCounter = 0;
 
 function isRetryableMermaidLoadError(error: unknown): boolean {
-  const raw = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+  const raw =
+    error instanceof Error ? `${error.name} ${error.message}` : String(error);
   const text = raw.toLowerCase();
-  return text.includes('failed to fetch dynamically imported module')
-    || text.includes('importing a module script failed')
-    || text.includes('chunkloaderror')
-    || (text.includes('chunk') && text.includes('failed'));
+  return (
+    text.includes('failed to fetch dynamically imported module') ||
+    text.includes('importing a module script failed') ||
+    text.includes('chunkloaderror') ||
+    (text.includes('chunk') && text.includes('failed'))
+  );
 }
 
 function sleep(ms: number) {
@@ -69,10 +72,16 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
     clearTimeout(debounceRef.current);
     let disposed = false;
 
-    const renderWithRetry = async (diagramCode: string, attempt: number): Promise<string> => {
+    const renderWithRetry = async (
+      diagramCode: string,
+      attempt: number,
+    ): Promise<string> => {
       try {
         const mermaid = await loadMermaid();
-        const { svg: rendered } = await mermaid.default.render(`${idRef.current}-${attempt}`, diagramCode);
+        const { svg: rendered } = await mermaid.default.render(
+          `${idRef.current}-${attempt}`,
+          diagramCode,
+        );
         return rendered;
       } catch (error) {
         if (attempt === 0 && isRetryableMermaidLoadError(error)) {
@@ -119,7 +128,9 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
       <div className="my-4 rounded-lg bg-muted border border-border p-8 flex items-center justify-center">
         <div className="animate-pulse flex flex-col items-center gap-2">
           <div className="h-24 w-48 bg-muted-foreground/20 rounded" />
-          <span className="text-sm text-muted-foreground">Mermaid 图表渲染中...</span>
+          <span className="text-sm text-muted-foreground">
+            Mermaid 图表渲染中...
+          </span>
         </div>
       </div>
     );
@@ -190,30 +201,26 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
           dangerouslySetInnerHTML={{ __html: svg! }}
         />
       </div>
-      {expanded && createPortal(
-        <div
-          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4 cursor-zoom-out"
-          onClick={() => setExpanded(false)}
+      {expanded && (
+        <PreviewDialog
+          title="Mermaid 图表预览"
+          onClose={() => setExpanded(false)}
+          layer="nested"
+          className="left-1/2 top-1/2 h-[95dvh] w-[95vw] -translate-x-1/2 -translate-y-1/2 rounded-xl bg-card p-6"
         >
-          <div
-            className="relative bg-card rounded-xl p-6 w-[95vw] h-[95vh] overflow-auto cursor-default"
-            onClick={(e) => e.stopPropagation()}
+          <button
+            onClick={() => setExpanded(false)}
+            className="absolute top-3 right-3 z-20 p-2 rounded-full bg-black/70 text-white hover:bg-black transition-colors cursor-pointer"
+            aria-label="关闭图表预览"
+            title="关闭"
           >
-            <button
-              onClick={() => setExpanded(false)}
-              className="absolute top-3 right-3 z-20 p-2 rounded-full bg-black/70 text-white hover:bg-black transition-colors cursor-pointer"
-              aria-label="关闭图表预览"
-              title="关闭"
-            >
-              <X size={16} />
-            </button>
-            <div
-              className="w-full h-full flex items-center justify-center [touch-action:pan-x_pan-y_pinch-zoom] [&>svg]:!w-[90vw] [&>svg]:!max-w-none [&>svg]:!h-auto [&>svg]:!max-h-[90vh]"
-              dangerouslySetInnerHTML={{ __html: svg! }}
-            />
-          </div>
-        </div>,
-        document.body
+            <X size={16} />
+          </button>
+          <div
+            className="w-full h-full overflow-auto flex items-center justify-center [touch-action:pan-x_pan-y_pinch-zoom] [&>svg]:!w-[90vw] [&>svg]:!max-w-none [&>svg]:!h-auto [&>svg]:!max-h-[90vh]"
+            dangerouslySetInnerHTML={{ __html: svg! }}
+          />
+        </PreviewDialog>
       )}
     </>
   );

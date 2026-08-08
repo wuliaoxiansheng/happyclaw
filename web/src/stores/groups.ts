@@ -7,6 +7,7 @@ export type { GroupInfo };
 
 interface GroupsState {
   groups: Record<string, GroupInfo>;
+  adminHostOnlyMode: boolean;
   loading: boolean;
   error: string | null;
   runnerStates: Record<string, 'idle' | 'running'>;
@@ -16,6 +17,7 @@ interface GroupsState {
 
 export const useGroupsStore = create<GroupsState>((set) => ({
   groups: {},
+  adminHostOnlyMode: false,
   loading: false,
   error: null,
   runnerStates: {},
@@ -23,16 +25,22 @@ export const useGroupsStore = create<GroupsState>((set) => ({
   loadGroups: async () => {
     set({ loading: true });
     try {
-      const data = await api.get<{ groups: Record<string, GroupInfo> }>(
-        '/api/groups',
-      );
+      const data = await api.get<{
+        groups: Record<string, GroupInfo>;
+        admin_host_only_mode?: boolean;
+      }>('/api/groups');
       const groups = Object.fromEntries(
         Object.entries(data.groups).map(([jid, group]) => [
           jid,
           normalizeGroupInteractionMode(group),
         ]),
       );
-      set({ groups, loading: false, error: null });
+      set({
+        groups,
+        adminHostOnlyMode: data.admin_host_only_mode === true,
+        loading: false,
+        error: null,
+      });
     } catch (err) {
       set({
         loading: false,

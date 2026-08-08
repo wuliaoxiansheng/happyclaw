@@ -45,14 +45,41 @@ vi.mock('../src/middleware/auth.ts', async (importOriginal) => {
 const web = await import('../src/web.js');
 const db = await import('../src/db.js');
 const stopGroup = vi.fn(async () => {});
+const reconnectUserIMChannels = vi.fn(async () => {});
+const runtimeSafetyBlocks = new Map<string, Set<string>>();
+const liveGroups: Record<string, any> = {};
+const blockGroupsForRuntimeSafety = vi.fn(
+  (jids: string[], _reason: string, source = 'default') => {
+    for (const jid of jids) {
+      const sources = runtimeSafetyBlocks.get(jid) ?? new Set<string>();
+      sources.add(source);
+      runtimeSafetyBlocks.set(jid, sources);
+    }
+  },
+);
+const unblockGroupsForRuntimeSafety = vi.fn(
+  (jids: string[], source = 'default') => {
+    for (const jid of jids) {
+      const sources = runtimeSafetyBlocks.get(jid);
+      sources?.delete(source);
+      if (sources?.size === 0) runtimeSafetyBlocks.delete(jid);
+    }
+  },
+);
 const app = web.createAppForTest({
   queue: {
     stopGroup,
     listDescendantJids: () => [],
     pauseGroupsForMutation: () => ({ id: 'test-pause' }),
     resumeGroupsAfterMutation: vi.fn(),
+    blockGroupsForRuntimeSafety,
+    unblockGroupsForRuntimeSafety,
+    isGroupRuntimeSafetyBlocked: (jid: string) => runtimeSafetyBlocks.has(jid),
   },
-  getRegisteredGroups: () => ({}),
+  getRegisteredGroups: () => liveGroups,
+  sessions: {},
+  ensureTerminalContainerStarted: vi.fn(() => true),
+  reconnectUserIMChannels,
 } as any);
 
 function asUser(role: 'admin' | 'member', permissions: string[] = []): void {
@@ -64,6 +91,18 @@ beforeAll(() => {
   fs.mkdirSync(path.join(tmpDir, 'db'), { recursive: true });
   fs.mkdirSync(path.join(tmpDir, 'groups'), { recursive: true });
   db.initDatabase();
+  const now = new Date().toISOString();
+  db.createUser({
+    id: 'settings-security-user',
+    username: 'settings-security-user',
+    password_hash: 'hash',
+    display_name: 'Settings Security User',
+    role: 'admin',
+    status: 'active',
+    created_at: now,
+    updated_at: now,
+    must_change_password: false,
+  });
 });
 
 afterAll(() => {
@@ -80,6 +119,7 @@ describe('system settings capability boundaries', () => {
     const body = await response.json();
     expect(body).not.toHaveProperty('externalClaudeDir');
     expect(body).not.toHaveProperty('pluginAutoScan');
+    expect(body).not.toHaveProperty('adminHostOnlyMode');
     expect(body).not.toHaveProperty('mainAgentContextSource');
     expect(body).not.toHaveProperty('mainAgentAutoCompactWindow');
     expect(body).not.toHaveProperty('mainAgentAutoCompactPercentage');
@@ -252,6 +292,347 @@ describe('system settings capability boundaries', () => {
     expect(
       db.listWorkspaceRuntimeSessionsByWorkspace('web:settings-admin-custom'),
     ).toEqual([]);
+  });
+
+  test('admin host-only mode migrates only active-admin runtimes and preserves member isolation', async () => {
+    const now = new Date().toISOString();
+    db.setRegisteredGroup('web:settings-admin-container', {
+      name: 'Admin container before policy',
+      folder: 'settings-admin-container',
+      added_at: now,
+      executionMode: 'container',
+      created_by: 'settings-admin-owner',
+    });
+    db.setRegisteredGroup('web:settings-member-container', {
+      name: 'Member container before policy',
+      folder: 'settings-member-container',
+      added_at: now,
+      executionMode: 'container',
+      created_by: 'settings-member-owner',
+    });
+    db.createTask({
+      id: 'settings-admin-container-task',
+      group_folder: 'settings-admin-container',
+      chat_jid: 'web:settings-admin-container',
+      prompt: 'admin policy migration',
+      schedule_type: 'cron',
+      schedule_value: '0 9 * * *',
+      context_mode: 'isolated',
+      execution_type: 'agent',
+      execution_mode: 'container',
+      next_run: new Date(Date.now() + 60_000).toISOString(),
+      status: 'active',
+      created_at: now,
+      created_by: 'settings-admin-owner',
+      notify_channels: null,
+    });
+    db.createTask({
+      id: 'settings-member-container-task',
+      group_folder: 'settings-member-container',
+      chat_jid: 'web:settings-member-container',
+      prompt: 'member remains isolated',
+      schedule_type: 'cron',
+      schedule_value: '0 9 * * *',
+      context_mode: 'isolated',
+      execution_type: 'agent',
+      execution_mode: 'container',
+      next_run: new Date(Date.now() + 60_000).toISOString(),
+      status: 'active',
+      created_at: now,
+      created_by: 'settings-member-owner',
+      notify_channels: null,
+    });
+
+    stopGroup.mockClear();
+    asUser('admin');
+    const response = await app.request('/api/config/host-integration', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ adminHostOnlyMode: true }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ adminHostOnlyMode: true });
+    expect(
+      db.getRegisteredGroup('web:settings-admin-container')?.executionMode,
+    ).toBe('host');
+    expect(
+      db.getTaskById('settings-admin-container-task')?.execution_mode,
+    ).toBe('host');
+    expect(
+      db.getRegisteredGroup('web:settings-member-container')?.executionMode,
+    ).toBe('container');
+    expect(
+      db.getTaskById('settings-member-container-task')?.execution_mode,
+    ).toBe('container');
+    expect(stopGroup).toHaveBeenCalledWith(
+      'web:settings-admin-container',
+      expect.objectContaining({ force: true, preserveQueuedWork: true }),
+    );
+
+    const disableResponse = await app.request('/api/config/host-integration', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ adminHostOnlyMode: false }),
+    });
+    expect(disableResponse.status).toBe(200);
+    expect(
+      db.getRegisteredGroup('web:settings-admin-container')?.executionMode,
+    ).toBe('host');
+  });
+
+  test('an exact retry repairs a persisted host-integration cleanup failure', async () => {
+    asUser('admin');
+    await app.request('/api/config/host-integration', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ adminHostOnlyMode: false }),
+    });
+    db.setRegisteredGroup('web:settings-admin-retry', {
+      name: 'Admin cleanup retry',
+      folder: 'settings-admin-retry',
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: 'settings-admin-owner',
+    });
+    db.setSession('settings-admin-retry', 'initial-container-session');
+
+    const callsByJid = new Map<string, number>();
+    stopGroup.mockImplementation(async (jid: string) => {
+      const calls = (callsByJid.get(jid) ?? 0) + 1;
+      callsByJid.set(jid, calls);
+      if (jid === 'web:settings-admin-retry' && calls === 2) {
+        db.setSession('settings-admin-retry', 'late-container-session');
+        throw new Error('simulated post-commit teardown failure');
+      }
+    });
+    runtimeSafetyBlocks.clear();
+    blockGroupsForRuntimeSafety.mockClear();
+    unblockGroupsForRuntimeSafety.mockClear();
+
+    const failed = await app.request('/api/config/host-integration', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ adminHostOnlyMode: true }),
+    });
+    expect(failed.status).toBe(503);
+    expect(await failed.json()).toMatchObject({
+      persisted: true,
+      retryable: true,
+    });
+    expect(
+      db.getRegisteredGroup('web:settings-admin-retry')?.executionMode,
+    ).toBe('host');
+    expect(db.getSession('settings-admin-retry')).toBe(
+      'late-container-session',
+    );
+    expect(runtimeSafetyBlocks.has('web:settings-admin-retry')).toBe(true);
+    expect(
+      db.getRouterState('admin_host_only_runtime_cleanup_pending'),
+    ).toContain('settings-admin-retry');
+
+    stopGroup.mockImplementation(async () => {});
+    const repaired = await app.request('/api/config/host-integration', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ adminHostOnlyMode: true }),
+    });
+    expect(repaired.status).toBe(200);
+    expect(db.getSession('settings-admin-retry')).toBeUndefined();
+    expect(runtimeSafetyBlocks.has('web:settings-admin-retry')).toBe(false);
+    expect(
+      db.getRouterState('admin_host_only_runtime_cleanup_pending'),
+    ).toBeUndefined();
+    expect(unblockGroupsForRuntimeSafety).toHaveBeenCalled();
+  });
+
+  test('host-only enable serializes with workspace publication and prewarm', async () => {
+    asUser('admin');
+    await app.request('/api/config/host-integration', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ adminHostOnlyMode: false }),
+    });
+    db.getOrCreateDefaultAgentProfile('settings-security-user');
+
+    let releaseStop!: () => void;
+    let reportStopEntered!: () => void;
+    const stopEntered = new Promise<void>((resolve) => {
+      reportStopEntered = resolve;
+    });
+    const stopGate = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    let heldFirstStop = false;
+    stopGroup.mockImplementation(async () => {
+      if (heldFirstStop) return;
+      heldFirstStop = true;
+      reportStopEntered();
+      await stopGate;
+    });
+
+    const enableRequest = app.request('/api/config/host-integration', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ adminHostOnlyMode: true }),
+    });
+    await stopEntered;
+    const createRequest = app.request('/api/groups', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Must not publish as Docker',
+        execution_mode: 'container',
+      }),
+    });
+    const completedWhilePolicyPaused = await Promise.race([
+      createRequest.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 25)),
+    ]);
+    expect(completedWhilePolicyPaused).toBe(false);
+
+    releaseStop();
+    expect((await enableRequest).status).toBe(200);
+    const createResponse = await createRequest;
+    expect(createResponse.status).toBe(409);
+    expect(await createResponse.json()).toMatchObject({
+      code: 'ADMIN_HOST_ONLY_MODE_ENABLED',
+    });
+    expect(
+      Object.values(db.getAllRegisteredGroups()).some(
+        (group) => group.name === 'Must not publish as Docker',
+      ),
+    ).toBe(false);
+    stopGroup.mockImplementation(async () => {});
+  });
+
+  test('promoting a member under host-only mode migrates runtimes and retries cleanup safely', async () => {
+    const now = new Date().toISOString();
+    db.createUser({
+      id: 'settings-promoted-admin',
+      username: 'settings-promoted-admin',
+      password_hash: 'hash',
+      display_name: 'Promoted Admin',
+      role: 'member',
+      status: 'active',
+      created_at: now,
+      updated_at: now,
+      must_change_password: false,
+    });
+    db.setRegisteredGroup('web:settings-promoted-admin', {
+      name: 'Promoted admin workspace',
+      folder: 'settings-promoted-admin',
+      added_at: now,
+      executionMode: 'container',
+      created_by: 'settings-promoted-admin',
+    });
+    db.createTask({
+      id: 'settings-promoted-admin-task',
+      group_folder: 'settings-promoted-admin',
+      chat_jid: 'web:settings-promoted-admin',
+      prompt: 'promotion migration',
+      schedule_type: 'cron',
+      schedule_value: '0 10 * * *',
+      context_mode: 'isolated',
+      execution_type: 'agent',
+      execution_mode: 'container',
+      next_run: new Date(Date.now() + 60_000).toISOString(),
+      status: 'active',
+      created_at: now,
+      created_by: 'settings-promoted-admin',
+      notify_channels: null,
+    });
+    db.setSession('settings-promoted-admin', 'promotion-initial-session');
+
+    let targetStops = 0;
+    stopGroup.mockImplementation(async (jid: string) => {
+      if (jid !== 'web:settings-promoted-admin') return;
+      targetStops += 1;
+      if (targetStops === 2) {
+        db.setSession('settings-promoted-admin', 'promotion-late-session');
+        throw new Error('simulated promotion post-commit failure');
+      }
+    });
+    runtimeSafetyBlocks.clear();
+    asUser('admin');
+    const failed = await app.request(
+      '/api/admin/users/settings-promoted-admin',
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ role: 'admin' }),
+      },
+    );
+    expect(failed.status).toBe(503);
+    expect(await failed.json()).toMatchObject({
+      persisted: true,
+      retryable: true,
+    });
+    expect(db.getUserById('settings-promoted-admin')?.role).toBe('admin');
+    expect(
+      db.getRegisteredGroup('web:settings-promoted-admin')?.executionMode,
+    ).toBe('host');
+    expect(db.getTaskById('settings-promoted-admin-task')?.execution_mode).toBe(
+      'host',
+    );
+    expect(db.getSession('settings-promoted-admin')).toBe(
+      'promotion-late-session',
+    );
+    expect(runtimeSafetyBlocks.has('web:settings-promoted-admin')).toBe(true);
+
+    stopGroup.mockImplementation(async () => {});
+    const repaired = await app.request(
+      '/api/admin/users/settings-promoted-admin',
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ role: 'admin' }),
+      },
+    );
+    expect(repaired.status).toBe(200);
+    expect(db.getSession('settings-promoted-admin')).toBeUndefined();
+    expect(runtimeSafetyBlocks.has('web:settings-promoted-admin')).toBe(false);
+    stopGroup.mockImplementation(async () => {});
+  });
+
+  test('reactivating an administrator applies host-only mode before reconnecting channels', async () => {
+    const now = new Date().toISOString();
+    db.createUser({
+      id: 'settings-reactivated-admin',
+      username: 'settings-reactivated-admin',
+      password_hash: 'hash',
+      display_name: 'Reactivated Admin',
+      role: 'admin',
+      status: 'disabled',
+      created_at: now,
+      updated_at: now,
+      must_change_password: false,
+    });
+    db.setRegisteredGroup('web:settings-reactivated-admin', {
+      name: 'Reactivated admin workspace',
+      folder: 'settings-reactivated-admin',
+      added_at: now,
+      executionMode: 'container',
+      created_by: 'settings-reactivated-admin',
+    });
+    reconnectUserIMChannels.mockClear();
+    stopGroup.mockImplementation(async () => {});
+
+    const response = await app.request(
+      '/api/admin/users/settings-reactivated-admin',
+      {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ status: 'active' }),
+      },
+    );
+    expect(response.status).toBe(200);
+    expect(db.getUserById('settings-reactivated-admin')?.status).toBe('active');
+    expect(
+      db.getRegisteredGroup('web:settings-reactivated-admin')?.executionMode,
+    ).toBe('host');
+    expect(reconnectUserIMChannels).toHaveBeenCalledWith(
+      'settings-reactivated-admin',
+    );
   });
 });
 

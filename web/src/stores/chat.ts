@@ -322,6 +322,7 @@ function markThinkingEnded(prev: StreamingState, next: StreamingState): void {
 
 interface ChatState {
   groups: Record<string, GroupInfo>;
+  adminHostOnlyMode: boolean;
   currentGroup: string | null;
   messages: Record<string, Message[]>;
   waiting: Record<string, boolean>;
@@ -1622,6 +1623,7 @@ function applyStreamEvent(
 
 export const useChatStore = create<ChatState>((set, get) => ({
   groups: {},
+  adminHostOnlyMode: false,
   currentGroup: null,
   messages: {},
   waiting: {},
@@ -1655,9 +1657,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     loadGroupsInFlight = (async () => {
       set({ loading: true });
       try {
-        const data = await api.get<{ groups: Record<string, GroupInfo> }>(
-          '/api/groups',
-        );
+        const data = await api.get<{
+          groups: Record<string, GroupInfo>;
+          admin_host_only_mode?: boolean;
+        }>('/api/groups');
         const groups = Object.fromEntries(
           Object.entries(data.groups).map(([jid, group]) => [
             jid,
@@ -1682,6 +1685,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
           return {
             groups,
+            adminHostOnlyMode: data.admin_host_only_mode === true,
             currentGroup: nextCurrent,
             loading: false,
             error: null,

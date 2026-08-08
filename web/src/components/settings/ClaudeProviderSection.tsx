@@ -6,13 +6,11 @@ import { api } from '../../api/client';
 import type {
   ProviderWithHealth,
   ProvidersListResponse,
-  BalancingConfig,
   ProviderHealthStatus,
 } from './types';
 import { getErrorMessage } from './types';
 import { ProviderList } from './ProviderList';
 import { ProviderEditor } from './ProviderEditor';
-import { BalancingSettings } from './BalancingSettings';
 
 interface ClaudeProviderSectionProps {
   setNotice: (msg: string | null) => void;
@@ -24,12 +22,10 @@ export function ClaudeProviderSection({
   setError,
 }: ClaudeProviderSectionProps) {
   const [providers, setProviders] = useState<ProviderWithHealth[]>([]);
-  const [balancing, setBalancing] = useState<BalancingConfig>({
-    strategy: 'round-robin',
-    unhealthyThreshold: 3,
-    recoveryIntervalMs: 300000,
-  });
-  const [enabledCount, setEnabledCount] = useState(0);
+  const enabledCount = providers.filter((provider) => provider.enabled).length;
+  const [defaultProviderId, setDefaultProviderId] = useState<string | null>(
+    null,
+  );
 
   const [loading, setLoading] = useState(true);
   const [togglingId, setTogglingId] = useState<string | null>(null);
@@ -54,10 +50,9 @@ export function ClaudeProviderSection({
         '/api/config/claude/providers',
       );
       setProviders(data.providers);
-      setBalancing(data.balancing);
-      setEnabledCount(data.enabledCount);
+      setDefaultProviderId(data.defaultProviderId);
     } catch (err) {
-      setError(getErrorMessage(err, '加载提供商列表失败'));
+      setError(getErrorMessage(err, '加载模型配置列表失败'));
     } finally {
       setLoading(false);
     }
@@ -122,7 +117,7 @@ export function ClaudeProviderSection({
         // failed afterward. Reload instead of leaving a stale toggle that a
         // user might click again and accidentally reverse.
         await loadProviders().catch(() => {});
-        setError(getErrorMessage(err, '切换提供商状态失败'));
+        setError(getErrorMessage(err, '切换模型配置状态失败'));
       } finally {
         setTogglingId(null);
       }
@@ -146,6 +141,25 @@ export function ClaudeProviderSection({
     [loadProviders, setNotice, setError],
   );
 
+  const handleSetDefault = useCallback(
+    async (provider: ProviderWithHealth) => {
+      setTogglingId(provider.id);
+      try {
+        await api.put('/api/config/claude/default', {
+          providerId: provider.id,
+        });
+        await loadProviders();
+        setNotice(`已将「${provider.name}」设为系统默认模型`);
+      } catch (err) {
+        await loadProviders().catch(() => {});
+        setError(getErrorMessage(err, '设置默认模型失败'));
+      } finally {
+        setTogglingId(null);
+      }
+    },
+    [loadProviders, setError, setNotice],
+  );
+
   // ─── 删除提供商 ───────────────────────────────────────────────
   const handleDeleteConfirm = useCallback(async () => {
     if (!pendingDeleteProvider) return;
@@ -156,10 +170,10 @@ export function ClaudeProviderSection({
 
     try {
       await api.delete(`/api/config/claude/providers/${provider.id}`);
-      setNotice(`已删除提供商「${provider.name}」`);
+      setNotice(`已删除模型配置「${provider.name}」`);
       await loadProviders();
     } catch (err) {
-      setError(getErrorMessage(err, '删除提供商失败'));
+      setError(getErrorMessage(err, '删除模型配置失败'));
     } finally {
       setDeletingId(null);
     }
@@ -178,9 +192,9 @@ export function ClaudeProviderSection({
           enabled: false,
         });
         await loadProviders();
-        setNotice(`已复制提供商「${provider.name}」，密钥需要重新填写`);
+        setNotice(`已复制模型配置「${provider.name}」，密钥需要重新填写`);
       } catch (err) {
-        setError(getErrorMessage(err, '复制提供商失败'));
+        setError(getErrorMessage(err, '复制模型配置失败'));
       }
     },
     [loadProviders, setNotice, setError],
@@ -198,23 +212,6 @@ export function ClaudeProviderSection({
     setEditingProvider(null);
   }, []);
 
-  // ─── 负载均衡配置变更 ─────────────────────────────────────────
-  const handleBalancingChange = useCallback(
-    async (updates: Partial<BalancingConfig>) => {
-      const newBalancing = { ...balancing, ...updates };
-      setBalancing(newBalancing);
-      try {
-        await api.put('/api/config/claude/balancing', newBalancing);
-        setNotice('负载均衡配置已保存');
-      } catch (err) {
-        setError(getErrorMessage(err, '保存负载均衡配置失败'));
-        // 回滚
-        await loadProviders();
-      }
-    },
-    [balancing, loadProviders, setNotice, setError],
-  );
-
   const busy = loading || togglingId !== null || deletingId !== null;
 
   if (loading && providers.length === 0) {
@@ -230,7 +227,7 @@ export function ClaudeProviderSection({
       {/* 提供商列表 */}
       <ProviderList
         providers={providers}
-        balancingStrategy={balancing.strategy}
+        defaultProviderId={defaultProviderId}
         onEdit={(p) => {
           setEditingProvider(p);
           setEditorOpen(true);
@@ -238,6 +235,7 @@ export function ClaudeProviderSection({
         onDelete={(p) => setPendingDeleteProvider(p)}
         onToggle={handleToggle}
         onResetHealth={handleResetHealth}
+        onSetDefault={handleSetDefault}
         onDuplicate={handleDuplicate}
         onAdd={() => {
           setEditingProvider(null);
@@ -248,20 +246,10 @@ export function ClaudeProviderSection({
         disabled={busy}
       />
 
-      {/* 负载均衡设置（启用 >= 2 个提供商时显示） */}
-      {enabledCount >= 2 && (
-        <BalancingSettings
-          balancing={balancing}
-          onChange={handleBalancingChange}
-          disabled={busy}
-        />
-      )}
-
       {/* 编辑器弹窗 */}
       <ProviderEditor
         open={editorOpen}
         provider={editingProvider}
-        balancingStrategy={balancing.strategy}
         onSave={handleEditorSave}
         onCancel={handleEditorCancel}
         setNotice={setNotice}
@@ -273,11 +261,11 @@ export function ClaudeProviderSection({
         open={pendingDeleteProvider !== null}
         onClose={() => setPendingDeleteProvider(null)}
         onConfirm={handleDeleteConfirm}
-        title="删除提供商"
+        title="删除模型配置"
         message={
           pendingDeleteProvider
-            ? `确认删除提供商「${pendingDeleteProvider.name}」？`
-            : '确认删除该提供商？'
+            ? `确认删除模型配置「${pendingDeleteProvider.name}」？`
+            : '确认删除该模型配置？'
         }
         confirmText="确认删除"
         confirmVariant="danger"

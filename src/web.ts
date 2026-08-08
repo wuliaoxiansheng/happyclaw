@@ -77,6 +77,7 @@ import {
 import {
   ensureChatExists,
   getRegisteredGroup,
+  getChannelMount,
   getJidsByFolder,
   storeMessageDirect,
   deleteUserSession,
@@ -89,6 +90,10 @@ import {
   setMessageFollowUp,
 } from './db.js';
 import { getGroupAllowedUserIds } from './group-broadcast-acl.js';
+import {
+  hasBoundWorkspaceReference,
+  resolveBoundWorkspaceJid,
+} from './workspace-attribution.js';
 import { markdownToPlainText } from './im-utils.js';
 import { isSessionExpired } from './auth.js';
 import type {
@@ -2215,15 +2220,30 @@ function isHostGroupJid(chatJid: string): boolean {
 
 /**
  * Normalize chatJid for WebSocket broadcasts.
- * IM groups (Feishu/Telegram) that share a folder with an is_home group are mapped
- * to that home group's web JID so the frontend can match all home-session events.
+ *
+ * A bound IM chat resolves to the workspace it is actually bound to. The
+ * folder scan below is only a fallback for unbound chats: an IM row keeps the
+ * `folder`/`created_by` of the channel account owner even after it is bound
+ * elsewhere, so scanning by folder would label another workspace's events with
+ * the account owner's home JID and surface them in the wrong client.
  */
 function normalizeHomeJid(chatJid: string): string {
   if (chatJid.startsWith('web:')) return chatJid;
   const group = getRegisteredGroup(chatJid);
   if (!group) return chatJid;
 
-  // Find the web: JID that shares this folder (typically the is_home group)
+  const attributionDeps = {
+    getRegisteredGroup,
+    getAgent,
+    getJidsByFolder,
+    getChannelMount,
+  };
+  const boundJid = resolveBoundWorkspaceJid(chatJid, attributionDeps);
+  if (boundJid) return boundJid;
+  if (hasBoundWorkspaceReference(chatJid, attributionDeps)) return chatJid;
+
+  // Unbound IM chat: fall back to the web: JID sharing this folder (typically
+  // the is_home group), which is where its messages are still attributed.
   const jids = getJidsByFolder(group.folder);
   for (const jid of jids) {
     if (jid.startsWith('web:')) {

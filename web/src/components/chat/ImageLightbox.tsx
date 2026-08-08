@@ -8,7 +8,11 @@ interface ImageLightboxProps {
   onClose: () => void;
 }
 
-export function ImageLightbox({ images, initialIndex, onClose }: ImageLightboxProps) {
+export function ImageLightbox({
+  images,
+  initialIndex,
+  onClose,
+}: ImageLightboxProps) {
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
   const [scale, setScale] = useState(1);
   const [translateY, setTranslateY] = useState(0);
@@ -100,21 +104,21 @@ export function ImageLightbox({ images, initialIndex, onClose }: ImageLightboxPr
 
   return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center"
+      className="pointer-events-auto fixed inset-0 z-[70] flex items-center justify-center"
       onClick={handleClose}
     >
       {/* Background overlay */}
-      <div
-        className="absolute inset-0 bg-black/90"
-        style={overlayStyle}
-      />
+      <div className="absolute inset-0 bg-black/90" style={overlayStyle} />
 
       {/* Close button */}
       <button
         onClick={handleClose}
         className="absolute top-4 right-4 z-30 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 backdrop-blur-sm flex items-center justify-center text-white transition-colors"
         aria-label="关闭"
-        style={{ opacity: isOpen && !isClosing ? 1 : 0, transition: 'opacity 300ms ease' }}
+        style={{
+          opacity: isOpen && !isClosing ? 1 : 0,
+          transition: 'opacity 300ms ease',
+        }}
       >
         <X className="w-6 h-6" />
       </button>
@@ -140,12 +144,15 @@ export function ImageLightbox({ images, initialIndex, onClose }: ImageLightboxPr
       {images.length > 1 && (
         <div
           className="absolute bottom-8 left-1/2 -translate-x-1/2 z-20 px-3 py-1 rounded-full bg-black/50 text-white text-sm"
-          style={{ opacity: isOpen && !isClosing ? 1 : 0, transition: 'opacity 300ms ease' }}
+          style={{
+            opacity: isOpen && !isClosing ? 1 : 0,
+            transition: 'opacity 300ms ease',
+          }}
         >
           {currentIndex + 1} / {images.length}
         </div>
       )}
     </div>,
-    document.body
+    document.body,
   );
 }

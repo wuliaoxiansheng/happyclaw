@@ -632,6 +632,47 @@ describe('GroupQueue IPC delivery receipts', () => {
     expect(recovered).toEqual([[receipt]]);
   });
 
+  test('restart owns one DB replay and produces exactly one replacement reply', async () => {
+    let attempts = 0;
+    let replies = 0;
+    let finishStuckRun: ((success: boolean) => void) | undefined;
+    const durableReplay: Receipt[] = [];
+    const recoveryCalls: string[][] = [];
+
+    queue.setProcessMessagesFn(async () => {
+      attempts++;
+      if (attempts === 1) {
+        return new Promise<boolean>((resolve) => {
+          finishStuckRun = resolve;
+          releaseRun = () => resolve(false);
+        });
+      }
+
+      const replay = durableReplay.shift();
+      if (replay) replies++;
+      return true;
+    });
+    queue.setOnUnacknowledgedIpcDeliveries((_jid, receipts) => {
+      recoveryCalls.push(receipts.map((receipt) => receipt.cursor.id));
+      durableReplay.push(...receipts);
+    });
+
+    await startRunner();
+    inject('stuck-follow-up');
+
+    const restarting = queue.restartGroup(JID);
+    finishStuckRun?.(false);
+    await restarting;
+    await tick();
+    await tick();
+
+    expect(recoveryCalls).toEqual([['stuck-follow-up']]);
+    expect(durableReplay).toEqual([]);
+    expect(attempts).toBe(2);
+    expect(replies).toBe(1);
+    expect(readPayloads()).toEqual([]);
+  });
+
   test('explicit stop abandons instead of replaying accepted deliveries', async () => {
     await startRunner();
     const receipt = inject('cancelled');

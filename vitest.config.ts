@@ -21,6 +21,12 @@ export default defineConfig({
     },
   },
   test: {
-    exclude: ['**/node_modules/**', '**/dist/**', 'data/**', '.claude/**'],
+    exclude: [
+      '**/node_modules/**',
+      '**/dist/**',
+      'data/**',
+      '.claude/**',
+      'web/tests/e2e/**',
+    ],
   },
 });

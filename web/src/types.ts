@@ -66,6 +66,8 @@ export interface AgentProfile {
   avatar_emoji: string | null;
   avatar_color: string | null;
   avatar_url: string | null;
+  /** Null means inherit the system default model configuration. */
+  model_config_id: string | null;
   runtime_policy: AgentProfileRuntimePolicy;
   /** Policy after applying system defaults and current authorization. */
   effective_runtime_policy?: AgentProfileRuntimePolicy;
@@ -77,7 +79,24 @@ export interface AgentProfile {
   updated_at: string;
 }
 
+export interface ModelConfigOption {
+  id: string;
+  name: string;
+  type: 'official' | 'third_party';
+  enabled: boolean;
+  anthropic_model: string;
+  is_default: boolean;
+}
+
 export type AgentProfilePromptMode = 'append' | 'replace';
+
+export type AgentEffortLevel =
+  | 'inherit'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max';
 
 export interface AgentProfilePrompts {
   identity_prompt: string;
@@ -99,6 +118,9 @@ export interface AgentProfilePromptVersion extends AgentProfilePrompts {
 }
 
 export interface AgentProfileRuntimePolicy {
+  reasoning: {
+    effort: AgentEffortLevel;
+  };
   context?: {
     source: 'managed' | 'host_claude';
     auto_compact_window?: number;
@@ -119,6 +141,7 @@ export interface AgentProfileRuntimePolicy {
 }
 
 export interface AgentProfileRuntimePolicyPatch {
+  reasoning?: Partial<AgentProfileRuntimePolicy['reasoning']>;
   context?: Partial<NonNullable<AgentProfileRuntimePolicy['context']>>;
   skills?: {
     mode?: AgentProfileRuntimePolicy['skills']['mode'];

@@ -40,34 +40,58 @@ const FIRST_RESPONSE_MESSAGE_TYPES = new Set([
   'stream_event',
 ]);
 
+export type SdkFirstResponseWatchdogPhase = 'first_response' | 'compaction';
+
 /**
  * Last-resort guard for third-party CLI/provider combinations that persist an
  * API error to the transcript but never forward it through the SDK iterator.
  */
 export class SdkFirstResponseWatchdog {
   private timer: ReturnType<typeof setTimeout> | undefined;
-  private observed = false;
+  private activePhase: SdkFirstResponseWatchdogPhase | undefined;
+  private timedOut = false;
 
   constructor(
     readonly timeoutMs: number,
-    onTimeout: () => void,
+    private readonly onTimeout: (
+      phase: SdkFirstResponseWatchdogPhase,
+      timeoutMs: number,
+    ) => void,
   ) {
-    this.timer = setTimeout(() => {
-      this.timer = undefined;
-      if (this.observed) return;
-      this.observed = true;
-      onTimeout();
-    }, timeoutMs);
+    this.arm(timeoutMs, 'first_response');
   }
 
   observe(messageType: string): void {
     if (!FIRST_RESPONSE_MESSAGE_TYPES.has(messageType)) return;
-    this.observed = true;
     this.clear();
+  }
+
+  /**
+   * Replace the short first-response deadline with one bounded allowance for
+   * SDK auto-compaction. The SDK exposes PreCompact but no matching completion
+   * hook, so this deadline covers both the summarization round-trip and the
+   * first real model response that follows it. Repeated PreCompact callbacks
+   * cannot keep extending the deadline indefinitely.
+   */
+  beginCompaction(timeoutMs: number): void {
+    if (this.timedOut || this.activePhase === 'compaction') return;
+    this.arm(timeoutMs, 'compaction');
   }
 
   clear(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
+    this.activePhase = undefined;
+  }
+
+  private arm(timeoutMs: number, phase: SdkFirstResponseWatchdogPhase): void {
+    this.clear();
+    this.activePhase = phase;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      this.activePhase = undefined;
+      this.timedOut = true;
+      this.onTimeout(phase, timeoutMs);
+    }, timeoutMs);
   }
 }

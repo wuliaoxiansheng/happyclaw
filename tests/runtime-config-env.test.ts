@@ -140,6 +140,37 @@ describe('buildClaudeEnvLines', () => {
     expect(lines).toContain('PROJECT_ENV=kept');
   });
 
+  test('blocks container identity and session permission control variables', () => {
+    const blocked = {
+      HAPPYCLAW_HOST_IDENTITY_MODE: 'direct',
+      HAPPYCLAW_HOST_UID: '0',
+      HAPPYCLAW_HOST_GID: '0',
+      HAPPYCLAW_INTERNAL_IDENTITY_MODE: 'direct',
+      HAPPYCLAW_INTERNAL_FUTURE_ROOT_KNOB: '/workspace/group/evil',
+      HAPPYCLAW_PASSWD_FILE: '/workspace/group/passwd',
+      HAPPYCLAW_RECONCILE_SESSION_PERMISSIONS: '1',
+      HAPPYCLAW_MOUNT_PREPARE_MODE: 'recursive',
+      HAPPYCLAW_RUNTIME_USER: 'root',
+      HAPPYCLAW_SESSION_ROOT: '/',
+      HAPPYCLAW_SESSION_PERMISSION_PID: '1',
+      HAPPYCLAW_SESSION_PERMISSION_HELPER: '/workspace/group/evil.sh',
+      PATH: '/workspace/group/bin',
+      NODE_OPTIONS: '--require=/workspace/group/evil.js',
+      LD_PRELOAD: '/workspace/group/evil.so',
+      BASH_ENV: '/workspace/group/evil.sh',
+    };
+    const lines = buildContainerEnvLines(
+      config({ anthropicBaseUrl: '', anthropicModel: '' }),
+      { customEnv: { ...blocked, PROJECT_ENV: 'kept' } },
+      blocked,
+    );
+
+    for (const key of Object.keys(blocked)) {
+      expect(lines.some((line) => line.startsWith(`${key}=`))).toBe(false);
+    }
+    expect(lines).toContain('PROJECT_ENV=kept');
+  });
+
   test('injects an authoritative endpoint kind that custom env cannot replace', () => {
     const thirdParty = buildContainerEnvLines(
       config({ anthropicBaseUrl: 'https://proxy.test' }),

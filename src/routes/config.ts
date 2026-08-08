@@ -21,6 +21,7 @@ import {
   deleteAgent,
   getRegisteredGroup,
   getAllRegisteredGroups,
+  forceActiveAdminRuntimesToHost,
   setRegisteredGroup,
   updateChatName,
   getAgent,
@@ -41,6 +42,7 @@ import {
   getChannelAccount,
   getGroupsByTargetAgent,
   updateAgentLastImJid,
+  countAgentProfilesByModelConfigId,
 } from '../db.js';
 import {
   channelConversationJid,
@@ -82,6 +84,8 @@ import {
   appendClaudeConfigAudit,
   getProviders,
   getEnabledProviders,
+  getDefaultProviderId,
+  setDefaultProvider,
   getBalancingConfig,
   saveBalancingConfig,
   createProvider,
@@ -157,6 +161,18 @@ import {
   withAgentProfileLocks,
   WorkspaceRuntimeQuiesceError,
 } from '../agent-profile-runtime.js';
+import { notifyTaskSchedulerChanged } from '../task-scheduler.js';
+import {
+  SYSTEM_CAPABILITY_LOCK_KEY,
+  withCapabilityScopeLocks,
+} from '../capability-lock.js';
+import {
+  ADMIN_HOST_ONLY_RUNTIME_SAFETY_SOURCE,
+  clearAdminHostOnlyCleanupPending,
+  getPendingAdminHostOnlyCleanupFolders,
+  markAdminHostOnlyCleanupPending,
+  restorePendingAdminHostOnlyRuntimeSafetyBlocks,
+} from '../admin-host-only-runtime.js';
 const configRoutes = new Hono<{ Variables: Variables }>();
 
 /**
@@ -196,6 +212,7 @@ let deps: any = null;
 export function injectConfigDeps(d: any) {
   deps = d;
   restorePendingProviderRuntimeSafetyBlocks();
+  restorePendingAdminHostOnlyRuntimeSafetyBlocks(d);
 }
 
 function createTelegramApiAgent(proxyUrl?: string): HttpsAgent | ProxyAgent {
@@ -856,10 +873,86 @@ configRoutes.get(
         })),
         balancing,
         enabledCount: enabledProviders.length,
+        defaultProviderId: getDefaultProviderId(),
       });
     } catch (err) {
       logger.error({ err }, 'Failed to list providers');
       return c.json({ error: 'Failed to list providers' }, 500);
+    }
+  },
+);
+
+// ─── PUT /claude/default — 设置所有继承型 Agent 使用的默认模型配置 ─────
+configRoutes.put(
+  '/claude/default',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const providerId =
+      typeof body.providerId === 'string' ? body.providerId.trim() : '';
+    if (!providerId) {
+      return c.json({ error: 'providerId (string) is required' }, 400);
+    }
+    const actor = (c.get('user') as AuthUser).username;
+
+    try {
+      return await withClaudeConfigMutationLock(async () => {
+        const previousProviderId = getDefaultProviderId();
+        if (previousProviderId === providerId) {
+          const provider = getProviders().find(
+            (item) => item.id === providerId,
+          );
+          if (!provider) throw new Error('未找到指定模型配置');
+          return c.json({
+            provider: toPublicProvider(provider),
+            defaultProviderId: provider.id,
+            applied: {
+              success: true,
+              stoppedCount: 0,
+              failedCount: 0,
+              persisted: true,
+            },
+          });
+        }
+        const mutation = await mutateClaudeConfigForAllGroups(
+          actor,
+          {
+            trigger: 'default_model_update',
+            previousProviderId,
+            providerId,
+          },
+          () => {
+            const provider = setDefaultProvider(providerId);
+            appendClaudeConfigAuditBestEffort(actor, 'set_default_model', [
+              `id:${provider.id}`,
+            ]);
+            return provider;
+          },
+        );
+        if (!mutation.applied.success) {
+          return c.json(
+            {
+              error: mutation.applied.error,
+              applied: mutation.applied,
+              ...(mutation.value
+                ? { provider: toPublicProvider(mutation.value) }
+                : {}),
+            },
+            503,
+          );
+        }
+        return c.json({
+          provider: toPublicProvider(mutation.value!),
+          defaultProviderId: mutation.value!.id,
+          applied: mutation.applied,
+        });
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to set default model';
+      logger.warn({ err, providerId }, 'Failed to set default model');
+      return c.json({ error: message }, 400);
     }
   },
 );
@@ -931,7 +1024,13 @@ configRoutes.patch(
           validation.data.anthropicModel !== undefined &&
           validation.data.anthropicModel !== previous.anthropicModel
         );
-        const protocolFieldChanged = baseUrlChanged || modelChanged;
+        const customEnvChanged = !!(
+          validation.data.customEnv !== undefined &&
+          JSON.stringify(validation.data.customEnv) !==
+            JSON.stringify(previous.customEnv)
+        );
+        const protocolFieldChanged =
+          baseUrlChanged || modelChanged || customEnvChanged;
         const pendingInvalidation = getPendingProviderSessionInvalidation(id);
         const sessionInvalidation = {
           modelChanged:
@@ -939,18 +1038,15 @@ configRoutes.patch(
           baseUrlChanged:
             baseUrlChanged || pendingInvalidation?.baseUrlChanged === true,
         };
-        // Preserve this PR's model/base-URL resume behavior for third-party
-        // gateways. We do not have a reproducible third-party backend failure
-        // proving that their sessions must be invalidated.
         const shouldClearSessions =
-          !!pendingInvalidation ||
-          (protocolFieldChanged && previous.type === 'official');
+          !!pendingInvalidation || protocolFieldChanged;
         const metadata = {
           trigger: 'provider_update',
           providerId: id,
           protocolFieldChanged,
           baseUrlChanged,
           modelChanged,
+          customEnvChanged,
         };
         const commit = () => {
           const updated = updateProvider(id, validation.data);
@@ -1096,6 +1192,13 @@ configRoutes.put(
                 providerId: id,
               },
               commit,
+              {
+                clearSessionsForProviderId: id,
+                sessionInvalidation: {
+                  modelChanged: true,
+                  baseUrlChanged: true,
+                },
+              },
             )
           : {
               value: commit(),
@@ -1148,6 +1251,12 @@ configRoutes.delete(
         const pendingInvalidation = getPendingProviderSessionInvalidation(id);
         if (!previous && !pendingInvalidation) {
           throw new Error('未找到指定供应商');
+        }
+        const referencedAgentCount = countAgentProfilesByModelConfigId(id);
+        if (referencedAgentCount > 0) {
+          throw new Error(
+            `该模型配置仍被 ${referencedAgentCount} 个智能体使用，请先重新分配`,
+          );
         }
         const sessionInvalidation = pendingInvalidation ?? {
           modelChanged: true,
@@ -2198,6 +2307,7 @@ function toHostIntegrationResponse(
   return {
     externalClaudeDir: settings.externalClaudeDir,
     pluginAutoScan: settings.pluginAutoScan,
+    adminHostOnlyMode: settings.adminHostOnlyMode,
     mainAgentContextSource: settings.mainAgentContextSource,
     mainAgentAutoCompactWindow: settings.mainAgentAutoCompactWindow,
     mainAgentAutoCompactPercentage: settings.mainAgentAutoCompactPercentage,
@@ -2242,126 +2352,242 @@ configRoutes.put(
       }
     }
 
-    const before = toHostIntegrationResponse(getSystemSettings());
-    const mainContextSourceChanged =
-      validation.data.mainAgentContextSource !== undefined &&
-      validation.data.mainAgentContextSource !== before.mainAgentContextSource;
-    const externalClaudeDirChanged =
-      validation.data.externalClaudeDir !== undefined &&
-      validation.data.externalClaudeDir !== before.externalClaudeDir;
-    const hostContextChanged =
-      mainContextSourceChanged || externalClaudeDirChanged;
-    const defaultCompactChanged =
-      (validation.data.mainAgentAutoCompactWindow !== undefined &&
-        validation.data.mainAgentAutoCompactWindow !==
-          before.mainAgentAutoCompactWindow) ||
-      (validation.data.mainAgentAutoCompactPercentage !== undefined &&
-        validation.data.mainAgentAutoCompactPercentage !==
-          before.mainAgentAutoCompactPercentage);
-    const contextMutationRequested =
-      hostContextChanged || defaultCompactChanged;
-    const workspaces = contextMutationRequested
-      ? Object.entries(getAllRegisteredGroups())
-          .map(([jid, group]) => ({
+    return withCapabilityScopeLocks([SYSTEM_CAPABILITY_LOCK_KEY], async () => {
+      const before = toHostIntegrationResponse(getSystemSettings());
+      const mainContextSourceChanged =
+        validation.data.mainAgentContextSource !== undefined &&
+        validation.data.mainAgentContextSource !==
+          before.mainAgentContextSource;
+      const externalClaudeDirChanged =
+        validation.data.externalClaudeDir !== undefined &&
+        validation.data.externalClaudeDir !== before.externalClaudeDir;
+      const hostContextChanged =
+        mainContextSourceChanged || externalClaudeDirChanged;
+      const adminHostOnlyModeChanged =
+        validation.data.adminHostOnlyMode !== undefined &&
+        validation.data.adminHostOnlyMode !== before.adminHostOnlyMode;
+      const enablingAdminHostOnlyMode =
+        adminHostOnlyModeChanged && validation.data.adminHostOnlyMode === true;
+      const pendingRuntimeCleanupFolders =
+        getPendingAdminHostOnlyCleanupFolders();
+      const repairingRuntimeCleanup = pendingRuntimeCleanupFolders.length > 0;
+      const enforcingAdminHostOnlyMode =
+        enablingAdminHostOnlyMode ||
+        (repairingRuntimeCleanup &&
+          before.adminHostOnlyMode &&
+          validation.data.adminHostOnlyMode !== false);
+      const defaultCompactChanged =
+        (validation.data.mainAgentAutoCompactWindow !== undefined &&
+          validation.data.mainAgentAutoCompactWindow !==
+            before.mainAgentAutoCompactWindow) ||
+        (validation.data.mainAgentAutoCompactPercentage !== undefined &&
+          validation.data.mainAgentAutoCompactPercentage !==
+            before.mainAgentAutoCompactPercentage);
+      const contextMutationRequested =
+        hostContextChanged ||
+        defaultCompactChanged ||
+        enablingAdminHostOnlyMode ||
+        repairingRuntimeCleanup;
+      const contextWorkspaces =
+        hostContextChanged || defaultCompactChanged
+          ? Object.entries(getAllRegisteredGroups())
+              .map(([jid, group]) => ({
+                jid,
+                group,
+                profile: group.created_by
+                  ? getAgentProfileForWorkspace(group.folder, group.created_by)
+                  : undefined,
+              }))
+              .filter(({ group, profile }) => {
+                if (!group.created_by || !profile) return false;
+                const isActiveAdmin =
+                  getUserById(group.created_by)?.role === 'admin';
+                const currentContextSource =
+                  resolveEffectiveAgentProfile(profile)?.runtime_policy.context
+                    .source ?? 'managed';
+                const nextContextSource = profile.is_default
+                  ? (validation.data.mainAgentContextSource ??
+                    before.mainAgentContextSource)
+                  : profile.runtime_policy.context.source;
+                return (
+                  (defaultCompactChanged && profile.is_default) ||
+                  (mainContextSourceChanged &&
+                    profile.is_default &&
+                    isActiveAdmin) ||
+                  (externalClaudeDirChanged &&
+                    isActiveAdmin &&
+                    (currentContextSource === 'host_claude' ||
+                      nextContextSource === 'host_claude'))
+                );
+              })
+          : [];
+      const allGroups =
+        enablingAdminHostOnlyMode || repairingRuntimeCleanup
+          ? getAllRegisteredGroups()
+          : {};
+      const activeAdminFolders = enablingAdminHostOnlyMode
+        ? new Set(
+            Object.values(allGroups)
+              .filter((group) => {
+                const owner = group.created_by
+                  ? getUserById(group.created_by)
+                  : undefined;
+                return owner?.role === 'admin' && owner.status === 'active';
+              })
+              .map((group) => group.folder),
+          )
+        : new Set<string>();
+      for (const folder of pendingRuntimeCleanupFolders) {
+        activeAdminFolders.add(folder);
+      }
+      const policyWorkspaces = Array.from(activeAdminFolders)
+        .map((folder) => {
+          const entries = Object.entries(allGroups).filter(
+            ([, group]) => group.folder === folder,
+          );
+          const preferred =
+            entries.find(([jid]) => jid.startsWith('web:')) ?? entries[0];
+          if (!preferred) return null;
+          const [jid, group] = preferred;
+          return {
             jid,
             group,
             profile: group.created_by
               ? getAgentProfileForWorkspace(group.folder, group.created_by)
               : undefined,
-          }))
-          .filter(({ group, profile }) => {
-            if (!group.created_by || !profile) return false;
-            const isActiveAdmin =
-              getUserById(group.created_by)?.role === 'admin';
-            const currentContextSource =
-              resolveEffectiveAgentProfile(profile)?.runtime_policy.context
-                .source ?? 'managed';
-            const nextContextSource = profile.is_default
-              ? (validation.data.mainAgentContextSource ??
-                before.mainAgentContextSource)
-              : profile.runtime_policy.context.source;
-            return (
-              (defaultCompactChanged && profile.is_default) ||
-              (mainContextSourceChanged &&
-                profile.is_default &&
-                isActiveAdmin) ||
-              (externalClaudeDirChanged &&
-                isActiveAdmin &&
-                (currentContextSource === 'host_claude' ||
-                  nextContextSource === 'host_claude'))
-            );
-          })
-      : [];
-    const sessionResetFolders = Array.from(
-      new Set(workspaces.map(({ group }) => group.folder)),
-    );
-    const commit = () => {
-      const value = saveSystemSettings(validation.data);
-      for (const folder of sessionResetFolders) deleteWorkspaceSessions(folder);
-      return value;
-    };
-    let saved: ReturnType<typeof saveSystemSettings>;
-    if (contextMutationRequested && deps) {
-      const profileIds = Array.from(
-        new Set(
-          workspaces
-            .map(({ profile }) => profile)
-            .filter((profile) => !!profile)
-            .map((profile) => profile.id),
-        ),
+          };
+        })
+        .filter(
+          (workspace): workspace is NonNullable<typeof workspace> =>
+            workspace !== null,
+        );
+      const workspaceByFolder = new Map<
+        string,
+        (typeof contextWorkspaces)[number] | (typeof policyWorkspaces)[number]
+      >();
+      for (const workspace of [...contextWorkspaces, ...policyWorkspaces]) {
+        workspaceByFolder.set(workspace.group.folder, workspace);
+      }
+      const workspaces = Array.from(workspaceByFolder.values());
+      const sessionResetFolders = Array.from(
+        new Set([
+          ...workspaces.map(({ group }) => group.folder),
+          ...pendingRuntimeCleanupFolders,
+        ]),
       );
-      try {
-        const result = await withAgentProfileLocks(profileIds, () =>
-          quiesceWorkspaceRunnersAroundCommit(
-            deps,
-            workspaces.map(({ jid, group }) => ({
-              folder: group.folder,
-              primaryJid: jid,
-            })),
-            { reason: 'Host integration context updated' },
-            commit,
+      let hostOnlyMigration:
+        | ReturnType<typeof forceActiveAdminRuntimesToHost>
+        | undefined;
+      const commit = () => {
+        if (enforcingAdminHostOnlyMode) {
+          hostOnlyMigration = forceActiveAdminRuntimesToHost();
+          if (deps) {
+            const liveGroups = deps.getRegisteredGroups();
+            for (const { jid } of hostOnlyMigration.affectedGroups) {
+              const fresh = getRegisteredGroup(jid);
+              if (fresh) liveGroups[jid] = fresh;
+            }
+          }
+        }
+        for (const folder of sessionResetFolders)
+          deleteWorkspaceSessions(folder);
+        if (deps?.sessions) {
+          for (const folder of sessionResetFolders)
+            delete deps.sessions[folder];
+        }
+        const value = saveSystemSettings(validation.data);
+        if (hostOnlyMigration?.migratedTaskIds.length) {
+          notifyTaskSchedulerChanged();
+        }
+        return value;
+      };
+      let saved: ReturnType<typeof saveSystemSettings>;
+      if (contextMutationRequested && deps) {
+        const profileIds = Array.from(
+          new Set(
+            workspaces
+              .map(({ profile }) => profile)
+              .filter((profile) => !!profile)
+              .map((profile) => profile.id),
           ),
         );
-        saved = result.value;
-      } catch (err) {
-        if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
-        return c.json(
-          {
-            error: err.persisted
-              ? 'Host integration was updated, but runtime cleanup failed; retry the same request'
-              : 'Failed to quiesce active workspaces; host integration was not updated',
-            persisted: err.persisted,
-            retryable: true,
-          },
-          503,
-        );
+        try {
+          const targets = workspaces.map(({ jid, group }) => ({
+            folder: group.folder,
+            primaryJid: jid,
+          }));
+          const result = await withAgentProfileLocks(profileIds, () =>
+            quiesceWorkspaceRunnersAroundCommit(
+              deps,
+              targets,
+              {
+                reason: 'Host integration context updated',
+                onPostCommitFailure: (runtimeJids) => {
+                  markAdminHostOnlyCleanupPending(sessionResetFolders);
+                  deps.queue.blockGroupsForRuntimeSafety?.(
+                    runtimeJids,
+                    'Host integration runtime cleanup failed after settings commit',
+                    ADMIN_HOST_ONLY_RUNTIME_SAFETY_SOURCE,
+                  );
+                },
+              },
+              commit,
+            ),
+          );
+          saved = result.value;
+          clearAdminHostOnlyCleanupPending(sessionResetFolders);
+          deps.queue.unblockGroupsForRuntimeSafety?.(
+            result.runtimeJids,
+            ADMIN_HOST_ONLY_RUNTIME_SAFETY_SOURCE,
+          );
+        } catch (err) {
+          if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+          return c.json(
+            {
+              error: err.persisted
+                ? 'Host integration was updated, but runtime cleanup failed; retry the same request'
+                : 'Failed to quiesce active workspaces; host integration was not updated',
+              persisted: err.persisted,
+              retryable: true,
+            },
+            503,
+          );
+        }
+      } else {
+        saved = commit();
       }
-    } else {
-      saved = commit();
-    }
-    const response = toHostIntegrationResponse(saved);
-    const changedFields = changedSettingFields(
-      before,
-      response,
-      validation.data,
-    );
-    const actor = c.get('user') as AuthUser;
-    if (changedFields.length > 0) {
-      logAuthEvent({
-        event_type: 'host_integration_updated',
-        username: actor.username,
-        actor_username: actor.username,
-        ip_address: getClientIp(c),
-        user_agent: c.req.header('user-agent') ?? null,
-        // Only names and a boolean are recorded; the host path is never logged.
-        details: {
-          changed_fields: changedFields,
-          external_claude_dir_configured: Boolean(response.externalClaudeDir),
-        },
-      });
-    }
+      const response = toHostIntegrationResponse(saved);
+      const changedFields = changedSettingFields(
+        before,
+        response,
+        validation.data,
+      );
+      const actor = c.get('user') as AuthUser;
+      if (changedFields.length > 0) {
+        logAuthEvent({
+          event_type: 'host_integration_updated',
+          username: actor.username,
+          actor_username: actor.username,
+          ip_address: getClientIp(c),
+          user_agent: c.req.header('user-agent') ?? null,
+          // Only names and a boolean are recorded; the host path is never logged.
+          details: {
+            changed_fields: changedFields,
+            external_claude_dir_configured: Boolean(response.externalClaudeDir),
+            ...(hostOnlyMigration
+              ? {
+                  host_only_migrated_groups:
+                    hostOnlyMigration.affectedGroups.length,
+                  host_only_migrated_tasks:
+                    hostOnlyMigration.migratedTaskIds.length,
+                }
+              : {}),
+          },
+        });
+      }
 
-    return c.json(response);
+      return c.json(response);
+    });
   },
 );
 

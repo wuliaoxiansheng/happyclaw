@@ -46,6 +46,7 @@ import {
   resolveHostIpcLogicalChatJid,
   routeHostIpcOutput,
 } from './host-ipc-output-router.js';
+import { resolveBoundWorkspaceJid } from './workspace-attribution.js';
 import {
   buildInterruptedReply,
   buildSteeredReply,
@@ -78,6 +79,10 @@ import {
   writeTasksSnapshot,
 } from './container-runner.js';
 import { resolveRunnerLivenessTimeouts } from './runner-liveness.js';
+import {
+  decideStuckRunnerRecovery,
+  resolveRunnerCpuActivity,
+} from './stuck-runner-recovery.js';
 import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
 import { isValidWorkspaceFolderName } from './workspace-folder.js';
 import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
@@ -121,6 +126,7 @@ import {
   type TaskRunNotificationPayload,
   type TaskRunNotificationReceipt,
   getUserHomeGroup,
+  forceActiveAdminRuntimesToHost,
   initDatabase,
   listUsers,
   setLastGroupSync,
@@ -1228,6 +1234,10 @@ const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
 const terminalWarmupInFlight = new Set<string>();
 const STUCK_RUNNER_CHECK_INTERVAL_POLLS = 15;
 const STUCK_RUNNER_IDLE_MS = 3 * 60 * 1000;
+// Recovery grace is bounded at 10 minutes. IPC-injected work measures this
+// against its dedicated debt clock so ordinary runner output cannot postpone
+// the ceiling; other candidates use their uninterrupted idle age (#618).
+const STUCK_RUNNER_FORCE_RESTART_MS = 10 * 60 * 1000;
 let stuckRunnerCheckCounter = 0;
 
 // OOM auto-recovery: track consecutive OOM (exit code 137) exits per folder.
@@ -2187,6 +2197,7 @@ function toContainerAgentProfile(
     identityHash: profile.identity_hash,
     identityPrompt: buildAgentProfilePrompt(profile),
     includeClaudePreset: profile.prompt_mode === 'append',
+    modelConfigId: profile.model_config_id,
     runtimePolicy: profile.runtime_policy,
   };
 }
@@ -2488,6 +2499,17 @@ interface ChannelOutboxDeliveryRef {
   ordinalSlot?: string;
 }
 
+/**
+ * `inputTurnId` is the correlation key runner-side MCP output resolves against,
+ * so it must be the id the runner actually reports — its IPC deliveryId for a
+ * warm turn, or ContainerInput.turnId for the cold startup turn.
+ *
+ * The runtime's own `inputTurnId` only matches on the cold path, where the
+ * durable message id and the runner turn id are the same value. Warm admission
+ * starts the runtime from the native message id (durable turn idempotency) but
+ * hands the runner a random deliveryId, so those callers must pass the
+ * deliveryId explicitly or every MCP-sent output would fail closed.
+ */
 function bindChannelOutboxScope(
   key: string,
   runtime: ChannelTurnRuntime,
@@ -2498,14 +2520,16 @@ function bindChannelOutboxScope(
     chatId: string;
     rootId?: string | null;
     threadId?: string | null;
+    logicalBaseChatJid?: string;
   },
+  inputTurnId: string | undefined = runtime.inputTurnId,
 ): ActiveChannelOutboxScope {
   return activeChannelOutboxScopes.bind(key, {
     ...route,
     rootId: route.rootId ?? null,
     threadId: route.threadId ?? null,
     turnRunId: runtime.runId,
-    inputTurnId: runtime.inputTurnId,
+    inputTurnId,
     owner: `happyclaw-outbox:${process.pid}:${runtime.runId}`,
   });
 }
@@ -2552,6 +2576,10 @@ async function deliverScopedChannelOutput(
         targetJid,
         scopeKey: ref.scopeKey,
         operationKey: ref.operationKey,
+        // Carries the unresolved correlation id as `missing:<inputTurnId>` when
+        // the lookup failed, which is what distinguishes a genuinely expired
+        // scope from a correlation-key mismatch.
+        scopeToken: ref.scopeToken,
       },
       'Suppressed channel side effect because its exact outbox scope is unavailable',
     );
@@ -3866,6 +3894,11 @@ function handleUnbindCommand(chatJid: string): string {
   return '已恢复 Bot 默认工作区。';
 }
 
+function isAdminHostOnlyOwner(ownerId: string | null | undefined): boolean {
+  if (!ownerId || !getSystemSettings().adminHostOnlyMode) return false;
+  return canExecuteOnHost(getUserById(ownerId));
+}
+
 function handleBindCommand(chatJid: string, rawSpec: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
@@ -3936,7 +3969,11 @@ async function handleNewCommand(
     name,
     folder,
     added_at: now,
-    executionMode: (await isDockerAvailable()) ? 'container' : 'host',
+    executionMode: isAdminHostOnlyOwner(userId)
+      ? 'host'
+      : getUserById(userId)?.role === 'admin' && !(await isDockerAvailable())
+        ? 'host'
+        : 'container',
     created_by: userId,
   };
 
@@ -5001,6 +5038,29 @@ function loadState(): void {
     }
   }
 
+  // Repair persisted runtime rows on every startup as well as on the settings
+  // transition. This also makes ADMIN_HOST_ONLY_MODE=true safe on first boot.
+  if (getSystemSettings().adminHostOnlyMode) {
+    const migration = forceActiveAdminRuntimesToHost();
+    if (
+      migration.affectedGroups.length > 0 ||
+      migration.migratedTaskIds.length > 0
+    ) {
+      registeredGroups = getAllRegisteredGroups();
+      for (const folder of migration.affectedFolders) {
+        delete sessions[folder];
+        deleteSession(folder);
+      }
+      logger.info(
+        {
+          migratedGroups: migration.affectedGroups.length,
+          migratedTasks: migration.migratedTaskIds.length,
+        },
+        'Repaired administrator runtimes for host-only mode',
+      );
+    }
+  }
+
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
@@ -5059,6 +5119,10 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   // bypass-permissions 模式下完全可达）。规则与典型 unix 目录命名一致。
   if (!group.folder || !isValidWorkspaceFolderName(group.folder)) {
     throw new Error(`registerGroup: invalid folder name: ${group.folder}`);
+  }
+
+  if (isAdminHostOnlyOwner(group.created_by)) {
+    group = { ...group, executionMode: 'host' };
   }
 
   // register_group is reachable from an agent IPC channel. Treat its
@@ -5765,7 +5829,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
     }
   } else if (
-    willClearSessionOnProviderSwitch(effectiveGroup.folder, undefined)
+    willClearSessionOnProviderSwitch(
+      effectiveGroup.folder,
+      undefined,
+      agentProfile?.model_config_id,
+    )
   ) {
     // Proactive provider switch (sticky binding unhealthy/disabled) will clear
     // the SDK session inside the runner. Inject history so the new provider's
@@ -6538,14 +6606,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           nextRuntime.dispose();
           return false;
         }
-        nextScope = bindChannelOutboxScope(mainAdmissionKey, nextRuntime, {
-          provider: nextAddress.provider,
-          accountId: nextAccountId,
-          sourceJid: newImJid,
-          chatId: nextAddress.externalChatId,
-          rootId: nextAddress.rootMessageId,
-          threadId: nextAddress.threadId,
-        });
+        nextScope = bindChannelOutboxScope(
+          mainAdmissionKey,
+          nextRuntime,
+          {
+            provider: nextAddress.provider,
+            accountId: nextAccountId,
+            sourceJid: newImJid,
+            chatId: nextAddress.externalChatId,
+            rootId: nextAddress.rootMessageId,
+            threadId: nextAddress.threadId,
+            logicalBaseChatJid: chatJid,
+          },
+          // The runtime keys durable idempotency off the native message id,
+          // but the runner correlates its MCP output with this deliveryId.
+          inputTurnId,
+        );
         channelTurnRuntimes.set(inputTurnId, nextRuntime);
         channelOutboxScopesByInput.set(inputTurnId, nextScope);
       }
@@ -7023,6 +7099,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               chatId: streamingAddress.externalChatId,
               rootId: streamingAddress.rootMessageId,
               threadId: streamingAddress.threadId,
+              logicalBaseChatJid: chatJid,
             },
           )
         : undefined;
@@ -9983,6 +10060,44 @@ function getIpcDeliveryTargetGroup(
   );
 }
 
+/**
+ * Fold a runner-supplied IM JID to the workspace it is bound to, so IPC output
+ * is attributed to the same workspace inbound routing selected. Returns null
+ * for unbound chats; callers keep the raw JID in that case.
+ */
+function resolveIpcOutputWorkspaceJid(chatJid: string): string | null {
+  return resolveBoundWorkspaceJid(chatJid, {
+    getRegisteredGroup: (jid) =>
+      registeredGroups[jid] ?? getRegisteredGroup(jid),
+    getAgent,
+    getJidsByFolder,
+    getChannelMount,
+  });
+}
+
+/**
+ * Recover the logical workspace captured for the exact input turn. Binding
+ * rows are mutable while a runner is working, so reading them only when IPC
+ * output arrives can attribute workspace A's delayed output to a newly-bound
+ * workspace B. The outbox scope already freezes the physical route; carry the
+ * logical base beside it without changing provider delivery.
+ */
+function resolveIpcOutputRuntimeChatJid(
+  sourceGroup: string,
+  ipcAgentId: string | null | undefined,
+  inputTurnId: unknown,
+  targetJid: string,
+): string | null {
+  if (typeof inputTurnId !== 'string' || !inputTurnId) return null;
+  return (
+    activeChannelOutboxScopes.resolveInput(
+      channelTurnScope(sourceGroup, ipcAgentId),
+      inputTurnId,
+      targetJid,
+    )?.logicalBaseChatJid ?? null
+  );
+}
+
 // Thin production wrapper around the pure helper in ./task-routing.ts so the
 // internal call sites keep their short signature (deps inferred from the
 // runtime IM manager + DB). Tests should import `broadcastToOwnerIMChannels`
@@ -10310,6 +10425,13 @@ function startIpcWatcher(): void {
                     : undefined,
                   taskRunId: ipcTaskId,
                   scheduledTask: data.isScheduledTask === true,
+                  runtimeChatJid: resolveIpcOutputRuntimeChatJid(
+                    sourceGroup,
+                    ipcAgentId,
+                    data.inputTurnId,
+                    data.chatJid,
+                  ),
+                  resolveWorkspaceJid: resolveIpcOutputWorkspaceJid,
                 });
                 // Feishu card JSON: store extracted markdown for web, send raw JSON to IM
                 const cardText = extractFeishuCardText(data.text);
@@ -10860,11 +10982,24 @@ function startIpcWatcher(): void {
 
                   // Conversation agents and isolated scheduled tasks store in
                   // virtual JIDs (agent/task tab), not the main conversation.
-                  const imgChatJid = ipcAgentId
-                    ? `${data.chatJid}#agent:${ipcAgentId}`
-                    : ipcTaskId && data.isScheduledTask
-                      ? `${data.chatJid}#task:${ipcTaskId}`
-                      : data.chatJid;
+                  // Shares the text path's resolver so images are attributed to
+                  // the bound workspace instead of the raw IM row.
+                  const imgChatJid = resolveHostIpcLogicalChatJid({
+                    sourceChatJid: data.chatJid,
+                    agentId: ipcAgentId,
+                    agentChatJid: ipcAgentId
+                      ? getAgent(ipcAgentId)?.chat_jid
+                      : undefined,
+                    taskRunId: ipcTaskId,
+                    scheduledTask: data.isScheduledTask === true,
+                    runtimeChatJid: resolveIpcOutputRuntimeChatJid(
+                      sourceGroup,
+                      ipcAgentId,
+                      data.inputTurnId,
+                      data.chatJid,
+                    ),
+                    resolveWorkspaceJid: resolveIpcOutputWorkspaceJid,
+                  });
 
                   // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
                   const displayText = caption
@@ -12259,15 +12394,29 @@ async function processTaskIpc(
         // The requested mode is part of task identity: otherwise an identical
         // prompt could silently reuse a task running across a different security
         // boundary (host vs container).
+        const taskCreatedBy = resolveTaskOwner(
+          {},
+          sourceGroupEntry,
+          targetGroupEntry,
+        );
+        const forceHostOnly = isAdminHostOnlyOwner(taskCreatedBy);
+        if (forceHostOnly && data.execution_mode === 'container') {
+          failSchedule(
+            'Administrator host-only mode is enabled; container task execution is unavailable.',
+          );
+          break;
+        }
         let executionMode: 'host' | 'container';
         try {
-          executionMode = resolveTaskExecutionModeForTarget(
-            targetGroupEntry.executionMode,
-            data.execution_mode === 'host' ||
-              data.execution_mode === 'container'
-              ? data.execution_mode
-              : undefined,
-          );
+          executionMode = forceHostOnly
+            ? 'host'
+            : resolveTaskExecutionModeForTarget(
+                targetGroupEntry.executionMode,
+                data.execution_mode === 'host' ||
+                  data.execution_mode === 'container'
+                  ? data.execution_mode
+                  : undefined,
+              );
         } catch (err) {
           failSchedule(err instanceof Error ? err.message : String(err));
           break;
@@ -12276,12 +12425,6 @@ async function processTaskIpc(
           failSchedule(SCRIPT_TASK_HOST_REQUIRED_ERROR);
           break;
         }
-        const taskCreatedBy = resolveTaskOwner(
-          {},
-          sourceGroupEntry,
-          targetGroupEntry,
-        );
-
         // 幂等去重：仅对 agent 任务生效。#564 的递归增殖只发生在 agent 触发回放路径；
         // 而 script 任务真正承载工作的是 script_command（prompt 常为空），prompt/schedule
         // 相同但命令不同的多个 script 任务是合法的，按 prompt 去重会静默丢任务。agent
@@ -12652,6 +12795,14 @@ async function processTaskIpc(
         failUpdate('Not authorized to update this task.');
         break;
       }
+      const targetGroup =
+        registeredGroups[task.chat_jid] ?? getRegisteredGroup(task.chat_jid);
+      const targetOwnerId =
+        targetGroup?.created_by ??
+        Object.values(registeredGroups).find(
+          (group) => group.folder === task.group_folder && !!group.created_by,
+        )?.created_by;
+      const forceHostOnly = isAdminHostOnlyOwner(targetOwnerId);
       const patch: Parameters<typeof updateTask>[1] = {};
       if (data.execution_type !== undefined) {
         if (data.execution_type === 'script' && !isAdminHome) {
@@ -12662,6 +12813,12 @@ async function processTaskIpc(
           data.execution_type === 'script' ? 'script' : 'agent';
       }
       if (data.execution_mode !== undefined) {
+        if (forceHostOnly && data.execution_mode === 'container') {
+          failUpdate(
+            'Administrator host-only mode is enabled; container task execution is unavailable.',
+          );
+          break;
+        }
         if (data.execution_mode === 'host' && !isAdminHome) {
           failUpdate(
             'Only the admin home container can set host execution mode.',
@@ -12670,6 +12827,8 @@ async function processTaskIpc(
         }
         patch.execution_mode =
           data.execution_mode === 'host' ? 'host' : 'container';
+      } else if (forceHostOnly && task.execution_mode !== 'host') {
+        patch.execution_mode = 'host';
       }
       // An update must not be a way around the create-time bound.
       if (
@@ -12744,8 +12903,6 @@ async function processTaskIpc(
         }
       }
       if (finalExecutionMode === 'host') {
-        const targetGroup =
-          registeredGroups[task.chat_jid] ?? getRegisteredGroup(task.chat_jid);
         if (!targetGroup || targetGroup.executionMode !== 'host') {
           failUpdate(
             'Target workspace runs in container mode; host execution is not allowed.',
@@ -13249,8 +13406,9 @@ async function processTaskIpc(
         const sourceEntry = Object.values(registeredGroups).find(
           (g) => g.folder === sourceGroup,
         );
-        const execMode =
-          data.executionMode === 'host' || data.executionMode === 'container'
+        const execMode = isAdminHostOnlyOwner(sourceEntry?.created_by)
+          ? 'host'
+          : data.executionMode === 'host' || data.executionMode === 'container'
             ? data.executionMode
             : undefined;
         try {
@@ -14080,7 +14238,11 @@ async function processAgentConversation(
   const startsFreshSession =
     !sessionId ||
     resetForAgentProfile ||
-    willClearSessionOnProviderSwitch(effectiveGroup.folder, agentId);
+    willClearSessionOnProviderSwitch(
+      effectiveGroup.folder,
+      agentId,
+      agentProfile?.model_config_id,
+    );
   let historyContext: ReturnType<typeof buildRecentConversationHistoryContext> =
     null;
   if (startsFreshSession) {
@@ -14755,14 +14917,20 @@ async function processAgentConversation(
           nextRuntime.dispose();
           return false;
         }
-        nextScope = bindChannelOutboxScope(agentAdmissionKey, nextRuntime, {
-          provider: nextAddress.provider,
-          accountId: nextAccountId,
-          sourceJid: targetSourceJid,
-          chatId: nextAddress.externalChatId,
-          rootId: nextAddress.rootMessageId,
-          threadId: nextAddress.threadId,
-        });
+        nextScope = bindChannelOutboxScope(
+          agentAdmissionKey,
+          nextRuntime,
+          {
+            provider: nextAddress.provider,
+            accountId: nextAccountId,
+            sourceJid: targetSourceJid,
+            chatId: nextAddress.externalChatId,
+            rootId: nextAddress.rootMessageId,
+            threadId: nextAddress.threadId,
+          },
+          // Same warm-path correlation split as the main workspace admission.
+          inputTurnId,
+        );
         agentChannelTurnRuntimes.set(inputTurnId, nextRuntime);
         agentChannelOutboxScopesByInput.set(inputTurnId, nextScope);
       }
@@ -17226,64 +17394,67 @@ async function startMessageLoop(): Promise<void> {
   }
 }
 
-/**
- * Check if a process tree has actively working descendant processes.
- * Returns true if any descendant (not just direct children) is consuming
- * CPU (> 0.5%), indicating real work rather than a network-blocked hang.
- */
-async function hasActiveCpuDescendants(pid: number): Promise<boolean> {
-  const execFileAsync = promisify(execFile);
-  try {
-    const { stdout } = await execFileAsync('ps', ['-eo', 'pid=,ppid=,pcpu='], {
-      timeout: 3000,
-    });
-
-    const children = new Map<number, number[]>();
-    const cpuByPid = new Map<number, number>();
-    for (const line of stdout.trim().split('\n')) {
-      const parts = line.trim().split(/\s+/);
-      if (parts.length < 3) continue;
-      const p = parseInt(parts[0], 10);
-      const pp = parseInt(parts[1], 10);
-      const cpu = parseFloat(parts[2]);
-      if (isNaN(p) || isNaN(pp)) continue;
-      if (!children.has(pp)) children.set(pp, []);
-      children.get(pp)!.push(p);
-      cpuByPid.set(p, cpu);
-    }
-
-    // Walk the full descendant tree (not just direct children)
-    const stack = [pid];
-    while (stack.length > 0) {
-      const current = stack.pop()!;
-      const kids = children.get(current);
-      if (!kids) continue;
-      for (const kid of kids) {
-        if ((cpuByPid.get(kid) ?? 0) > 0.5) return true;
-        stack.push(kid);
-      }
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
 async function recoverStuckPendingGroups(): Promise<void> {
-  const stuckGroups = queue.getStuckPendingGroups(STUCK_RUNNER_IDLE_MS);
-  for (const { jid, idleMs } of stuckGroups) {
-    const pid = queue.getRunnerPid(jid);
-    if (pid && (await hasActiveCpuDescendants(pid))) {
+  const stuckGroups = queue.getStuckPendingGroups(
+    STUCK_RUNNER_IDLE_MS,
+    STUCK_RUNNER_FORCE_RESTART_MS,
+  );
+  for (const candidate of stuckGroups) {
+    const pid = candidate.runnerPid ?? undefined;
+    const cpuActivity = await resolveRunnerCpuActivity(candidate);
+    const currentCandidate = queue.revalidateStuckRecoveryCandidate(
+      candidate,
+      STUCK_RUNNER_IDLE_MS,
+      STUCK_RUNNER_FORCE_RESTART_MS,
+    );
+    if (!currentCandidate) {
       logger.info(
-        { chatJid: jid, idleMs, pid },
-        'Runner idle but has CPU-active child processes; skipping restart',
+        {
+          chatJid: candidate.jid,
+          queryId: candidate.queryId,
+          runnerGeneration: candidate.runnerGeneration,
+          pid,
+          reason: candidate.reason,
+          runtime: candidate.runtime,
+        },
+        'Skipping stale stuck-runner candidate after CPU probe',
+      );
+      continue;
+    }
+    const { jid, idleMs, reason, runtime, ipcOwedMs } = currentCandidate;
+    const decision = decideStuckRunnerRecovery(
+      currentCandidate,
+      cpuActivity,
+      STUCK_RUNNER_FORCE_RESTART_MS,
+    );
+    if (decision.action === 'defer') {
+      logger.info(
+        {
+          chatJid: jid,
+          idleMs,
+          ipcOwedMs,
+          pid,
+          reason,
+          runtime,
+          cpuActivity,
+          deferReason: decision.reason,
+        },
+        'Runner recovery deferred while owed work remains within its grace policy',
       );
       continue;
     }
 
     logger.warn(
-      { chatJid: jid, idleMs },
-      'Runner has pending messages but no activity; restarting',
+      {
+        chatJid: jid,
+        idleMs,
+        ipcOwedMs,
+        reason,
+        runtime,
+        cpuActivity,
+        restartReason: decision.reason,
+      },
+      'Runner has owed user work but no activity; restarting',
     );
     queue.restartGroup(jid).catch((err) => {
       logger.error(
@@ -17643,6 +17814,9 @@ function buildOnNewChat(
       // we should claim ownership but preserve the user's chosen folder.
       if (!existing.created_by) {
         existing.created_by = userId;
+        if (isAdminHostOnlyOwner(userId)) {
+          existing.executionMode = 'host';
+        }
         setRegisteredGroup(chatJid, existing);
         registeredGroups[chatJid] = existing;
         logger.info(
@@ -17691,6 +17865,7 @@ function buildOnNewChat(
           Object.assign(existing, releaseOwner(existing), {
             folder: homeFolder,
             created_by: userId,
+            executionMode: isAdminHostOnlyOwner(userId) ? 'host' : 'container',
             // Trust belongs to the previous HappyClaw user's channel binding,
             // not merely to the provider chat id. Never carry that trust into
             // the new user's Agent Builder authorization boundary.

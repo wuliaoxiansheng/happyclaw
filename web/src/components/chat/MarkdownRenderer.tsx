@@ -7,9 +7,9 @@ import rehypeKatex from 'rehype-katex';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import React, { useState, useMemo, memo } from 'react';
-import { createPortal } from 'react-dom';
 import { Copy, Check } from 'lucide-react';
 import { MermaidDiagram } from './MermaidDiagram';
+import { PreviewDialog } from './PreviewDialog';
 import { resolveMarkdownImageSrc } from '../../utils/markdownImageSrc';
 import 'highlight.js/styles/github.css';
 import 'katex/dist/katex.min.css';
@@ -32,19 +32,19 @@ function MarkdownImageLightbox({
   src: string;
   onClose: () => void;
 }) {
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center cursor-pointer"
-      onClick={onClose}
+  return (
+    <PreviewDialog
+      title="图片预览"
+      onClose={onClose}
+      layer="nested"
+      className="left-1/2 top-1/2 max-h-[90dvh] max-w-[90vw] -translate-x-1/2 -translate-y-1/2"
     >
       <img
         src={src}
         alt="放大查看"
         className="max-w-[90vw] max-h-[90vh] object-contain cursor-default"
-        onClick={(e) => e.stopPropagation()}
       />
-    </div>,
-    document.body,
+    </PreviewDialog>
   );
 }
 
@@ -90,9 +90,18 @@ function MarkdownImage({
         src={src}
         alt={alt || ''}
         loading={loading}
+        role="button"
+        tabIndex={0}
+        aria-label={alt ? `放大图片：${alt}` : '放大图片'}
         className="my-3 max-w-full rounded-lg border border-border cursor-pointer hover:shadow-md transition-shadow"
         style={{ maxHeight: '400px', objectFit: 'contain' }}
         onClick={() => setExpanded(true)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            setExpanded(true);
+          }
+        }}
         onError={() => setError(true)}
       />
       {expanded && (
