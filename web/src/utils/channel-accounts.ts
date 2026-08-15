@@ -174,6 +174,48 @@ export const CHANNEL_PROVIDER_OPTIONS: ChannelProviderOption[] = [
     supportsPairing: true,
   },
   {
+    value: 'wecom',
+    label: '企业微信',
+    description: '使用企业微信智能机器人的 Bot ID 和 Secret 建立长连接。',
+    authMode: 'credentials',
+    credentials: [
+      {
+        key: 'botId',
+        label: '智能机器人 Bot ID',
+        required: true,
+        help: '在企业微信管理后台的智能机器人详情中复制。',
+      },
+      {
+        key: 'secret',
+        label: '智能机器人 Secret',
+        required: true,
+        secret: true,
+        help: '仅用于长连接鉴权，请勿填写企业应用 Secret。',
+      },
+      {
+        key: 'corpId',
+        label: '企业 ID（可选）',
+        help: '可在企业微信“我的企业”页面底部找到。',
+      },
+    ],
+    setupGuide: {
+      title: '先创建企业微信智能机器人',
+      steps: [
+        '在企业微信管理后台创建智能机器人并启用 API 模式。',
+        '选择长连接接收消息，复制 Bot ID 和 Secret。',
+        '保存后等待连接成功，再用配对码授权具体单聊或群聊。',
+      ],
+      action: {
+        label: '查看企业微信开发文档',
+        url: 'https://developer.work.weixin.qq.com/document/path/101039',
+      },
+      nextStep:
+        '连接成功后生成配对码，在目标会话中发送 /pair <配对码> 完成授权。',
+    },
+    supportsTest: true,
+    supportsPairing: true,
+  },
+  {
     value: 'dingtalk',
     label: '钉钉',
     description: '通过钉钉企业内部应用的机器人凭证接入。',

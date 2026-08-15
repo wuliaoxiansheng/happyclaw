@@ -21,6 +21,8 @@ export interface FeishuRichContentClient {
 export interface FeishuParsedContent {
   text: string;
   imageKeys?: string[];
+  /** Internal completeness signal used when the parsed content is quoted. */
+  materialComplete?: boolean;
 }
 
 export interface FeishuRichContentLimits {
@@ -75,6 +77,8 @@ interface NormalizedItem {
   rootId?: string;
   timestampMs?: number;
   senderLabel?: string;
+  materialComplete: boolean;
+  forwardMaterialResolved?: boolean;
 }
 
 export interface EnrichFeishuInboundContentInput {
@@ -111,6 +115,7 @@ export interface EnrichedFeishuInboundContent {
     id: string;
     sender?: string;
     text: string;
+    materialResolved?: boolean;
     attachmentHints?: string[];
   }>;
   richMessageResolved: boolean;
@@ -190,30 +195,43 @@ function plainText(value: unknown): string | undefined {
   return undefined;
 }
 
+interface NormalizedInteractiveCard extends FeishuParsedContent {
+  materialComplete: boolean;
+}
+
 /** Recursively harvest user-visible card fields without serializing styling. */
-export function normalizeFeishuInteractiveCard(
+function normalizeFeishuInteractiveCardWithCompleteness(
   rawContent: string,
   limits: Pick<
     FeishuRichContentLimits,
     'maxCardNodes' | 'maxTextChars' | 'maxImageKeys'
   > = DEFAULT_FEISHU_RICH_CONTENT_LIMITS,
-): FeishuParsedContent {
+): NormalizedInteractiveCard {
   const root = safeJson(rawContent);
   if (typeof root === 'string') {
-    return { text: root.trim() || '[飞书卡片消息]' };
+    return {
+      text: root.trim() || '[飞书卡片消息]',
+      materialComplete: false,
+    };
   }
 
   const lines: string[] = [];
   const imageKeys = new Set<string>();
   let visited = 0;
   let textChars = 0;
+  let materialComplete = true;
   const seenObjects = new Set<object>();
 
   const addLine = (value: string | undefined) => {
     const normalized = value?.replace(/\s+/g, ' ').trim();
-    if (!normalized || textChars >= limits.maxTextChars) return;
+    if (!normalized || lines[lines.length - 1] === normalized) return;
+    if (textChars >= limits.maxTextChars) {
+      materialComplete = false;
+      return;
+    }
     const remaining = limits.maxTextChars - textChars;
     const clipped = normalized.slice(0, remaining);
+    if (clipped.length < normalized.length) materialComplete = false;
     if (lines[lines.length - 1] !== clipped) {
       lines.push(clipped);
       textChars += clipped.length + 1;
@@ -221,12 +239,11 @@ export function normalizeFeishuInteractiveCard(
   };
 
   const visit = (node: unknown, depth: number) => {
-    if (
-      node === null ||
-      node === undefined ||
-      depth > 12 ||
-      visited >= limits.maxCardNodes
-    ) {
+    if (node === null || node === undefined) {
+      return;
+    }
+    if (depth > 12 || visited >= limits.maxCardNodes) {
+      materialComplete = false;
       return;
     }
     if (Array.isArray(node)) {
@@ -245,9 +262,13 @@ export function normalizeFeishuInteractiveCard(
         : typeof object.img_key === 'string'
           ? object.img_key
           : undefined;
-    if (imageKey && imageKeys.size < limits.maxImageKeys) {
-      imageKeys.add(imageKey);
-      addLine('[图片]');
+    if (imageKey && !imageKeys.has(imageKey)) {
+      if (imageKeys.size < limits.maxImageKeys) {
+        imageKeys.add(imageKey);
+        addLine('[图片]');
+      } else {
+        materialComplete = false;
+      }
     }
 
     const tag = typeof object.tag === 'string' ? object.tag : undefined;
@@ -282,7 +303,20 @@ export function normalizeFeishuInteractiveCard(
   return {
     text: lines.join('\n').trim() || '[飞书卡片消息]',
     imageKeys: imageKeys.size > 0 ? [...imageKeys] : undefined,
+    materialComplete,
   };
+}
+
+export function normalizeFeishuInteractiveCard(
+  rawContent: string,
+  limits: Pick<
+    FeishuRichContentLimits,
+    'maxCardNodes' | 'maxTextChars' | 'maxImageKeys'
+  > = DEFAULT_FEISHU_RICH_CONTENT_LIMITS,
+): FeishuParsedContent {
+  const { materialComplete: _materialComplete, ...parsed } =
+    normalizeFeishuInteractiveCardWithCompleteness(rawContent, limits);
+  return parsed;
 }
 
 function normalizeItem(
@@ -295,7 +329,7 @@ function normalizeItem(
   const rawContent = item.body?.content ?? '';
   const parsed =
     messageType === 'interactive'
-      ? normalizeFeishuInteractiveCard(rawContent, limits)
+      ? normalizeFeishuInteractiveCardWithCompleteness(rawContent, limits)
       : parseContent(messageType, rawContent);
   if (!parsed.text.trim() && !parsed.imageKeys?.length) return undefined;
   const messageId = item.message_id ?? '';
@@ -305,6 +339,8 @@ function normalizeItem(
     text: parsed.text.trim(),
     imageKeys,
     imageRefs: imageKeys.map((imageKey) => ({ messageId, imageKey })),
+    materialComplete:
+      messageType !== 'interactive' || parsed.materialComplete === true,
     ...(item.parent_id ? { parentId: item.parent_id } : {}),
     ...(item.root_id ? { rootId: item.root_id } : {}),
     ...(item.create_time
@@ -336,13 +372,13 @@ function normalizeFetchedMessage(
     };
   }
 
-  const children = items
-    .filter(
-      (item) =>
-        item !== exact &&
-        (item.upper_message_id === requestedId || !!item.upper_message_id),
-    )
-    .slice(0, limits.maxForwardItems)
+  const childCandidates = items.filter(
+    (item) =>
+      item !== exact &&
+      (item.upper_message_id === requestedId || !!item.upper_message_id),
+  );
+  const boundedCandidates = childCandidates.slice(0, limits.maxForwardItems);
+  const children = boundedCandidates
     .map((item) => normalizeItem(item, parseContent, limits))
     .filter((item): item is NormalizedItem => !!item);
   if (children.length === 0) {
@@ -351,6 +387,10 @@ function normalizeFetchedMessage(
       normalized: normalizeItem(exact, parseContent, limits),
     };
   }
+  const forwardMaterialResolved =
+    childCandidates.length <= limits.maxForwardItems &&
+    children.length === boundedCandidates.length &&
+    children.every((child) => child.materialComplete);
   return {
     item: exact,
     normalized: {
@@ -363,7 +403,14 @@ function normalizeFetchedMessage(
         }),
       ].join('\n'),
       imageKeys: children.flatMap((child) => child.imageKeys),
-      imageRefs: children.flatMap((child) => child.imageRefs),
+      imageRefs: children.flatMap((child) =>
+        child.imageKeys.map((imageKey) => ({
+          messageId: requestedId,
+          imageKey,
+        })),
+      ),
+      materialComplete: forwardMaterialResolved,
+      forwardMaterialResolved,
       ...(exact.parent_id ? { parentId: exact.parent_id } : {}),
       ...(exact.root_id ? { rootId: exact.root_id } : {}),
       ...(exact.create_time
@@ -413,7 +460,12 @@ async function resolveCurrentRichMessage(
   const seenImages = new Set<string>();
   for (const item of normalized) {
     for (const ref of item.imageRefs) {
-      const messageId = ref.messageId || item.messageId || input.messageId;
+      // Feishu's resource endpoint owns images embedded in a merged-forward
+      // card under the outer message ID. Child IDs returned by message.get
+      // look plausible but fail with 234003 in production.
+      const messageId = forward
+        ? input.messageId
+        : ref.messageId || item.messageId || input.messageId;
       const identity = `${messageId}\u0000${ref.imageKey}`;
       if (imageRefs.length < limits.maxImageKeys && !seenImages.has(identity)) {
         seenImages.add(identity);
@@ -573,6 +625,11 @@ export async function enrichFeishuInboundContent(
             id: item.messageId,
             ...(item.senderLabel ? { sender: item.senderLabel } : {}),
             text: boundedText,
+            ...(item.forwardMaterialResolved &&
+            boundedText.length === rawText.length &&
+            candidateImageRefs.length === item.imageRefs.length
+              ? { materialResolved: true }
+              : {}),
           });
           referencedImageRefs.push(...candidateImageRefs);
           remainingImageBudget -= candidateImageRefs.length;

@@ -410,6 +410,26 @@ describe('IM strict send acknowledgement', () => {
     ).rejects.toThrow('document denied');
   });
 
+  test('message create and reply require an explicit code=0 acknowledgement', async () => {
+    const { feishu } = await connectedTransports();
+
+    controls.feishuMessageCreate.mockResolvedValueOnce({});
+    await expect(
+      feishu.sendMessage('oc_1', 'create', undefined, {
+        presentation: 'native',
+      }),
+    ).rejects.toThrow('code=undefined');
+
+    controls.feishuMessageReply.mockResolvedValueOnce({
+      data: { message_id: 'om_unwrapped_reply' },
+    });
+    await expect(
+      feishu.sendMessage('oc_1#root:om_root', 'reply', undefined, {
+        presentation: 'native',
+      }),
+    ).rejects.toThrow('code=undefined');
+  });
+
   test('accepts SDK-unwrapped upload acknowledgements without code=0', async () => {
     const { feishu } = await connectedTransports();
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'strict-im-ack-'));

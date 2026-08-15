@@ -1412,11 +1412,18 @@ export function getDefaultProviderId(): string | null {
 export function setDefaultProvider(id: string): UnifiedProvider {
   const state = readStoredStateV4();
   if (!state) throw new Error('模型配置不存在');
-  const provider = state.providers.find((item) => item.id === id);
-  if (!provider) throw new Error('未找到指定模型配置');
-  if (!provider.enabled) throw new Error('默认模型配置必须处于启用状态');
-  writeStoredStateV4(state.providers, state.balancing, provider.id);
-  return provider;
+  const idx = state.providers.findIndex((item) => item.id === id);
+  if (idx < 0) throw new Error('未找到指定模型配置');
+  const provider = state.providers[idx];
+  // 默认模型是所有「跟随系统默认」Agent 的运行时兜底，必须处于启用状态。
+  // 这里在提升为默认时自动启用，而不是直接报错：用户可以把一个处于关闭状态
+  // 的备选模型一步设为默认，从而把原默认释放出来去禁用或删除，避免死结。
+  const next = provider.enabled
+    ? provider
+    : { ...provider, enabled: true, updatedAt: new Date().toISOString() };
+  if (!provider.enabled) state.providers[idx] = next;
+  writeStoredStateV4(state.providers, state.balancing, id);
+  return next;
 }
 
 export function getBalancingConfig(): BalancingConfig {
@@ -1605,6 +1612,56 @@ export function updateProviderSecrets(
   state.providers[idx] = updated;
   writeStoredStateV4(state.providers, state.balancing, state.defaultProviderId);
   return updated;
+}
+
+function oauthCredentialsSnapshot(credentials: ClaudeOAuthCredentials): string {
+  return JSON.stringify({
+    accessToken: credentials.accessToken,
+    refreshToken: credentials.refreshToken,
+    expiresAt: credentials.expiresAt,
+    scopes: [...new Set(credentials.scopes)].sort(),
+    ...(credentials.subscriptionType
+      ? { subscriptionType: credentials.subscriptionType }
+      : {}),
+  });
+}
+
+/**
+ * Persist an SDK-refreshed OAuth credential only if the provider still holds
+ * the exact credential snapshot used to start reconciliation. The synchronous
+ * read/modify/write is a compare-and-swap boundary inside the Node process, so
+ * an admin update or another session refresh cannot be silently overwritten.
+ */
+export function updateProviderOAuthCredentialsIfCurrent(
+  id: string,
+  expected: ClaudeOAuthCredentials,
+  refreshed: ClaudeOAuthCredentials,
+): boolean {
+  const state = readStoredStateV4();
+  if (!state) throw new Error('Claude 配置不存在');
+  const idx = state.providers.findIndex((provider) => provider.id === id);
+  if (idx < 0) throw new Error('未找到指定供应商');
+
+  const current = state.providers[idx];
+  const currentOauth = buildClaudeAiOauthPayload(providerToConfig(current));
+  if (
+    !currentOauth ||
+    oauthCredentialsSnapshot(currentOauth) !==
+      oauthCredentialsSnapshot(expected)
+  ) {
+    return false;
+  }
+
+  state.providers[idx] = {
+    ...current,
+    claudeOAuthCredentials: {
+      ...refreshed,
+      scopes: [...new Set(refreshed.scopes)].sort(),
+    },
+    updatedAt: new Date().toISOString(),
+  };
+  writeStoredStateV4(state.providers, state.balancing, state.defaultProviderId);
+  return true;
 }
 
 export function setProviderEnabled(
@@ -2938,19 +2995,34 @@ export function toPublicContainerEnvConfig(
  * Merge global config with per-container overrides.
  * Non-empty per-container fields override the global value.
  */
+export function hasExplicitWorkspaceClaudeAuth(
+  override: ContainerEnvConfig,
+): boolean {
+  return !!(override.anthropicApiKey || override.anthropicAuthToken);
+}
+
 export function mergeClaudeEnvConfig(
   global: ClaudeProviderConfig,
   override: ContainerEnvConfig,
 ): ClaudeProviderConfig {
+  const hasExplicitAuth = hasExplicitWorkspaceClaudeAuth(override);
   const merged: ClaudeProviderConfig = {
     anthropicBaseUrl: override.anthropicBaseUrl || global.anthropicBaseUrl,
-    anthropicAuthToken:
-      override.anthropicAuthToken || global.anthropicAuthToken,
-    anthropicApiKey: override.anthropicApiKey || global.anthropicApiKey,
-    claudeCodeOauthToken:
-      override.claudeCodeOauthToken || global.claudeCodeOauthToken,
-    claudeOAuthCredentials:
-      override.claudeOAuthCredentials ?? global.claudeOAuthCredentials,
+    // A workspace key/token is an authentication-mode selection, not an
+    // independent field overlay. Never combine it with a global credential of
+    // another kind or with an inherited Claude OAuth session.
+    anthropicAuthToken: hasExplicitAuth
+      ? override.anthropicAuthToken || ''
+      : override.anthropicAuthToken || global.anthropicAuthToken,
+    anthropicApiKey: hasExplicitAuth
+      ? override.anthropicApiKey || ''
+      : override.anthropicApiKey || global.anthropicApiKey,
+    claudeCodeOauthToken: hasExplicitAuth
+      ? ''
+      : override.claudeCodeOauthToken || global.claudeCodeOauthToken,
+    claudeOAuthCredentials: hasExplicitAuth
+      ? null
+      : (override.claudeOAuthCredentials ?? global.claudeOAuthCredentials),
     anthropicModel: override.anthropicModel || global.anthropicModel,
     updatedAt: global.updatedAt,
   };
@@ -3083,15 +3155,19 @@ export function buildContainerEnvLines(
 // ─── OAuth credentials file management ────────────────────────────
 
 /**
- * Write .credentials.json to a Claude session directory.
- * Format matches what Claude Code CLI/Agent SDK natively reads.
+ * Build the claudeAiOauth object in the exact shape Claude Code CLI reads,
+ * shared by the .credentials.json file and the macOS Keychain entry so the
+ * two credential stores can never disagree on content.
  */
-export function writeCredentialsFile(
-  sessionDir: string,
-  config: ClaudeProviderConfig,
-): void {
+export function buildClaudeAiOauthPayload(config: ClaudeProviderConfig): {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  scopes: string[];
+  subscriptionType?: string;
+} | null {
   const creds = config.claudeOAuthCredentials;
-  if (!creds) return;
+  if (!creds) return null;
 
   // Claude CLI requires scopes to recognize the token as valid.
   // Fall back to a sensible default when the stored credentials lack scopes
@@ -3100,13 +3176,7 @@ export function writeCredentialsFile(
     ? creds.scopes
     : DEFAULT_CREDENTIAL_SCOPES;
 
-  const claudeAiOauth: {
-    accessToken: string;
-    refreshToken: string;
-    expiresAt: number;
-    scopes: string[];
-    subscriptionType?: string;
-  } = {
+  const claudeAiOauth: ReturnType<typeof buildClaudeAiOauthPayload> = {
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
@@ -3115,8 +3185,21 @@ export function writeCredentialsFile(
   // Only include subscriptionType when explicitly configured — avoids
   // misleading Claude CLI when the actual subscription tier is unknown.
   if (creds.subscriptionType) {
-    claudeAiOauth.subscriptionType = creds.subscriptionType;
+    claudeAiOauth!.subscriptionType = creds.subscriptionType;
   }
+  return claudeAiOauth;
+}
+
+/**
+ * Write .credentials.json to a Claude session directory.
+ * Format matches what Claude Code CLI/Agent SDK natively reads.
+ */
+export function writeCredentialsFile(
+  sessionDir: string,
+  config: ClaudeProviderConfig,
+): void {
+  const claudeAiOauth = buildClaudeAiOauthPayload(config);
+  if (!claudeAiOauth) return;
 
   const credentialsData = { claudeAiOauth };
 
@@ -3299,6 +3382,10 @@ export interface AppearanceConfig {
   aiAvatarColor: string;
   aiAvatarUrl: string | null;
   aiAvatarMode: 'brand' | 'emoji';
+  // 400x400 square mark shown in the collapsed sidebar rail.
+  brandIconUrl: string | null;
+  // 600x200 left-aligned wordmark shown above the workspace list.
+  brandBannerUrl: string | null;
 }
 
 const DEFAULT_APPEARANCE_CONFIG: AppearanceConfig = {
@@ -3308,6 +3395,8 @@ const DEFAULT_APPEARANCE_CONFIG: AppearanceConfig = {
   aiAvatarColor: '#0d9488',
   aiAvatarUrl: null,
   aiAvatarMode: 'brand',
+  brandIconUrl: null,
+  brandBannerUrl: null,
 };
 
 export function getAppearanceConfig(): AppearanceConfig {
@@ -3340,6 +3429,14 @@ export function getAppearanceConfig(): AppearanceConfig {
           ? raw.aiAvatarUrl
           : null,
       aiAvatarMode: raw.aiAvatarMode === 'emoji' ? 'emoji' : 'brand',
+      brandIconUrl:
+        typeof raw.brandIconUrl === 'string' && raw.brandIconUrl
+          ? raw.brandIconUrl
+          : null,
+      brandBannerUrl:
+        typeof raw.brandBannerUrl === 'string' && raw.brandBannerUrl
+          ? raw.brandBannerUrl
+          : null,
     };
   } catch (err) {
     logger.warn(
@@ -3362,6 +3459,14 @@ export function saveAppearanceConfig(
     aiAvatarUrl:
       next.aiAvatarUrl === undefined ? existing.aiAvatarUrl : next.aiAvatarUrl,
     aiAvatarMode: next.aiAvatarMode ?? existing.aiAvatarMode,
+    brandIconUrl:
+      next.brandIconUrl === undefined
+        ? existing.brandIconUrl
+        : next.brandIconUrl,
+    brandBannerUrl:
+      next.brandBannerUrl === undefined
+        ? existing.brandBannerUrl
+        : next.brandBannerUrl,
     updatedAt: new Date().toISOString(),
   };
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
@@ -3375,6 +3480,8 @@ export function saveAppearanceConfig(
     aiAvatarColor: config.aiAvatarColor,
     aiAvatarUrl: config.aiAvatarUrl,
     aiAvatarMode: config.aiAvatarMode,
+    brandIconUrl: config.brandIconUrl,
+    brandBannerUrl: config.brandBannerUrl,
   };
 }
 

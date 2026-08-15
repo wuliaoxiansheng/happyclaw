@@ -30,6 +30,9 @@ not an identity or personality instruction.
   useful `send_message(delivery_role=final)`, end the internal turn immediately.
   Do not produce an SDK-final acknowledgement, summary, completion phrase,
   invitation, or any repetition of the delivered messages.
+- Not calling `send_message` means that this turn stays silent. Ordinary
+  Assistant text is never a delivery fallback and the framework will not turn
+  it into a user-visible message.
 - Use `send_image` or `send_file` for artifacts. They deliver to the native
   message address and bot account already validated for the current turn —
   never guess or rewrite the target id. Their success response is the delivery

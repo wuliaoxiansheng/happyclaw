@@ -43,6 +43,15 @@ export type ImBindingMode = 'single_context' | 'thread_map';
 export type ChannelRoutingMode = 'single_session' | 'thread_map';
 export type AudienceMode = 'everyone' | 'owner_only';
 
+/** Provider-proven relation between two physical inbound messages. */
+export interface ChannelContentLink {
+  kind: 'forward_bundle' | 'rapid_topic_bundle';
+  /** Stable identity for one forward operation, normally its root message id. */
+  bundleId: string;
+  role: 'forwarded_content' | 'forwarder_comment';
+  relatedMessageId?: string;
+}
+
 /**
  * Provider-fetched context for a message referenced by the current inbound
  * turn. The text is prompt-only metadata: `NewMessage.content` remains scoped
@@ -52,6 +61,10 @@ export interface ChannelReferencedMessage {
   id: string;
   sender?: string;
   text: string;
+  /** Structural relation asserted by the provider adapter, never inferred from text. */
+  contentLink?: ChannelContentLink;
+  /** Provider material was fetched beyond a placeholder-only forward shell. */
+  materialResolved?: boolean;
   /** Prompt hints for referenced files/images that were materialized locally. */
   attachmentHints?: string[];
   /**
@@ -97,6 +110,8 @@ export interface ChannelTurnContext {
     parentId?: string;
     threadId?: string;
     type?: string;
+    /** Structural relation asserted by the provider adapter. */
+    contentLink?: ChannelContentLink;
     referencedMessages?: ChannelReferencedMessage[];
   };
   sender?: {
@@ -216,6 +231,7 @@ export type ChannelProvider =
   | 'telegram'
   | 'qq'
   | 'wechat'
+  | 'wecom'
   | 'dingtalk'
   | 'discord'
   | 'whatsapp';
@@ -429,7 +445,13 @@ export interface NewMessage {
 
 export type FollowUpMode = 'queue' | 'steer';
 
-export type FollowUpStatus = 'queued' | 'promoting' | 'released' | 'cancelled';
+export type FollowUpStatus =
+  | 'queued'
+  | 'promoting'
+  | 'released'
+  | 'cancelled'
+  /** Preserved in history, but already delivered through a linked physical input. */
+  | 'subsumed';
 
 export interface QueuedFollowUp {
   id: string;
@@ -589,6 +611,13 @@ export interface TaskRunDefinitionSnapshot {
   execution_mode: 'host' | 'container' | null;
   script_command: string | null;
   notify_channels: string[] | null;
+  /**
+   * Delivery contract frozen when a group-mode occurrence crosses the durable
+   * workspace-prompt hand-off.  It is intentionally absent on historical and
+   * isolated runs; consumers fall back to the workspace mode only for those
+   * legacy rows.
+   */
+  interaction_mode?: InteractionMode;
 }
 
 /** Durable state for one scheduled/manual occurrence. */

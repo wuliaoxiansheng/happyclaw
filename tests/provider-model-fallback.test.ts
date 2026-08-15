@@ -12,6 +12,7 @@ import {
 import {
   resolveClaudeProviderRuntime,
   resolveClaudeQueryModelRuntime,
+  resolveProviderReportedModelTier,
 } from '../container/agent-runner/src/provider-runtime.js';
 import {
   IpcTurnDeliveryTracker,
@@ -21,7 +22,11 @@ import {
   classifyProviderLimitNotice as classifyHostProviderLimitNotice,
   isProviderFailureResult,
 } from '../src/agent-output-parser.js';
-import { applyFallbackModelToEnvLines } from '../src/container-runner.js';
+import {
+  applyFallbackModelToEnvLines,
+  resolvePoolTierEnv,
+} from '../src/container-runner.js';
+import { SDK_DEFAULT_MODEL_TIER } from '../src/provider-pool.js';
 
 function message(id: string, text = `prompt-${id}`): IpcInputMessage {
   return {
@@ -112,6 +117,16 @@ describe('provider model fallback lifecycle', () => {
         "You've hit your Opus limit.",
       ),
     ).toBe(false);
+  });
+
+  test('reports the official SDK default as a stable model tier', () => {
+    const provider = resolveClaudeProviderRuntime({
+      HAPPYCLAW_CLAUDE_ENDPOINT_KIND: 'official',
+    });
+    expect(provider.model).toBe('');
+    expect(resolveProviderReportedModelTier(provider)).toBe(
+      SDK_DEFAULT_MODEL_TIER,
+    );
   });
 
   test('maps structured SDK rate limits to the correct blast radius', () => {
@@ -237,5 +252,14 @@ describe('provider model fallback lifecycle', () => {
     const cleared = ['HAPPYCLAW_FALLBACK_MODEL=inherited-value', 'KEEP_ME=yes'];
     applyFallbackModelToEnvLines(cleared, '');
     expect(cleared).toEqual(['KEEP_ME=yes']);
+  });
+
+  test('an explicit Agent pin keeps fallback inside its account in a multi-provider install', () => {
+    expect(resolvePoolTierEnv(undefined, 3, 'fallback-model', true)).toEqual({
+      runnerFallbackModel: 'fallback-model',
+    });
+    expect(resolvePoolTierEnv(undefined, 3, 'fallback-model', false)).toEqual(
+      {},
+    );
   });
 });

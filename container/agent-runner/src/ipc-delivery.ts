@@ -19,6 +19,28 @@ export interface IpcInputMessage {
   receipt?: IpcDeliveryReceipt;
 }
 
+const SCHEDULED_GROUP_PROMPT_ID_PREFIX = 'scheduled-task-prompt:';
+
+/** Recover the exact group-mode task occurrence from its durable input batch. */
+export function scheduledGroupRunIdFromIpcMessages(
+  messages: readonly IpcInputMessage[],
+  taskId: string | null | undefined,
+): string | null {
+  if (!taskId) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.taskId !== taskId || !message.receipt) continue;
+    const cursors = message.receipt.coveredCursors ?? [message.receipt.cursor];
+    for (let j = cursors.length - 1; j >= 0; j--) {
+      const id = cursors[j]?.id;
+      if (!id?.startsWith(SCHEDULED_GROUP_PROMPT_ID_PREFIX)) continue;
+      const runId = id.slice(SCHEDULED_GROUP_PROMPT_ID_PREFIX.length);
+      if (runId && /^[a-zA-Z0-9-]+$/.test(runId)) return runId;
+    }
+  }
+  return null;
+}
+
 /**
  * Restore durable arrival order after draining IPC files. Requeued messages
  * can receive newer filenames than messages written while a query is tearing
@@ -186,6 +208,13 @@ export class IpcTurnDeliveryTracker {
    * removes the turn ahead of it. */
   get currentTurnDeliveryId(): string | undefined {
     return latestIpcDeliveryId(this.turns[0] ?? []);
+  }
+
+  /** Durable receipts owned by the SDK turn producing output right now. */
+  get currentTurnReceipts(): IpcDeliveryReceipt[] {
+    return this.currentTurnMessages
+      .map((message) => message.receipt)
+      .filter((receipt): receipt is IpcDeliveryReceipt => !!receipt);
   }
 
   /** Accepted follow-up turns after the current one, kept in delivery order. */

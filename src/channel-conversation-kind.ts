@@ -53,6 +53,12 @@ export function resolveChannelConversationKind(
     return baseJid.length > 'discord:'.length ? 'group' : 'unknown';
   }
 
+  if (baseJid.startsWith('wecom:')) {
+    if (baseJid.startsWith('wecom:c2c:')) return 'direct';
+    if (baseJid.startsWith('wecom:group:')) return 'group';
+    return 'unknown';
+  }
+
   if (baseJid.startsWith('whatsapp:')) {
     if (baseJid.endsWith('@s.whatsapp.net')) return 'direct';
     if (baseJid.endsWith('@g.us')) return 'group';

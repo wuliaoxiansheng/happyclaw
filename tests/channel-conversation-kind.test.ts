@@ -15,6 +15,8 @@ describe('resolveChannelConversationKind', () => {
     ['whatsapp:123@s.whatsapp.net', 'direct'],
     ['whatsapp:123@g.us', 'group'],
     ['wechat:wxid_user', 'direct'],
+    ['wecom:c2c:user#account:bot-a', 'direct'],
+    ['wecom:group:team#account:bot-a', 'group'],
     ['telegram:123#account:bot-a#thread:1', 'direct'],
     ['telegram:-100123#account:bot-a', 'group'],
   ])('classifies %s as %s', (jid, expected) => {

@@ -70,6 +70,10 @@ describe('Agent Runner reply-mode prompt contract', () => {
     expect(proactiveOutput).toContain('简单问题直接回答');
     expect(proactive).not.toContain('minimal internal acknowledgement');
     expect(proactive).toContain('SDK-final acknowledgement');
+    expect(proactive).toContain('Assistant text is never a delivery fallback');
+    expect(proactiveOutput).toContain(
+      '普通 Assistant 文本绝不是发送失败时的备用回复',
+    );
     expect(hostPolicy).toContain("return mode === 'assistant';");
     expect(hostPolicy).toContain("return mode === 'proactive';");
   });

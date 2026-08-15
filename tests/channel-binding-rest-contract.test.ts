@@ -64,7 +64,7 @@ describe('channel binding REST contract', () => {
   test('frontend capability table mirrors workspace and native-thread policy', () => {
     const capabilities = read('web/src/constants/im-capabilities.ts');
     expect((capabilities.match(/can_bind_workspace: true/g) ?? []).length).toBe(
-      7,
+      8,
     );
     expect(capabilities).toMatch(
       /telegram:[\s\S]*supports_thread_map: true[\s\S]*supports_activation_modes: false/,
@@ -74,6 +74,9 @@ describe('channel binding REST contract', () => {
     );
     expect(capabilities).toMatch(
       /wechat:[\s\S]*supports_thread_map: false[\s\S]*supports_activation_modes: false/,
+    );
+    expect(capabilities).toMatch(
+      /wecom:[\s\S]*supports_thread_map: false[\s\S]*supports_activation_modes: true/,
     );
   });
 

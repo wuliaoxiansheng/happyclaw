@@ -40,6 +40,8 @@ export interface McpContext {
    * Cleared between turns by the agent-runner main loop so that regular
    * follow-up messages aren't misattributed to the prior task. */
   currentTaskId?: string | null;
+  /** Exact durable group-mode occurrence correlated from the scheduler prompt. */
+  currentScheduledTaskRunId?: string | null;
   /** Mutable correlation id for the user input currently being answered.
    * Cold starts use the triggering message id; IPC turns use the host-issued
    * delivery id from their receipt. */
@@ -465,6 +467,9 @@ export function buildSendMessageData(
   }
   if (ctx.currentTaskId) {
     data.taskId = ctx.currentTaskId;
+  }
+  if (ctx.currentScheduledTaskRunId) {
+    data.scheduledTaskRunId = ctx.currentScheduledTaskRunId;
   }
   if (ctx.currentInputTurnId) {
     data.inputTurnId = ctx.currentInputTurnId;

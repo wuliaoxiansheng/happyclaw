@@ -71,7 +71,13 @@ export interface Message {
     | 'error'
     | null;
   delivery_mode?: FollowUpMode | null;
-  delivery_status?: 'queued' | 'promoting' | 'released' | 'cancelled' | null;
+  delivery_status?:
+    | 'queued'
+    | 'promoting'
+    | 'released'
+    | 'cancelled'
+    | 'subsumed'
+    | null;
   delivery_run_id?: string | null;
   delivery_updated_at?: string | null;
 }
@@ -3294,7 +3300,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         !msg.is_from_me &&
         msg.delivery_status !== 'queued' &&
         msg.delivery_status !== 'promoting' &&
-        msg.delivery_status !== 'cancelled';
+        msg.delivery_status !== 'cancelled' &&
+        msg.delivery_status !== 'subsumed';
       const isHidden = typeof document !== 'undefined' && document.hidden;
       const isOtherChat =
         s.currentGroup !== chatJid || !!s.activeAgentTab[chatJid];

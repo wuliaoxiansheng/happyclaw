@@ -16,10 +16,12 @@ import {
   deleteFile,
   createDirectory,
   isSystemPath,
+  isEditLockedPath,
   MAX_FILE_SIZE,
   getGroupStorageUsage,
   invalidateGroupStorageUsage,
   getFileRoot,
+  safeWriteWorkspaceFile,
 } from '../file-manager.js';
 import { checkStorageLimit, isBillingEnabled } from '../billing.js';
 import { MAX_FILE_SIZE_MB } from '../config.js';
@@ -121,7 +123,14 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 // 不安全的扩展名（HTML/SVG 有 XSS 风险，压缩包不可预览）
-const UNSAFE_PREVIEW_EXTENSIONS = new Set(['html', 'svg', 'zip', 'tar', 'gz', '7z']);
+const UNSAFE_PREVIEW_EXTENSIONS = new Set([
+  'html',
+  'svg',
+  'zip',
+  'tar',
+  'gz',
+  '7z',
+]);
 
 // 允许 inline 预览的安全 MIME 类型（从 MIME_MAP 中排除不安全扩展名自动推导）
 const SAFE_PREVIEW_MIME_TYPES = new Set(
@@ -348,45 +357,16 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
 
       // 验证目标路径 + 文件名的完整路径（防止 file.name 含 ../../ 绕过）
       const fullRelativePath = path.join(targetPath, file.name);
-      const targetFilePath = validateAndResolvePath(
-        group.folder,
-        fullRelativePath,
-        rootOverride,
-      );
-      const targetDir = path.dirname(targetFilePath);
-
-      // 确保目标目录存在
-      if (!fs.existsSync(targetDir)) {
-        fs.mkdirSync(targetDir, { recursive: true });
-      }
-
-      // 写入文件：用 O_NOFOLLOW 防 leaf TOCTOU——validateAndResolvePath 与
-      // writeFileSync 之间，对 RW 工作区有写权限的 agent 可以临时把
-      // targetFilePath 替换成符号链接指向系统敏感路径，让上传的内容写到
-      // workspace 之外。父目录被换成 symlink 的场景仍依赖 validateAndResolvePath
-      // 的 ancestor realpath 校验拦截，但 leaf 由 O_NOFOLLOW 强保护。
-      // 用 fs.writeFileSync(fd, ...) 让 Node 内置循环处理 short-write。
+      validateAndResolvePath(group.folder, fullRelativePath, rootOverride);
       const buffer = await file.arrayBuffer();
       const data = Buffer.from(buffer);
-      const noFollowFlag = (fs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
-      if (noFollowFlag !== undefined) {
-        const flags =
-          fs.constants.O_WRONLY |
-          fs.constants.O_CREAT |
-          fs.constants.O_TRUNC |
-          noFollowFlag;
-        let fd: number | null = null;
-        try {
-          fd = fs.openSync(targetFilePath, flags, 0o644);
-          fs.writeFileSync(fd, data);
-        } finally {
-          if (fd !== null) {
-            try { fs.closeSync(fd); } catch { /* ignore */ }
-          }
-        }
-      } else {
-        fs.writeFileSync(targetFilePath, data);
-      }
+      safeWriteWorkspaceFile(
+        group.folder,
+        fullRelativePath,
+        data,
+        { mustExist: false, createParents: true },
+        rootOverride,
+      );
 
       uploadedFiles.push(file.name);
     }
@@ -639,8 +619,7 @@ fileRoutes.get('/:jid/files/preview/:path', authMiddleware, (c) => {
       const rangeHeader = c.req.header('range');
       if (rangeHeader) {
         const normalizedRange = rangeHeader.trim();
-        const isBytesRange =
-          normalizedRange.toLowerCase().startsWith('bytes=');
+        const isBytesRange = normalizedRange.toLowerCase().startsWith('bytes=');
         const isMultiRange = isBytesRange && normalizedRange.includes(',');
 
         if (isBytesRange && !isMultiRange) {
@@ -792,8 +771,8 @@ fileRoutes.put('/:jid/files/content/:path', authMiddleware, async (c) => {
       'utf-8',
     );
 
-    // 禁止写入系统路径
-    if (isSystemPath(relativePath)) {
+    // 禁止写入系统路径（CLAUDE.md 等例外仍可编辑内容，删除/覆盖上传照旧禁止）
+    if (isEditLockedPath(relativePath)) {
       return c.json({ error: 'Cannot edit system file' }, 403);
     }
 
@@ -845,66 +824,16 @@ fileRoutes.put('/:jid/files/content/:path', authMiddleware, async (c) => {
       }
     }
 
-    // 原子写入：先 lstat 检查目标如已存在则不能是 symlink（防 TOCTOU 把
-    // absolutePath 替换成指向系统路径的链接 → rename 走的是目录项替换不会
-    // 跟随，但若先存在 symlink 时仍会替换它本身，对调用方语义没有破坏；
-    // 但仍然 lstat 校验目录祖先没被偷换）。
-    try {
-      const lst = fs.lstatSync(absolutePath);
-      if (lst.isSymbolicLink()) {
-        return c.json({ error: 'Refusing to overwrite symbolic link' }, 403);
-      }
-    } catch (err: any) {
-      if (err && err.code !== 'ENOENT') throw err;
-    }
-    const tmp = `${absolutePath}.tmp`;
-    // 用 fs.writeFileSync(fd, ...) 让 Node 内置循环处理 partial-write
-    // (NFS / 容器 IO 限流 / 磁盘满边界都可能 short-write 导致内容截断)。
-    // 配合 O_NOFOLLOW + O_EXCL 防 symlink 预放（Windows 不支持 NOFOLLOW，
-    // 走 fallback writeFileSync，由前置 lstat 守住 leaf）。
-    // tmp 失败务必 unlink，否则下次同文件 PUT 在 O_EXCL 处永久 EEXIST 锁死；
-    // rename 阶段失败也走 finally 清理。
-    const noFollowFlag = (fs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
-    let renameOk = false;
-    try {
-      if (noFollowFlag !== undefined) {
-        const flags =
-          fs.constants.O_WRONLY |
-          fs.constants.O_CREAT |
-          fs.constants.O_TRUNC |
-          fs.constants.O_EXCL |
-          noFollowFlag;
-        let fd: number | null = null;
-        try {
-          fd = fs.openSync(tmp, flags, 0o644);
-          // writeFileSync 接受 fd，内部循环处理 short-write
-          fs.writeFileSync(fd, body.content, 'utf-8');
-        } finally {
-          if (fd !== null) {
-            try { fs.closeSync(fd); } catch { /* ignore */ }
-          }
-        }
-      } else {
-        // Windows fallback：用 'wx' 等价的 O_EXCL 创建避免覆写预放 symlink。
-        try {
-          fs.writeFileSync(tmp, body.content, { encoding: 'utf-8', flag: 'wx', mode: 0o644 });
-        } catch (err: any) {
-          if (err && err.code === 'EEXIST') {
-            // 旧 tmp 残留：删后重试一次。
-            fs.unlinkSync(tmp);
-            fs.writeFileSync(tmp, body.content, { encoding: 'utf-8', flag: 'wx', mode: 0o644 });
-          } else {
-            throw err;
-          }
-        }
-      }
-      fs.renameSync(tmp, absolutePath);
-      renameOk = true;
-    } finally {
-      if (!renameOk) {
-        try { fs.unlinkSync(tmp); } catch { /* ignore */ }
-      }
-    }
+    // The helper performs descriptor-relative openat/renameat traversal, so a
+    // concurrent Agent cannot replace an ancestor with an external symlink in
+    // the await window above and redirect this host write outside the workspace.
+    safeWriteWorkspaceFile(
+      group.folder,
+      relativePath,
+      Buffer.from(body.content, 'utf-8'),
+      { mustExist: true, createParents: false },
+      rootOverride,
+    );
 
     invalidateGroupStorageUsage(group.folder, rootOverride);
     return c.json({ success: true });

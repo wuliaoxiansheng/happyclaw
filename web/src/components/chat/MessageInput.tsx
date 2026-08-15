@@ -844,7 +844,9 @@ export function MessageInput({
               <span>
                 {queuedFollowUps.some((item) => item.delivery_mode === 'steer')
                   ? '正在停止当前回复，随后发送引导消息'
-                  : `${queuedFollowUps.length} 条消息已排队`}
+                  : queuedFollowUps.length > 1
+                    ? `${queuedFollowUps.length} 条消息已排队，将合并为下一轮`
+                    : '1 条消息已排队'}
               </span>
             </div>
             <div className="max-h-56 divide-y divide-border/70 overflow-y-auto">

@@ -32,6 +32,65 @@ describe('provider pool recovery state', () => {
     }
   });
 
+  test('a rate-limited provider stays quarantined until its reported reset', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-08-07T06:39:00.000Z'));
+      const pool = new ProviderPool();
+      pool.refreshFromConfig(
+        [
+          { id: 'account-1', enabled: true, weight: 1 },
+          { id: 'account-2', enabled: true, weight: 1 },
+        ],
+        {
+          strategy: 'weighted-round-robin',
+          unhealthyThreshold: 1,
+          recoveryIntervalMs: 300_000,
+        },
+      );
+
+      // Anthropic reported a five_hour rejection resetting at 16:00Z.
+      const resetsAt = new Date('2026-08-07T16:00:00.000Z').getTime();
+      pool.reportFailure('account-1', true, resetsAt);
+      expect(pool.getHealthStatus('account-1').healthy).toBe(false);
+
+      // The flat recovery interval must not resurrect a provider that the
+      // upstream account limit keeps rejecting for hours.
+      vi.advanceTimersByTime(300_000);
+      pool.refreshRecoveryState();
+      expect(pool.getHealthStatus('account-1').healthy).toBe(false);
+      expect(pool.selectProvider()).toBe('account-2');
+
+      // Once the reported window elapses the provider returns to rotation.
+      vi.setSystemTime(new Date(resetsAt));
+      pool.refreshRecoveryState();
+      expect(pool.getHealthStatus('account-1').healthy).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('a quarantined provider without a reported reset still uses the interval', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-08-07T06:39:00.000Z'));
+      const pool = new ProviderPool();
+      pool.refreshFromConfig([{ id: 'account-1', enabled: true, weight: 1 }], {
+        strategy: 'failover',
+        unhealthyThreshold: 1,
+        recoveryIntervalMs: 300_000,
+      });
+      pool.reportFailure('account-1', true);
+
+      vi.advanceTimersByTime(300_000);
+      pool.refreshRecoveryState();
+
+      expect(pool.getHealthStatus('account-1').healthy).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test('failure disposition sees providers added after one-time selection', () => {
     const pool = new ProviderPool();
     const balancing = {

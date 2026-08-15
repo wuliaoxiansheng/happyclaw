@@ -103,7 +103,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 69;
+export const CURRENT_SCHEMA_VERSION = 71;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -193,7 +193,7 @@ function stmts() {
                 delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
          FROM messages
          WHERE chat_jid = ? AND (timestamp > ? OR (timestamp = ? AND id > ?)) AND is_from_me = 0
-           AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled')
+           AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'subsumed')
          ORDER BY timestamp ASC, id ASC`,
       ),
       getExpiredSessionIds: db.prepare(
@@ -216,7 +216,7 @@ function getNewMessagesStmt(jidCount: number): any {
          AND chat_jid IN (${placeholders})
          AND is_from_me = 0
          AND COALESCE(source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt')
-         AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled')
+         AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'subsumed')
        ORDER BY timestamp ASC, id ASC`,
     );
     // Cap cache size to avoid unbounded growth in deployments where the
@@ -702,6 +702,20 @@ export function initDatabase(): void {
       ON channel_accounts(owner_user_id, provider, updated_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_accounts_one_default
       ON channel_accounts(owner_user_id, provider) WHERE is_default = 1;
+    CREATE TABLE IF NOT EXISTS wechat_context_tokens (
+      channel_account_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      context_token TEXT NOT NULL,
+      refreshed_at_ms INTEGER NOT NULL,
+      source_message_id TEXT,
+      source_sequence INTEGER,
+      send_count INTEGER NOT NULL DEFAULT 0,
+      last_sent_at_ms INTEGER,
+      PRIMARY KEY (channel_account_id, user_id),
+      FOREIGN KEY (channel_account_id) REFERENCES channel_accounts(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_wechat_context_tokens_refreshed
+      ON wechat_context_tokens(refreshed_at_ms);
     CREATE TABLE IF NOT EXISTS im_context_bindings (
       source_jid TEXT NOT NULL,
       context_type TEXT NOT NULL,
@@ -1225,6 +1239,12 @@ export function initDatabase(): void {
   );
   ensureColumn('usage_records', 'billed_cost_usd', 'REAL NOT NULL DEFAULT 0');
   ensureColumn('usage_records', 'usage_date', 'TEXT');
+  // v70 -> v71: distinguish an exact getUpdates replay from a different
+  // inbound message whose provider timestamp falls in the same millisecond.
+  // Unconditional ensureColumn also repairs production databases already
+  // stamped v70 before this process starts.
+  ensureColumn('wechat_context_tokens', 'source_message_id', 'TEXT');
+  ensureColumn('wechat_context_tokens', 'source_sequence', 'INTEGER');
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_event_model
       ON usage_records(event_id, model) WHERE event_id IS NOT NULL;
@@ -2764,6 +2784,132 @@ export function getMessageChannelTurnContext(
   return parseChannelTurnContext(row?.channel_context) ?? null;
 }
 
+/**
+ * Find a previously admitted note that already carries the complete material
+ * for this physical merged-forward root. This durable lookup lets a root event
+ * that arrives after its note remain visible in history without scheduling a
+ * redundant Agent turn. Merely sharing a bundle id is not enough: enrichment
+ * must have persisted the provider-fetched root as forwarded material.
+ */
+export function findForwardBundleCoveringComment(
+  chatJid: string,
+  bundleId: string,
+  sender: string,
+): string | null {
+  const rows = db
+    .prepare(
+      `SELECT id, channel_context
+       FROM messages
+       WHERE chat_jid = ? AND sender = ? AND is_from_me = 0
+         AND channel_context IS NOT NULL
+         AND COALESCE(delivery_status, '') <> 'cancelled'
+         AND json_valid(channel_context)
+         AND json_extract(channel_context, '$.message.contentLink.kind') = 'forward_bundle'
+         AND json_extract(channel_context, '$.message.contentLink.bundleId') = ?
+         AND json_extract(channel_context, '$.message.contentLink.role') = 'forwarder_comment'
+       ORDER BY timestamp DESC, id DESC`,
+    )
+    .all(chatJid, sender, bundleId) as Array<{
+    id: string;
+    channel_context?: unknown;
+  }>;
+  for (const row of rows) {
+    const context = parseChannelTurnContext(row.channel_context);
+    if (!context) continue;
+    const link = context.message.contentLink;
+    if (
+      link?.kind !== 'forward_bundle' ||
+      link.bundleId !== bundleId ||
+      link.role !== 'forwarder_comment'
+    ) {
+      continue;
+    }
+    const coversRoot = context.message.referencedMessages?.some(
+      (reference) =>
+        reference.id === bundleId &&
+        reference.materialResolved === true &&
+        reference.contentLink?.kind === 'forward_bundle' &&
+        reference.contentLink.bundleId === bundleId &&
+        reference.contentLink.role === 'forwarded_content',
+    );
+    if (coversRoot) return String(row.id);
+  }
+  return null;
+}
+
+/** Find any already-persisted companion note for a provider bundle, including
+ * a note that was cancelled or whose quoted material was incomplete. The
+ * result is used only to recognize a root event that arrived out of provider
+ * order; delivery eligibility remains the responsibility of the covering
+ * lookup above. The raw direct-parent shape is included because a best-effort
+ * note-first OAPI probe can return no item, leaving no link to persist even
+ * though the later root proves the relation. */
+export function findForwardBundleCommentTail(
+  chatJid: string,
+  bundleId: string,
+  sender: string,
+  rootTimestamp: string,
+): { id: string; timestamp: string } | null {
+  const rootMs = Date.parse(rootTimestamp);
+  const latestCompanionTimestamp = Number.isFinite(rootMs)
+    ? new Date(rootMs + 60_000).toISOString()
+    : rootTimestamp;
+  const row = db
+    .prepare(
+      `SELECT id, timestamp
+       FROM messages
+       WHERE chat_jid = ? AND sender = ? AND is_from_me = 0
+         AND channel_context IS NOT NULL
+         AND json_valid(channel_context)
+         AND timestamp >= ? AND timestamp <= ?
+         AND (
+           (
+             json_extract(channel_context, '$.message.contentLink.kind') = 'forward_bundle'
+             AND json_extract(channel_context, '$.message.contentLink.bundleId') = ?
+             AND json_extract(channel_context, '$.message.contentLink.role') = 'forwarder_comment'
+           ) OR (
+             json_extract(channel_context, '$.message.rootId') = ?
+             AND json_extract(channel_context, '$.message.parentId') = ?
+             AND json_extract(channel_context, '$.message.type') IN ('text', 'post')
+           )
+         )
+       ORDER BY timestamp DESC, id DESC
+       LIMIT 1`,
+    )
+    .get(
+      chatJid,
+      sender,
+      rootTimestamp,
+      latestCompanionTimestamp,
+      bundleId,
+      bundleId,
+      bundleId,
+    ) as { id: string; timestamp: string } | undefined;
+  return row ?? null;
+}
+
+/** Preserve actual admission order for a provider event known to have arrived
+ * late. Cursor readers are intentionally monotonic in `(timestamp,id)`; using
+ * the root's older provider create_time here would make a complete late root
+ * permanently invisible after its newer note committed. */
+export function sequenceInboundTimestampAfterChatTail(
+  chatJid: string,
+  proposedTimestamp: string,
+): string {
+  const row = db
+    .prepare(
+      `SELECT timestamp FROM messages
+       WHERE chat_jid = ? AND is_from_me = 0
+       ORDER BY timestamp DESC, id DESC LIMIT 1`,
+    )
+    .get(chatJid) as { timestamp?: string } | undefined;
+  const tail = row?.timestamp;
+  if (!tail || proposedTimestamp > tail) return proposedTimestamp;
+  const tailMs = Date.parse(tail);
+  if (!Number.isFinite(tailMs)) return proposedTimestamp;
+  return new Date(tailMs + 1).toISOString();
+}
+
 function normalizeQueuedFollowUpRow(
   row: Record<string, unknown>,
 ): QueuedFollowUp {
@@ -3049,6 +3195,58 @@ export function claimNextQueuedFollowUp(
   })();
 }
 
+/**
+ * Atomically snapshot the next durable follow-up turn.
+ *
+ * Normal queued messages are drained together in the user-visible queue order
+ * so a burst received while an Agent loop is active becomes one subsequent
+ * Agent turn.  A steer is an explicit priority hand-off and therefore remains
+ * a single-message barrier; later queued messages wait for the turn after it.
+ * Rows admitted after this transaction are intentionally left for the next
+ * snapshot.
+ */
+export function claimNextQueuedFollowUpBatch(
+  chatJid: string,
+  runId: string,
+): QueuedFollowUp[] {
+  const select = db.prepare(
+    `${FOLLOW_UP_SELECT}
+     WHERE chat_jid = ? AND delivery_status = 'queued'
+     ORDER BY delivery_priority ASC, timestamp ASC, id ASC`,
+  );
+  const update = db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'promoting', delivery_run_id = ?,
+         delivery_updated_at = ?
+     WHERE chat_jid = ? AND id = ? AND delivery_status = 'queued'`,
+  );
+  return db.transaction(() => {
+    const rows = select.all(chatJid) as Array<Record<string, unknown>>;
+    if (rows.length === 0) return [];
+    const queued = rows.map(normalizeQueuedFollowUpRow);
+    const firstSteerIndex = queued.findIndex(
+      (item) => item.delivery_mode === 'steer',
+    );
+    const claimed =
+      firstSteerIndex === 0
+        ? queued.slice(0, 1)
+        : queued.slice(
+            0,
+            firstSteerIndex === -1 ? queued.length : firstSteerIndex,
+          );
+    const updatedAt = new Date().toISOString();
+    for (const item of claimed) {
+      const result = update.run(runId, updatedAt, chatJid, item.id);
+      if (result.changes !== 1) {
+        throw new Error(
+          `Failed to claim queued follow-up batch row ${item.id}`,
+        );
+      }
+    }
+    return claimed;
+  })();
+}
+
 export function releaseQueuedFollowUp(
   chatJid: string,
   messageId: string,
@@ -3065,6 +3263,59 @@ export function releaseQueuedFollowUp(
       updatedAt,
     },
   );
+}
+
+export function releaseQueuedFollowUpBatch(
+  items: Array<Pick<QueuedFollowUp, 'chat_jid' | 'id'>>,
+  runId: string,
+  updatedAt = new Date().toISOString(),
+): boolean {
+  if (items.length === 0) return false;
+  const update = db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'released', delivery_run_id = ?,
+         delivery_updated_at = ?
+     WHERE chat_jid = ? AND id = ?
+       AND delivery_status IN ('queued', 'promoting')`,
+  );
+  try {
+    return db.transaction(() => {
+      for (const item of items) {
+        const result = update.run(runId, updatedAt, item.chat_jid, item.id);
+        if (result.changes !== 1) {
+          throw new Error(`Failed to release follow-up batch row ${item.id}`);
+        }
+      }
+      return true;
+    })();
+  } catch {
+    return false;
+  }
+}
+
+export function restorePromotingFollowUpBatch(
+  items: Array<Pick<QueuedFollowUp, 'chat_jid' | 'id'>>,
+): boolean {
+  if (items.length === 0) return false;
+  const update = db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'queued', delivery_updated_at = ?
+     WHERE chat_jid = ? AND id = ? AND delivery_status = 'promoting'`,
+  );
+  try {
+    return db.transaction(() => {
+      const updatedAt = new Date().toISOString();
+      for (const item of items) {
+        const result = update.run(updatedAt, item.chat_jid, item.id);
+        if (result.changes !== 1) {
+          throw new Error(`Failed to restore follow-up batch row ${item.id}`);
+        }
+      }
+      return true;
+    })();
+  } catch {
+    return false;
+  }
 }
 
 export function beginPromotingFollowUp(
@@ -3086,6 +3337,19 @@ export function cancelQueuedFollowUp(
   messageId: string,
   updatedAt?: string,
 ): QueuedFollowUp | null {
+  // A late physical forward root can be durably covered by this note. Once
+  // that happens, cancelling only the note would hide both inputs. Treat the
+  // pair as already admitted; a cancel that wins before root arrival remains
+  // allowed, and the later root is then scheduled normally.
+  const coversSubsumedRoot = db
+    .prepare(
+      `SELECT 1 FROM messages
+       WHERE chat_jid = ? AND delivery_status = 'subsumed'
+         AND delivery_run_id = ?
+       LIMIT 1`,
+    )
+    .get(chatJid, messageId);
+  if (coversSubsumedRoot) return null;
   return transitionFollowUp(
     chatJid,
     messageId,
@@ -3093,6 +3357,43 @@ export function cancelQueuedFollowUp(
     'cancelled',
     { updatedAt },
   );
+}
+
+/**
+ * Atomically cancel the durable follow-up cutoff captured by `/break`.
+ * Rows arriving after this synchronous transaction are not part of the
+ * cutoff and continue through the normal queue. A covered late-forward root
+ * is cancelled with its owning note so the audit trail does not leave half a
+ * bundle hidden as `subsumed`.
+ */
+export function cancelQueuedFollowUpsAtCutoff(
+  chatJid: string,
+  updatedAt = new Date().toISOString(),
+): QueuedFollowUp[] {
+  return db.transaction(() => {
+    const items = listQueuedFollowUps(chatJid);
+    if (items.length === 0) return [];
+    const cancelQueued = db.prepare(
+      `UPDATE messages
+       SET delivery_status = 'cancelled', delivery_updated_at = ?
+       WHERE chat_jid = ? AND id = ?
+         AND delivery_status IN ('queued', 'promoting')`,
+    );
+    const cancelCoveredRoot = db.prepare(
+      `UPDATE messages
+       SET delivery_status = 'cancelled', delivery_updated_at = ?
+       WHERE chat_jid = ? AND delivery_status = 'subsumed'
+         AND delivery_run_id = ?`,
+    );
+    for (const item of items) {
+      const result = cancelQueued.run(updatedAt, chatJid, item.id);
+      if (result.changes !== 1) {
+        throw new Error(`Failed to cancel follow-up cutoff row ${item.id}`);
+      }
+      cancelCoveredRoot.run(updatedAt, chatJid, item.id);
+    }
+    return items;
+  })();
 }
 
 /**
@@ -5776,6 +6077,7 @@ export interface StoreScheduledGroupPromptInput {
   senderName: string;
   text: string;
   queuedResult: string;
+  interactionMode: InteractionMode;
 }
 
 /**
@@ -5790,10 +6092,17 @@ export interface StoreScheduledGroupPromptInput {
 export function storeScheduledGroupPromptAndCompleteRun(
   input: StoreScheduledGroupPromptInput,
 ): string {
+  if (
+    input.interactionMode !== 'assistant' &&
+    input.interactionMode !== 'proactive'
+  ) {
+    throw new Error('Invalid scheduled group interaction mode');
+  }
   return db.transaction(() => {
     const run = db
       .prepare(
-        `SELECT task_id, status, lease_owner, lease_token, started_at, created_at
+        `SELECT task_id, status, lease_owner, lease_token, started_at, created_at,
+                definition_snapshot
          FROM task_runs WHERE id = ?`,
       )
       .get(input.runId) as
@@ -5805,6 +6114,7 @@ export function storeScheduledGroupPromptAndCompleteRun(
           | 'lease_token'
           | 'started_at'
           | 'created_at'
+          | 'definition_snapshot'
         >
       | undefined;
     if (!run || run.task_id !== input.taskId) {
@@ -5812,6 +6122,21 @@ export function storeScheduledGroupPromptAndCompleteRun(
         `Group task run ${input.runId} does not belong to task ${input.taskId}`,
       );
     }
+
+    let definitionSnapshot: TaskRunDefinitionSnapshot;
+    try {
+      definitionSnapshot = JSON.parse(
+        run.definition_snapshot,
+      ) as TaskRunDefinitionSnapshot;
+    } catch {
+      throw new Error(
+        `Group task run ${input.runId} has an invalid definition snapshot`,
+      );
+    }
+    if (definitionSnapshot.context_mode !== 'group') {
+      throw new Error(`Task run ${input.runId} is not a group-mode occurrence`);
+    }
+    definitionSnapshot.interaction_mode = input.interactionMode;
 
     ensureChatExists(input.chatJid);
     const messageId = storeMessageDirect(
@@ -5839,6 +6164,7 @@ export function storeScheduledGroupPromptAndCompleteRun(
       .prepare(
         `UPDATE task_runs
          SET status = 'delivered', result = ?, error = NULL,
+             definition_snapshot = ?,
              notification_status = 'skipped', notification_error = NULL,
              duration_ms = ?, completed_at = ?,
              lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
@@ -5847,6 +6173,7 @@ export function storeScheduledGroupPromptAndCompleteRun(
       )
       .run(
         input.queuedResult,
+        JSON.stringify(definitionSnapshot),
         durationMs,
         now,
         now,
@@ -6302,11 +6629,40 @@ export interface TaskRunImFileNotificationPayload {
   fileName: string;
 }
 
+interface TaskRunImChannelNotificationBase {
+  /** Resolve the current binding for this channel again on durable retry. */
+  targetChannel: string;
+  ownerId: string;
+  workspaceFolder: string;
+}
+
+export interface TaskRunImChannelMessageNotificationPayload extends TaskRunImChannelNotificationBase {
+  kind: 'im_channel_message';
+  text: string;
+}
+
+export interface TaskRunImChannelImageNotificationPayload extends TaskRunImChannelNotificationBase {
+  kind: 'im_channel_image';
+  filePath: string;
+  mimeType: string;
+  caption?: string;
+  fileName?: string;
+}
+
+export interface TaskRunImChannelFileNotificationPayload extends TaskRunImChannelNotificationBase {
+  kind: 'im_channel_file';
+  filePath: string;
+  fileName: string;
+}
+
 export type TaskRunAtomicNotificationPayload =
   | TaskRunTextNotificationPayload
   | TaskRunImMessageNotificationPayload
   | TaskRunImImageNotificationPayload
-  | TaskRunImFileNotificationPayload;
+  | TaskRunImFileNotificationPayload
+  | TaskRunImChannelMessageNotificationPayload
+  | TaskRunImChannelImageNotificationPayload
+  | TaskRunImChannelFileNotificationPayload;
 
 export type TaskRunNotificationPayload =
   | TaskRunAtomicNotificationPayload
@@ -6476,7 +6832,9 @@ function notificationPayloadChannels(
       taskRunNotificationPayloadItems(payload).map((item) =>
         'targetJid' in item
           ? item.targetJid.split(':', 1)[0] || item.targetJid
-          : (item.options?.notifyChannels?.[0] ?? item.chatJid),
+          : 'targetChannel' in item
+            ? item.targetChannel
+            : (item.options?.notifyChannels?.[0] ?? item.chatJid),
       ),
     ),
   ];
@@ -10186,6 +10544,225 @@ export function getLegacyChannelAccount(
   return row ? parseChannelAccountRow(row) : undefined;
 }
 
+export interface StoredWeChatContextToken {
+  channel_account_id: string;
+  user_id: string;
+  context_token: string;
+  refreshed_at_ms: number;
+  source_message_id: string | null;
+  source_sequence: number | null;
+  send_count: number;
+  last_sent_at_ms: number | null;
+}
+
+export type WeChatContextTokenClaimResult =
+  | { status: 'claimed'; record: StoredWeChatContextToken }
+  | { status: 'missing' | 'changed' | 'expired' | 'quota_exhausted' };
+
+/** List only one channel account's reply credentials; tokens never cross accounts. */
+export function listWeChatContextTokens(
+  channelAccountId: string,
+): StoredWeChatContextToken[] {
+  return db
+    .prepare(
+      `SELECT channel_account_id, user_id, context_token, refreshed_at_ms,
+              source_message_id, source_sequence, send_count, last_sent_at_ms
+       FROM wechat_context_tokens
+       WHERE channel_account_id = ?`,
+    )
+    .all(channelAccountId) as StoredWeChatContextToken[];
+}
+
+/** A new authorized inbound message refreshes both lifetime and send budget. */
+export function upsertWeChatContextToken(input: {
+  channelAccountId: string;
+  userId: string;
+  contextToken: string;
+  refreshedAtMs: number;
+  sourceMessageId?: string | null;
+  sourceSequence?: number | null;
+}): StoredWeChatContextToken {
+  db.prepare(
+    `INSERT INTO wechat_context_tokens (
+       channel_account_id, user_id, context_token, refreshed_at_ms,
+       source_message_id, source_sequence, send_count, last_sent_at_ms
+     ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL)
+     ON CONFLICT(channel_account_id, user_id) DO UPDATE SET
+       context_token = excluded.context_token,
+       refreshed_at_ms = excluded.refreshed_at_ms,
+       source_message_id = excluded.source_message_id,
+       source_sequence = excluded.source_sequence,
+       send_count = 0,
+       last_sent_at_ms = NULL
+     WHERE (
+       excluded.source_message_id IS NULL
+       AND wechat_context_tokens.source_message_id IS NULL
+       AND excluded.refreshed_at_ms > wechat_context_tokens.refreshed_at_ms
+     ) OR (
+       excluded.source_message_id IS NOT NULL
+       AND wechat_context_tokens.source_message_id IS NOT NULL
+       AND excluded.source_message_id <> wechat_context_tokens.source_message_id
+       AND (
+         (
+           excluded.source_sequence IS NOT NULL
+           AND wechat_context_tokens.source_sequence IS NOT NULL
+           AND excluded.source_sequence > wechat_context_tokens.source_sequence
+         ) OR (
+           excluded.source_sequence IS NOT NULL
+           AND wechat_context_tokens.source_sequence IS NULL
+           AND excluded.refreshed_at_ms >= wechat_context_tokens.refreshed_at_ms
+         ) OR (
+           excluded.source_sequence IS NULL
+           AND wechat_context_tokens.source_sequence IS NOT NULL
+           AND excluded.refreshed_at_ms > wechat_context_tokens.refreshed_at_ms
+         ) OR (
+           excluded.source_sequence IS NULL
+           AND wechat_context_tokens.source_sequence IS NULL
+           AND excluded.refreshed_at_ms >= wechat_context_tokens.refreshed_at_ms
+         )
+       )
+     ) OR (
+       excluded.source_message_id IS NOT NULL
+       AND wechat_context_tokens.source_message_id IS NULL
+       AND (
+         excluded.refreshed_at_ms > wechat_context_tokens.refreshed_at_ms
+         OR (
+           excluded.refreshed_at_ms = wechat_context_tokens.refreshed_at_ms
+           AND excluded.context_token <> wechat_context_tokens.context_token
+         )
+       )
+     )`,
+  ).run(
+    input.channelAccountId,
+    input.userId,
+    input.contextToken,
+    input.refreshedAtMs,
+    input.sourceMessageId ?? null,
+    input.sourceSequence ?? null,
+  );
+  return db
+    .prepare(
+      `SELECT channel_account_id, user_id, context_token, refreshed_at_ms,
+              source_message_id, source_sequence, send_count, last_sent_at_ms
+       FROM wechat_context_tokens
+       WHERE channel_account_id = ? AND user_id = ?`,
+    )
+    .get(input.channelAccountId, input.userId) as StoredWeChatContextToken;
+}
+
+/**
+ * Atomically reserve one or more sendmessage calls against a specific token
+ * generation. Reserving before network I/O is deliberately conservative: a
+ * crash can consume local budget, but can never make us exceed iLink's limit.
+ */
+export function claimWeChatContextToken(input: {
+  channelAccountId: string;
+  userId: string;
+  expectedToken: string;
+  expectedRefreshedAtMs: number;
+  expectedSourceMessageId?: string | null;
+  claimCount: number;
+  maxSendCount: number;
+  maxAgeMs: number;
+  nowMs: number;
+}): WeChatContextTokenClaimResult {
+  if (!Number.isInteger(input.claimCount) || input.claimCount <= 0) {
+    throw new Error('WeChat context_token claimCount must be positive');
+  }
+  return db
+    .transaction((): WeChatContextTokenClaimResult => {
+      const record = db
+        .prepare(
+          `SELECT channel_account_id, user_id, context_token, refreshed_at_ms,
+                  source_message_id, source_sequence, send_count, last_sent_at_ms
+           FROM wechat_context_tokens
+           WHERE channel_account_id = ? AND user_id = ?`,
+        )
+        .get(input.channelAccountId, input.userId) as
+        | StoredWeChatContextToken
+        | undefined;
+      if (!record) return { status: 'missing' };
+      if (
+        record.context_token !== input.expectedToken ||
+        record.refreshed_at_ms !== input.expectedRefreshedAtMs ||
+        (input.expectedSourceMessageId !== undefined &&
+          record.source_message_id !== input.expectedSourceMessageId)
+      ) {
+        return { status: 'changed' };
+      }
+      if (input.nowMs - record.refreshed_at_ms >= input.maxAgeMs) {
+        return { status: 'expired' };
+      }
+      if (record.send_count + input.claimCount > input.maxSendCount) {
+        return { status: 'quota_exhausted' };
+      }
+      const sendCount = record.send_count + input.claimCount;
+      db.prepare(
+        `UPDATE wechat_context_tokens
+         SET send_count = ?, last_sent_at_ms = ?
+         WHERE channel_account_id = ? AND user_id = ?
+           AND context_token = ? AND refreshed_at_ms = ?`,
+      ).run(
+        sendCount,
+        input.nowMs,
+        input.channelAccountId,
+        input.userId,
+        input.expectedToken,
+        input.expectedRefreshedAtMs,
+      );
+      return {
+        status: 'claimed',
+        record: {
+          ...record,
+          send_count: sendCount,
+          last_sent_at_ms: input.nowMs,
+        },
+      };
+    })
+    .immediate();
+}
+
+/** Compare-and-delete prevents an old failed request from erasing a refresh. */
+export function deleteWeChatContextToken(input: {
+  channelAccountId: string;
+  userId: string;
+  expectedToken?: string;
+  expectedRefreshedAtMs?: number;
+  expectedSourceMessageId?: string | null;
+}): boolean {
+  const withGeneration =
+    input.expectedToken !== undefined &&
+    input.expectedRefreshedAtMs !== undefined;
+  const result = db
+    .prepare(
+      withGeneration
+        ? input.expectedSourceMessageId !== undefined
+          ? `DELETE FROM wechat_context_tokens
+             WHERE channel_account_id = ? AND user_id = ?
+               AND context_token = ? AND refreshed_at_ms = ?
+               AND source_message_id IS ?`
+          : `DELETE FROM wechat_context_tokens
+             WHERE channel_account_id = ? AND user_id = ?
+               AND context_token = ? AND refreshed_at_ms = ?`
+        : `DELETE FROM wechat_context_tokens
+           WHERE channel_account_id = ? AND user_id = ?`,
+    )
+    .run(
+      input.channelAccountId,
+      input.userId,
+      ...(withGeneration
+        ? [
+            input.expectedToken,
+            input.expectedRefreshedAtMs,
+            ...(input.expectedSourceMessageId !== undefined
+              ? [input.expectedSourceMessageId]
+              : []),
+          ]
+        : []),
+    );
+  return result.changes > 0;
+}
+
 export function listChannelAccountsForUser(
   ownerUserId: string,
 ): ChannelAccount[] {
@@ -10316,6 +10893,11 @@ export function deleteChannelAccount(id: string, ownerUserId: string): boolean {
   return db.transaction(() => {
     const current = getChannelAccountForUser(id, ownerUserId);
     if (!current) return false;
+    // Keep cleanup correct even on legacy databases where foreign-key
+    // enforcement had to be disabled because of unrelated historical orphans.
+    db.prepare(
+      'DELETE FROM wechat_context_tokens WHERE channel_account_id = ?',
+    ).run(id);
     const result = db
       .prepare(
         'DELETE FROM channel_accounts WHERE id = ? AND owner_user_id = ?',

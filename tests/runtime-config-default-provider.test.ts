@@ -139,4 +139,92 @@ describe('default model configuration', () => {
       defaultProviderId: firstEnabledId,
     });
   });
+
+  test('promoting a disabled provider to default auto-enables it', () => {
+    const primary = runtimeConfig.createProvider({
+      name: 'Auto-enable primary',
+      type: 'third_party',
+      anthropicBaseUrl: 'https://ae-primary.example.test',
+      anthropicAuthToken: 'ae-primary-token',
+      anthropicModel: 'ae-primary-model',
+      enabled: true,
+    });
+    runtimeConfig.setDefaultProvider(primary.id);
+    expect(runtimeConfig.getDefaultProviderId()).toBe(primary.id);
+
+    const alt = runtimeConfig.createProvider({
+      name: 'Auto-enable alt',
+      type: 'third_party',
+      anthropicBaseUrl: 'https://ae-alt.example.test',
+      anthropicAuthToken: 'ae-alt-token',
+      anthropicModel: 'ae-alt-model',
+      enabled: false,
+    });
+    expect(alt.enabled).toBe(false);
+
+    // 旧行为是抛错「默认模型配置必须处于启用状态」；现在应自动启用并设为默认，
+    // 从而把原默认释放出来去禁用或删除，避免死结。
+    const promoted = runtimeConfig.setDefaultProvider(alt.id);
+    expect(promoted.enabled).toBe(true);
+    expect(runtimeConfig.getDefaultProviderId()).toBe(alt.id);
+    expect(() =>
+      runtimeConfig.setProviderEnabled(primary.id, false),
+    ).not.toThrow();
+  });
+
+  test('persists refreshed OAuth credentials with full compare-and-swap semantics', () => {
+    const original = {
+      accessToken: 'oauth-access-original',
+      refreshToken: 'oauth-refresh-original',
+      expiresAt: 1_800_000_000_000,
+      // Imported legacy credentials can lack scopes; reconciliation sees the
+      // default scopes emitted by buildClaudeAiOauthPayload.
+      scopes: [],
+      subscriptionType: 'max',
+    };
+    const effectiveOriginal = {
+      ...original,
+      scopes: ['user:inference', 'user:profile', 'user:sessions:claude_code'],
+    };
+    const refreshed = {
+      accessToken: 'oauth-access-refreshed',
+      refreshToken: 'oauth-refresh-refreshed',
+      expiresAt: 1_800_003_600_000,
+      scopes: ['user:inference', 'user:profile'],
+      subscriptionType: 'max',
+    };
+    const provider = runtimeConfig.createProvider({
+      name: 'OAuth CAS provider',
+      type: 'official',
+      claudeOAuthCredentials: original,
+      enabled: true,
+    });
+
+    expect(
+      runtimeConfig.updateProviderOAuthCredentialsIfCurrent(
+        provider.id,
+        {
+          ...effectiveOriginal,
+          scopes: [...effectiveOriginal.scopes].reverse(),
+        },
+        refreshed,
+      ),
+    ).toBe(true);
+    expect(
+      runtimeConfig.getProviders().find((item) => item.id === provider.id)
+        ?.claudeOAuthCredentials,
+    ).toEqual(refreshed);
+
+    expect(
+      runtimeConfig.updateProviderOAuthCredentialsIfCurrent(
+        provider.id,
+        original,
+        { ...refreshed, accessToken: 'must-not-win' },
+      ),
+    ).toBe(false);
+    expect(
+      runtimeConfig.getProviders().find((item) => item.id === provider.id)
+        ?.claudeOAuthCredentials,
+    ).toEqual(refreshed);
+  });
 });

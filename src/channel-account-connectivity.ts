@@ -7,6 +7,7 @@ import {
   createWeChatHttpDispatcher,
   isWeChatConnectTimeout,
 } from './wechat-http.js';
+import { createWeComConnection } from './wecom.js';
 
 export interface ChannelAccountCredentialTestResult {
   success: boolean;
@@ -135,6 +136,31 @@ export async function testChannelAccountCredentials(
     } finally {
       clearTimeout(timer);
       await dispatcher.close();
+    }
+  }
+
+  if (account.provider === 'wecom') {
+    const connection = createWeComConnection({
+      botId: secret.botId || '',
+      secret: secret.secret || '',
+      corpId: secret.corpId,
+      channelAccountId: account.id,
+    });
+    try {
+      await connection.connect({
+        onNewChat: () => undefined,
+        // Credential tests never admit inbound traffic received during the
+        // short authentication probe.
+        isChatAuthorized: () => false,
+      });
+      return { success: true };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      await connection.disconnect().catch(() => undefined);
     }
   }
 

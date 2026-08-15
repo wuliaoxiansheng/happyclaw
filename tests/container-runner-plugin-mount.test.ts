@@ -57,8 +57,13 @@ const catalog = await import('../src/plugin-catalog.js');
 const utils = await import('../src/plugin-utils.js');
 const materializer = await import('../src/plugin-materializer.js');
 
-const { buildVolumeMounts, prepareHostPlugins, replaceHostMcpServersEnv } =
-  containerRunner;
+const {
+  buildContainerArgs,
+  buildVolumeMounts,
+  prepareHostPlugins,
+  replaceHostMcpServersEnv,
+  resolveContainerProxyConfig,
+} = containerRunner;
 const { writeCatalogIndex, getCatalogSnapshotDir } = catalog;
 const { CONTAINER_PLUGINS_PATH } = utils;
 const { getUserRuntimeRoot, getUserPluginRuntimeDir } = materializer;
@@ -150,6 +155,53 @@ afterEach(() => {
       fs.rmSync(path.join(tmpDataDir, entry), { recursive: true, force: true });
     }
   }
+});
+
+describe('buildVolumeMounts — container proxy secret boundary', () => {
+  test('writes credentials to the 0600 runtime env file, never docker argv', () => {
+    const secret = 'proxy-password-must-stay-in-env-file';
+    const proxy = resolveContainerProxyConfig(
+      {
+        httpsProxy: `http://alice:${secret}@proxy.example:8443`,
+        httpProxy: '',
+        noProxy: 'localhost,.internal',
+      },
+      'linux',
+    );
+    const mounts = buildVolumeMounts(
+      fakeGroup('proxy-secret', USER) as any,
+      false,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      proxy,
+    );
+
+    const envMount = mounts.find(
+      (mount) => mount.containerPath === '/workspace/env-dir',
+    );
+    expect(envMount).toMatchObject({ readonly: true });
+    const envFile = path.join(envMount!.hostPath, 'env');
+    const envContents = fs.readFileSync(envFile, 'utf8');
+    expect(envContents).toContain(
+      `HTTPS_PROXY='http://alice:${secret}@proxy.example:8443'`,
+    );
+    expect(envContents).toContain("NO_PROXY='localhost,.internal'");
+    expect(fs.statSync(envFile).mode & 0o777).toBe(0o600);
+
+    const args = buildContainerArgs(mounts, 'proxy-secret', 'UTC', {
+      mode: 'unknown',
+    });
+    expect(args.join(' ')).not.toContain(secret);
+    expect(args.join(' ')).not.toContain('HTTPS_PROXY=');
+  });
 });
 
 describe('buildVolumeMounts — Claude Code plugins runtime mount', () => {

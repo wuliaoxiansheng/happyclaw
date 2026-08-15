@@ -52,6 +52,10 @@ describe('reproducible build contract', () => {
     expect(ci).toContain('npm ci');
     expect(ci).toContain('npm --prefix web ci');
     expect(ci).toContain('npm --prefix container/agent-runner ci');
+    expect(ci).toContain('npm run audit:prod');
+    expect(read('package.json')).toContain(
+      'npm --prefix container/agent-runner audit --omit=dev',
+    );
     expect(ci).not.toMatch(/^\s+npm(?: --prefix \S+)? install\s*$/m);
     expect(ci).toMatch(/uses: actions\/checkout@[a-f0-9]{40}/);
     expect(ci).toMatch(/uses: actions\/setup-node@[a-f0-9]{40}/);

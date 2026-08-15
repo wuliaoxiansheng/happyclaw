@@ -2650,7 +2650,7 @@ export class StreamingCardController {
       this.auxFlushCtrl = new FlushController(1500, 0);
       this.maxPatchFailures = 3;
 
-      logger.debug(
+      logger.info(
         { chatId: this.chatId, messageId, mode: 'streaming' },
         'Streaming card created via streaming mode',
       );
@@ -2685,7 +2685,7 @@ export class StreamingCardController {
       this.flushCtrl = new FlushController(1000, 50);
       this.maxPatchFailures = 3;
 
-      logger.debug(
+      logger.info(
         { chatId: this.chatId, messageId, mode: 'cardkit-v1' },
         'Streaming card created via CardKit v1',
       );
@@ -2738,7 +2738,7 @@ export class StreamingCardController {
         throw new Error('No message_id in response');
       }
 
-      logger.debug(
+      logger.info(
         { chatId: this.chatId, messageId: this.messageId, mode: 'legacy' },
         'Streaming card created via legacy path',
       );

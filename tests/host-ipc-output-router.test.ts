@@ -272,14 +272,13 @@ describe('host IPC primary output routing', () => {
     });
     expect(coordinator.attemptedFinalText).toBe('准确的完整总结正文');
     expect(
-      coordinator.resolveProactiveFinalRecovery(
-        '已通过 send_message(final) 投递完整总结。本轮工作已完成。',
-      ),
-    ).toEqual({
-      deliver: false,
-      text: '准确的完整总结正文',
-      reason: 'explicit_final_attempted',
-    });
+      activeTurnOutputs.recordAttemptedFinal({
+        scopeKey: scope,
+        inputTurnId: 'turn-1',
+        text: '另一个不应替换首个 final 的正文',
+      }),
+    ).toBe(false);
+    expect(coordinator.attemptedFinalText).toBe('准确的完整总结正文');
   });
 
   test('wires both host execution paths to the live visible answer for interruption persistence', () => {

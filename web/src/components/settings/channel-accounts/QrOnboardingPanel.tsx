@@ -46,6 +46,7 @@ export function QrOnboardingPanel({
   const [verifyCode, setVerifyCode] = useState('');
   const [error, setError] = useState<string | null>(null);
   const autoStartedRef = useRef(false);
+  const whatsappConnectedSyncedRef = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -130,12 +131,26 @@ export function QrOnboardingPanel({
 
   useEffect(() => {
     if (account.provider !== 'whatsapp') return;
+    whatsappConnectedSyncedRef.current = false;
     const unsubscribe = wsManager.on(
       'whatsapp_status',
       (event: Partial<ChannelOnboardingState> & { accountId?: string }) => {
         if (event.accountId !== account.id) return;
         const { accountId: _accountId, ...statusEvent } = event;
         void _accountId;
+        if (statusEvent.status !== 'connected') {
+          whatsappConnectedSyncedRef.current = false;
+        } else if (!whatsappConnectedSyncedRef.current) {
+          whatsappConnectedSyncedRef.current = true;
+          // The websocket updates this panel immediately, but the account-level
+          // pairing gate reads the authoritative account in the Zustand store.
+          // Reconcile it once before the connected state stops QR polling.
+          void refresh().then((current) => {
+            if (current?.auth_status !== 'authorized') {
+              whatsappConnectedSyncedRef.current = false;
+            }
+          });
+        }
         setOnboarding((current) =>
           mergeWhatsAppOnboardingState(current, statusEvent),
         );
@@ -144,7 +159,7 @@ export function QrOnboardingPanel({
     return () => {
       unsubscribe();
     };
-  }, [account.id, account.provider]);
+  }, [account.id, account.provider, refresh]);
 
   useEffect(() => {
     if (account.provider !== 'wechat') return;

@@ -940,11 +940,6 @@ function AccountConnectionDialog({
               </div>
             )}
 
-            {supportsChannelPairing(account.provider) &&
-              account.has_credentials && (
-                <AccountPairingSection account={account} />
-              )}
-
             {account.has_credentials && (
               <div className="border-t border-border pt-4">
                 <Button
@@ -961,6 +956,12 @@ function AccountConnectionDialog({
             )}
           </div>
         )}
+
+        {supportsChannelPairing(account.provider) &&
+          account.has_credentials && (
+            <AccountPairingSection account={account} />
+          )}
+
         {error && (
           <p role="alert" className="text-sm text-error">
             {error}

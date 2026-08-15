@@ -13,7 +13,7 @@ import type {
   RunnerRuntime,
   StuckRecoveryCandidate,
 } from './stuck-runner-recovery.js';
-import type { ChannelTurnContext } from './types.js';
+import type { ChannelTurnContext, InteractionMode } from './types.js';
 export type SendMessageResult = 'sent' | 'no_active';
 export interface IpcMessageCursor {
   timestamp: string;
@@ -52,6 +52,8 @@ export interface RunnerMessageRequirements {
    * constraint. Ignored for host-mode processes.
    */
   feishuCliAccountId?: string | null;
+  /** Delivery contract fixed in the runner system prompt and MCP tools. */
+  interactionMode?: InteractionMode;
 }
 
 interface FeishuCliIdentityRequirement {
@@ -150,6 +152,10 @@ interface GroupState {
   /** Prevent duplicate query-start broadcasts when several delivery paths
    * observe the same reserved query. */
   announcedQueryId: string | null;
+  /** Query that requested an interrupt before its IPC directory existed. */
+  pendingInterruptQueryId: string | null;
+  /** Host callback when a deferred cold-boot interrupt cannot be published. */
+  deferredInterruptFailure?: (queryId: string) => void;
   pendingMessages: boolean;
   pendingTasks: QueuedTask[];
   process: ChildProcess | null;
@@ -165,6 +171,9 @@ interface GroupState {
   retryTask: QueuedTask | null;
   /** Exact message batch captured by the current message-lane attempt. */
   messageRetrySnapshot: MessageRetrySnapshot | null;
+  /** Physical inputs owned by the current logical query only. Unlike the
+   * runner-attempt retry snapshot, this is cleared at every query boundary. */
+  currentQueryCoveredMessageIds: Set<string>;
   restarting: boolean;
   /** Provider profile ID selected for the current active runner (null = default/override). */
   selectedProviderId: string | null;
@@ -172,6 +181,8 @@ interface GroupState {
    * Host processes always keep this null because their native feishu-cli
    * environment/config is authoritative. */
   feishuCliAccountId: string | null;
+  /** Main runner contract; null for task/legacy runners. */
+  interactionMode: InteractionMode | null;
   /** True when a _drain sentinel has been written for the current active runner. */
   drainSentinelWritten: boolean;
   /** True when messages have been IPC-injected into the running agent via sendMessage().
@@ -233,6 +244,7 @@ export class GroupQueue {
       ) => void | Promise<void>)
     | null = null;
   private onContainerExitFn: ((groupJid: string) => void) | null = null;
+  private onRunnerQueryTeardownFn: ((groupJid: string) => void) | null = null;
   private onRunnerStateChangeFn:
     | ((chatJid: string, state: 'idle' | 'running') => void)
     | null = null;
@@ -283,6 +295,7 @@ export class GroupQueue {
         queryId: null,
         queryStartedAt: null,
         announcedQueryId: null,
+        pendingInterruptQueryId: null,
         pendingMessages: false,
         pendingTasks: [],
         process: null,
@@ -295,9 +308,11 @@ export class GroupQueue {
         retryTimer: null,
         retryTask: null,
         messageRetrySnapshot: null,
+        currentQueryCoveredMessageIds: new Set(),
         restarting: false,
         selectedProviderId: null,
         feishuCliAccountId: null,
+        interactionMode: null,
         drainSentinelWritten: false,
         hasIpcInjectedMessages: false,
         ipcOwedSinceAt: null,
@@ -623,12 +638,24 @@ export class GroupQueue {
     groupJid: string,
     snapshot: MessageRetrySnapshot,
   ): boolean {
-    const state = this.groups.get(groupJid);
-    if (!state?.active || state.activeRunnerIsTask) return false;
+    // A cold message runner becomes active before it registers its folder and
+    // process handle. Prefer that exact state during the boot window; sibling
+    // JIDs still fall back to the fully registered shared runner.
+    const ownState = this.groups.get(groupJid);
+    const state = ownState?.active
+      ? ownState
+      : this.resolveActiveState(groupJid);
+    if (!state?.active) return false;
     const coveredCursors = [...snapshot.coveredCursors]
       .map((cursor) => ({ ...cursor }))
       .sort(compareIpcMessageCursors);
     if (coveredCursors.length === 0) return false;
+    // Conversation-agent lanes are implemented with runTask but still own
+    // user-message queries. Track their coverage without turning it into a
+    // message-lane retry snapshot. Scheduled task runners remain excluded.
+    if (state.activeRunnerIsTask) {
+      return groupJid.includes('#agent:');
+    }
     state.messageRetrySnapshot = {
       coveredCursors,
       cursor: { ...coveredCursors[coveredCursors.length - 1] },
@@ -636,8 +663,46 @@ export class GroupQueue {
     return true;
   }
 
+  /**
+   * Bind physical inputs to the query that is current at this exact moment.
+   * Unlike setMessageRetrySnapshot, this never changes runner-attempt retry
+   * ownership and refuses a warm append that belongs to a later SDK turn.
+   */
+  setCurrentQueryCoverage(
+    groupJid: string,
+    expectedQueryId: string,
+    snapshot: MessageRetrySnapshot,
+  ): boolean {
+    const ownState = this.groups.get(groupJid);
+    const state =
+      ownState?.active && ownState.queryInFlight
+        ? ownState
+        : this.resolveActiveState(groupJid);
+    if (
+      !state?.active ||
+      !state.queryInFlight ||
+      state.queryId !== expectedQueryId
+    ) {
+      return false;
+    }
+    const coveredCursors = [...snapshot.coveredCursors]
+      .map((cursor) => ({ ...cursor }))
+      .sort(compareIpcMessageCursors);
+    if (coveredCursors.length === 0) return false;
+    state.currentQueryCoveredMessageIds = new Set(
+      coveredCursors.map((cursor) => cursor.id),
+    );
+    return true;
+  }
+
   setOnContainerExit(fn: (groupJid: string) => void): void {
     this.onContainerExitFn = fn;
+  }
+
+  /** Observe the synchronous point where a runner can no longer emit output.
+   * Kept separate from onContainerExit, whose single owner is the Web runtime. */
+  setOnRunnerQueryTeardown(fn: (groupJid: string) => void): void {
+    this.onRunnerQueryTeardownFn = fn;
   }
 
   setOnRunnerStateChange(
@@ -1099,6 +1164,8 @@ export class GroupQueue {
     state.queryId = null;
     state.queryStartedAt = null;
     state.announcedQueryId = null;
+    state.pendingInterruptQueryId = null;
+    state.currentQueryCoveredMessageIds = new Set();
     if (!completedQueryId) return;
     // Publish the terminal event before the legacy idle callback. The callback
     // may synchronously reserve/announce the next queued query; ordering the
@@ -1112,8 +1179,29 @@ export class GroupQueue {
   }
 
   getActiveQueryId(groupJid: string): string | null {
-    const state = this.resolveActiveState(groupJid);
+    const ownState = this.groups.get(groupJid);
+    const state =
+      ownState?.active && ownState.queryInFlight
+        ? ownState
+        : this.resolveActiveState(groupJid);
     return state?.active && state.queryInFlight ? state.queryId : null;
+  }
+
+  /** True only when the immutable DB batch owned by the active query includes
+   * this physical input. Used by provider-level semantic coalescing so an
+   * unrelated query can never be interrupted merely because it shares a lane. */
+  activeQueryExclusivelyCoversMessage(
+    groupJid: string,
+    messageId: string,
+  ): boolean {
+    const ownState = this.groups.get(groupJid);
+    const state =
+      ownState?.active && ownState.queryInFlight
+        ? ownState
+        : this.resolveActiveState(groupJid);
+    if (!state?.active || !state.queryInFlight || !state.queryId) return false;
+    const covered = state.currentQueryCoveredMessageIds;
+    return covered?.size === 1 && covered.has(messageId);
   }
 
   /** Reserve the next logical query before asynchronous prompt expansion.
@@ -1126,6 +1214,8 @@ export class GroupQueue {
     state.queryId = randomUUID();
     state.queryStartedAt = Date.now();
     state.announcedQueryId = null;
+    state.pendingInterruptQueryId = null;
+    state.currentQueryCoveredMessageIds = new Set();
     return state.queryId;
   }
 
@@ -1147,6 +1237,8 @@ export class GroupQueue {
     state.queryId = null;
     state.queryStartedAt = null;
     state.announcedQueryId = null;
+    state.pendingInterruptQueryId = null;
+    state.currentQueryCoveredMessageIds = new Set();
     this.announceQueryFinish(
       groupJid,
       expectedQueryId,
@@ -1328,6 +1420,14 @@ export class GroupQueue {
     );
   }
 
+  requiresInteractionModeRestart(
+    groupJid: string,
+    interactionMode: InteractionMode,
+  ): boolean {
+    const state = this.resolveActiveState(groupJid);
+    return state !== null && state.interactionMode !== interactionMode;
+  }
+
   enqueueMessageCheck(groupJid: string): void {
     if (this.shuttingDown) return;
 
@@ -1497,6 +1597,8 @@ export class GroupQueue {
       taskRunId?: string;
       selectedProviderId?: string | null;
       feishuCliAccountId?: string | null;
+      interactionMode?: InteractionMode;
+      onDeferredInterruptFailure?: (queryId: string) => void;
     },
   ): void {
     const state = this.getGroup(groupJid);
@@ -1509,6 +1611,41 @@ export class GroupQueue {
     state.taskRunId = opts.taskRunId || null;
     state.selectedProviderId = opts.selectedProviderId ?? null;
     state.feishuCliAccountId = opts.feishuCliAccountId ?? null;
+    state.interactionMode = opts.interactionMode ?? null;
+    state.deferredInterruptFailure = opts.onDeferredInterruptFailure;
+    const pendingInterruptQueryId = state.pendingInterruptQueryId;
+    if (
+      pendingInterruptQueryId &&
+      state.queryInFlight &&
+      state.queryId === pendingInterruptQueryId
+    ) {
+      // The companion note can arrive while the cold runner is still being
+      // prepared and has no IPC path. Materialize that query-bound interrupt
+      // as soon as registration creates a stable path; a later query can never
+      // inherit it because every query boundary clears the pending identity.
+      state.pendingInterruptQueryId = null;
+      if (!this.interruptQuery(groupJid, pendingInterruptQueryId)) {
+        state.deferredInterruptFailure?.(pendingInterruptQueryId);
+        logger.warn(
+          { groupJid, pendingInterruptQueryId },
+          'Failed to publish deferred query interrupt after runner registration',
+        );
+      }
+    } else if (pendingInterruptQueryId) {
+      state.pendingInterruptQueryId = null;
+    }
+    // An incompatible suffix or a new message can be queued after runForGroup
+    // marks the lane active but before the child process registers. The first
+    // drain attempt has no groupFolder/input path yet; close that boot window
+    // here so pending work does not wait for the warm runner's idle timeout.
+    if (
+      state.pendingMessages &&
+      !state.activeRunnerIsTask &&
+      !state.drainSentinelWritten
+    ) {
+      const wrote = this.writeDrainSentinel(state as ActiveGroupState);
+      if (wrote) state.drainSentinelWritten = true;
+    }
   }
 
   /**
@@ -1594,6 +1731,25 @@ export class GroupQueue {
       return 'no_active';
     }
 
+    if (
+      requirements?.interactionMode !== undefined &&
+      state.interactionMode !== requirements.interactionMode
+    ) {
+      this.requestDrainForActiveRunner(
+        groupJid,
+        'Draining runner before switching interaction mode',
+      );
+      logger.info(
+        {
+          groupJid,
+          activeInteractionMode: state.interactionMode,
+          requiredInteractionMode: requirements.interactionMode,
+        },
+        'Rejected warm IPC injection across interaction modes',
+      );
+      return 'no_active';
+    }
+
     // If the active runner is a scheduled task (not a user-message handler),
     // do NOT pipe user messages into it.  The task container has no knowledge
     // of the user conversation context, so any IPC message injected here would
@@ -1623,8 +1779,8 @@ export class GroupQueue {
     // child echoes this identity on every stream event, which lets Web reject
     // late A output without confusing a legitimate retry B that reuses the
     // same durable input/turn ID.
-    const queryRunId =
-      state.queryInFlight && state.queryId ? state.queryId : randomUUID();
+    const startsCurrentQuery = !state.queryInFlight || !state.queryId;
+    const queryRunId = startsCurrentQuery ? randomUUID() : state.queryId!;
 
     const inputDir = this.resolveIpcInputDir(state);
     let tempPath: string | undefined;
@@ -1712,6 +1868,14 @@ export class GroupQueue {
         state.queryId = queryRunId;
         state.queryStartedAt = Date.now();
         state.announcedQueryId = null;
+        state.pendingInterruptQueryId = null;
+        state.currentQueryCoveredMessageIds = new Set(
+          receipt
+            ? (receipt.coveredCursors ?? [receipt.cursor]).map(
+                (cursor) => cursor.id,
+              )
+            : [],
+        );
         this.announceQueryStart(groupJid, state);
       }
       try {
@@ -2044,9 +2208,15 @@ export class GroupQueue {
    * query.interrupt(). The container stays alive and accepts new messages.
    */
   interruptQuery(groupJid: string, expectedQueryId?: string): boolean {
-    // Use resolveActiveState so sibling JIDs (feishu/telegram sharing the
-    // same folder as a web group) are correctly resolved to the active runner.
-    const state = this.resolveActiveState(groupJid);
+    // During cold boot the exact JID is active before registerProcess supplies
+    // groupFolder. Prefer it so a provider companion cannot miss the brief
+    // pre-IPC interrupt window; registered sibling JIDs still resolve through
+    // their shared runner as before.
+    const ownState = this.groups.get(groupJid);
+    const state =
+      ownState?.active && ownState.queryInFlight
+        ? ownState
+        : this.resolveActiveState(groupJid);
     if (!state || !state.queryInFlight) return false;
     if (expectedQueryId && state.queryId !== expectedQueryId) return false;
 
@@ -2054,7 +2224,18 @@ export class GroupQueue {
     // 中断把已积累的 backoff 进度归零。
     this.cancelRetryTimer(state);
 
-    const inputDir = this.resolveIpcInputDir(state);
+    if (!state.groupFolder) {
+      if (!state.queryId) return false;
+      state.pendingInterruptQueryId = state.queryId;
+      logger.info(
+        { groupJid, queryId: state.queryId },
+        'Deferred query interrupt until runner registration',
+      );
+      return true;
+    }
+    state.pendingInterruptQueryId = null;
+
+    const inputDir = this.resolveIpcInputDir(state as ActiveGroupState);
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       try {
@@ -2062,7 +2243,10 @@ export class GroupQueue {
       } catch {
         /* ignore */
       }
-      fs.writeFileSync(path.join(inputDir, '_interrupt'), '');
+      // Bind the sentinel to this exact host query. The runner may start after
+      // a long cold-image delay, while an old file can survive a host crash;
+      // query identity—not mtime—distinguishes those cases safely.
+      fs.writeFileSync(path.join(inputDir, '_interrupt'), state.queryId ?? '');
       logger.info({ groupJid, inputDir }, 'Interrupt sentinel written');
       return true;
     } catch (err) {
@@ -2353,8 +2537,10 @@ export class GroupQueue {
     state.queryId = randomUUID();
     state.queryStartedAt = Date.now();
     state.announcedQueryId = null;
+    state.pendingInterruptQueryId = null;
     state.pendingMessages = false;
     state.messageRetrySnapshot = null;
+    state.currentQueryCoveredMessageIds = new Set();
     this.waitingGroups.delete(groupJid);
     this.activeCount++;
     if (isHostMode) {
@@ -2471,6 +2657,16 @@ export class GroupQueue {
       state.queryId = null;
       state.queryStartedAt = null;
       state.announcedQueryId = null;
+      state.pendingInterruptQueryId = null;
+      state.currentQueryCoveredMessageIds = new Set();
+      try {
+        this.onRunnerQueryTeardownFn?.(groupJid);
+      } catch (err) {
+        logger.error(
+          { groupJid, err },
+          'onRunnerQueryTeardown callback failed',
+        );
+      }
       if (unfinishedQueryId) {
         this.announceQueryFinish(
           groupJid,
@@ -2485,6 +2681,8 @@ export class GroupQueue {
       state.agentId = null;
       state.taskRunId = null;
       state.runnerRuntime = null;
+      state.interactionMode = null;
+      state.deferredInterruptFailure = undefined;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;
@@ -2559,6 +2757,8 @@ export class GroupQueue {
     state.queryId = state.queryInFlight ? randomUUID() : null;
     state.queryStartedAt = state.queryInFlight ? Date.now() : null;
     state.announcedQueryId = null;
+    state.pendingInterruptQueryId = null;
+    state.currentQueryCoveredMessageIds = new Set();
     this.waitingGroups.delete(groupJid);
     this.activeCount++;
     if (isHostMode) {
@@ -2631,6 +2831,16 @@ export class GroupQueue {
       state.queryId = null;
       state.queryStartedAt = null;
       state.announcedQueryId = null;
+      state.pendingInterruptQueryId = null;
+      state.currentQueryCoveredMessageIds = new Set();
+      try {
+        this.onRunnerQueryTeardownFn?.(groupJid);
+      } catch (err) {
+        logger.error(
+          { groupJid, err },
+          'onRunnerQueryTeardown callback failed',
+        );
+      }
       if (unfinishedQueryId) {
         this.announceQueryFinish(
           groupJid,
@@ -2645,6 +2855,8 @@ export class GroupQueue {
       state.agentId = null;
       state.taskRunId = null;
       state.runnerRuntime = null;
+      state.interactionMode = null;
+      state.deferredInterruptFailure = undefined;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;

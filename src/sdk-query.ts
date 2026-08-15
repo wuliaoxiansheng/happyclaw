@@ -52,7 +52,12 @@ export async function sdkQuery(
       options: {
         ...(model && { model }),
         env,
-        maxTurns: 1,
+        maxTurns: 2,
+        // sdkQuery is intentionally text-only. allowedTools controls permission
+        // prompts, not tool visibility, so isolate both tools and settings/skills.
+        tools: [],
+        skills: [],
+        settingSources: [],
         allowedTools: [],
         permissionMode: 'bypassPermissions' as const,
         allowDangerouslySkipPermissions: true,

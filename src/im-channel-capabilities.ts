@@ -66,6 +66,17 @@ export const IM_CHANNEL_CAPABILITIES: Record<string, ImChannelCapabilities> = {
     supports_streaming_updates: false,
     supports_file_send: false,
   },
+  wecom: {
+    channel_type: 'wecom',
+    label: '企业微信',
+    can_bind_workspace: true,
+    can_bind_session: true,
+    supports_thread_map: false,
+    supports_activation_modes: true,
+    supports_owner_mention: true,
+    supports_streaming_updates: true,
+    supports_file_send: false,
+  },
   discord: {
     channel_type: 'discord',
     label: 'Discord',

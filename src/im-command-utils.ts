@@ -89,7 +89,9 @@ export function formatWorkspaceList(
   }
 
   lines.push('');
-  lines.push('💡 /sw <消息> 并行任务 · /recall 总结 · /clear 重置');
+  lines.push(
+    '💡 /steer <消息> 插队 · /break 停止 · /sw <消息> 并行任务 · /clear 重置',
+  );
   return lines.join('\n');
 }
 
@@ -246,7 +248,7 @@ export function formatSystemStatus(
     `⚡ 状态: ${statusText}`,
     `📦 负载: ${queueStatus.activeContainerCount}/${queueStatus.maxContainers} 容器, ${queueStatus.activeHostProcessCount} 个宿主机进程（不同会话不设并发上限）`,
     '',
-    '💡 /sw <消息> 并行任务 · /where 绑定 · /list 全部',
+    '💡 /steer <消息> 插队 · /break 停止 · /where 绑定 · /list 全部',
   ];
 
   return lines.join('\n');

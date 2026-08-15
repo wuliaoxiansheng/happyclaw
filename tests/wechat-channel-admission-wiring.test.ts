@@ -55,6 +55,23 @@ describe('WeChat admission and lifecycle wiring', () => {
     );
   });
 
+  test('adapter never acknowledges outbound work without a live connector', async () => {
+    const channel = createWeChatChannel({
+      botToken: 'token',
+      ilinkBotId: 'bot',
+    });
+
+    await expect(channel.sendMessage('peer', 'hello')).rejects.toThrow(
+      'not connected',
+    );
+    await expect(
+      channel.sendImage?.('peer', Buffer.from('image'), 'image/png'),
+    ).rejects.toThrow('not connected');
+    await expect(
+      channel.sendFile?.('peer', '/tmp/file', 'file.txt'),
+    ).rejects.toThrow('not connected');
+  });
+
   test('manager account-scopes WeChat admission callbacks and forwards expiry', async () => {
     const manager = new IMConnectionManager();
     const isChatAuthorized = vi.fn(() => true);

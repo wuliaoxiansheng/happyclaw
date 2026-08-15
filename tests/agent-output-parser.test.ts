@@ -305,7 +305,7 @@ describe('attachStdoutHandler — framed output parsing (marker collision)', () 
     expect(out[0].result).toBe('hi');
   });
 
-  test('preserves a hidden proactive final candidate for host recovery', async () => {
+  test('preserves a hidden proactive final candidate as control-plane data', async () => {
     const out = await runParser([
       `${S}${JSON.stringify({
         status: 'success',

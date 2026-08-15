@@ -89,6 +89,16 @@ describe('channel onboarding frontend protocol contract', () => {
     expect(store).toContain('/logout');
   });
 
+  test('QR-session accounts render pairing controls outside the credential branch', () => {
+    const manager = read(
+      'web/src/components/settings/ChannelAccountsManager.tsx',
+    );
+    expect(manager).toContain(
+      '        )}\n\n        {supportsChannelPairing(account.provider) &&',
+    );
+    expect(manager).toContain('<AccountPairingSection account={account} />');
+  });
+
   test('auth and transport status are rendered as independent states', () => {
     const manager = read(
       'web/src/components/settings/ChannelAccountsManager.tsx',

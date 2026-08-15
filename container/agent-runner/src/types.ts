@@ -8,6 +8,13 @@
 export type { StreamEventType, StreamEvent } from './stream-event.types.js';
 import type { ClaudeContextAudit, StreamEvent } from './stream-event.types.js';
 
+export interface ChannelContentLink {
+  kind: 'forward_bundle' | 'rapid_topic_bundle';
+  bundleId: string;
+  role: 'forwarded_content' | 'forwarder_comment';
+  relatedMessageId?: string;
+}
+
 /**
  * Sanitized, per-input-turn channel identity supplied by the HappyClaw host.
  *
@@ -44,6 +51,7 @@ export interface ChannelTurnContext {
     parentId?: string;
     threadId?: string;
     type?: string;
+    contentLink?: ChannelContentLink;
   };
   sender?: {
     openId?: string;
@@ -79,6 +87,27 @@ function compactObject<T extends UnknownRecord>(value: T): T | undefined {
   return Object.values(value).some((item) => item !== undefined)
     ? value
     : undefined;
+}
+
+function normalizeContentLink(value: unknown): ChannelContentLink | undefined {
+  const link = asRecord(value);
+  const bundleId = optionalString(link?.bundleId);
+  const kind = optionalString(link?.kind);
+  const role = optionalString(link?.role);
+  if (
+    (kind !== 'forward_bundle' && kind !== 'rapid_topic_bundle') ||
+    !bundleId ||
+    (role !== 'forwarded_content' && role !== 'forwarder_comment')
+  ) {
+    return undefined;
+  }
+  const relatedMessageId = optionalString(link?.relatedMessageId);
+  return {
+    kind,
+    bundleId,
+    role,
+    ...(relatedMessageId ? { relatedMessageId } : {}),
+  };
 }
 
 /**
@@ -163,6 +192,7 @@ export function normalizeChannelTurnContext(
       parentId: optionalString(message?.parentId),
       threadId: optionalString(message?.threadId),
       type: optionalString(message?.type),
+      contentLink: normalizeContentLink(message?.contentLink),
     }),
     sender: compactObject({
       openId: optionalString(sender?.openId),
@@ -292,15 +322,35 @@ export interface ContainerOutput {
   /**
    * Non-empty SDK final text produced under the interactive Proactive contract.
    *
-   * Proactive mode still keeps `result` null so ordinary SDK text is never
-   * published blindly. The host reconciles this candidate against physically
-   * acknowledged `send_message` deliveries and only publishes it when the
-   * model failed to send a final utterance.
+   * Proactive mode keeps `result` null and public interactive hosts must never
+   * publish this candidate. It crosses the runner boundary only for internal
+   * diagnostics and scheduled-result extraction.
    */
   proactiveFinalCandidate?: string;
   newSessionId?: string;
   error?: string;
   providerFailure?: boolean;
+  /**
+   * Upstream `rate_limit_event.resetsAt` for an account-scope rejection. The
+   * host quarantines the provider until this instant instead of the flat
+   * recovery interval, so a five-hour account limit cannot re-enter rotation
+   * every few minutes and burn one turn per cycle.
+   */
+  providerRateLimitResetsAt?: number;
+  /**
+   * Upstream limit text captured when a provider failure was raised by a model
+   * wall. The host shows it instead of the generic pool notice, but only after
+   * every account is exhausted.
+   */
+  providerFailureNotice?: string;
+  /**
+   * Whether the rejection walled the whole account or just one model tier.
+   * Model-scope walls quarantine the (account, model) pair only: the account's
+   * other tiers and every other account's budget for this model stay usable.
+   */
+  providerRateLimitScope?: 'account' | 'model';
+  /** The model that was actually in use when the limit was reported. */
+  providerRateLimitModel?: string;
   /**
    * Set by the host after it quarantines the failed provider and checks the
    * remaining pool. The agent runner itself only emits providerFailure.
@@ -351,6 +401,20 @@ export interface ContainerOutput {
    * release the next durable queued follow-up. */
   queryIdle?: boolean;
   ipcReceipts?: Array<{
+    deliveryId: string;
+    chatJid: string;
+    coveredCursors?: Array<{
+      timestamp: string;
+      id: string;
+      sourceJid?: string;
+    }>;
+    cursor: { timestamp: string; id: string; sourceJid?: string };
+  }>;
+  /** Exact durable inputs that became the current SDK turn immediately after
+   * this completion. Present only while the same streaming query stays busy.
+   * Hosts use it to bind provider coalescing to the real current turn rather
+   * than to a later IPC message that merely entered the stream. */
+  activeIpcReceipts?: Array<{
     deliveryId: string;
     chatJid: string;
     coveredCursors?: Array<{

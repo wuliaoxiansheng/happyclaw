@@ -1,7 +1,5 @@
 import crypto from 'node:crypto';
 
-import { isRedundantProactiveSdkClosure } from './proactive-final-classifier.js';
-
 /**
  * User-visible delivery semantics are deliberately owned by the HappyClaw
  * host, not inferred from the fact that an MCP tool happened to run.
@@ -29,19 +27,6 @@ export interface TurnOutputProjection {
 export interface ResolvedPrimaryAnswer {
   text: string | null;
   source: 'sdk_final' | 'mcp_final' | 'candidate' | 'empty';
-}
-
-export interface ProactiveFinalRecoveryDecision {
-  deliver: boolean;
-  text: string | null;
-  reason:
-    | 'missing_final_delivery'
-    | 'empty_candidate'
-    | 'duplicate_delivery'
-    | 'explicit_final_delivered'
-    | 'explicit_final_attempted'
-    | 'redundant_sdk_closure'
-    | 'untracked_turn';
 }
 
 function normalizeDeliveredText(text: string): string {
@@ -79,9 +64,6 @@ export class TurnOutputCoordinator {
   private attemptedFinal: string | null = null;
   private finalized = false;
   private deliveredUtteranceCount = 0;
-  private deliveredFinalUtterance = false;
-  private readonly deliveredProgressTexts: string[] = [];
-  private readonly deliveredTextFingerprints = new Set<string>();
   private readonly stagedFingerprints = new Set<string>();
 
   /**
@@ -279,70 +261,13 @@ export class TurnOutputCoordinator {
     this.finalized = true;
   }
 
-  recordDeliveredUtterance(input?: {
+  recordDeliveredUtterance(_input?: {
     role?: TurnMessageDeliveryRole;
     text?: string;
   }): boolean {
     if (this.finalized) return false;
     this.deliveredUtteranceCount += 1;
-    if (input?.role === 'final') {
-      this.deliveredFinalUtterance = true;
-    }
-    const normalizedText = input?.text
-      ? normalizeDeliveredText(input.text)
-      : '';
-    if (normalizedText) {
-      this.deliveredTextFingerprints.add(
-        crypto.createHash('sha256').update(normalizedText).digest('hex'),
-      );
-      if (input?.role === 'progress') {
-        this.deliveredProgressTexts.push(normalizedText);
-        if (this.deliveredProgressTexts.length > 8) {
-          this.deliveredProgressTexts.shift();
-        }
-      }
-    }
     return true;
-  }
-
-  /**
-   * Reconcile hidden SDK final text produced in Proactive mode.
-   *
-   * A physically acknowledged, explicitly-final utterance is authoritative.
-   * Exact text matches are also suppressed so older models that repeat the
-   * delivered answer in SDK final text do not create duplicates. A narrow
-   * courtesy-closure check also suppresses low-value SDK tails after a complete
-   * progress answer; everything else is recovered by the host.
-   */
-  resolveProactiveFinalRecovery(
-    candidate: string | null | undefined,
-  ): ProactiveFinalRecoveryDecision {
-    const text = candidate?.trim() ? candidate : null;
-    if (!text) {
-      return { deliver: false, text: null, reason: 'empty_candidate' };
-    }
-    const normalizedText = normalizeDeliveredText(text);
-    const fingerprint = crypto
-      .createHash('sha256')
-      .update(normalizedText)
-      .digest('hex');
-    if (this.deliveredTextFingerprints.has(fingerprint)) {
-      return { deliver: false, text, reason: 'duplicate_delivery' };
-    }
-    if (this.deliveredFinalUtterance) {
-      return { deliver: false, text, reason: 'explicit_final_delivered' };
-    }
-    if (this.attemptedFinal !== null) {
-      return {
-        deliver: false,
-        text: this.attemptedFinal,
-        reason: 'explicit_final_attempted',
-      };
-    }
-    if (isRedundantProactiveSdkClosure(text, this.deliveredProgressTexts)) {
-      return { deliver: false, text, reason: 'redundant_sdk_closure' };
-    }
-    return { deliver: true, text, reason: 'missing_final_delivery' };
   }
 
   get deliveredUtterances(): number {
@@ -393,12 +318,6 @@ export interface RecordAttemptedFinalInput {
   scopeKey: string;
   inputTurnId: string;
   text: string;
-}
-
-export interface ResolveProactiveFinalRecoveryInput {
-  scopeKey: string;
-  inputTurnId: string;
-  text: string | null | undefined;
 }
 
 /**
@@ -521,8 +440,8 @@ export class ActiveTurnOutputRegistry {
 
   /**
    * Record a durable user-visible projection without claiming that the native
-   * provider acknowledged it. Used when recovery persists the final answer to
-   * the canonical Web session after a native delivery failure.
+   * provider acknowledged it. Used when the exact text from an explicit
+   * send_message(final) is preserved in Web after native delivery failure.
    */
   recordProjectedUtterance(input: RecordDeliveredUtteranceInput): boolean {
     const binding = this.bindings.get(
@@ -534,31 +453,6 @@ export class ActiveTurnOutputRegistry {
         text: input.text,
       }) ?? false
     );
-  }
-
-  resolveProactiveFinalRecovery(
-    input: ResolveProactiveFinalRecoveryInput,
-  ): ProactiveFinalRecoveryDecision {
-    const binding = this.bindings.get(
-      this.key(input.scopeKey, input.inputTurnId),
-    );
-    if (binding) {
-      return binding.coordinator.resolveProactiveFinalRecovery(input.text);
-    }
-    const text = input.text?.trim() ? input.text : null;
-    const attemptedFinal = this.attemptedFinals.get(
-      this.key(input.scopeKey, input.inputTurnId),
-    );
-    if (text && attemptedFinal) {
-      return {
-        deliver: false,
-        text: attemptedFinal,
-        reason: 'explicit_final_attempted',
-      };
-    }
-    return text
-      ? { deliver: true, text, reason: 'untracked_turn' }
-      : { deliver: false, text: null, reason: 'empty_candidate' };
   }
 
   /**

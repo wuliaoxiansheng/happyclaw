@@ -1,4 +1,6 @@
 export const CLAUDE_ENDPOINT_KIND_ENV = 'HAPPYCLAW_CLAUDE_ENDPOINT_KIND';
+/** Must stay aligned with the host pool's default-tier identity. */
+export const SDK_DEFAULT_MODEL_TIER = '__happyclaw_sdk_default_model__';
 
 export type ClaudeEndpointKind = 'official' | 'custom';
 
@@ -14,6 +16,16 @@ export interface ClaudeQueryModelRuntime {
   model: string;
   queryModelOptions: { model?: string };
   usageModelKey: string;
+}
+
+/** Model identity reported to the host without forcing the SDK's default. */
+export function resolveProviderReportedModelTier(
+  providerRuntime: ClaudeProviderRuntime,
+  modelOverride?: string,
+): string {
+  return (
+    modelOverride?.trim() || providerRuntime.model || SDK_DEFAULT_MODEL_TIER
+  );
 }
 
 /** Resolve a model at query time so a warm runner can switch tiers without respawn. */

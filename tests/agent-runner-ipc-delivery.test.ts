@@ -14,6 +14,7 @@ import {
   partitionIpcMessagesForLogicalTurn,
   requeueIpcInputMessages,
   resolveLogicalQueryInputTurnId,
+  scheduledGroupRunIdFromIpcMessages,
   shouldAcceptIpcMessagesDuringQuery,
   serializeIpcInputMessage,
   type IpcDeliveryReceipt,
@@ -40,6 +41,33 @@ function message(id: string): IpcInputMessage {
 }
 
 describe('agent-runner IPC delivery turn tracker', () => {
+  test('recovers the scheduled group occurrence from a warm-runner receipt', () => {
+    const scheduled: IpcInputMessage = {
+      text: 'scheduled',
+      taskId: 'task-42',
+      receipt: {
+        deliveryId: 'delivery-random',
+        chatJid: 'web:main',
+        coveredCursors: [
+          {
+            timestamp: '2026-08-13T00:00:00.000Z',
+            id: 'scheduled-task-prompt:run-abc',
+          },
+        ],
+        cursor: {
+          timestamp: '2026-08-13T00:00:00.000Z',
+          id: 'scheduled-task-prompt:run-abc',
+        },
+      },
+    };
+    expect(scheduledGroupRunIdFromIpcMessages([scheduled], 'task-42')).toBe(
+      'run-abc',
+    );
+    expect(
+      scheduledGroupRunIdFromIpcMessages([scheduled], 'another-task'),
+    ).toBeNull();
+  });
+
   test('orders requeued older messages before newly written messages by durable cursor', () => {
     const olderRequeued = message('1');
     const newerArrival = message('2');
@@ -125,6 +153,19 @@ describe('agent-runner IPC delivery turn tracker', () => {
     expect(tracker.hasPendingTurns).toBe(false);
   });
 
+  test('after interrupt, exposes only the next turn and not every later turn', () => {
+    const turnA = message('1');
+    const turnB = message('2');
+    const turnC = message('3');
+    const tracker = new IpcTurnDeliveryTracker([turnA]);
+    tracker.acceptTurn([turnB]);
+    tracker.acceptTurn([turnC]);
+
+    expect(tracker.cancelCurrentTurn()).toEqual([turnA]);
+    expect(tracker.currentTurnReceipts).toEqual([turnB.receipt]);
+    expect(tracker.laterTurnMessages).toEqual([turnC]);
+  });
+
   test('keeps slow turn A as output owner until A completes, then advances to queued B', () => {
     const turnA = message('1');
     const turnB = message('2');
@@ -181,6 +222,7 @@ describe('agent-runner IPC delivery turn tracker', () => {
     ]);
 
     expect(tracker.completeNextTurn()).toEqual([turnA.receipt]);
+    expect(tracker.currentTurnReceipts).toEqual([turnB.receipt]);
     correlation.syncCurrentTurn();
     const firstBEvent = correlation.correlate({
       status: 'stream',

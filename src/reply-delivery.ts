@@ -8,6 +8,54 @@
  * without the surrounding IO/streaming machinery.
  */
 
+import type { InteractionMode } from './types.js';
+
+export interface ScheduledGroupDeliveryContract {
+  /** SDK final is the one physical IM delivery lane. */
+  frameworkDeliversFinalText: boolean;
+  /** Agent must call send_message; SDK final remains archive-only. */
+  agentDeliversWithSendMessage: boolean;
+}
+
+export interface ScheduledProactiveArchiveCandidateInput {
+  status: 'success' | 'error' | 'stream' | 'closed';
+  inputTurnCompleted?: boolean;
+  hasScheduledGroupRuns: boolean;
+  /** Interactive Proactive runner output lane. */
+  proactiveFinalCandidate?: string | null;
+  /** Task-output runner lane (scheduled turns intentionally use this lane). */
+  result?: string | null;
+}
+
+/** Select the archive-only SDK final after a healthy scheduled input ends. */
+export function resolveScheduledProactiveArchiveCandidate(
+  input: ScheduledProactiveArchiveCandidateInput,
+): string {
+  if (
+    !input.hasScheduledGroupRuns ||
+    input.status !== 'success' ||
+    input.inputTurnCompleted !== true
+  ) {
+    return '';
+  }
+  return (input.proactiveFinalCandidate ?? input.result ?? '').trim();
+}
+
+/** Exactly one lane owns physical IM delivery for a scheduled group turn. */
+export function resolveScheduledGroupDeliveryContract(
+  interactionMode: InteractionMode,
+): ScheduledGroupDeliveryContract {
+  return interactionMode === 'assistant'
+    ? {
+        frameworkDeliversFinalText: true,
+        agentDeliversWithSendMessage: false,
+      }
+    : {
+        frameworkDeliversFinalText: false,
+        agentDeliversWithSendMessage: true,
+      };
+}
+
 export interface ReplyResultInfo {
   /**
    * Non-null means this result is an interim checkpoint, not the final

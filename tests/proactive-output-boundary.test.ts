@@ -148,5 +148,13 @@ describe('Proactive SDK output boundary', () => {
         /publishesFrameworkAnswer\(interactionMode\)\s*\?\s*[^;]*reduceStreamEvent/g,
       )?.length,
     ).toBeGreaterThanOrEqual(2);
+    expect(source).not.toContain('deliverProactiveFinalFallback');
+    expect(source).not.toContain('recoverProactiveFinalCandidate');
+    expect(source).not.toContain("sourceKind: 'proactive_sdk_fallback'");
+    expect(
+      source.match(
+        /Suppressed Proactive(?: agent)? SDK final without send_message delivery/g,
+      ),
+    ).toHaveLength(2);
   });
 });

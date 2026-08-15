@@ -2,9 +2,20 @@ import { describe, expect, test, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   enabledProviders: [
-    { id: 'provider-a', enabled: true, weight: 1 },
-    { id: 'provider-b', enabled: true, weight: 1 },
+    {
+      id: 'provider-a',
+      enabled: true,
+      weight: 1,
+      anthropicModel: 'primary-model',
+    },
+    {
+      id: 'provider-b',
+      enabled: true,
+      weight: 1,
+      anthropicModel: 'primary-model',
+    },
   ],
+  fallbackModel: 'fallback-model',
 }));
 
 vi.mock('../src/logger.js', () => ({
@@ -24,11 +35,16 @@ vi.mock('../src/runtime-config.js', async () => {
     ...actual,
     getEnabledProviders: () => mocks.enabledProviders,
     getDefaultProviderId: () => null,
+    getSystemSettings: () => ({
+      ...actual.getSystemSettings(),
+      fallbackModel: mocks.fallbackModel,
+    }),
   };
 });
 
 const { runAgentWithModelFallback } =
   await import('../src/container-runner.js');
+const { providerPool } = await import('../src/provider-pool.js');
 type AgentRunner = import('../src/container-runner.js').AgentRunner;
 type ContainerOutput = import('../src/container-runner.js').ContainerOutput;
 
@@ -39,6 +55,139 @@ const group = {
 } as never;
 
 describe('scheduled provider fallback', () => {
+  test('drains every primary account before retrying the fallback tier', async () => {
+    for (const provider of mocks.enabledProviders) {
+      providerPool.resetHealth(provider.id);
+    }
+    providerPool.refreshFromConfig(mocks.enabledProviders, {
+      strategy: 'round-robin',
+      unhealthyThreshold: 1,
+      recoveryIntervalMs: 300_000,
+    });
+    const primaryTier = new Map(
+      mocks.enabledProviders.map((provider) => [
+        provider.id,
+        provider.anthropicModel,
+      ]),
+    );
+    const attempts: Array<{ providerId: string; tier: string }> = [];
+    const runFn = vi.fn(
+      async (
+        _group: unknown,
+        _input: unknown,
+        onProcess: (
+          proc: never,
+          identifier: string,
+          selectedProviderId: string | null,
+        ) => void,
+        onOutput?: (output: ContainerOutput) => Promise<void>,
+      ): Promise<ContainerOutput> => {
+        const onPrimary = providerPool.hasCandidateForTier(primaryTier);
+        const tier = onPrimary ? 'primary-model' : mocks.fallbackModel;
+        const providerId = providerPool.selectProvider(
+          onPrimary ? primaryTier : tier,
+        );
+        attempts.push({ providerId, tier });
+        onProcess({} as never, `attempt-${attempts.length}`, providerId);
+        if (attempts.length <= mocks.enabledProviders.length) {
+          providerPool.reportModelFailure(providerId, tier);
+          const failure: ContainerOutput = {
+            status: 'success',
+            result: null,
+            providerFailure: true,
+            providerFailureTerminal: false,
+            providerRateLimitScope: 'model',
+            providerRateLimitModel: tier,
+          };
+          await onOutput?.(failure);
+          return failure;
+        }
+        const success: ContainerOutput = {
+          status: 'success',
+          result: 'fallback completed',
+          inputTurnCompleted: true,
+        };
+        await onOutput?.(success);
+        return success;
+      },
+    );
+
+    const output = await runAgentWithModelFallback(
+      runFn as unknown as AgentRunner,
+      group,
+      {
+        prompt: 'cross every primary account first',
+        groupFolder: group.folder,
+        chatJid: group.jid,
+        isMain: false,
+        isHome: false,
+        isAdminHome: false,
+        isScheduledTask: true,
+      },
+      () => {},
+      async () => {},
+    );
+
+    expect(attempts.map((attempt) => attempt.tier)).toEqual([
+      'primary-model',
+      'primary-model',
+      'fallback-model',
+    ]);
+    expect(output).toMatchObject({
+      result: 'fallback completed',
+      inputTurnCompleted: true,
+    });
+  });
+
+  test('stops a non-terminal scheduled retry that made no pool progress', async () => {
+    for (const provider of mocks.enabledProviders) {
+      providerPool.resetHealth(provider.id);
+    }
+    providerPool.refreshFromConfig(mocks.enabledProviders, {
+      strategy: 'round-robin',
+      unhealthyThreshold: 1,
+      recoveryIntervalMs: 300_000,
+    });
+    const runFn = vi.fn(
+      async (
+        _group: unknown,
+        _input: unknown,
+        onProcess: (
+          proc: never,
+          identifier: string,
+          selectedProviderId: string | null,
+        ) => void,
+      ): Promise<ContainerOutput> => {
+        onProcess({} as never, 'no-progress', 'provider-a');
+        return {
+          status: 'success',
+          result: null,
+          providerFailure: true,
+          providerFailureTerminal: false,
+        };
+      },
+    );
+
+    const output = await runAgentWithModelFallback(
+      runFn as unknown as AgentRunner,
+      group,
+      {
+        prompt: 'do not loop forever',
+        groupFolder: group.folder,
+        chatJid: group.jid,
+        isMain: false,
+        isHome: false,
+        isAdminHome: false,
+        isScheduledTask: true,
+      },
+      () => {},
+    );
+
+    expect(runFn).toHaveBeenCalledOnce();
+    expect(output.providerFailureTerminal).toBe(true);
+    expect(output.inputTurnCompleted).toBe(true);
+  });
+
   test('does not retry a scheduled prompt on another model when the Agent is pinned', async () => {
     const runFn = vi.fn(
       async (): Promise<ContainerOutput> => ({

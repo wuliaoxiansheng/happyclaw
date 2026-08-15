@@ -138,6 +138,7 @@ import { parseOAuthUsageBucket } from '../runtime-config.js';
 import type { AudienceMode, AuthUser, RegisteredGroup } from '../types.js';
 import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
+import brandAssetRoutes from './brand-assets.js';
 import { testFeishuCredentials } from '../feishu-connectivity.js';
 import {
   buildSessionMountUpdate,
@@ -2189,6 +2190,8 @@ configRoutes.delete(
   },
 );
 
+configRoutes.route('/', brandAssetRoutes);
+
 // Public endpoint — no auth required (like /api/auth/status)
 configRoutes.get('/appearance/public', (c) => {
   try {
@@ -2200,6 +2203,8 @@ configRoutes.get('/appearance/public', (c) => {
       aiAvatarColor: config.aiAvatarColor,
       aiAvatarUrl: config.aiAvatarUrl,
       aiAvatarMode: config.aiAvatarMode,
+      brandIconUrl: config.brandIconUrl,
+      brandBannerUrl: config.brandBannerUrl,
     });
   } catch (err) {
     logger.error({ err }, 'Failed to load public appearance config');

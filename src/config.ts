@@ -36,6 +36,34 @@ export const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024;
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'riba2534/happyclaw-agent:latest';
+
+export interface ContainerProxyConfig {
+  httpsProxy: string;
+  httpProxy: string;
+  noProxy: string;
+}
+
+/**
+ * Read the host proxy variables forwarded to container agents. Each variable
+ * is independent, and lower-case aliases are accepted for common shell setups.
+ */
+export function readContainerProxyConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): ContainerProxyConfig {
+  return {
+    httpsProxy: env.HTTPS_PROXY || env.https_proxy || '',
+    httpProxy: env.HTTP_PROXY || env.http_proxy || '',
+    noProxy: env.NO_PROXY || env.no_proxy || '',
+  };
+}
+
+// These values are written to the per-container 0600 runtime env file instead
+// of docker argv, keeping credentials out of process listings and debug logs.
+const CONTAINER_PROXY_CONFIG = readContainerProxyConfig();
+export const CONTAINER_HTTPS_PROXY = CONTAINER_PROXY_CONFIG.httpsProxy;
+export const CONTAINER_HTTP_PROXY = CONTAINER_PROXY_CONFIG.httpProxy;
+export const CONTAINER_NO_PROXY = CONTAINER_PROXY_CONFIG.noProxy;
+
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses TZ env var with Asia/Shanghai fallback
 export const TIMEZONE =

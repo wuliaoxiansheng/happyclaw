@@ -32,10 +32,13 @@ vi.mock('../src/logger.js', () => ({
 }));
 
 const {
+  applyContainerProxyEnvLines,
   buildContainerArgs,
   detectContainerHostIdentity,
+  resolveContainerProxyConfig,
   resolveContainerHostIdentity,
 } = await import('../src/container-runner.js');
+const { readContainerProxyConfig } = await import('../src/config.js');
 
 const mounts = [
   {
@@ -189,6 +192,154 @@ describe('buildContainerArgs identity contract', () => {
   });
 });
 
+describe('container proxy boundary', () => {
+  const identity = { mode: 'unknown' } as const;
+
+  test('reads lower-case proxy aliases independently', () => {
+    expect(
+      readContainerProxyConfig({
+        https_proxy: 'http://https.example:8443',
+        http_proxy: 'http://http.example:8080',
+        no_proxy: 'localhost,.internal',
+      }),
+    ).toEqual({
+      httpsProxy: 'http://https.example:8443',
+      httpProxy: 'http://http.example:8080',
+      noProxy: 'localhost,.internal',
+    });
+  });
+
+  test.each([
+    [
+      'HTTP only',
+      { httpsProxy: '', httpProxy: 'http://proxy.example:8080', noProxy: '' },
+      ['HTTP_PROXY=http://proxy.example:8080'],
+    ],
+    [
+      'HTTPS only',
+      { httpsProxy: 'http://proxy.example:8443', httpProxy: '', noProxy: '' },
+      ['HTTPS_PROXY=http://proxy.example:8443'],
+    ],
+    [
+      'NO_PROXY only',
+      { httpsProxy: '', httpProxy: '', noProxy: 'localhost,.internal' },
+      ['NO_PROXY=localhost,.internal'],
+    ],
+  ] as const)(
+    'resolves %s without coupling variables',
+    (_label, config, envLines) => {
+      expect(resolveContainerProxyConfig(config, 'linux')).toEqual({
+        envLines,
+        addHostGateway: false,
+      });
+    },
+  );
+
+  test.each(['darwin', 'win32'] as const)(
+    'rewrites loopback to the Docker Desktop host on %s',
+    (platform) => {
+      expect(
+        resolveContainerProxyConfig(
+          {
+            httpsProxy: 'http://alice:secret@127.0.0.1:20174',
+            httpProxy: '',
+            noProxy: '',
+          },
+          platform,
+        ),
+      ).toEqual({
+        envLines: [
+          'HTTPS_PROXY=http://alice:secret@host.docker.internal:20174/',
+        ],
+        addHostGateway: false,
+      });
+    },
+  );
+
+  test.each(['localhost', '127.0.0.1', '[::1]'])(
+    'fails fast for Linux loopback proxy host %s',
+    (hostname) => {
+      expect(() =>
+        resolveContainerProxyConfig(
+          {
+            httpsProxy: `http://${hostname}:8080`,
+            httpProxy: '',
+            noProxy: '',
+          },
+          'linux',
+        ),
+      ).toThrow(/Linux bridge containers cannot reach.*Docker bridge/i);
+    },
+  );
+
+  test('passes non-loopback URLs through unchanged', () => {
+    expect(
+      resolveContainerProxyConfig(
+        {
+          httpsProxy: 'http://user:secret@10.0.0.5:8443',
+          httpProxy: 'http://10.0.0.5:8080',
+          noProxy: '',
+        },
+        'linux',
+      ),
+    ).toEqual({
+      envLines: [
+        'HTTPS_PROXY=http://user:secret@10.0.0.5:8443',
+        'HTTP_PROXY=http://10.0.0.5:8080',
+      ],
+      addHostGateway: false,
+    });
+  });
+
+  test('proxy env overrides matching provider env without affecting siblings', () => {
+    const envLines = [
+      'https_proxy=http://provider.example:8443',
+      'PROVIDER_FLAG=1',
+    ];
+    applyContainerProxyEnvLines(envLines, [
+      'HTTPS_PROXY=http://host.example:8443',
+    ]);
+    expect(envLines).toEqual([
+      'PROVIDER_FLAG=1',
+      'HTTPS_PROXY=http://host.example:8443',
+    ]);
+  });
+
+  test('docker argv contains only non-sensitive proxy networking options', () => {
+    const secret = 'proxy-password-must-not-appear';
+    const resolved = resolveContainerProxyConfig(
+      {
+        httpsProxy: `http://alice:${secret}@proxy.example:8443`,
+        httpProxy: '',
+        noProxy: '',
+      },
+      'linux',
+    );
+    const args = buildContainerArgs(mounts, 'proxy-test', 'UTC', identity, {
+      addHostGateway: resolved.addHostGateway,
+    });
+    expect(
+      envArgs(args).some(
+        (arg) =>
+          arg.startsWith('HTTPS_PROXY=') ||
+          arg.startsWith('HTTP_PROXY=') ||
+          arg.startsWith('NO_PROXY='),
+      ),
+    ).toBe(false);
+    expect(args.join(' ')).not.toContain(secret);
+    expect(args).not.toContain('--add-host');
+  });
+
+  test('adds host-gateway only when requested by resolved network config', () => {
+    const args = buildContainerArgs(mounts, 'proxy-test', 'UTC', identity, {
+      addHostGateway: true,
+    });
+    const addHostIndex = args.indexOf('--add-host');
+    expect(addHostIndex).toBeGreaterThan(-1);
+    expect(args[addHostIndex + 1]).toBe('host.docker.internal:host-gateway');
+  });
+});
+
 describe('entrypoint permission contract', () => {
   const dockerfile = fs.readFileSync(
     path.join(repoRoot, 'container', 'Dockerfile'),
@@ -204,6 +355,10 @@ describe('entrypoint permission contract', () => {
   );
   const watcher = fs.readFileSync(
     path.join(repoRoot, 'container', 'session-permissions-watcher.mjs'),
+    'utf8',
+  );
+  const rescanQueue = fs.readFileSync(
+    path.join(repoRoot, 'container', 'session-permissions-rescan-queue.mjs'),
     'utf8',
   );
   const mountBoundaryPath = path.join(
@@ -244,6 +399,7 @@ describe('entrypoint permission contract', () => {
     expect(entrypoint).toContain(
       'runuser -u node -- env HOME=/home/node /usr/bin/git',
     );
+    expect(dockerfile).toContain('session-permissions-rescan-queue.mjs');
     expect(dockerfile).toContain('chown -R root:root /app/prompts');
     expect(dockerfile).toContain('find /app/prompts -type d -exec chmod 0555');
     expect(dockerfile).toContain('find /app/prompts -type f -exec chmod 0444');
@@ -278,6 +434,11 @@ describe('entrypoint permission contract', () => {
     expect(watcher).not.toContain('lstatSync');
     expect(watcher).toContain('RESCAN_INTERVAL_MS = 30_000');
     expect(watcher).not.toContain('RESCAN_INTERVAL_MS = 500');
+    expect(watcher).toContain('fs.opendirSync');
+    expect(watcher).not.toContain('fs.readdirSync');
+    expect(watcher).toContain('createBoundedRescanScheduler');
+    expect(rescanQueue).toContain('MAX_PENDING_RESCAN_TARGETS = 256');
+    expect(rescanQueue).toContain('pendingTargets.clear()');
     expect(mountBoundary).not.toMatch(/catch\s*\{/);
   });
 
@@ -330,6 +491,11 @@ describe.skipIf(!integrationImageAvailable)(
       'container',
       'session-permissions-watcher.mjs',
     );
+    const rescanQueuePath = path.join(
+      repoRoot,
+      'container',
+      'session-permissions-rescan-queue.mjs',
+    );
     const mountBoundaryPath = path.join(
       repoRoot,
       'container',
@@ -365,6 +531,8 @@ describe.skipIf(!integrationImageAvailable)(
           `${helperPath}:/tmp/session-permissions.sh:ro`,
           '-v',
           `${watcherPath}:/app/session-permissions-watcher.mjs:ro`,
+          '-v',
+          `${rescanQueuePath}:/app/session-permissions-rescan-queue.mjs:ro`,
           '-v',
           `${mountBoundaryPath}:/app/session-permissions-mount.mjs:ro`,
           ...extraArgs,

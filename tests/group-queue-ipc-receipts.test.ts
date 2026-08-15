@@ -50,6 +50,7 @@ async function startRunner(
   options: {
     containerName?: string | null;
     feishuCliAccountId?: string | null;
+    interactionMode?: 'assistant' | 'proactive';
   } = {},
 ): Promise<void> {
   queue.enqueueMessageCheck(JID);
@@ -67,6 +68,7 @@ async function startRunner(
       containerName: options.containerName ?? null,
       groupFolder: FOLDER,
       feishuCliAccountId: options.feishuCliAccountId,
+      interactionMode: options.interactionMode,
     },
   );
 }
@@ -107,6 +109,66 @@ afterEach(async () => {
 });
 
 describe('GroupQueue IPC delivery receipts', () => {
+  test('closes the runner boot window when an incompatible suffix is already queued', async () => {
+    queue.enqueueMessageCheck(JID);
+    await tick();
+    // Simulates processGroupMessages splitting the durable input prefix before
+    // onProcess has registered the child/input directory.
+    queue.enqueueMessageCheck(JID);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(false);
+
+    queue.registerProcess(JID, { killed: false, kill: () => true } as never, {
+      containerName: null,
+      groupFolder: FOLDER,
+      interactionMode: 'assistant',
+    });
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(true);
+  });
+
+  test('drains a warm runner before injecting another interaction contract', async () => {
+    await startRunner({ interactionMode: 'assistant' });
+
+    expect(queue.requiresInteractionModeRestart(JID, 'proactive')).toBe(true);
+    expect(
+      queue.sendMessage(
+        JID,
+        'proactive scheduled prompt',
+        undefined,
+        undefined,
+        JID,
+        'task-proactive',
+        undefined,
+        undefined,
+        undefined,
+        { interactionMode: 'proactive' },
+      ),
+    ).toBe('no_active');
+    expect(readPayloads()).toEqual([]);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(true);
+  });
+
+  test('accepts a warm scheduled prompt with the runner frozen mode', async () => {
+    await startRunner({ interactionMode: 'proactive' });
+
+    expect(queue.requiresInteractionModeRestart(JID, 'proactive')).toBe(false);
+    expect(
+      queue.sendMessage(
+        JID,
+        'proactive scheduled prompt',
+        undefined,
+        undefined,
+        JID,
+        'task-proactive',
+        undefined,
+        undefined,
+        undefined,
+        { interactionMode: 'proactive' },
+      ),
+    ).toBe('sent');
+    expect(readPayloads()).toHaveLength(1);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(false);
+  });
+
   test('restarts a container before switching the injected Feishu Bot', async () => {
     await startRunner({
       containerName: 'happyclaw-bot-a',

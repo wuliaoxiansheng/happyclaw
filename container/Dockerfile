@@ -196,6 +196,8 @@ RUN set -eu && \
       > "$DOWNLOAD_TMP/checksum.txt" && \
     (cd "$DOWNLOAD_TMP" && sha256sum -c checksum.txt) && \
     tar -xzf "$DOWNLOAD_TMP/$ARCHIVE" --strip-components=1 -C /usr/local/bin && \
+    chown root:root /usr/local/bin/feishu-cli && \
+    chmod 755 /usr/local/bin/feishu-cli && \
     feishu-cli --version && \
     printf '%s\n' "$RELEASE_TAG" > /usr/local/share/feishu-cli-version && \
     rm -rf "$DOWNLOAD_TMP"
@@ -216,7 +218,7 @@ RUN npm run build \
 RUN mkdir -p /workspace/group /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
 # Copy entrypoint scripts (run as root, then drop to node via runuser)
-COPY entrypoint.sh session-permissions.sh session-permissions-mount.mjs session-permissions-watcher.mjs session-generated-paths.mjs session-prompts-copy.mjs /app/
+COPY entrypoint.sh session-permissions.sh session-permissions-mount.mjs session-permissions-rescan-queue.mjs session-permissions-watcher.mjs session-generated-paths.mjs session-prompts-copy.mjs /app/
 RUN chmod +x /app/entrypoint.sh
 
 # Set ownership to node user (non-root) for writable directories

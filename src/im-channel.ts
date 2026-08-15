@@ -28,6 +28,12 @@ import {
   type WeChatConnectionState,
 } from './wechat.js';
 import {
+  createWeComConnection,
+  type WeComConnection,
+  type WeComConnectionConfig,
+  type WeComConnectionState,
+} from './wecom.js';
+import {
   createDingTalkConnection,
   type DingTalkConnection,
   type DingTalkConnectionConfig,
@@ -70,14 +76,44 @@ import {
 import type { DingTalkStreamingCardController } from './dingtalk-streaming-card.js';
 import type { DiscordStreamingEditController } from './discord-streaming-edit.js';
 import type { QQStreamingController } from './qq-streaming-card.js';
+import type { WeComStreamingController } from './wecom-streaming.js';
 import { CHANNEL_PREFIXES } from './channel-prefixes.js';
 
-/** Union type for any streaming card controller (Feishu, DingTalk, Discord, or QQ) */
+/** Union type for any streaming card controller (Feishu, DingTalk, Discord, QQ, or WeCom) */
 export type StreamingSession =
   | StreamingCardController
   | DingTalkStreamingCardController
   | DiscordStreamingEditController
-  | QQStreamingController;
+  | QQStreamingController
+  | WeComStreamingController;
+
+/**
+ * Whether a streaming session has settled into a terminal presentation state
+ * and may be rotated out. The Feishu controller reports `isActive() === false`
+ * while still `'idle'` (lazily-created card waiting for its first stream
+ * event); rotating it out at that point orphans the durable card reservation
+ * and the provider card never publishes. Controllers without a `currentState`
+ * accessor treat `'idle'` as active inside `isActive()` already.
+ */
+export function isStreamingSessionSettled(session: StreamingSession): boolean {
+  if (session.isActive()) return false;
+  return (session as { currentState?: string }).currentState !== 'idle';
+}
+
+/**
+ * Append the current main-answer projection while the provider session can
+ * still accept output. Feishu is intentionally inactive while `idle`, so an
+ * `isActive()` guard alone would drop a text-only turn's first visible delta
+ * before `append()` can lazily create the provider card.
+ */
+export function appendStreamingSessionAnswer(
+  session: StreamingSession,
+  text: string,
+): boolean {
+  if (isStreamingSessionSettled(session)) return false;
+  session.append(text);
+  return true;
+}
 
 // ─── Unified Interface ──────────────────────────────────────────
 
@@ -123,8 +159,13 @@ export interface IMChannelConnectOpts {
     messageId: string;
     senderImId: string;
     requestedMode?: FollowUpMode;
-    repliedToActiveCard: boolean;
+    coalesceBundleId?: string;
   }) => FollowUpDisposition;
+  onSessionBreak?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+  }) => Promise<string>;
   onFollowUpCardAction?: (input: {
     sourceJid: string;
     targetJid: string;
@@ -165,6 +206,8 @@ export interface IMChannelConnectOpts {
   shouldDeferInbound?: () => boolean;
   /** WeChat iLink authorization/transport lifecycle. */
   onWeChatConnectionStateChange?: (state: WeChatConnectionState) => void;
+  /** WeCom WebSocket authentication/transport lifecycle. */
+  onWeComConnectionStateChange?: (state: WeComConnectionState) => void;
 }
 
 export interface IMChannel {
@@ -198,6 +241,7 @@ export interface IMChannel {
     chatId: string,
     onCardCreated?: (messageId: string) => void,
     lifecycle?: StreamingCardLifecycle,
+    inputMessageId?: string,
   ): Promise<StreamingSession | undefined>;
   /** Reconcile a non-terminal card through this exact connected Bot. */
   reconcileStreamingCard?(
@@ -274,6 +318,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
         onAgentMessage: opts.onAgentMessage,
         onFollowUpMessage: opts.onFollowUpMessage,
+        onSessionBreak: opts.onSessionBreak,
         onFollowUpCardAction: opts.onFollowUpCardAction,
         onBotAddedToGroup: opts.onBotAddedToGroup,
         onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
@@ -827,11 +872,9 @@ export function createWeChatChannel(
 
     async sendMessage(chatId: string, text: string): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'WeChat channel not connected, skip sending message',
+        throw new Error(
+          `WeChat channel is not connected; message to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendMessage(chatId, text);
     },
@@ -844,11 +887,9 @@ export function createWeChatChannel(
       fileName?: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'WeChat channel not connected, skip sending image',
+        throw new Error(
+          `WeChat channel is not connected; image to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
     },
@@ -859,11 +900,9 @@ export function createWeChatChannel(
       fileName: string,
     ): Promise<void> {
       if (!inner) {
-        logger.warn(
-          { chatId },
-          'WeChat channel not connected, skip sending file',
+        throw new Error(
+          `WeChat channel is not connected; file to ${chatId} was not sent`,
         );
-        return;
       }
       await inner.sendFile(chatId, filePath, fileName);
     },
@@ -896,6 +935,77 @@ export function createWeChatChannel(
 
     isConnected(): boolean {
       return inner?.isConnected() ?? false;
+    },
+  };
+
+  return channel;
+}
+
+// ─── WeCom (企业微信智能机器人) Adapter ──────────────────────────
+
+export function createWeComChannel(config: WeComConnectionConfig): IMChannel {
+  let inner: WeComConnection | null = null;
+
+  const channel: IMChannel = {
+    channelType: 'wecom',
+
+    async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      inner ??= createWeComConnection(config);
+      try {
+        await inner.connect({
+          onReady: opts.onReady,
+          onNewChat: opts.onNewChat,
+          ignoreMessagesBefore: opts.ignoreMessagesBefore,
+          isChatAuthorized: opts.isChatAuthorized,
+          onPairAttempt: opts.onPairAttempt,
+          onConnectionStateChange: opts.onWeComConnectionStateChange,
+          onCommand: opts.onCommand,
+          resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
+          onAgentMessage: opts.onAgentMessage,
+          normalizeIncomingJid: opts.normalizeIncomingJid,
+          shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
+          isGroupOwnerMessage: opts.isGroupOwnerMessage,
+          isSenderAllowedInGroup: opts.isSenderAllowedInGroup,
+          resolveRegisteredGroup: opts.resolveRegisteredGroup,
+        });
+        return true;
+      } catch (err) {
+        logger.error({ err }, 'WeCom channel connect failed');
+        return false;
+      }
+    },
+
+    async disconnect(): Promise<void> {
+      if (inner) {
+        await inner.disconnect();
+        inner = null;
+      }
+    },
+
+    async sendMessage(chatId: string, text: string): Promise<void> {
+      if (!inner) {
+        throw new Error('WeCom channel is not connected');
+      }
+      await inner.sendMessage(chatId, text);
+    },
+
+    // 企微智能机器人无「正在输入」态，setTyping 为 no-op。
+    async setTyping(): Promise<void> {
+      return;
+    },
+
+    isConnected(): boolean {
+      return inner?.isConnected() ?? false;
+    },
+
+    async createStreamingSession(
+      chatId: string,
+      _onCardCreated?: (messageId: string) => void,
+      _lifecycle?: StreamingCardLifecycle,
+      inputMessageId?: string,
+    ): Promise<StreamingSession | undefined> {
+      if (!inner) throw new Error('WeCom channel is not connected');
+      return inner.createStreamingSession(chatId, inputMessageId);
     },
   };
 

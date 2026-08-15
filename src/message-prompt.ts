@@ -1,5 +1,9 @@
 import { CHANNEL_PREFIXES } from './channel-prefixes.js';
-import type { ChannelReferencedMessage, NewMessage } from './types.js';
+import type {
+  ChannelContentLink,
+  ChannelReferencedMessage,
+  NewMessage,
+} from './types.js';
 
 export interface FormatMessagesOptions {
   /**
@@ -55,6 +59,18 @@ function referencedMessages(message: NewMessage): ChannelReferencedMessage[] {
   return message.channel_context?.message.referencedMessages ?? [];
 }
 
+function contentLinkAttributes(link: ChannelContentLink | undefined): string {
+  if (!link) return '';
+  const relation =
+    link.role === 'forwarded_content' ? 'forwarded_material' : 'forwarder_note';
+  const instructionScope =
+    link.role === 'forwarded_content' ? 'context_only' : 'current_request';
+  return (
+    ` relation="${relation}" instruction_scope="${instructionScope}"` +
+    ` bundle_id="${escapeXml(link.bundleId)}"`
+  );
+}
+
 export function collectReferencedMessageIds(
   messages: NewMessage[],
 ): Set<string> {
@@ -94,7 +110,8 @@ function formatMissingReference(
   const senderAttr = reference.sender
     ? ` sender="${escapeXml(reference.sender)}"`
     : '';
-  return `<referenced_message id="${escapeXml(reference.id)}"${senderAttr}>${escapeXml(body)}</referenced_message>`;
+  const relationAttrs = contentLinkAttributes(reference.contentLink);
+  return `<referenced_message id="${escapeXml(reference.id)}"${senderAttr}${relationAttrs}>${escapeXml(body)}</referenced_message>`;
 }
 
 /**
@@ -118,6 +135,9 @@ export function formatMessages(
       : '';
     const replyTo = message.channel_context?.message.parentId;
     const replyAttr = replyTo ? ` reply_to="${escapeXml(replyTo)}"` : '';
+    const relationAttrs = contentLinkAttributes(
+      message.channel_context?.message.contentLink,
+    );
     const references = referencedMessages(message)
       .map((reference) => formatMissingReference(reference, knownMessageIds))
       .filter((reference): reference is string => !!reference);
@@ -128,7 +148,7 @@ export function formatMessages(
 
     const formatted =
       `<message id="${escapeXml(message.id)}" sender="${escapeXml(message.sender_name)}"` +
-      `${sourceAttr}${replyAttr} time="${escapeXml(message.timestamp)}">` +
+      `${sourceAttr}${replyAttr}${relationAttrs} time="${escapeXml(message.timestamp)}">` +
       `${referenceBlock}${escapeXml(message.content)}</message>`;
     knownMessageIds.add(message.id);
     return formatted;
