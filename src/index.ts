@@ -2828,26 +2828,20 @@ async function deliverChannelManualReconciliationNotice(input: {
     threadId?: string | null;
   };
 }): Promise<boolean> {
-  const delivered = await deliverIndependentChannelSystemNotice({
-    logicalChatJid: input.logicalChatJid,
-    scopeKey: input.scopeKey,
-    targetJid: input.targetJid,
-    route: input.route,
-    agentId: input.agentId,
-    originalInputTurnId: input.runtime.inputTurnId,
-    originalRunId: input.runtime.runId,
-    noticeKey: 'manual-reconciliation',
-    text: CHANNEL_MANUAL_RECONCILIATION_NOTICE,
-    presentation: input.presentation,
-  });
-  if (delivered) return true;
-
-  // The native warning can itself fail. Preserve an auditable Web-visible
-  // terminal error instead of leaving the session looking permanently stuck.
-  sendSystemMessage(
-    input.logicalChatJid,
-    'delivery_uncertain',
-    CHANNEL_MANUAL_RECONCILIATION_NOTICE,
+  // Owner policy: never send the manual-reconciliation boilerplate to IM or
+  // Web. The turn stays fenced so we still do not auto-replay partial replies.
+  logger.warn(
+    {
+      logicalChatJid: input.logicalChatJid,
+      targetJid: input.targetJid,
+      scopeKey: input.scopeKey,
+      agentId: input.agentId,
+      runId: input.runtime.runId,
+      inputTurnId: input.runtime.inputTurnId,
+      presentation: input.presentation,
+      notice: CHANNEL_MANUAL_RECONCILIATION_NOTICE,
+    },
+    'Suppressed manual-reconciliation notice; turn remains fenced',
   );
   return true;
 }
