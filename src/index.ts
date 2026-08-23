@@ -11,7 +11,6 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   STORE_DIR,
-  MAIN_GROUP_FOLDER,
   CONVERSATION_AGENT_ARCHIVE_DAYS,
   POLL_INTERVAL,
   TIMEZONE,
@@ -61,6 +60,11 @@ import { resolveTurnOutcome } from './turn-outcome.js';
 import { finalizeChannelCardAfterDelivery } from './channel-card-finalization.js';
 import { resolveContainerOutputInputTurnId } from './channel-output-correlation.js';
 import { SteeringTransitionRegistry } from './steering-transition.js';
+import {
+  selectBatchProcessingIndicatorOwners,
+  type ProcessingIndicatorInput,
+  type ProcessingIndicatorOwner,
+} from './processing-indicator-batch.js';
 import { resolveFeishuFollowUpMode } from './follow-up-policy.js';
 import { discardStartupTypedIpcDeliveries } from './ipc-delivery-recovery.js';
 import {
@@ -96,7 +100,6 @@ import {
   createTask,
   deleteExpiredSessions,
   getExpiredSessionIds,
-  deleteTask,
   ensureChatExists,
   ensureUserHomeGroup,
   getAllChats,
@@ -122,13 +125,10 @@ import {
   getTaskById,
   getTaskRunById,
   getActiveTaskRunForTask,
-  getTaskRunsForTask,
   finalizeDeliveredGroupTaskRun,
   recordGroupWorkspaceProjectionFailureAndFinalize,
   recordTaskRunNotificationReceipt,
   finalizeTaskRunNotificationIfPending,
-  type TaskRunAtomicNotificationPayload,
-  type TaskRunNotificationPayload,
   type TaskRunNotificationReceipt,
   getUserHomeGroup,
   forceActiveAdminRuntimesToHost,
@@ -246,7 +246,9 @@ import {
   isNativeContextContainer,
   resolveChannelMountTarget,
   restoreDefaultChannelMount,
+  attachDefaultChannelAccountMount,
   upgradeNativeContextChannelMount,
+  injectChannelMountRuntimePort,
 } from './channel-mount-service.js';
 import { isThreadMapCapableChat } from './im-channel-capabilities.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
@@ -274,11 +276,14 @@ import {
 } from './channel-reliability-store.js';
 import { ChannelTurnRuntime } from './channel-turn-runtime.js';
 import { resolveStickyChannelOwner } from './channel-session-owner.js';
-import { migrateLegacyWhatsAppAuthDir } from './whatsapp.js';
+import { migrateLegacyWhatsAppAuthDir } from './whatsapp-auth.js';
+import {
+  canonicalizeWhatsAppConversationJid,
+  resolveWhatsAppConversationAliasFromGroups,
+} from './whatsapp-jid.js';
 import {
   appendStreamingSessionAnswer,
   getChannelType,
-  extractChatId,
   isStreamingSessionSettled,
   type StreamingSession,
   type ChannelMessageDeliveryOptions,
@@ -358,8 +363,10 @@ import {
 import {
   invalidateSessionCache,
   getWebDeps,
-  canAccessGroup,
+  type WebDeps,
 } from './web-context.js';
+import { canAccessGroup } from './group-acl.js';
+import { StreamingBuffer } from './streaming-buffer.js';
 import { resolveEffectiveAgentProfile } from './agent-profile-runtime.js';
 import {
   AgentBuilderTurnRegistry,
@@ -394,16 +401,12 @@ import {
 import {
   loadChannelAccountSecret,
   saveChannelAccountSecret,
-  type ChannelAccountSecret,
 } from './channel-account-secrets.js';
 import {
   ensureLegacyDefaultChannelAccount,
   syncDefaultChannelAccountCredentials,
 } from './channel-account-migration.js';
-import {
-  applyChannelAccountRegistrationFallback,
-  resolveChannelAccountFallbackWorkspace,
-} from './channel-account-routing.js';
+import { resolveChannelAccountFallbackWorkspace } from './channel-account-routing.js';
 import { testChannelAccountCredentials } from './channel-account-connectivity.js';
 import {
   buildAgentProfilePrompt,
@@ -426,7 +429,6 @@ import {
   saveFeishuOwnerOpenId,
   saveUserTelegramConfig,
   saveUserWeChatConfig,
-  updateAllSessionCredentials,
 } from './runtime-config.js';
 import {
   MAX_TASK_PROMPT_LENGTH,
@@ -484,7 +486,6 @@ import {
 } from './billing.js';
 import { recordUsageEvent } from './usage-service.js';
 import {
-  AgentStatus,
   AgentProfile,
   ChannelMessageMeta,
   ChannelTurnContext,
@@ -1703,6 +1704,7 @@ async function dispatchNextQueuedFollowUp(chatJid: string): Promise<void> {
   }
   broadcastFollowUpUpdate(chatJid);
 
+  let prePublishedIndicatorOwners: ProcessingIndicatorOwner[] = [];
   try {
     const prepared = await prepareFollowUp(items);
     if (items.some((queued) => !getQueuedFollowUp(chatJid, queued.id))) {
@@ -1746,11 +1748,33 @@ async function dispatchNextQueuedFollowUp(chatJid: string): Promise<void> {
       queue.releaseQueryReservation(chatJid, reservedRunId, true);
       return;
     }
+    prePublishedIndicatorOwners = selectBatchProcessingIndicatorOwners(
+      agentItems.map((queued) => ({
+        id: queued.id,
+        sourceJid: queued.source_jid,
+      })),
+      getChannelType(chatJid) ? chatJid : null,
+    );
+    // GroupQueue can announce idle while the old turn's provider cleanup is
+    // still settling. Fence the hand-off so Feishu observes delete(A) before
+    // add(B), matching the Session batch lifecycle instead of allowing even a
+    // sub-millisecond overlap.
+    await clearTrackedProcessingIndicators(chatJid);
+    await beginBatchAckReactions(chatJid, prePublishedIndicatorOwners);
     const result = injectPreparedFollowUp(agentItems, prepared, reservedRunId);
+    if (result === 'sent') {
+      // The active main/agent admission map now owns terminal cleanup.
+      prePublishedIndicatorOwners = [];
+    } else {
+      await clearUntrackedBatchAckReactions(prePublishedIndicatorOwners);
+      prePublishedIndicatorOwners = [];
+    }
     if (result !== 'sent') {
       queue.releaseQueryReservation(chatJid, reservedRunId);
     }
   } catch (err) {
+    await clearUntrackedBatchAckReactions(prePublishedIndicatorOwners);
+    prePublishedIndicatorOwners = [];
     const remaining = items.filter((queued) =>
       getQueuedFollowUp(chatJid, queued.id),
     );
@@ -1926,6 +1950,42 @@ function interruptAndRunFollowUp(
     state: 'interrupting',
     message: '正在根据这条消息调整当前任务。',
     item: first,
+  };
+}
+
+/**
+ * `/steer` is a durable direction change, not a single-message queue barrier.
+ * The command stays in arrival order with the Session's existing pending
+ * inputs; after the current generation is interrupted, the next snapshot
+ * drains them as one batch.
+ */
+function steerQueuedFollowUpBatch(
+  chatJid: string,
+  messageId: string,
+): FollowUpActionResult {
+  const item = getQueuedFollowUp(chatJid, messageId);
+  if (!item) {
+    return { ok: false, message: '这条引导消息已被处理或取消。' };
+  }
+  const activeRunId = queue.getActiveQueryId(chatJid);
+  if (activeRunId) markSteeringInterrupt(chatJid);
+  if (!activeRunId || !queue.interruptQuery(chatJid, activeRunId)) {
+    clearSteeringInterrupt(chatJid);
+    dispatchQueuedFollowUpFamily(chatJid);
+    return {
+      ok: true,
+      state: 'queued',
+      message: '当前回复已结束，引导将随下一批消息处理。',
+      item,
+    };
+  }
+  void clearTrackedProcessingIndicators(chatJid);
+  broadcastFollowUpUpdate(chatJid);
+  return {
+    ok: true,
+    state: 'interrupting',
+    message: '正在根据新指令调整当前任务。',
+    item,
   };
 }
 
@@ -3284,26 +3344,13 @@ async function settleAndRecordTaskIpcDeliveries(
   return { accepted: true, receipt: outcome.receipt };
 }
 
-/** Fire-and-forget wrapper for sendImWithRetry (used in non-await contexts). */
-function sendImWithFailTracking(
-  imJid: string,
-  text: string,
-  localImagePaths: string[],
-  outbox?: ChannelOutboxDeliveryRef,
-): void {
-  sendImWithRetry(imJid, text, localImagePaths, outbox).catch(() => {});
-}
-
-export function isCursorAfter(
-  candidate: MessageCursor,
-  base: MessageCursor,
-): boolean {
+function isCursorAfter(candidate: MessageCursor, base: MessageCursor): boolean {
   if (candidate.timestamp > base.timestamp) return true;
   if (candidate.timestamp < base.timestamp) return false;
   return candidate.id > base.id;
 }
 
-export function normalizeCursor(value: unknown): MessageCursor {
+function normalizeCursor(value: unknown): MessageCursor {
   if (typeof value === 'string') {
     return { timestamp: value, id: '' };
   }
@@ -3679,7 +3726,7 @@ async function handleClearCommand(chatJid: string): Promise<string> {
       },
       target.agentId ?? undefined,
     );
-    return '已清除对话上下文 ✓';
+    return 'Session context cleared.';
   } catch (err) {
     logger.error(
       {
@@ -4734,6 +4781,54 @@ function trackProcessingIndicator(
     trackedProcessingIndicators.set(logicalJid, inputs);
   }
   inputs.set(inputTurnId, transportJid);
+}
+
+async function activateBatchProcessingIndicators(
+  logicalJid: string,
+  inputs: ProcessingIndicatorInput[],
+  fallbackTransportJid?: string | null,
+): Promise<ProcessingIndicatorOwner[]> {
+  const owners = selectBatchProcessingIndicatorOwners(
+    inputs,
+    fallbackTransportJid,
+  );
+  await beginBatchAckReactions(logicalJid, owners);
+  for (const owner of owners) {
+    trackProcessingIndicator(logicalJid, owner.inputTurnId, owner.transportJid);
+  }
+  return owners;
+}
+
+async function beginBatchAckReactions(
+  logicalJid: string,
+  owners: ProcessingIndicatorOwner[],
+): Promise<void> {
+  await Promise.all(
+    owners.map(async (owner) => {
+      if (getChannelType(owner.transportJid) === 'feishu') {
+        await imManager
+          .beginAckReaction(owner.transportJid, owner.inputTurnId)
+          .catch((err) => {
+            logger.warn(
+              { err, logicalJid, ...owner },
+              'Failed to add active batch acknowledgement reaction',
+            );
+          });
+      }
+    }),
+  );
+}
+
+async function clearUntrackedBatchAckReactions(
+  owners: ProcessingIndicatorOwner[],
+): Promise<void> {
+  await Promise.allSettled(
+    owners
+      .filter((owner) => getChannelType(owner.transportJid) === 'feishu')
+      .map((owner) =>
+        imManager.clearAckReaction(owner.transportJid, owner.inputTurnId),
+      ),
+  );
 }
 
 function untrackProcessingIndicator(
@@ -6017,6 +6112,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       ? lastProcessed.source_jid
       : replySourceImJid;
   const initialTypingTransportJid = initialProcessingIndicatorJid ?? chatJid;
+  const initialProcessingIndicatorOwners =
+    await activateBatchProcessingIndicators(
+      chatJid,
+      missedMessages.map((message) => ({
+        id: message.id,
+        sourceJid: message.source_jid,
+      })),
+      null,
+    );
   const initialTypingReady = setTyping(
     chatJid,
     true,
@@ -6051,28 +6155,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const queryTaskIds = new Set<string>();
   const healthyCompletedInputTurns = new Set<string>();
   const processingIndicatorJidsByInput = new Map<string, string>();
-  // One cold SDK turn may cover several rapidly-arriving DB inputs. Each
-  // provider reaction is owned by the original DB message id, while the SDK
-  // completion is correlated to the batch's terminal input id.
+  // One cold SDK turn may cover several rapidly-arriving DB inputs. The
+  // provider reaction belongs to this active batch's selected message, while
+  // the SDK completion is correlated to the batch's terminal input id.
   const processingIndicatorInputsByCompletion = new Map<string, string[]>([
     [
       lastProcessed.id,
-      [...new Set(missedMessages.map((message) => message.id))],
+      initialProcessingIndicatorOwners.map((owner) => owner.inputTurnId),
     ],
   ]);
   const processingTypingLeaseIdsByCompletion = new Map<string, string>([
     [lastProcessed.id, lastProcessed.id],
   ]);
-  for (const message of missedMessages) {
-    const indicatorJid =
-      message.source_jid && getChannelType(message.source_jid)
-        ? message.source_jid
-        : directImReply
-          ? chatJid
-          : null;
-    if (!indicatorJid) continue;
-    processingIndicatorJidsByInput.set(message.id, indicatorJid);
-    trackProcessingIndicator(chatJid, message.id, indicatorJid);
+  for (const owner of initialProcessingIndicatorOwners) {
+    processingIndicatorJidsByInput.set(owner.inputTurnId, owner.transportJid);
   }
   const clearProcessingIndicatorForInput = async (
     inputTurnId: string,
@@ -6454,6 +6550,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let streamingAccumulatedThinking = '';
   let streamInterrupted = false;
   let streamSteered = false;
+  let runnerClosedBySteer = false;
   // 本 run 是否已进入 finally 收尾。outputChain 的迟到回调可能在 run resolve
   // 之后才执行（waitForOutputChain 30s 兜底只放行不取消）；此时绝不能再重建
   // 流式卡片——重建出的卡片永远无人 complete，成为僵尸「生成中」卡。
@@ -6751,27 +6848,30 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         coveredInputs && coveredInputs.length > 0
           ? coveredInputs
           : [{ id: inputTurnId, sourceJid: newSourceJid ?? undefined }];
-      const exactInputIds = [...new Set(exactInputs.map((input) => input.id))];
-      processingIndicatorInputsByCompletion.set(inputTurnId, exactInputIds);
-      processingTypingLeaseIdsByCompletion.set(inputTurnId, inputTurnId);
       const fallbackProcessingIndicatorJid =
         newSourceJid && getChannelType(newSourceJid) ? newSourceJid : newImJid;
-      for (const exactInput of exactInputs) {
-        const processingIndicatorJid =
-          exactInput.sourceJid && getChannelType(exactInput.sourceJid)
-            ? exactInput.sourceJid
-            : fallbackProcessingIndicatorJid;
-        if (processingIndicatorJid) {
-          processingIndicatorJidsByInput.set(
-            exactInput.id,
-            processingIndicatorJid,
-          );
-          trackProcessingIndicator(
-            chatJid,
-            exactInput.id,
-            processingIndicatorJid,
-          );
-        }
+      const selectedIndicatorOwners = selectBatchProcessingIndicatorOwners(
+        exactInputs.map((input) => ({
+          id: input.id,
+          sourceJid: input.sourceJid,
+        })),
+        fallbackProcessingIndicatorJid,
+      );
+      processingIndicatorInputsByCompletion.set(
+        inputTurnId,
+        selectedIndicatorOwners.map((owner) => owner.inputTurnId),
+      );
+      processingTypingLeaseIdsByCompletion.set(inputTurnId, inputTurnId);
+      for (const owner of selectedIndicatorOwners) {
+        processingIndicatorJidsByInput.set(
+          owner.inputTurnId,
+          owner.transportJid,
+        );
+        trackProcessingIndicator(
+          chatJid,
+          owner.inputTurnId,
+          owner.transportJid,
+        );
       }
       // This runs in GroupQueue's beforePublish hook, before the IPC temp file
       // is atomically renamed into the runner-visible inbox. A host runner can
@@ -8695,6 +8795,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       currentSourceJid,
       currentChannelContext,
       agentProfile,
+      missedMessages.map((message) => message.id),
     );
   } finally {
     runEnded = true;
@@ -8718,6 +8819,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
     for (const [inputTurnId, coordinator] of turnOutputCoordinators) {
       activeTurnOutputs.unbind(mainAdmissionKey, inputTurnId, coordinator);
+    }
+
+    runnerClosedBySteer =
+      output?.status === 'closed' &&
+      steeringTransitions.consumeRunnerClose(chatJid, lastProcessed.id);
+    if (runnerClosedBySteer) {
+      streamInterrupted = true;
+      streamSteered = true;
+      commitCursor(lastProcessed.id);
+      queue.markRunnerQueryIdle(chatJid);
+      logger.info(
+        { chatJid, inputTurnId: lastProcessed.id },
+        'Container close resolved as a clean steer transition',
+      );
     }
 
     // ── 检测中断：有累积文本但从未发送回复 ──
@@ -8836,8 +8951,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             : false;
           if (!notified) channelManualNoticesAcknowledged = false;
           terminal = settled;
-        } else if (explicitDiscard) {
-          settled = runtime.cancel('Input discarded by explicit stop');
+        } else if (explicitDiscard || runnerClosedBySteer) {
+          settled = runtime.cancel(
+            runnerClosedBySteer
+              ? 'Input superseded by explicit steer'
+              : 'Input discarded by explicit stop',
+          );
           terminal = settled;
         } else if (
           healthyInputCompleted &&
@@ -9074,6 +9193,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   if (output.status === 'closed') {
+    if (runnerClosedBySteer) {
+      await clearProcessingIndicatorForInput(ipcReplyTurnTracker.inputTurnId);
+      return true;
+    }
     const activeInputHealthy = healthyCompletedInputTurns.has(
       ipcReplyTurnTracker.inputTurnId,
     );
@@ -9584,6 +9707,7 @@ async function runAgent(
   currentSourceJid?: string,
   channelContext?: ChannelTurnContext,
   agentProfile?: AgentProfile,
+  currentBatchMessageIds?: readonly string[],
 ): Promise<{ status: 'success' | 'error' | 'closed'; error?: string }> {
   const isHome = !!group.is_home;
   const owner = group.created_by ? getUserById(group.created_by) : undefined;
@@ -9777,6 +9901,7 @@ async function runAgent(
           prompt,
           sessionId,
           turnId,
+          currentBatchMessageIds,
           queryRunId: queue.getActiveQueryId(chatJid) ?? undefined,
           groupFolder: group.folder,
           chatJid,
@@ -9806,6 +9931,7 @@ async function runAgent(
           prompt,
           sessionId,
           turnId,
+          currentBatchMessageIds,
           queryRunId: queue.getActiveQueryId(chatJid) ?? undefined,
           groupFolder: group.folder,
           chatJid,
@@ -9998,7 +10124,7 @@ async function sendMessage(
   return (await sendMessageWithOutcome(jid, text, options)).messageId;
 }
 
-export function buildOverflowPartialReply(partialText: string): string {
+function buildOverflowPartialReply(partialText: string): string {
   const trimmed = partialText.trimEnd();
   return trimmed
     ? `${trimmed}\n\n---\n*⚠️ 上下文压缩中，稍后自动继续*`
@@ -10051,152 +10177,35 @@ function saveInterruptedStreamingMessages(): void {
   }
 
   // Clean up buffer files since we saved to DB (avoids duplicates on next startup)
-  cleanStreamingBufferDir();
+  streamingBuffer.clean();
 }
 
-// ─── Periodic Streaming Buffer ──────────────────────────────────────
-// Writes in-progress streaming text to disk every 5s so that even SIGKILL
-// crashes preserve most of the partial response.
-
-const STREAMING_BUFFER_DIR = path.join(DATA_DIR, 'streaming-buffer');
-const STREAMING_BUFFER_INTERVAL_MS = 5000;
-let streamingBufferInterval: ReturnType<typeof setInterval> | null = null;
-
-export function encodeJidForFilename(jid: string): string {
-  return Buffer.from(jid).toString('base64url');
-}
-
-export function decodeJidFromFilename(filename: string): string {
-  const name = filename.endsWith('.txt') ? filename.slice(0, -4) : filename;
-  return Buffer.from(name, 'base64url').toString();
-}
-
-/** Write all active streaming texts to disk (atomic write per file). */
-function flushStreamingBuffer(): void {
-  try {
-    const activeTexts = getActiveStreamingTexts();
-    if (activeTexts.size === 0) {
-      // Nothing streaming — clean up any stale files
-      cleanStreamingBufferDir();
-      return;
-    }
-
-    fs.mkdirSync(STREAMING_BUFFER_DIR, { recursive: true });
-
-    const activeFiles = new Set<string>();
-    for (const [jid, text] of activeTexts) {
-      const filename = encodeJidForFilename(jid) + '.txt';
-      activeFiles.add(filename);
-      const filePath = path.join(STREAMING_BUFFER_DIR, filename);
-      const tmpPath = filePath + '.tmp';
-      fs.writeFileSync(tmpPath, text);
-      fs.renameSync(tmpPath, filePath);
-    }
-
-    // Remove files for JIDs that are no longer streaming
-    try {
-      for (const f of fs.readdirSync(STREAMING_BUFFER_DIR)) {
-        if (f.endsWith('.txt') && !activeFiles.has(f)) {
-          fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, f));
-        }
-      }
-    } catch {
-      /* ignore cleanup errors */
-    }
-  } catch (err) {
-    logger.debug({ err }, 'Error flushing streaming buffer');
-  }
-}
-
-/** On startup, recover interrupted responses from buffer files left by a crash. */
-function recoverStreamingBuffer(): void {
-  try {
-    if (!fs.existsSync(STREAMING_BUFFER_DIR)) return;
-
-    const txtFiles = fs
-      .readdirSync(STREAMING_BUFFER_DIR)
-      .filter((f) => f.endsWith('.txt'));
-    if (txtFiles.length === 0) return;
-
-    logger.info(
-      { count: txtFiles.length },
-      'Recovering interrupted streaming messages from buffer files',
-    );
-
-    for (const filename of txtFiles) {
-      try {
-        const jid = decodeJidFromFilename(filename);
-        const text = fs.readFileSync(
-          path.join(STREAMING_BUFFER_DIR, filename),
-          'utf-8',
-        );
-        if (text.trim()) {
-          const interruptedText = buildInterruptedReply(text);
-          const msgId = crypto.randomUUID();
-          const timestamp = new Date().toISOString();
-          ensureChatExists(jid);
-          storeMessageDirect(
-            msgId,
-            jid,
-            'happyclaw-agent',
-            ASSISTANT_NAME,
-            interruptedText,
-            timestamp,
-            true,
-            {
-              meta: {
-                sourceKind: 'interrupt_partial',
-                finalizationReason: 'crash_recovery',
-              },
-            },
-          );
-          logger.info(
-            { jid, textLen: text.length },
-            'Recovered interrupted streaming message',
-          );
-        }
-        fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, filename));
-      } catch (err) {
-        logger.warn(
-          { err, filename },
-          'Error recovering streaming buffer file',
-        );
-      }
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Error recovering streaming buffer');
-  }
-}
-
-/** Remove all buffer files. */
-function cleanStreamingBufferDir(): void {
-  try {
-    if (!fs.existsSync(STREAMING_BUFFER_DIR)) return;
-    for (const f of fs.readdirSync(STREAMING_BUFFER_DIR)) {
-      try {
-        fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, f));
-      } catch {
-        /* ignore */
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-}
-
-function startStreamingBuffer(): void {
-  streamingBufferInterval = setInterval(
-    flushStreamingBuffer,
-    STREAMING_BUFFER_INTERVAL_MS,
-  );
-}
-
-function stopStreamingBuffer(): void {
-  if (streamingBufferInterval) {
-    clearInterval(streamingBufferInterval);
-    streamingBufferInterval = null;
-  }
-}
+const streamingBuffer = new StreamingBuffer(
+  path.join(DATA_DIR, 'streaming-buffer'),
+  {
+    getActiveTexts: getActiveStreamingTexts,
+    persistInterrupted: (jid, text, reason) => {
+      const msgId = crypto.randomUUID();
+      const timestamp = new Date().toISOString();
+      ensureChatExists(jid);
+      storeMessageDirect(
+        msgId,
+        jid,
+        'happyclaw-agent',
+        ASSISTANT_NAME,
+        buildInterruptedReply(text),
+        timestamp,
+        true,
+        {
+          meta: {
+            sourceKind: 'interrupt_partial',
+            finalizationReason: reason,
+          },
+        },
+      );
+    },
+  },
+);
 
 // Thin production wrapper around the pure helper in ./cross-group-acl.ts so
 // the helper can be unit-tested without booting all of index.ts.
@@ -14613,23 +14622,29 @@ async function processAgentConversation(
     : undefined;
   const healthyAgentCompletedInputTurns = new Set<string>();
   const agentProcessingIndicatorJidsByInput = new Map<string, string>();
+  const initialAgentProcessingIndicatorOwners =
+    await activateBatchProcessingIndicators(
+      virtualChatJid,
+      missedMessages.map((message) => ({
+        id: message.id,
+        sourceJid: message.source_jid,
+      })),
+      null,
+    );
   const agentProcessingIndicatorInputsByCompletion = new Map<string, string[]>([
     [
       lastProcessed.id,
-      [...new Set(missedMessages.map((message) => message.id))],
+      initialAgentProcessingIndicatorOwners.map((owner) => owner.inputTurnId),
     ],
   ]);
   const agentProcessingTypingLeaseIdsByCompletion = new Map<string, string>([
     [lastProcessed.id, lastProcessed.id],
   ]);
-  for (const message of missedMessages) {
-    const indicatorJid =
-      message.source_jid && getChannelType(message.source_jid)
-        ? message.source_jid
-        : replySourceImJid;
-    if (!indicatorJid) continue;
-    agentProcessingIndicatorJidsByInput.set(message.id, indicatorJid);
-    trackProcessingIndicator(virtualChatJid, message.id, indicatorJid);
+  for (const owner of initialAgentProcessingIndicatorOwners) {
+    agentProcessingIndicatorJidsByInput.set(
+      owner.inputTurnId,
+      owner.transportJid,
+    );
   }
   const clearAgentProcessingIndicatorForInput = async (
     inputTurnId: string,
@@ -14948,6 +14963,7 @@ async function processAgentConversation(
   // the container drained mid-query so the finally block finalizes the card as
   // "reconnecting" instead of leaving a zombie 生成中 card.
   let agentClosed = false;
+  let runnerClosedBySteer = false;
   // ── 卡片挂起完成机制（与主路径 runContainerAgent 对齐）──
   // Sub-Agent 路径首条回复后本就不再向 IM 发消息（isFirstReply 门控），挂起
   // 机制在这里同时修复了"后台任务汇总只入库、飞书永远看不到"的消息丢失。
@@ -15229,32 +15245,32 @@ async function processAgentConversation(
         coveredInputs && coveredInputs.length > 0
           ? coveredInputs
           : [{ id: inputTurnId, sourceJid: newSourceJid ?? undefined }];
-      const exactInputIds = [...new Set(exactInputs.map((input) => input.id))];
-      agentProcessingIndicatorInputsByCompletion.set(
-        inputTurnId,
-        exactInputIds,
-      );
-      agentProcessingTypingLeaseIdsByCompletion.set(inputTurnId, inputTurnId);
       const fallbackProcessingIndicatorJid =
         newSourceJid && getChannelType(newSourceJid)
           ? newSourceJid
           : targetSourceJid;
-      for (const exactInput of exactInputs) {
-        const processingIndicatorJid =
-          exactInput.sourceJid && getChannelType(exactInput.sourceJid)
-            ? exactInput.sourceJid
-            : fallbackProcessingIndicatorJid;
-        if (processingIndicatorJid) {
-          agentProcessingIndicatorJidsByInput.set(
-            exactInput.id,
-            processingIndicatorJid,
-          );
-          trackProcessingIndicator(
-            virtualChatJid,
-            exactInput.id,
-            processingIndicatorJid,
-          );
-        }
+      const selectedIndicatorOwners = selectBatchProcessingIndicatorOwners(
+        exactInputs.map((input) => ({
+          id: input.id,
+          sourceJid: input.sourceJid,
+        })),
+        fallbackProcessingIndicatorJid,
+      );
+      agentProcessingIndicatorInputsByCompletion.set(
+        inputTurnId,
+        selectedIndicatorOwners.map((owner) => owner.inputTurnId),
+      );
+      agentProcessingTypingLeaseIdsByCompletion.set(inputTurnId, inputTurnId);
+      for (const owner of selectedIndicatorOwners) {
+        agentProcessingIndicatorJidsByInput.set(
+          owner.inputTurnId,
+          owner.transportJid,
+        );
+        trackProcessingIndicator(
+          virtualChatJid,
+          owner.inputTurnId,
+          owner.transportJid,
+        );
       }
       return {
         rollback: () => {
@@ -16676,6 +16692,7 @@ async function processAgentConversation(
       prompt,
       sessionId,
       turnId: lastProcessed.id,
+      currentBatchMessageIds: missedMessages.map((message) => message.id),
       queryRunId: queue.getActiveQueryId(virtualJid) ?? undefined,
       groupFolder: effectiveGroup.folder,
       chatJid,
@@ -16756,6 +16773,25 @@ async function processAgentConversation(
         onProcessCb,
         wrappedOnOutput,
         ownerHomeFolder,
+      );
+    }
+
+    runnerClosedBySteer =
+      output.status === 'closed' &&
+      steeringTransitions.consumeRunnerClose(
+        virtualChatJid,
+        output.turnId || activeAgentInputTurnId,
+      );
+    if (runnerClosedBySteer) {
+      agentClosed = false;
+      agentStreamInterrupted = true;
+      agentStreamSteered = true;
+      commitCursor(activeAgentInputTurnId);
+      retryUnfinishedTurn = false;
+      queue.markRunnerQueryIdle(virtualJid);
+      logger.info(
+        { chatJid, agentId, inputTurnId: activeAgentInputTurnId },
+        'Conversation agent close resolved as a clean steer transition',
       );
     }
 
@@ -16845,7 +16881,7 @@ async function processAgentConversation(
         { chatJid, agentId, turnOutcome },
         'Explicit stop discarded the interrupted agent input without replay',
       );
-    } else if (output.status === 'closed') {
+    } else if (output.status === 'closed' && !runnerClosedBySteer) {
       const turnOutcome = resolveTurnOutcome({
         status: output.status,
         healthyInputTurnCompleted: activeAgentInputHealthy,
@@ -16933,6 +16969,10 @@ async function processAgentConversation(
           } else {
             await agentStreamingSession.abort('已停止').catch(() => {});
           }
+        } else if (runnerClosedBySteer) {
+          await agentStreamingSession
+            .complete(agentStreamingAccText)
+            .catch(() => {});
         } else if (agentClosed) {
           // Container drained/_closed the in-flight query; the message will be
           // retried, so just finalize the card (区别于"已中断"：系统侧打断重试).
@@ -17009,8 +17049,12 @@ async function processAgentConversation(
             : false;
           if (!notified) allAgentManualNoticesAcknowledged = false;
           terminal = settled;
-        } else if (explicitDiscard) {
-          settled = runtime.cancel('Input discarded by explicit stop');
+        } else if (explicitDiscard || runnerClosedBySteer) {
+          settled = runtime.cancel(
+            runnerClosedBySteer
+              ? 'Input superseded by explicit steer'
+              : 'Input discarded by explicit stop',
+          );
           terminal = settled;
         } else if (agentDeterministicTerminalError) {
           settled = runtime.fail(agentDeterministicTerminalError);
@@ -18624,18 +18668,24 @@ function buildOnPairAttempt(
     const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
     if (group) {
       const fallbackWorkspaceJid = defaultWorkspaceJid ?? pairingUserHome.jid;
-      const updated = accountId
-        ? applyChannelAccountRegistrationFallback(
-            group,
-            accountId,
-            fallbackWorkspaceJid,
-          )
-        : {
-            ...group,
-            ...(group.target_main_jid || group.target_agent_id
-              ? {}
-              : { target_main_jid: fallbackWorkspaceJid }),
-          };
+      const updated = attachDefaultChannelAccountMount({
+        sourceJid: jid,
+        group,
+        accountId,
+        fallbackWorkspaceJid,
+        userId: result.userId,
+        onCreated: (agent, workspaceJid) => {
+          broadcastAgentStatus(
+            workspaceJid,
+            agent.id,
+            'idle',
+            agent.name,
+            '',
+            undefined,
+            'conversation',
+          );
+        },
+      });
       const pairedOwnerImId = ownerImIdFromDirectConversationJid(jid);
       const paired = pairedOwnerImId
         ? claimOwner(
@@ -19395,11 +19445,7 @@ function handleIncomingFollowUp(input: {
     runId: activeRunId,
   });
   if (mode === 'steer') {
-    const result = promoteFollowUp(
-      input.targetJid,
-      input.messageId,
-      activeRunId,
-    );
+    const result = steerQueuedFollowUpBatch(input.targetJid, input.messageId);
     if (result.ok) {
       return { disposition: 'steered', runId: activeRunId };
     }
@@ -19558,8 +19604,48 @@ async function handleFeishuSessionBreak(input: {
     'Feishu session break processed',
   );
   return interrupted || cancelled.length > 0
-    ? '已停止当前任务，并取消此前排队的消息。'
-    : '当前没有正在执行或排队的任务。';
+    ? 'Current task stopped.'
+    : 'No active task to stop.';
+}
+
+async function handleFeishuSessionClear(input: {
+  sourceJid: string;
+  targetJid?: string;
+  senderImId: string;
+}): Promise<string> {
+  const targetJid = input.targetJid;
+  const runtime = targetJid ? resolveFollowUpRuntime(targetJid) : null;
+  if (!targetJid || !runtime) {
+    return '当前绑定目标不存在，无法执行 /clear。';
+  }
+  try {
+    await executeSessionReset(
+      runtime.baseChatJid,
+      runtime.effectiveGroup.folder,
+      {
+        queue,
+        sessions,
+        broadcast: broadcastNewMessage,
+        setLastAgentTimestamp: setCursors,
+      },
+      runtime.agentId ?? undefined,
+    );
+    logger.info(
+      {
+        sourceJid: input.sourceJid,
+        targetJid,
+        senderImId: input.senderImId,
+      },
+      'Feishu session clear processed',
+    );
+    return 'Session context cleared.';
+  } catch (err) {
+    logger.error(
+      { err, sourceJid: input.sourceJid, targetJid },
+      'Feishu session clear failed',
+    );
+    return 'Failed to clear the session context. Please try again.';
+  }
 }
 
 function resolveChannelAccountWorkspace(account: ChannelAccount): {
@@ -19570,6 +19656,26 @@ function resolveChannelAccountWorkspace(account: ChannelAccount): {
     getGroup: getRegisteredGroup,
     getHome: getUserHomeGroup,
   });
+}
+
+/**
+ * Resolve a canonical WhatsApp transport identity onto an existing legacy key
+ * without changing durable data. Authorization still runs after this lookup.
+ */
+function normalizeWhatsAppInboundConversationJid(jid: string): string | null {
+  const canonicalJid = canonicalizeWhatsAppConversationJid(jid);
+  const resolved = resolveWhatsAppConversationAliasFromGroups(
+    canonicalJid,
+    registeredGroups,
+  );
+  if (resolved.status === 'conflict') {
+    logger.warn(
+      { canonicalJid, aliases: resolved.aliases },
+      'Rejected ambiguous legacy WhatsApp aliases; run offline repair',
+    );
+    return null;
+  }
+  return resolved.jid;
 }
 
 async function disconnectChannelAccountById(accountId: string): Promise<void> {
@@ -19618,11 +19724,24 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
     baseOnNewChat(jid, name);
     const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
     if (!group) return;
-    const updated = applyChannelAccountRegistrationFallback(
+    const updated = attachDefaultChannelAccountMount({
+      sourceJid: jid,
       group,
-      account.id,
-      workspace.jid,
-    );
+      accountId: account.id,
+      fallbackWorkspaceJid: workspace.jid,
+      userId: account.owner_user_id,
+      onCreated: (agent, workspaceJid) => {
+        broadcastAgentStatus(
+          workspaceJid,
+          agent.id,
+          'idle',
+          agent.name,
+          '',
+          undefined,
+          'conversation',
+        );
+      },
+    });
     // Steady-state inbound messages resolve to an already-attached group;
     // rewriting an identical row on every message was pure write amplification.
     if (updated === group) return;
@@ -19633,6 +19752,8 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
     accountId: account.id,
     scopeIncomingJids: !account.is_legacy_default,
     ignoreMessagesBefore: Date.now(),
+    onMessagePersisted: broadcastNewMessage,
+    onFollowUpsChanged: broadcastFollowUpUpdate,
     onCommand: handleCommand,
     resolveGroupFolder: (jid: string) => resolveEffectiveFolder(jid),
     resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
@@ -19667,6 +19788,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
             ),
           onFollowUpMessage: handleIncomingFollowUp,
           onSessionBreak: handleFeishuSessionBreak,
+          onSessionClear: handleFeishuSessionClear,
           onFollowUpCardAction: handleFollowUpCardAction,
           onCardInterrupt: handleCardInterrupt,
           onP2pSender: (senderOpenId: string) => {
@@ -19959,6 +20081,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
         onNewChat,
         {
           ...common,
+          normalizeIncomingJid: normalizeWhatsAppInboundConversationJid,
           isChatAuthorized: buildIsChatAuthorized(
             account.owner_user_id,
             account.id,
@@ -20399,7 +20522,7 @@ async function main(): Promise<void> {
 
     // Agent output is now quiescent. Persist any partial text that did not
     // reach a normal result before touching the external card lifecycle.
-    stopStreamingBuffer();
+    streamingBuffer.stop();
     saveInterruptedStreamingMessages();
 
     // Phase 2: terminalize every remaining card while the Feishu clients are
@@ -20568,6 +20691,8 @@ async function main(): Promise<void> {
           config,
           onNewChat,
           {
+            onMessagePersisted: broadcastNewMessage,
+            onFollowUpsChanged: broadcastFollowUpUpdate,
             ignoreMessagesBefore,
             onCommand: handleCommand,
             resolveGroupFolder: (chatJid: string) =>
@@ -20588,6 +20713,7 @@ async function main(): Promise<void> {
               isSenderAllowedInGroup(jid, sender, getReloadOwnerOpenId),
             onFollowUpMessage: handleIncomingFollowUp,
             onSessionBreak: handleFeishuSessionBreak,
+            onSessionClear: handleFeishuSessionClear,
             onFollowUpCardAction: handleFollowUpCardAction,
             onCardInterrupt: handleCardInterrupt,
             onP2pSender: onReloadP2pSender,
@@ -20616,6 +20742,7 @@ async function main(): Promise<void> {
           buildIsChatAuthorized(userId),
           buildOnPairAttempt(userId),
           {
+            onMessagePersisted: broadcastNewMessage,
             onCommand: handleCommand,
             ignoreMessagesBefore,
             resolveGroupFolder: (chatJid: string) =>
@@ -20651,6 +20778,7 @@ async function main(): Promise<void> {
           buildIsChatAuthorized(userId),
           buildOnPairAttempt(userId),
           {
+            onMessagePersisted: broadcastNewMessage,
             onCommand: handleCommand,
             resolveGroupFolder: (chatJid: string) =>
               resolveEffectiveFolder(chatJid),
@@ -20677,6 +20805,7 @@ async function main(): Promise<void> {
           config,
           onNewChat,
           {
+            onMessagePersisted: broadcastNewMessage,
             isChatAuthorized: buildIsChatAuthorized(userId),
             onPairAttempt: buildOnPairAttempt(userId),
             ignoreMessagesBefore,
@@ -20709,6 +20838,7 @@ async function main(): Promise<void> {
           config,
           onNewChat,
           {
+            onMessagePersisted: broadcastNewMessage,
             isChatAuthorized: buildIsChatAuthorized(userId),
             onPairAttempt: buildOnPairAttempt(userId),
             ignoreMessagesBefore,
@@ -20752,6 +20882,7 @@ async function main(): Promise<void> {
           },
           onNewChat,
           {
+            onMessagePersisted: broadcastNewMessage,
             isChatAuthorized: buildIsChatAuthorized(userId),
             onPairAttempt: buildOnPairAttempt(userId),
             // With a durable cursor, replay is intentional recovery and must
@@ -20795,6 +20926,7 @@ async function main(): Promise<void> {
           },
           onNewChat,
           {
+            onMessagePersisted: broadcastNewMessage,
             isChatAuthorized: buildIsChatAuthorized(userId),
             onPairAttempt: buildOnPairAttempt(userId),
             ignoreMessagesBefore: Date.now(),
@@ -20879,7 +21011,7 @@ async function main(): Promise<void> {
   };
 
   // Start Web server early so frontend auth/API isn't blocked by Feishu readiness.
-  startWebServer({
+  const webRuntimeDeps: WebDeps = {
     queue,
     getRegisteredGroups: () => registeredGroups,
     sessions,
@@ -21022,7 +21154,12 @@ async function main(): Promise<void> {
     editFollowUp,
     reorderFollowUp,
     interruptAndRunFollowUp,
+  };
+  injectChannelMountRuntimePort({
+    getRegisteredGroups: webRuntimeDeps.getRegisteredGroups,
+    clearImFailCounts: webRuntimeDeps.clearImFailCounts,
   });
+  startWebServer(webRuntimeDeps);
 
   // Clean expired sessions every hour
   setInterval(
@@ -21977,12 +22114,12 @@ async function main(): Promise<void> {
     void channelReliabilityRecoveryLoop?.trigger();
   });
   imManager.resumeDeferredInbound();
-  recoverStreamingBuffer();
+  streamingBuffer.recover();
   recoverStartupTypedIpcDeliveries();
   recoverPendingMessages();
   recoverConversationAgents();
   startIpcWatcher();
-  startStreamingBuffer();
+  streamingBuffer.start();
   startMessageLoop();
 
   // Start Feishu group sync if any connection is active

@@ -3,9 +3,13 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import type { Variables } from '../web-context.js';
-import { getWebDeps } from '../web-context.js';
+import {
+  getWebDeps,
+  projectWebAgentRemoved,
+  projectWebAgentStatus,
+} from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
-import { canAccessGroup, canModifyGroup } from '../web-context.js';
+import { canAccessGroup, canModifyGroup } from '../group-acl.js';
 import {
   clearSessionChannelOwner,
   getRegisteredGroup,
@@ -475,10 +479,8 @@ router.post('/:jid/agents', authMiddleware, async (c) => {
   const virtualChatJid = `${jid}#agent:${agentId}`;
   ensureChatExists(virtualChatJid);
 
-  // Broadcast agent_status (idle) via WebSocket
-  // Import dynamically to avoid circular deps
-  const { broadcastAgentStatus } = await import('../web.js');
-  broadcastAgentStatus(jid, agentId, 'idle', name, description);
+  // Broadcast through the injected Web projection boundary.
+  projectWebAgentStatus(jid, agentId, 'idle', name, description);
 
   logger.info(
     { agentId, jid, name, userId: user.id },
@@ -557,8 +559,7 @@ router.post('/:jid/sessions', authMiddleware, async (c) => {
   ensureAgentDirectories(group.folder, sessionId);
   ensureChatExists(`${jid}#agent:${sessionId}`);
 
-  const { broadcastAgentStatus } = await import('../web.js');
-  broadcastAgentStatus(jid, sessionId, 'idle', name, description);
+  projectWebAgentStatus(jid, sessionId, 'idle', name, description);
 
   logger.info(
     { sessionId, jid, name, userId: user.id },
@@ -629,8 +630,7 @@ router.patch('/:jid/agents/:agentId', authMiddleware, async (c) => {
   updateChatName(virtualChatJid, name);
 
   // Broadcast update via WebSocket
-  const { broadcastAgentStatus } = await import('../web.js');
-  broadcastAgentStatus(
+  projectWebAgentStatus(
     jid,
     agentId,
     agent.status as import('../types.js').AgentStatus,
@@ -687,8 +687,7 @@ router.patch('/:jid/sessions/:sessionId', authMiddleware, async (c) => {
   updateAgentContextInfo(sessionId, { title_source: 'manual' });
   updateChatName(`${jid}#agent:${sessionId}`, name);
 
-  const { broadcastAgentStatus } = await import('../web.js');
-  broadcastAgentStatus(
+  projectWebAgentStatus(
     jid,
     sessionId,
     session.status as import('../types.js').AgentStatus,
@@ -836,8 +835,7 @@ router.delete('/:jid/agents/:agentId', authMiddleware, async (c) => {
   deleteAgent(agentId);
 
   // Broadcast removal
-  const { broadcastAgentRemoved } = await import('../web.js');
-  broadcastAgentRemoved(jid, agentId, agent.name);
+  projectWebAgentRemoved(jid, agentId, agent.name);
 
   logger.info({ agentId, jid, userId: user.id }, 'Agent deleted by user');
   return c.json({ success: true });
@@ -948,8 +946,7 @@ router.delete('/:jid/sessions/:sessionId', authMiddleware, async (c) => {
   clearSessionChannelOwner(group.folder, sessionId);
   deleteAgent(sessionId);
 
-  const { broadcastAgentRemoved } = await import('../web.js');
-  broadcastAgentRemoved(jid, sessionId, session.name);
+  projectWebAgentRemoved(jid, sessionId, session.name);
 
   logger.info({ sessionId, jid, userId: user.id }, 'Session deleted by user');
   return c.json({ success: true });

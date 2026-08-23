@@ -31,7 +31,6 @@ import type {
 } from 'discord.js';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import { detectImageMimeType } from './image-detector.js';
@@ -83,11 +82,12 @@ export interface DiscordConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   onBotRemovedFromGroup?: (chatJid: string) => void;
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
 }
 
 export interface DiscordHistoryMessage {
@@ -648,7 +648,7 @@ export function createDiscordConnection(
           },
         );
 
-        broadcastNewMessage(
+        opts.onMessagePersisted?.(
           targetJid,
           {
             id,

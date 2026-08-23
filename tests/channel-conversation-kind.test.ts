@@ -13,6 +13,14 @@ describe('resolveChannelConversationKind', () => {
     ['discord:dm:123', 'direct'],
     ['discord:456', 'group'],
     ['whatsapp:123@s.whatsapp.net', 'direct'],
+    ['whatsapp:1555:42@s.whatsapp.net', 'direct'],
+    ['whatsapp:123456789012345@lid', 'direct'],
+    ['whatsapp:123456789012345@lid#account:bot-a', 'direct'],
+    ['whatsapp:hosted-user@hosted', 'direct'],
+    ['whatsapp:hosted-user@hosted.lid', 'direct'],
+    ['whatsapp:15551234567@c.us', 'direct'],
+    ['whatsapp:15551234567:14@c.us#account:bot-a', 'direct'],
+    ['whatsapp:16505361212@c.us', 'direct'],
     ['whatsapp:123@g.us', 'group'],
     ['wechat:wxid_user', 'direct'],
     ['wecom:c2c:user#account:bot-a', 'direct'],
@@ -40,6 +48,12 @@ describe('resolveChannelConversationKind', () => {
       'unknown',
     );
     expect(resolveChannelConversationKind('web:main')).toBe('unknown');
+    expect(resolveChannelConversationKind('whatsapp:status@broadcast')).toBe(
+      'unknown',
+    );
+    expect(resolveChannelConversationKind('whatsapp:123@newsletter')).toBe(
+      'unknown',
+    );
   });
 });
 

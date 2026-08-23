@@ -27,6 +27,8 @@ const controls = vi.hoisted(() => ({
   chatList: vi.fn(),
   messageCreate: vi.fn(),
   messageReply: vi.fn(),
+  reactionCreate: vi.fn(),
+  reactionDelete: vi.fn(),
 }));
 
 vi.mock('../src/config.js', async (importOriginal) => ({
@@ -62,8 +64,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
         reply: controls.messageReply,
       },
       messageReaction: {
-        create: vi.fn().mockResolvedValue({ code: 0 }),
-        delete: vi.fn().mockResolvedValue({ code: 0 }),
+        create: controls.reactionCreate,
+        delete: controls.reactionDelete,
       },
       messageResource: { get: controls.messageResourceGet },
     };
@@ -130,6 +132,11 @@ beforeEach(() => {
     code: 0,
     data: { message_id: 'om_reply' },
   });
+  controls.reactionCreate.mockReset().mockResolvedValue({
+    code: 0,
+    data: { reaction_id: 'reaction_1' },
+  });
+  controls.reactionDelete.mockReset().mockResolvedValue({ code: 0 });
   controls.messageResourceGet.mockReset().mockResolvedValue({
     getReadableStream: () =>
       (async function* () {
@@ -221,6 +228,31 @@ async function connect(
 }
 
 describe('Feishu durable Inbox and cursor integration', () => {
+  test('adds OnIt only when the active batch explicitly acquires it', async () => {
+    const connected = await connect(`account-batch-ack-${Date.now()}`, vi.fn());
+    const messageId = 'om_batch_ack';
+
+    await connected.handler(event(messageId, Date.now(), '排队时不要打表情'));
+    expect(controls.reactionCreate).not.toHaveBeenCalled();
+    expect(connected.handlers['im.message.reaction.created_v1']).toBeTypeOf(
+      'function',
+    );
+    expect(connected.handlers['im.message.reaction.deleted_v1']).toBeTypeOf(
+      'function',
+    );
+
+    await connected.connection.beginAckReaction('ou_durable_user', messageId);
+    expect(controls.reactionCreate).toHaveBeenCalledWith({
+      path: { message_id: messageId },
+      data: { reaction_type: { emoji_type: 'OnIt' } },
+    });
+
+    await connected.connection.clearAckReaction('ou_durable_user', messageId);
+    expect(controls.reactionDelete).toHaveBeenCalledWith({
+      path: { message_id: messageId, reaction_id: 'reaction_1' },
+    });
+  });
+
   test('durably queues a busy follow-up without sending an action card', async () => {
     const accountId = `account-silent-queue-${Date.now()}`;
     const followUp = vi.fn(() => ({
@@ -299,12 +331,17 @@ describe('Feishu durable Inbox and cursor integration', () => {
 
   test('only a real Bot mention can execute the exact lowercase /break command in a group', async () => {
     const accountId = `account-break-command-${Date.now()}`;
-    const onSessionBreak = vi
-      .fn()
-      .mockResolvedValue('已停止当前任务，并取消此前排队的消息。');
+    const onSessionBreak = vi.fn().mockResolvedValue('Current task stopped.');
     const executed = vi.fn();
     const connected = await connect(accountId, executed, {
       shouldProcessGroupMessage: () => true,
+      resolveEffectiveChatJid: (jid, meta) => ({
+        effectiveJid: meta?.threadId
+          ? 'web:durable-feishu-test#agent:break-thread-agent'
+          : 'web:durable-feishu-test',
+        agentId: meta?.threadId ? 'break-thread-agent' : null,
+        sourceJid: jid,
+      }),
       onSessionBreak,
     });
     const createTime = Date.now();
@@ -315,6 +352,9 @@ describe('Feishu durable Inbox and cursor integration', () => {
         ...event('om_real_break', createTime, '').message,
         chat_id: 'oc_break_group',
         chat_type: 'group',
+        root_id: 'om_break_root',
+        parent_id: 'om_break_root',
+        thread_id: 'omt_break_thread',
         content: JSON.stringify({ text: '@_user_1 /break' }),
         mentions: [
           {
@@ -328,13 +368,13 @@ describe('Feishu durable Inbox and cursor integration', () => {
 
     expect(onSessionBreak).toHaveBeenCalledWith({
       sourceJid: 'feishu:oc_break_group',
-      targetJid: 'web:durable-feishu-test',
+      targetJid: 'web:durable-feishu-test#agent:break-thread-agent',
       senderImId: 'ou_durable_user',
     });
     expect(executed).not.toHaveBeenCalledWith('om_real_break');
-    expect(controls.messageCreate).toHaveBeenCalledTimes(1);
+    expect(controls.messageReply).toHaveBeenCalledTimes(1);
 
-    controls.messageCreate.mockClear();
+    controls.messageReply.mockClear();
     await connected.handler({
       ...event('om_fake_break', createTime + 1, ''),
       message: {
@@ -348,7 +388,70 @@ describe('Feishu durable Inbox and cursor integration', () => {
 
     expect(onSessionBreak).toHaveBeenCalledTimes(1);
     expect(executed).toHaveBeenCalledWith('om_fake_break');
-    expect(controls.messageCreate).not.toHaveBeenCalled();
+    expect(controls.messageReply).not.toHaveBeenCalled();
+  });
+
+  test('only a real Bot mention can execute exact lowercase /clear', async () => {
+    const accountId = `account-clear-command-${Date.now()}`;
+    const onSessionClear = vi
+      .fn()
+      .mockResolvedValue('Session context cleared.');
+    const executed = vi.fn();
+    const connected = await connect(accountId, executed, {
+      shouldProcessGroupMessage: () => true,
+      resolveEffectiveChatJid: (jid, meta) => ({
+        effectiveJid: meta?.threadId
+          ? 'web:durable-feishu-test#agent:thread-agent'
+          : 'web:durable-feishu-test',
+        agentId: meta?.threadId ? 'thread-agent' : null,
+        sourceJid: jid,
+      }),
+      onSessionClear,
+    });
+    const createTime = Date.now();
+    const mentioned = {
+      key: '@_user_1',
+      name: 'Inbox Test Bot',
+      id: { open_id: 'ou_bot' },
+    };
+
+    await connected.handler({
+      ...event('om_real_clear', createTime, ''),
+      message: {
+        ...event('om_real_clear', createTime, '').message,
+        chat_id: 'oc_clear_group',
+        chat_type: 'group',
+        root_id: 'om_clear_root',
+        parent_id: 'om_clear_root',
+        thread_id: 'omt_clear_thread',
+        content: JSON.stringify({ text: '@_user_1 /clear' }),
+        mentions: [mentioned],
+      },
+    });
+
+    expect(onSessionClear).toHaveBeenCalledWith({
+      sourceJid: 'feishu:oc_clear_group',
+      targetJid: 'web:durable-feishu-test#agent:thread-agent',
+      senderImId: 'ou_durable_user',
+    });
+    expect(executed).not.toHaveBeenCalledWith('om_real_clear');
+    expect(controls.messageReply).toHaveBeenCalledTimes(1);
+
+    controls.messageReply.mockClear();
+    await connected.handler({
+      ...event('om_fake_clear', createTime + 1, ''),
+      message: {
+        ...event('om_fake_clear', createTime + 1, '').message,
+        chat_id: 'oc_clear_group',
+        chat_type: 'group',
+        content: JSON.stringify({ text: '@Inbox Test Bot /clear' }),
+        mentions: [],
+      },
+    });
+
+    expect(onSessionClear).toHaveBeenCalledTimes(1);
+    expect(executed).toHaveBeenCalledWith('om_fake_clear');
+    expect(controls.messageReply).not.toHaveBeenCalled();
   });
 
   test('bootstraps the first P2P DM after an account-scoped route rejection', async () => {
@@ -967,9 +1070,10 @@ describe('Feishu durable Inbox and cursor integration', () => {
     });
   });
 
-  test('keeps an explicit /queue override on a merged-forward companion', async () => {
+  test('treats legacy /queue text as an ordinary default-queued message', async () => {
     const accountId = `account-forward-explicit-queue-${Date.now()}`;
     const followUps = vi.fn(() => ({ disposition: 'started' as const }));
+    const onCommand = vi.fn().mockResolvedValue(null);
     controls.messageGet.mockResolvedValue({
       data: {
         items: [
@@ -991,6 +1095,7 @@ describe('Feishu durable Inbox and cursor integration', () => {
     });
     const connected = await connect(accountId, vi.fn(), {
       onFollowUpMessage: followUps as TestConnectOptions['onFollowUpMessage'],
+      onCommand,
     });
     const createTime = Date.now();
 
@@ -1015,10 +1120,11 @@ describe('Feishu durable Inbox and cursor integration', () => {
     expect(followUps).toHaveBeenLastCalledWith(
       expect.objectContaining({
         messageId: 'om_forward_queue_note',
-        requestedMode: 'queue',
+        requestedMode: undefined,
         coalesceBundleId: undefined,
       }),
     );
+    expect(onCommand).not.toHaveBeenCalled();
   });
 
   test('two live instances concurrently execute one external message exactly once', async () => {

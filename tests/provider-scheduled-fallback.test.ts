@@ -34,7 +34,6 @@ vi.mock('../src/runtime-config.js', async () => {
   return {
     ...actual,
     getEnabledProviders: () => mocks.enabledProviders,
-    getDefaultProviderId: () => null,
     getSystemSettings: () => ({
       ...actual.getSystemSettings(),
       fallbackModel: mocks.fallbackModel,

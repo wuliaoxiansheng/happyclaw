@@ -1,11 +1,10 @@
 import { Hono, type Context } from 'hono';
 import type { Variables } from '../web-context.js';
 import {
-  canAccessGroup,
-  canModifyGroup,
   hasHostExecutionPermission,
   isHostExecutionGroup,
 } from '../web-context.js';
+import { canAccessGroup, canModifyGroup } from '../group-acl.js';
 import { authMiddleware } from '../middleware/auth.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import {

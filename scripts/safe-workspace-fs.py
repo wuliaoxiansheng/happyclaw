@@ -51,17 +51,20 @@ def open_parent(root_fd: int, parts: list[str], create: bool) -> tuple[int, str]
         raise
 
 
-def ensure_safe_leaf(parent_fd: int, leaf: str, must_exist: bool) -> None:
+def existing_safe_leaf_mode(
+    parent_fd: int, leaf: str, must_exist: bool
+) -> int | None:
     try:
         info = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
         if must_exist:
             fail("File not found")
-        return
+        return None
     if stat.S_ISLNK(info.st_mode):
         fail("Refusing to overwrite symbolic link")
     if not stat.S_ISREG(info.st_mode):
         fail("Target is not a regular file")
+    return stat.S_IMODE(info.st_mode)
 
 
 def write_file(root_fd: int, request: dict[str, object]) -> None:
@@ -72,7 +75,9 @@ def write_file(root_fd: int, request: dict[str, object]) -> None:
     temporary = f".{leaf}.happyclaw-{secrets.token_hex(12)}.tmp"
     temporary_created = False
     try:
-        ensure_safe_leaf(parent_fd, leaf, bool(request.get("mustExist", False)))
+        existing_mode = existing_safe_leaf_mode(
+            parent_fd, leaf, bool(request.get("mustExist", False))
+        )
         encoded = request.get("dataBase64")
         if not isinstance(encoded, str):
             fail("File data is required")
@@ -85,6 +90,12 @@ def write_file(root_fd: int, request: dict[str, object]) -> None:
         )
         temporary_created = True
         try:
+            # Atomic replacement must not silently turn an executable into a
+            # data file or broaden a private file from 0600 to 0644. Direct
+            # writes preserve an existing inode's mode, so mirror that contract
+            # on the temporary inode before replacing the leaf.
+            if existing_mode is not None:
+                os.fchmod(file_fd, existing_mode)
             view = memoryview(data)
             while view:
                 written = os.write(file_fd, view)

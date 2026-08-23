@@ -36,16 +36,7 @@ afterAll(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-/**
- * An auto-resolved defaultProviderId must not disable the balancing pool.
- *
- * resolveDefaultProviderId() falls back to the first enabled provider, so every
- * installation has a default. If that counted as a pin, a multi-account pool
- * would send every session to the same provider — and, because the pinned path
- * skips the health check, keep sending them there after that account hit its
- * limit.
- */
-describe('default model configuration vs. balancing pool', () => {
+describe('automatic enabled-model pool', () => {
   const created: string[] = [];
 
   beforeAll(() => {
@@ -60,10 +51,6 @@ describe('default model configuration vs. balancing pool', () => {
         }).id,
       );
     }
-  });
-
-  test('a default is still auto-resolved for display and single-provider use', () => {
-    expect(runtimeConfig.getDefaultProviderId()).toBe(created[0]);
   });
 
   test('rotates across enabled providers when no Agent pinned a configuration', () => {

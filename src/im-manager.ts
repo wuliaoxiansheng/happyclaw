@@ -26,22 +26,10 @@ import type {
   DiscordChannelInfo,
   DiscordGuildInfo,
 } from './discord.js';
-import { type FeishuConnectionConfig } from './feishu.js';
 import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
-import type { TelegramConnectionConfig } from './telegram.js';
-import type { QQConnectionConfig } from './qq.js';
-import type {
-  WeChatConnectionConfig,
-  WeChatConnectionState,
-} from './wechat.js';
+import type { WeChatConnectionState } from './wechat.js';
 import type { WeComConnectionConfig, WeComConnectionState } from './wecom.js';
-import type { DingTalkConnectionConfig } from './dingtalk.js';
-import type { DiscordConnectionConfig } from './discord.js';
-import {
-  getWhatsAppAuthDir,
-  type WhatsAppConnectionConfig,
-  type WhatsAppConnectionState,
-} from './whatsapp.js';
+import type { WhatsAppConnectionState } from './whatsapp.js';
 import { rm } from 'fs/promises';
 import crypto from 'node:crypto';
 import { DATA_DIR } from './config.js';
@@ -168,6 +156,8 @@ export interface ConnectFeishuOptions {
     sourceJid?: string;
   } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onMessagePersisted?: IMChannelConnectOpts['onMessagePersisted'];
+  onFollowUpsChanged?: IMChannelConnectOpts['onFollowUpsChanged'];
   onFollowUpMessage?: (input: {
     targetJid: string;
     sourceJid: string;
@@ -177,6 +167,11 @@ export interface ConnectFeishuOptions {
     coalesceBundleId?: string;
   }) => FollowUpDisposition;
   onSessionBreak?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+  }) => Promise<string>;
+  onSessionClear?: (input: {
     sourceJid: string;
     targetJid?: string;
     senderImId: string;
@@ -358,13 +353,20 @@ export class IMConnectionManager {
         return false;
       }
     };
+    const normalizeIncomingJid = (jid: string) => {
+      const scoped = scope(jid);
+      if (!inboundAllowed()) return null;
+      return opts.normalizeIncomingJid
+        ? opts.normalizeIncomingJid(scoped)
+        : scoped;
+    };
     return {
       ...opts,
       shouldDeferInbound: () =>
         this.inboundDeferred ||
         this.inboundPaused ||
         opts.shouldDeferInbound?.() === true,
-      normalizeIncomingJid: scope,
+      normalizeIncomingJid,
       onNewChat: (jid, name) => {
         if (inboundAllowed()) opts.onNewChat(scope(jid), name);
       },
@@ -467,6 +469,21 @@ export class IMConnectionManager {
             }) =>
               inboundAllowed()
                 ? opts.onSessionBreak!({
+                    ...input,
+                    sourceJid: scope(input.sourceJid),
+                  })
+                : Promise.resolve('当前通道暂不可用。'),
+          }
+        : {}),
+      ...(opts.onSessionClear
+        ? {
+            onSessionClear: (input: {
+              sourceJid: string;
+              targetJid?: string;
+              senderImId: string;
+            }) =>
+              inboundAllowed()
+                ? opts.onSessionClear!({
                     ...input,
                     sourceJid: scope(input.sourceJid),
                   })
@@ -957,6 +974,22 @@ export class IMConnectionManager {
   }
 
   /**
+   * Add the ack reaction for the exact provider message that owns an active
+   * processing batch. Unsupported channels keep their existing native typing
+   * or ingress acknowledgement behaviour.
+   */
+  async beginAckReaction(jid: string, inputMessageId: string): Promise<void> {
+    const channelType = getChannelType(jid);
+    if (!channelType) return;
+
+    const chatId = extractProviderTarget(jid);
+    const channel = this.findChannelForJid(jid, channelType);
+    if (channel?.beginAckReaction) {
+      await channel.beginAckReaction(chatId, inputMessageId);
+    }
+  }
+
+  /**
    * Clear the ack reaction for a chat (e.g. when streaming card handled the reply).
    */
   async clearAckReaction(jid: string, inputMessageId: string): Promise<void> {
@@ -1247,8 +1280,11 @@ export class IMConnectionManager {
         resolveGroupFolder: options?.resolveGroupFolder,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
+        onMessagePersisted: options?.onMessagePersisted,
+        onFollowUpsChanged: options?.onFollowUpsChanged,
         onFollowUpMessage: options?.onFollowUpMessage,
         onSessionBreak: options?.onSessionBreak,
+        onSessionClear: options?.onSessionClear,
         onFollowUpCardAction: options?.onFollowUpCardAction,
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
@@ -1290,6 +1326,7 @@ export class IMConnectionManager {
         sourceJid?: string;
       } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      onMessagePersisted?: IMChannelConnectOpts['onMessagePersisted'];
       onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
       onBotRemovedFromGroup?: (chatJid: string) => void;
       onNativeContextDetected?: (
@@ -1324,6 +1361,7 @@ export class IMConnectionManager {
         resolveGroupFolder: options?.resolveGroupFolder,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
+        onMessagePersisted: options?.onMessagePersisted,
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
         onNativeContextDetected: options?.onNativeContextDetected,
@@ -1358,6 +1396,7 @@ export class IMConnectionManager {
         sourceJid?: string;
       } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      onMessagePersisted?: IMChannelConnectOpts['onMessagePersisted'];
     },
   ): Promise<boolean> {
     if (!config.appId || !config.appSecret) {
@@ -1385,6 +1424,7 @@ export class IMConnectionManager {
         resolveGroupFolder: options?.resolveGroupFolder,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
+        onMessagePersisted: options?.onMessagePersisted,
       },
       options?.accountId,
       options?.scopeIncomingJids,
@@ -1431,6 +1471,7 @@ export class IMConnectionManager {
         sourceJid?: string;
       } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      onMessagePersisted?: IMChannelConnectOpts['onMessagePersisted'];
       isChatAuthorized?: (jid: string) => boolean;
       onPairAttempt?: (
         jid: string,
@@ -1479,6 +1520,7 @@ export class IMConnectionManager {
         resolveGroupFolder: options?.resolveGroupFolder,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
+        onMessagePersisted: options?.onMessagePersisted,
         isChatAuthorized: options?.isChatAuthorized,
         onPairAttempt: options?.onPairAttempt,
         onWeChatConnectionStateChange: options?.onConnectionStateChange,
@@ -1507,6 +1549,7 @@ export class IMConnectionManager {
         sourceJid?: string;
       } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      onMessagePersisted?: IMChannelConnectOpts['onMessagePersisted'];
       shouldProcessGroupMessage?: (
         chatJid: string,
         senderImId?: string,
@@ -1554,6 +1597,7 @@ export class IMConnectionManager {
         onCommand: options?.onCommand,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
+        onMessagePersisted: options?.onMessagePersisted,
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
         isGroupOwnerMessage: options?.isGroupOwnerMessage,
         isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
@@ -1598,6 +1642,7 @@ export class IMConnectionManager {
         sourceJid?: string;
       } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      onMessagePersisted?: IMChannelConnectOpts['onMessagePersisted'];
       onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
       onBotRemovedFromGroup?: (chatJid: string) => void;
       shouldProcessGroupMessage?: (
@@ -1609,6 +1654,7 @@ export class IMConnectionManager {
         chatJid: string,
         senderImId?: string,
       ) => boolean;
+      normalizeIncomingJid?: (jid: string) => string | null;
       onConnectionUpdate?: (
         userId: string,
         accountId: string,
@@ -1616,6 +1662,7 @@ export class IMConnectionManager {
       ) => void;
     },
   ): Promise<boolean> {
+    const { getWhatsAppAuthDir } = await import('./whatsapp-auth.js');
     const channel = createWhatsAppChannel(
       {
         accountId: config.accountId,
@@ -1650,11 +1697,13 @@ export class IMConnectionManager {
         resolveGroupFolder: options?.resolveGroupFolder,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
+        onMessagePersisted: options?.onMessagePersisted,
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
         isGroupOwnerMessage: options?.isGroupOwnerMessage,
         isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
+        normalizeIncomingJid: options?.normalizeIncomingJid,
       },
       options?.accountId,
       options?.scopeIncomingJids,
@@ -1701,6 +1750,7 @@ export class IMConnectionManager {
    * keeps the noise/Signal pre-keys on disk for silent reconnect.
    */
   async logoutUserWhatsApp(userId: string, accountId?: string): Promise<void> {
+    const { getWhatsAppAuthDir } = await import('./whatsapp-auth.js');
     const conn = this.connections.get(userId);
     const channelKey = this.channelKey('whatsapp', accountId);
     const channel = conn?.channels.get(channelKey);
@@ -1768,6 +1818,7 @@ export class IMConnectionManager {
         sourceJid?: string;
       } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      onMessagePersisted?: IMChannelConnectOpts['onMessagePersisted'];
       onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
       onBotRemovedFromGroup?: (chatJid: string) => void;
       shouldProcessGroupMessage?: (
@@ -1813,6 +1864,7 @@ export class IMConnectionManager {
         resolveGroupFolder: options?.resolveGroupFolder,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
+        onMessagePersisted: options?.onMessagePersisted,
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
@@ -1854,6 +1906,7 @@ export class IMConnectionManager {
         sourceJid?: string;
       } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      onMessagePersisted?: IMChannelConnectOpts['onMessagePersisted'];
       onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
       onBotRemovedFromGroup?: (chatJid: string) => void;
       shouldProcessGroupMessage?: (
@@ -1882,6 +1935,7 @@ export class IMConnectionManager {
         resolveGroupFolder: options?.resolveGroupFolder,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
+        onMessagePersisted: options?.onMessagePersisted,
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,

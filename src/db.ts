@@ -6,6 +6,7 @@ import path from 'path';
 import { STORE_DIR, GROUPS_DIR } from './config.js';
 import { normalizeAgentEffort } from './agent-effort.js';
 import { logger } from './logger.js';
+import { isValidWorkspaceFolderName } from './workspace-folder.js';
 import {
   AgentProfile,
   AgentBuilderDefinition,
@@ -70,6 +71,7 @@ import {
 } from './types.js';
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 import { channelConversationJid } from './channel-address.js';
+import { resolveChannelConversationKind } from './channel-conversation-kind.js';
 import { getChannelFromJid } from './channel-prefixes.js';
 import { parseAudienceMode } from './im-audience-policy.js';
 import { parseContainerConfig } from './mount-security.js';
@@ -78,6 +80,8 @@ import {
   normalizeAgentProfilePrompts,
   promptModeFromLegacyPreset,
 } from './agent-profile-prompts.js';
+import { assertDatabaseMaintenanceAccess } from './database-maintenance.js';
+import { CURRENT_SCHEMA_VERSION } from './schema-version.js';
 import {
   bindChannelReliabilityDatabase,
   createChannelReliabilitySchema,
@@ -103,7 +107,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 71;
+export { CURRENT_SCHEMA_VERSION };
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -139,8 +143,14 @@ function stmts() {
         `INSERT OR REPLACE INTO messages (
           id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me,
           attachments, token_usage, channel_context, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason, task_id,
-          delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at,
+          history_recovery_allowed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          COALESCE((
+            SELECT history_recovery_allowed FROM messages
+            WHERE id = ? AND chat_jid = ?
+          ), 1)
+        )`,
       ),
       insertUsageInsert: db.prepare(
         `INSERT INTO usage_records (id, event_id, user_id, group_folder, agent_id, message_id, model,
@@ -465,15 +475,36 @@ function enforcePreMigrationBackup(dbPath: string): void {
   }
 }
 
-export function initDatabase(): void {
+export function initDatabase(
+  options: { requireCurrentSchema?: boolean } = {},
+): void {
   const dbPath = path.join(STORE_DIR, 'messages.db');
+  assertDatabaseMaintenanceAccess(dbPath);
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   db = new Database(dbPath);
+  try {
+    // Close the check→open race with the repair CLI: if it acquired its guard
+    // after our first check, this process must close the just-opened handle
+    // before the repair's lsof preflight can proceed.
+    assertDatabaseMaintenanceAccess(dbPath);
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 
   db.exec('PRAGMA busy_timeout = 5000');
   const rawSchemaVersionBeforeInit =
     getRouterStateInternal('schema_version') ?? null;
+  if (
+    options.requireCurrentSchema &&
+    rawSchemaVersionBeforeInit !== String(CURRENT_SCHEMA_VERSION)
+  ) {
+    db.close();
+    throw new Error(
+      `Database must already be schema v${CURRENT_SCHEMA_VERSION}; refusing maintenance bootstrap for ${rawSchemaVersionBeforeInit === null ? 'an unversioned database' : `schema v${rawSchemaVersionBeforeInit}`}`,
+    );
+  }
   try {
     enforcePreMigrationBackup(dbPath);
   } catch (error) {
@@ -565,6 +596,7 @@ export function initDatabase(): void {
       delivery_run_id TEXT,
       delivery_priority INTEGER NOT NULL DEFAULT 0,
       delivery_updated_at TEXT,
+      history_recovery_allowed INTEGER NOT NULL DEFAULT 1,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -1441,9 +1473,19 @@ export function initDatabase(): void {
   ensureColumn('messages', 'delivery_run_id', 'TEXT');
   ensureColumn('messages', 'delivery_priority', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('messages', 'delivery_updated_at', 'TEXT');
+  // v72 -> v73: fence legacy workspace transcript rows that mixed private and
+  // group messages without trusting provider-controlled timestamps. Existing
+  // rows can be disabled for model recovery while future rows default to safe.
+  ensureColumn(
+    'messages',
+    'history_recovery_allowed',
+    'INTEGER NOT NULL DEFAULT 1',
+  );
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_messages_follow_up_queue
       ON messages(chat_jid, delivery_status, delivery_priority, timestamp, id);
+    CREATE INDEX IF NOT EXISTS idx_messages_history_recovery
+      ON messages(chat_jid, history_recovery_allowed, timestamp);
   `);
   // A process may have crashed after reserving a queued message for a card
   // action but before injecting it. Reservations are process-local, so make
@@ -2501,9 +2543,263 @@ export function initDatabase(): void {
     }
   }
 
+  // v71 -> v72: WeCom 1:1 chats that were registration-fallback bound to a
+  // workspace main session shared that workspace's channel-owner slot with
+  // any group in the same workspace. Move those DMs onto dedicated
+  // channel_direct sessions. Groups, manual session binds, and missing
+  // workspaces are left untouched. Idempotent for already-migrated rows.
+  const wecomDirectMountSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (wecomDirectMountSchemaVersion < 72) {
+    migrateWecomDirectWorkspaceMountsToSessions();
+  }
+
+  // v72 -> v73: #654 already made new registration kind-aware and migrated
+  // leftover WeCom DMs. Pre-#654 chats on other JID-classifiable channels
+  // (QQ / DingTalk / Discord / WhatsApp / Telegram / WeChat) can still sit
+  // on target_main_jid and share channel_session_owner:{folder}:main with a
+  // group in the same workspace — including a WeChat DM stealing owner from
+  // a group on another channel. Classify from the JID only; Feishu stays
+  // unknown here and is not migrated. Do not rewrite the v72 WeCom block.
+  const classifiableDirectMountSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (classifiableDirectMountSchemaVersion < 73) {
+    migrateClassifiableDirectWorkspaceMountsToSessions();
+  }
+
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', String(CURRENT_SCHEMA_VERSION));
+}
+
+/**
+ * Move WeCom DMs off a shared workspace main mount onto a dedicated
+ * conversation session. Existing `target_agent_id` binds (manual or
+ * already-migrated) and every group chat are left alone. If the workspace
+ * main owner slot still points at the DM, clear it so a later group
+ * message cannot keep delivering into that private chat.
+ */
+export function migrateWecomDirectWorkspaceMountsToSessions(): number {
+  return db
+    .transaction(() => {
+      const groups = getAllRegisteredGroups();
+      let migrated = 0;
+      const affectedWorkspaces = new Map<string, RegisteredGroup>();
+      const cutoff = new Date().toISOString();
+
+      for (const [jid, group] of Object.entries(groups)) {
+        if (!jid.startsWith('wecom:c2c:')) continue;
+        if (!group.target_main_jid || group.target_agent_id) continue;
+
+        const workspaceJid = resolveWorkspaceJidForMount(group.target_main_jid);
+        if (!workspaceJid) continue;
+        const workspace = getRegisteredGroup(workspaceJid);
+        if (!workspace) continue;
+
+        const conversationJid = channelConversationJid(jid);
+        const reusable = listAgentsByJid(workspaceJid).find(
+          (agent) =>
+            agent.source_kind === 'channel_direct' &&
+            agent.last_im_jid &&
+            (agent.last_im_jid === conversationJid ||
+              channelConversationJid(agent.last_im_jid) === conversationJid),
+        );
+
+        const now = new Date().toISOString();
+        const agent =
+          reusable ??
+          (() => {
+            const created: SubAgent = {
+              id: crypto.randomUUID(),
+              group_folder: workspace.folder,
+              chat_jid: workspaceJid,
+              name: group.name || conversationJid,
+              prompt: '',
+              status: 'idle',
+              kind: 'conversation',
+              created_by: group.created_by ?? workspace.created_by ?? null,
+              created_at: now,
+              completed_at: null,
+              result_summary: null,
+              last_im_jid: conversationJid,
+              spawned_from_jid: null,
+              source_kind: 'channel_direct',
+              last_active_at: now,
+            };
+            createAgent(created);
+            const virtualChatJid = `${workspaceJid}#agent:${created.id}`;
+            ensureChatExists(virtualChatJid);
+            updateChatName(virtualChatJid, created.name);
+            return created;
+          })();
+
+        setRegisteredGroup(jid, {
+          ...group,
+          target_agent_id: agent.id,
+          target_main_jid: undefined,
+          binding_mode: 'single_context',
+        });
+
+        affectedWorkspaces.set(workspaceJid, workspace);
+
+        migrated += 1;
+      }
+
+      let isolated = 0;
+      for (const [workspaceJid, workspace] of affectedWorkspaces) {
+        if (
+          isolateLegacyDirectWorkspaceMain(
+            workspaceJid,
+            workspace.folder,
+            cutoff,
+          )
+        ) {
+          isolated += 1;
+        }
+      }
+
+      if (migrated > 0) {
+        logger.info(
+          { migrated, isolatedWorkspaces: isolated },
+          'Migrated WeCom direct chats off shared workspace main mounts',
+        );
+      }
+      return migrated;
+    })
+    .immediate();
+}
+
+/**
+ * Move leftover JID-classifiable DMs off a shared workspace main mount.
+ * Same skip rules as v72: already-bound sessions (manual or v72 WeCom),
+ * groups, unknown/unclassifiable JIDs (including Feishu without metadata),
+ * and missing workspaces stay untouched. If the workspace main owner still
+ * points at the DM, clear it so a later group message cannot keep
+ * delivering into that private chat.
+ */
+export function migrateClassifiableDirectWorkspaceMountsToSessions(): number {
+  return db
+    .transaction(() => {
+      const groups = getAllRegisteredGroups();
+      let migrated = 0;
+      const affectedWorkspaces = new Map<string, RegisteredGroup>();
+      const cutoff = new Date().toISOString();
+
+      for (const [jid, group] of Object.entries(groups)) {
+        if (resolveChannelConversationKind(jid) !== 'direct') continue;
+        if (!group.target_main_jid || group.target_agent_id) continue;
+
+        const workspaceJid = resolveWorkspaceJidForMount(group.target_main_jid);
+        if (!workspaceJid) continue;
+        const workspace = getRegisteredGroup(workspaceJid);
+        if (!workspace) continue;
+
+        const conversationJid = channelConversationJid(jid);
+        const reusable = listAgentsByJid(workspaceJid).find(
+          (agent) =>
+            agent.source_kind === 'channel_direct' &&
+            agent.last_im_jid &&
+            (agent.last_im_jid === conversationJid ||
+              channelConversationJid(agent.last_im_jid) === conversationJid),
+        );
+
+        const now = new Date().toISOString();
+        const agent =
+          reusable ??
+          (() => {
+            const created: SubAgent = {
+              id: crypto.randomUUID(),
+              group_folder: workspace.folder,
+              chat_jid: workspaceJid,
+              name: group.name || conversationJid,
+              prompt: '',
+              status: 'idle',
+              kind: 'conversation',
+              created_by: group.created_by ?? workspace.created_by ?? null,
+              created_at: now,
+              completed_at: null,
+              result_summary: null,
+              last_im_jid: conversationJid,
+              spawned_from_jid: null,
+              source_kind: 'channel_direct',
+              last_active_at: now,
+            };
+            createAgent(created);
+            const virtualChatJid = `${workspaceJid}#agent:${created.id}`;
+            ensureChatExists(virtualChatJid);
+            updateChatName(virtualChatJid, created.name);
+            return created;
+          })();
+
+        setRegisteredGroup(jid, {
+          ...group,
+          target_agent_id: agent.id,
+          target_main_jid: undefined,
+          binding_mode: 'single_context',
+        });
+
+        affectedWorkspaces.set(workspaceJid, workspace);
+
+        migrated += 1;
+      }
+
+      // A database already stamped v72 may have had its WeCom mount moved by
+      // the old migration without invalidating the contaminated main SDK
+      // session. Do not infer contamination merely from a dedicated session:
+      // require a persisted inbound row whose workspace chat_jid and direct
+      // source_jid prove that this DM previously entered main history.
+      const persistedSourcesByWorkspace = new Map<string, Set<string>>();
+      for (const [jid, group] of Object.entries(groups)) {
+        if (resolveChannelConversationKind(jid) !== 'direct') continue;
+        if (!group.target_agent_id || group.target_main_jid) continue;
+        const agent = getAgent(group.target_agent_id);
+        if (!agent || agent.source_kind !== 'channel_direct') continue;
+        const workspaceJid = agent.chat_jid;
+        const workspace = getRegisteredGroup(workspaceJid);
+        if (!workspace) continue;
+        const conversationJid = channelConversationJid(jid);
+        let persistedSources = persistedSourcesByWorkspace.get(workspaceJid);
+        if (!persistedSources) {
+          const rows = db
+            .prepare(
+              `SELECT DISTINCT source_jid FROM messages
+               WHERE chat_jid = ? AND is_from_me = 0 AND source_jid IS NOT NULL`,
+            )
+            .all(workspaceJid) as Array<{ source_jid: string }>;
+          persistedSources = new Set(
+            rows.map((row) => channelConversationJid(row.source_jid)),
+          );
+          persistedSourcesByWorkspace.set(workspaceJid, persistedSources);
+        }
+        if (persistedSources.has(conversationJid)) {
+          affectedWorkspaces.set(workspaceJid, workspace);
+        }
+      }
+
+      let isolated = 0;
+      for (const [workspaceJid, workspace] of affectedWorkspaces) {
+        if (
+          isolateLegacyDirectWorkspaceMain(
+            workspaceJid,
+            workspace.folder,
+            cutoff,
+          )
+        ) {
+          isolated += 1;
+        }
+      }
+
+      if (migrated > 0 || isolated > 0) {
+        logger.info(
+          { migrated, isolatedWorkspaces: isolated },
+          'Migrated classifiable direct chats off shared workspace main mounts',
+        );
+      }
+      return migrated;
+    })
+    .immediate();
 }
 
 /**
@@ -2748,6 +3044,8 @@ export function storeMessageDirect(
     meta?.deliveryRunId ?? null,
     meta?.deliveryPriority ?? 0,
     meta?.deliveryUpdatedAt ?? null,
+    effectiveMsgId,
+    chatJid,
   );
   return effectiveMsgId;
 }
@@ -3198,12 +3496,12 @@ export function claimNextQueuedFollowUp(
 /**
  * Atomically snapshot the next durable follow-up turn.
  *
- * Normal queued messages are drained together in the user-visible queue order
- * so a burst received while an Agent loop is active becomes one subsequent
- * Agent turn.  A steer is an explicit priority hand-off and therefore remains
- * a single-message barrier; later queued messages wait for the turn after it.
- * Rows admitted after this transaction are intentionally left for the next
- * snapshot.
+ * All messages waiting in one Session are drained together in the user-visible
+ * queue order so a burst received while an Agent loop is active becomes one
+ * subsequent Agent turn. A `/steer` changes the active generation, not this
+ * batching rule: messages already pending at the cutoff remain in the same
+ * next batch. Rows admitted after this transaction are intentionally left for
+ * the next snapshot.
  */
 export function claimNextQueuedFollowUpBatch(
   chatJid: string,
@@ -3223,17 +3521,7 @@ export function claimNextQueuedFollowUpBatch(
   return db.transaction(() => {
     const rows = select.all(chatJid) as Array<Record<string, unknown>>;
     if (rows.length === 0) return [];
-    const queued = rows.map(normalizeQueuedFollowUpRow);
-    const firstSteerIndex = queued.findIndex(
-      (item) => item.delivery_mode === 'steer',
-    );
-    const claimed =
-      firstSteerIndex === 0
-        ? queued.slice(0, 1)
-        : queued.slice(
-            0,
-            firstSteerIndex === -1 ? queued.length : firstSteerIndex,
-          );
+    const claimed = rows.map(normalizeQueuedFollowUpRow);
     const updatedAt = new Date().toISOString();
     for (const item of claimed) {
       const result = update.run(runId, updatedAt, chatJid, item.id);
@@ -3316,20 +3604,6 @@ export function restorePromotingFollowUpBatch(
   } catch {
     return false;
   }
-}
-
-export function beginPromotingFollowUp(
-  chatJid: string,
-  messageId: string,
-): QueuedFollowUp | null {
-  return transitionFollowUp(chatJid, messageId, ['queued'], 'promoting');
-}
-
-export function restorePromotingFollowUp(
-  chatJid: string,
-  messageId: string,
-): QueuedFollowUp | null {
-  return transitionFollowUp(chatJid, messageId, ['promoting'], 'queued');
 }
 
 export function cancelQueuedFollowUp(
@@ -3505,236 +3779,6 @@ export function rebuildMessageTokenUsageFromLedger(
 }
 
 /**
- * Get token usage statistics aggregated by date.
- */
-export function getTokenUsageStats(
-  days: number,
-  chatJids?: string[],
-): Array<{
-  date: string;
-  model: string;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  cache_creation_tokens: number;
-  reasoning_tokens: number;
-  cost_usd: number;
-  message_count: number;
-}> {
-  const since = new Date();
-  since.setDate(since.getDate() - days);
-  const sinceStr = since.toISOString();
-
-  const jidFilter =
-    chatJids && chatJids.length > 0
-      ? `AND m.chat_jid IN (${chatJids.map(() => '?').join(',')})`
-      : '';
-  const params: unknown[] = [sinceStr, ...(chatJids || [])];
-
-  const baseQuery = `
-    SELECT
-      date(m.timestamp) as date,
-      json_extract(m.token_usage, '$.modelUsage') as model_usage_json,
-      json_extract(m.token_usage, '$.inputTokens') as input_tokens,
-      json_extract(m.token_usage, '$.outputTokens') as output_tokens,
-      json_extract(m.token_usage, '$.cacheReadInputTokens') as cache_read_tokens,
-      json_extract(m.token_usage, '$.cacheCreationInputTokens') as cache_creation_tokens,
-      json_extract(m.token_usage, '$.reasoningTokens') as reasoning_tokens,
-      json_extract(m.token_usage, '$.costUSD') as cost_usd
-    FROM messages m
-    WHERE m.token_usage IS NOT NULL
-      AND m.timestamp >= ?
-      ${jidFilter}
-    ORDER BY m.timestamp ASC
-  `;
-
-  const rows = db.prepare(baseQuery).all(...params) as Array<{
-    date: string;
-    model_usage_json: string | null;
-    input_tokens: number;
-    output_tokens: number;
-    cache_read_tokens: number;
-    cache_creation_tokens: number;
-    reasoning_tokens: number;
-    cost_usd: number;
-  }>;
-
-  // Aggregate by date + model
-  type AggregatedEntry = {
-    date: string;
-    model: string;
-    input_tokens: number;
-    output_tokens: number;
-    cache_read_tokens: number;
-    cache_creation_tokens: number;
-    reasoning_tokens: number;
-    cost_usd: number;
-    message_count: number;
-  };
-  const aggregated = new Map<string, AggregatedEntry>();
-
-  function addToAggregated(
-    date: string,
-    model: string,
-    inputTokens: number,
-    outputTokens: number,
-    cacheReadTokens: number,
-    cacheCreationTokens: number,
-    reasoningTokens: number,
-    costUsd: number,
-  ): void {
-    const key = `${date}|${model}`;
-    const existing = aggregated.get(key);
-    if (existing) {
-      existing.input_tokens += inputTokens;
-      existing.output_tokens += outputTokens;
-      existing.cache_read_tokens += cacheReadTokens;
-      existing.cache_creation_tokens += cacheCreationTokens;
-      existing.reasoning_tokens += reasoningTokens;
-      existing.cost_usd += costUsd;
-      existing.message_count += 1;
-    } else {
-      aggregated.set(key, {
-        date,
-        model,
-        input_tokens: inputTokens,
-        output_tokens: outputTokens,
-        cache_read_tokens: cacheReadTokens,
-        cache_creation_tokens: cacheCreationTokens,
-        reasoning_tokens: reasoningTokens,
-        cost_usd: costUsd,
-        message_count: 1,
-      });
-    }
-  }
-
-  for (const row of rows) {
-    if (row.model_usage_json) {
-      try {
-        const modelUsage = JSON.parse(row.model_usage_json) as Record<
-          string,
-          {
-            inputTokens: number;
-            outputTokens: number;
-            cacheReadInputTokens?: number;
-            cacheCreationInputTokens?: number;
-            reasoningTokens?: number;
-            costUSD: number;
-          }
-        >;
-        for (const [model, usage] of Object.entries(modelUsage)) {
-          addToAggregated(
-            row.date,
-            model,
-            usage.inputTokens || 0,
-            usage.outputTokens || 0,
-            usage.cacheReadInputTokens || 0,
-            usage.cacheCreationInputTokens || 0,
-            usage.reasoningTokens || 0,
-            usage.costUSD || 0,
-          );
-        }
-      } catch (e) {
-        logger.warn(
-          { date: row.date, error: e },
-          'Failed to parse model_usage_json',
-        );
-        // fallback: use aggregate fields
-        addToAggregated(
-          row.date,
-          'unknown',
-          row.input_tokens || 0,
-          row.output_tokens || 0,
-          row.cache_read_tokens || 0,
-          row.cache_creation_tokens || 0,
-          row.reasoning_tokens || 0,
-          row.cost_usd || 0,
-        );
-      }
-    } else {
-      addToAggregated(
-        row.date,
-        'unknown',
-        row.input_tokens || 0,
-        row.output_tokens || 0,
-        row.cache_read_tokens || 0,
-        row.cache_creation_tokens || 0,
-        row.reasoning_tokens || 0,
-        row.cost_usd || 0,
-      );
-    }
-  }
-
-  return Array.from(aggregated.values());
-}
-
-/**
- * Get token usage summary totals.
- */
-export function getTokenUsageSummary(
-  days: number,
-  chatJids?: string[],
-): {
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalCacheReadTokens: number;
-  totalCacheCreationTokens: number;
-  totalReasoningTokens: number;
-  totalCostUSD: number;
-  totalMessages: number;
-  totalActiveDays: number;
-} {
-  const since = new Date();
-  since.setDate(since.getDate() - days);
-  const sinceStr = since.toISOString();
-
-  const jidFilter =
-    chatJids && chatJids.length > 0
-      ? `AND chat_jid IN (${chatJids.map(() => '?').join(',')})`
-      : '';
-  const params: unknown[] = [sinceStr, ...(chatJids || [])];
-
-  const row = db
-    .prepare(
-      `
-    SELECT
-      COALESCE(SUM(json_extract(token_usage, '$.inputTokens')), 0) as total_input,
-      COALESCE(SUM(json_extract(token_usage, '$.outputTokens')), 0) as total_output,
-      COALESCE(SUM(json_extract(token_usage, '$.cacheReadInputTokens')), 0) as total_cache_read,
-      COALESCE(SUM(json_extract(token_usage, '$.cacheCreationInputTokens')), 0) as total_cache_creation,
-      COALESCE(SUM(json_extract(token_usage, '$.reasoningTokens')), 0) as total_reasoning,
-      COALESCE(SUM(json_extract(token_usage, '$.costUSD')), 0) as total_cost,
-      COUNT(*) as total_messages,
-      COUNT(DISTINCT date(timestamp)) as total_active_days
-    FROM messages
-    WHERE token_usage IS NOT NULL AND timestamp >= ?
-      ${jidFilter}
-  `,
-    )
-    .get(...params) as {
-    total_input: number;
-    total_output: number;
-    total_cache_read: number;
-    total_cache_creation: number;
-    total_reasoning: number;
-    total_cost: number;
-    total_messages: number;
-    total_active_days: number;
-  };
-
-  return {
-    totalInputTokens: row.total_input,
-    totalOutputTokens: row.total_output,
-    totalCacheReadTokens: row.total_cache_read,
-    totalCacheCreationTokens: row.total_cache_creation,
-    totalReasoningTokens: row.total_reasoning,
-    totalCostUSD: row.total_cost,
-    totalMessages: row.total_messages,
-    totalActiveDays: row.total_active_days,
-  };
-}
-
-/**
  * Get a local timezone date string (YYYY-MM-DD) from a Date or ISO string.
  */
 function toLocalDateString(date?: Date | string): string {
@@ -3760,57 +3804,6 @@ export function getUsageDateWindow(
     days: normalizedDays,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
   };
-}
-
-/**
- * Insert a usage record and update daily summary.
- */
-export function insertUsageRecord(record: {
-  userId: string;
-  groupFolder: string;
-  agentId?: string | null;
-  messageId?: string;
-  model: string;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadInputTokens: number;
-  cacheCreationInputTokens: number;
-  reasoningTokens?: number;
-  costUSD: number;
-  durationMs?: number;
-  numTurns?: number;
-  source?: string;
-}): void {
-  recordUsageEventBatch({
-    eventId: crypto.randomUUID(),
-    userId: record.userId,
-    groupFolder: record.groupFolder,
-    agentId: record.agentId,
-    messageId: record.messageId,
-    inputTokens: record.inputTokens,
-    outputTokens: record.outputTokens,
-    cacheReadInputTokens: record.cacheReadInputTokens,
-    cacheCreationInputTokens: record.cacheCreationInputTokens,
-    reasoningTokens: record.reasoningTokens || 0,
-    providerEstimatedCostUSD: record.costUSD,
-    billedCostUSD: 0,
-    durationMs: record.durationMs,
-    numTurns: record.numTurns,
-    source: record.source,
-    models: [
-      {
-        model: record.model,
-        inputTokens: record.inputTokens,
-        outputTokens: record.outputTokens,
-        cacheReadInputTokens: record.cacheReadInputTokens,
-        cacheCreationInputTokens: record.cacheCreationInputTokens,
-        reasoningTokens: record.reasoningTokens || 0,
-        providerEstimatedCostUSD: record.costUSD,
-        billedCostUSD: 0,
-      },
-    ],
-    trackBillingUsage: false,
-  });
 }
 
 export interface UsageModelRecordInput {
@@ -4072,149 +4065,6 @@ export function recordUsageEventBatch(input: UsageEventRecordInput): {
 
     return { inserted: true };
   })();
-}
-
-/**
- * Get usage stats from daily summary table (fixes timezone + token KPI issues).
- */
-export function getUsageDailyStats(
-  days: number,
-  userId?: string,
-  modelFilter?: string,
-): Array<{
-  date: string;
-  model: string;
-  user_id: string;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  cache_creation_tokens: number;
-  reasoning_tokens: number;
-  cost_usd: number;
-  request_count: number;
-}> {
-  const window = getUsageDateWindow(days);
-  const conditions: string[] = ['date >= ?', 'date <= ?'];
-  const params: unknown[] = [window.from, window.to];
-
-  if (userId) {
-    conditions.push('user_id = ?');
-    params.push(userId);
-  }
-  if (modelFilter) {
-    conditions.push('model = ?');
-    params.push(modelFilter);
-  }
-
-  const whereClause = conditions.join(' AND ');
-  return db
-    .prepare(
-      `
-    SELECT date, model, user_id,
-      total_input_tokens as input_tokens,
-      total_output_tokens as output_tokens,
-      total_cache_read_tokens as cache_read_tokens,
-      total_cache_creation_tokens as cache_creation_tokens,
-      total_reasoning_tokens as reasoning_tokens,
-      total_cost_usd as cost_usd,
-      request_count
-    FROM usage_daily_summary
-    WHERE ${whereClause}
-    ORDER BY date ASC
-  `,
-    )
-    .all(...params) as Array<{
-    date: string;
-    model: string;
-    user_id: string;
-    input_tokens: number;
-    output_tokens: number;
-    cache_read_tokens: number;
-    cache_creation_tokens: number;
-    reasoning_tokens: number;
-    cost_usd: number;
-    request_count: number;
-  }>;
-}
-
-/**
- * Get usage summary from daily summary table.
- */
-export function getUsageDailySummary(
-  days: number,
-  userId?: string,
-  modelFilter?: string,
-): {
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalCacheReadTokens: number;
-  totalCacheCreationTokens: number;
-  totalReasoningTokens: number;
-  totalCostUSD: number;
-  totalMessages: number;
-  totalActiveDays: number;
-} {
-  const window = getUsageDateWindow(days);
-  const conditions: string[] = ['date >= ?', 'date <= ?'];
-  const params: unknown[] = [window.from, window.to];
-
-  if (userId) {
-    conditions.push('user_id = ?');
-    params.push(userId);
-  }
-  if (modelFilter) {
-    conditions.push('model = ?');
-    params.push(modelFilter);
-  }
-
-  const whereClause = conditions.join(' AND ');
-  const row = db
-    .prepare(
-      `
-    SELECT
-      COALESCE(SUM(total_input_tokens), 0) as total_input,
-      COALESCE(SUM(total_output_tokens), 0) as total_output,
-      COALESCE(SUM(total_cache_read_tokens), 0) as total_cache_read,
-      COALESCE(SUM(total_cache_creation_tokens), 0) as total_cache_creation,
-      COALESCE(SUM(total_reasoning_tokens), 0) as total_reasoning,
-      COALESCE(SUM(total_cost_usd), 0) as total_cost,
-      COALESCE(SUM(request_count), 0) as total_messages,
-      COUNT(DISTINCT date) as total_active_days
-    FROM usage_daily_summary
-    WHERE ${whereClause}
-  `,
-    )
-    .get(...params) as {
-    total_input: number;
-    total_output: number;
-    total_cache_read: number;
-    total_cache_creation: number;
-    total_reasoning: number;
-    total_cost: number;
-    total_messages: number;
-    total_active_days: number;
-  };
-
-  return {
-    totalInputTokens: row.total_input,
-    totalOutputTokens: row.total_output,
-    totalCacheReadTokens: row.total_cache_read,
-    totalCacheCreationTokens: row.total_cache_creation,
-    totalReasoningTokens: row.total_reasoning,
-    totalCostUSD: row.total_cost,
-    totalMessages: row.total_messages,
-    totalActiveDays: row.total_active_days,
-  };
-}
-
-/**
- * Get list of all models that have usage data.
- */
-export function getUsageModels(): string[] {
-  const rows = db
-    .prepare('SELECT DISTINCT model FROM usage_daily_summary ORDER BY model')
-    .all() as Array<{ model: string }>;
-  return rows.map((r) => r.model);
 }
 
 export interface UsageQueryFilters {
@@ -4654,15 +4504,6 @@ function mapTaskRow(row: unknown): ScheduledTask {
 export function getTaskById(id: string): ScheduledTask | undefined {
   const row = db.prepare('SELECT * FROM scheduled_tasks WHERE id = ?').get(id);
   return row ? mapTaskRow(row) : undefined;
-}
-
-export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
-  return db
-    .prepare(
-      'SELECT * FROM scheduled_tasks WHERE group_folder = ? AND deleted_at IS NULL ORDER BY created_at DESC',
-    )
-    .all(groupFolder)
-    .map(mapTaskRow);
 }
 
 export function getAllTasks(): ScheduledTask[] {
@@ -5133,27 +4974,6 @@ export function deleteTask(id: string): void {
   db.prepare('DELETE FROM task_runs WHERE task_id = ?').run(id);
   db.prepare('DELETE FROM task_run_logs WHERE task_id = ?').run(id);
   db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
-}
-
-export function deleteTasksForGroup(groupFolder: string): void {
-  const tx = db.transaction((folder: string) => {
-    db.prepare(
-      `DELETE FROM task_runs
-       WHERE task_id IN (SELECT id FROM scheduled_tasks WHERE group_folder = ?)`,
-    ).run(folder);
-    db.prepare(
-      `
-      DELETE FROM task_run_logs
-      WHERE task_id IN (
-        SELECT id FROM scheduled_tasks WHERE group_folder = ?
-      )
-      `,
-    ).run(folder);
-    db.prepare('DELETE FROM scheduled_tasks WHERE group_folder = ?').run(
-      folder,
-    );
-  });
-  tx(groupFolder);
 }
 
 export function getDueTasks(): ScheduledTask[] {
@@ -8118,6 +7938,120 @@ function sessionChannelOwnerKey(
   return `channel_session_owner:${groupFolder}:${agentId || 'main'}`;
 }
 
+const CONVERSATION_HISTORY_ISOLATION_PREFIX = 'conversation_history_isolation:';
+
+/**
+ * Durable marker written after a legacy direct mount proves the workspace main
+ * history may contain private conversation content. The Web transcript remains
+ * intact; affected rows are unavailable only to model-context recovery.
+ */
+export function getConversationHistoryIsolationMarker(
+  chatJid: string,
+): string | undefined {
+  return getRouterState(`${CONVERSATION_HISTORY_ISOLATION_PREFIX}${chatJid}`);
+}
+
+/**
+ * Atomically invalidate a workspace main resume lifecycle once. The marker
+ * makes this idempotent: a later retry must not delete a clean session that the
+ * workspace created after this migration completed.
+ */
+function isolateLegacyDirectWorkspaceMain(
+  workspaceJid: string,
+  groupFolder: string,
+  isolationStartedAt: string,
+): boolean {
+  const inserted = db
+    .prepare('INSERT OR IGNORE INTO router_state (key, value) VALUES (?, ?)')
+    .run(
+      `${CONVERSATION_HISTORY_ISOLATION_PREFIX}${workspaceJid}`,
+      isolationStartedAt,
+    );
+  if (inserted.changes === 0) return false;
+
+  db.prepare(
+    'UPDATE messages SET history_recovery_allowed = 0 WHERE chat_jid = ?',
+  ).run(workspaceJid);
+  db.prepare(
+    "DELETE FROM sessions WHERE group_folder = ? AND agent_id = ''",
+  ).run(groupFolder);
+  db.prepare(
+    "DELETE FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ''",
+  ).run(groupFolder);
+  db.prepare('DELETE FROM router_state WHERE key = ?').run(
+    sessionChannelOwnerKey(groupFolder, null),
+  );
+  return true;
+}
+
+/**
+ * Force a new conversation-history isolation generation for a workspace main
+ * lifecycle. Unlike `isolateLegacyDirectWorkspaceMain`, this overwrites an
+ * existing marker and re-fences every current main-history row, including
+ * post-marker leaks. Used by the one-time leftover-DM repair tool — not by
+ * schema migrations.
+ */
+export function resetWorkspaceMainIsolationGeneration(
+  workspaceJid: string,
+  groupFolder: string,
+  isolationStartedAt = new Date().toISOString(),
+): string {
+  db.prepare(
+    'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
+  ).run(
+    `${CONVERSATION_HISTORY_ISOLATION_PREFIX}${workspaceJid}`,
+    isolationStartedAt,
+  );
+  db.prepare(
+    'UPDATE messages SET history_recovery_allowed = 0 WHERE chat_jid = ?',
+  ).run(workspaceJid);
+  db.prepare(
+    "DELETE FROM sessions WHERE group_folder = ? AND agent_id = ''",
+  ).run(groupFolder);
+  db.prepare(
+    "DELETE FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ''",
+  ).run(groupFolder);
+  db.prepare('DELETE FROM router_state WHERE key = ?').run(
+    sessionChannelOwnerKey(groupFolder, null),
+  );
+  return isolationStartedAt;
+}
+
+export function runImmediateTransaction<T>(fn: () => T): T {
+  return db.transaction(fn).immediate();
+}
+
+/** Distinct inbound sources still eligible for model-context recovery. */
+export function listRecoverableInboundSourceJids(chatJid: string): string[] {
+  return (
+    db
+      .prepare(
+        `SELECT DISTINCT source_jid FROM messages
+         WHERE chat_jid = ? AND is_from_me = 0 AND history_recovery_allowed = 1
+           AND source_jid IS NOT NULL`,
+      )
+      .all(chatJid) as Array<{ source_jid: string }>
+  ).map((row) => row.source_jid);
+}
+
+/** Recoverable inbound rows whose source is one of the given JIDs. */
+export function countRecoverableInboundMessagesFromSources(
+  chatJid: string,
+  sourceJids: readonly string[],
+): number {
+  const unique = [...new Set(sourceJids.filter(Boolean))];
+  if (unique.length === 0) return 0;
+  const placeholders = unique.map(() => '?').join(', ');
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM messages
+       WHERE chat_jid = ? AND is_from_me = 0 AND history_recovery_allowed = 1
+         AND source_jid IN (${placeholders})`,
+    )
+    .get(chatJid, ...unique) as { n: number };
+  return Number(row.n);
+}
+
 /** The first native transport that owns a logical warm Session. */
 export function getSessionChannelOwner(
   groupFolder: string,
@@ -11018,6 +10952,28 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
 }
 
 /**
+ * Persist a channel reroute and release a stale workspace-main owner in one
+ * transaction. The owner is cleared only when it belongs to the same canonical
+ * direct conversation, so unrelated channels cannot lose their sticky route.
+ */
+export function setRegisteredGroupAndClearMatchingMainOwner(
+  jid: string,
+  group: RegisteredGroup,
+  previousWorkspaceFolder: string,
+): void {
+  db.transaction(() => {
+    setRegisteredGroup(jid, group);
+    const ownerJid = getSessionChannelOwner(previousWorkspaceFolder, null);
+    if (
+      ownerJid &&
+      channelConversationJid(ownerJid) === channelConversationJid(jid)
+    ) {
+      clearSessionChannelOwner(previousWorkspaceFolder, null);
+    }
+  })();
+}
+
+/**
  * Refresh the provider-hosted avatar for an already registered external chat.
  * Discovery invokes onNewChat first, so a missing row means the chat was not
  * admitted and must not be created as a side effect of avatar synchronization.
@@ -11453,13 +11409,6 @@ export function getChannelMount(channelJid: string): ChannelMount | undefined {
   return row ? parseChannelMountRow(row) : undefined;
 }
 
-export function listChannelMounts(): ChannelMount[] {
-  const rows = db
-    .prepare('SELECT * FROM channel_mounts ORDER BY updated_at DESC')
-    .all() as ChannelMountRow[];
-  return rows.map(parseChannelMountRow);
-}
-
 export function listChannelMountsByWorkspace(
   workspaceJid: string,
 ): ChannelMount[] {
@@ -11612,12 +11561,6 @@ export function listImContextBindingsByAgent(
   return rows.map(mapImContextBindingRow);
 }
 
-export function deleteImContextBindingsByWorkspace(workspaceJid: string): void {
-  db.prepare('DELETE FROM im_context_bindings WHERE workspace_jid = ?').run(
-    workspaceJid,
-  );
-}
-
 export function deleteImContextBindingsByAgent(agentId: string): void {
   db.prepare('DELETE FROM im_context_bindings WHERE agent_id = ?').run(agentId);
 }
@@ -11632,16 +11575,6 @@ export function touchImContextBindingActivity(
   db.prepare(
     'UPDATE im_context_bindings SET last_active_at = ?, updated_at = ? WHERE source_jid = ? AND context_type = ? AND context_id = ?',
   ).run(lastActiveAt, lastActiveAt, sourceJid, contextType, contextId);
-}
-
-/** List native-thread agent IDs for a workspace JID (legacy Feishu included). */
-export function listFeishuThreadAgentIds(workspaceJid: string): string[] {
-  const rows = db
-    .prepare(
-      "SELECT id FROM agents WHERE chat_jid = ? AND source_kind IN ('native_thread', 'feishu_thread')",
-    )
-    .all(workspaceJid) as { id: string }[];
-  return rows.map((r) => r.id);
 }
 
 /**
@@ -11660,6 +11593,26 @@ export function getUserHomeGroup(
 }
 
 /**
+ * Ensure the on-disk workspace directory for a group folder exists, mirroring
+ * what registerGroup() does for non-home workspaces. Home groups created via
+ * ensureUserHomeGroup() historically only wrote the DB row, which left
+ * ENOENT traps for any filesystem access (e.g. file uploads) before the
+ * first Agent run lazily created the directory. Failure here must not block
+ * the login/registration path that calls this, so it only warns.
+ */
+function ensureGroupDirExists(folder: string): void {
+  if (!isValidWorkspaceFolderName(folder)) {
+    logger.warn({ folder }, 'Skipping group dir creation: invalid folder name');
+    return;
+  }
+  try {
+    fs.mkdirSync(path.join(GROUPS_DIR, folder, 'logs'), { recursive: true });
+  } catch (err) {
+    logger.warn({ err, folder }, 'Failed to ensure group directory exists');
+  }
+}
+
+/**
  * Ensure a user has a home group. If not, create one.
  * The first admin keeps the legacy web:main home. Every other account gets an
  * owner-specific home workspace. Admin homes use host execution; member homes
@@ -11673,6 +11626,7 @@ export function ensureUserHomeGroup(
 ): string {
   const existing = getUserHomeGroup(userId);
   if (existing) {
+    ensureGroupDirExists(existing.folder);
     assignWorkspaceAgentProfile(
       existing.folder,
       getOrCreateDefaultAgentProfile(userId).id,
@@ -11699,6 +11653,7 @@ export function ensureUserHomeGroup(
   };
 
   setRegisteredGroup(jid, group);
+  ensureGroupDirExists(folder);
   assignWorkspaceAgentProfile(
     folder,
     getOrCreateDefaultAgentProfile(userId).id,
@@ -11993,12 +11948,18 @@ export function deleteGroupData(
      * Callers update their live routing cache only after this transaction
      * succeeds.
      */
-    channelUpdates?: Array<{ jid: string; group: RegisteredGroup }>;
+    channelUpdates?:
+      | Array<{ jid: string; group: RegisteredGroup }>
+      | (() => Array<{ jid: string; group: RegisteredGroup }>);
   } = {},
 ): void {
   const tx = db.transaction(() => {
     const legacyMainJid = `web:${folder}`;
-    for (const update of options.channelUpdates ?? []) {
+    const channelUpdates =
+      typeof options.channelUpdates === 'function'
+        ? options.channelUpdates()
+        : (options.channelUpdates ?? []);
+    for (const update of channelUpdates) {
       setRegisteredGroup(update.jid, update.group);
     }
     db.prepare(
@@ -12140,6 +12101,36 @@ export function getMessagesPage(
     NewMessage & { is_from_me: number }
   >;
 
+  return rows.map((row) => normalizeMessageRow(row));
+}
+
+/**
+ * Recent persisted messages that are safe to replay into a fresh model
+ * session. Privacy migrations leave the Web transcript untouched and fence
+ * only legacy mixed-history rows. Current cold-run messages are excluded in
+ * SQL so a large pending batch cannot consume the entire recovery window.
+ */
+export function getConversationHistoryMessagesPage(
+  chatJid: string,
+  excludedMessageIds: ReadonlySet<string>,
+  limit = 50,
+): Array<NewMessage & { is_from_me: boolean }> {
+  const excluded = [...excludedMessageIds].filter(Boolean);
+  const safeLimit = Math.min(200, Math.max(1, Math.floor(limit)));
+  const rows = db
+    .prepare(
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
+              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
+              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
+       FROM messages
+       WHERE chat_jid = ? AND history_recovery_allowed = 1
+         AND id NOT IN (SELECT value FROM json_each(?))
+       ORDER BY timestamp DESC, id DESC
+       LIMIT ?`,
+    )
+    .all(chatJid, JSON.stringify(excluded), safeLimit) as Array<
+    NewMessage & { is_from_me: number }
+  >;
   return rows.map((row) => normalizeMessageRow(row));
 }
 
@@ -12286,35 +12277,6 @@ export function getTaskRunLogs(taskId: string, limit = 20): TaskRunLog[] {
   `,
     )
     .all(taskId, limit) as TaskRunLog[];
-}
-
-// ===================== Daily Summary Queries =====================
-
-/**
- * Get messages for a chat within a time range, ordered by timestamp ASC.
- */
-export function getMessagesByTimeRange(
-  chatJid: string,
-  startTs: number,
-  endTs: number,
-  limit = 500,
-): Array<NewMessage & { is_from_me: boolean }> {
-  const startIso = new Date(startTs).toISOString();
-  const endIso = new Date(endTs).toISOString();
-  const rows = db
-    .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
-       FROM messages
-       WHERE chat_jid = ? AND timestamp >= ? AND timestamp < ?
-       ORDER BY timestamp ASC
-       LIMIT ?`,
-    )
-    .all(chatJid, startIso, endIso, limit) as Array<
-    NewMessage & { is_from_me: number }
-  >;
-
-  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -13260,48 +13222,6 @@ export function queryAuthAuditLogs(
   return { logs, total, limit, offset };
 }
 
-export function getAuthAuditLogs(limit = 100, offset = 0): AuthAuditLog[] {
-  return queryAuthAuditLogs({ limit, offset }).logs;
-}
-
-export function checkLoginRateLimitFromAudit(
-  username: string,
-  ip: string,
-  maxAttempts: number,
-  lockoutMinutes: number,
-): { allowed: boolean; retryAfterSeconds?: number; attempts: number } {
-  if (maxAttempts <= 0) return { allowed: true, attempts: 0 };
-  const windowStart = new Date(
-    Date.now() - lockoutMinutes * 60 * 1000,
-  ).toISOString();
-  const rows = db
-    .prepare(
-      `
-      SELECT created_at
-      FROM auth_audit_log
-      WHERE event_type = 'login_failed'
-        AND username = ?
-        AND ip_address = ?
-        AND created_at >= ?
-        AND (details IS NULL OR details NOT LIKE '%"reason":"rate_limited"%')
-      ORDER BY created_at ASC
-      `,
-    )
-    .all(username, ip, windowStart) as Array<{ created_at: string }>;
-
-  const attempts = rows.length;
-  if (attempts < maxAttempts) return { allowed: true, attempts };
-
-  const oldest = rows[0]?.created_at;
-  const oldestTs = oldest ? Date.parse(oldest) : Date.now();
-  const retryAt = oldestTs + lockoutMinutes * 60 * 1000;
-  const retryAfterSeconds = Math.max(
-    1,
-    Math.ceil((retryAt - Date.now()) / 1000),
-  );
-  return { allowed: false, retryAfterSeconds, attempts };
-}
-
 // ===================== Sub-Agent CRUD =====================
 
 export function createAgent(agent: SubAgent): void {
@@ -13336,15 +13256,6 @@ export function getAgent(id: string): SubAgent | undefined {
     | undefined;
   if (!row) return undefined;
   return mapAgentRow(row);
-}
-
-export function listAgentsByFolder(folder: string): SubAgent[] {
-  const rows = db
-    .prepare(
-      'SELECT * FROM agents WHERE group_folder = ? ORDER BY created_at DESC',
-    )
-    .all(folder) as Array<Record<string, unknown>>;
-  return rows.map(mapAgentRow);
 }
 
 export function listAgentsByJid(chatJid: string): SubAgent[] {
@@ -13568,7 +13479,8 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
             | 'manual'
             | 'native_thread'
             | 'feishu_thread'
-            | 'auto_im')
+            | 'auto_im'
+            | 'channel_direct')
         : null,
     thread_id: typeof row.thread_id === 'string' ? row.thread_id : null,
     root_message_id:
@@ -14135,18 +14047,6 @@ export function expireSubscriptions(): number {
   return result.changes + renewed;
 }
 
-export function updateSubscriptionAutoRenew(
-  userId: string,
-  autoRenew: boolean,
-): boolean {
-  const result = db
-    .prepare(
-      "UPDATE user_subscriptions SET auto_renew = ? WHERE user_id = ? AND status = 'active'",
-    )
-    .run(autoRenew ? 1 : 0, userId);
-  return result.changes > 0;
-}
-
 function mapSubscriptionRow(row: Record<string, unknown>): UserSubscription {
   return {
     id: String(row.id),
@@ -14511,16 +14411,6 @@ export function createRedeemCode(code: RedeemCode): void {
     code.batch_id,
     code.created_at,
   );
-}
-
-export function incrementRedeemCodeUsage(code: string, userId: string): void {
-  const now = new Date().toISOString();
-  db.prepare(
-    'UPDATE redeem_codes SET used_count = used_count + 1 WHERE code = ?',
-  ).run(code);
-  db.prepare(
-    'INSERT INTO redeem_code_usage (code, user_id, redeemed_at) VALUES (?, ?, ?)',
-  ).run(code, userId, now);
 }
 
 export function deleteRedeemCode(code: string): boolean {
@@ -15015,15 +14905,6 @@ export function batchAssignPlan(
   });
   txn();
   return count;
-}
-
-export function getPlanSubscriberCount(planId: string): number {
-  const row = db
-    .prepare(
-      "SELECT COUNT(*) as cnt FROM user_subscriptions WHERE plan_id = ? AND status = 'active'",
-    )
-    .get(planId) as { cnt: number };
-  return row.cnt;
 }
 
 export function getAllPlanSubscriberCounts(): Record<string, number> {

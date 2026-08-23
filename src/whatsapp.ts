@@ -1,9 +1,9 @@
 /**
- * WhatsApp Channel — Baileys integration (M1: QR login + connection state)
+ * WhatsApp Channel — Baileys integration
  *
  * 基于 OpenClaw 同版本的 baileys 7.0.0-rc13 接入 WhatsApp Web 协议。
  *
- * M1 范围（本提交）：
+ * Supported behavior:
  *  - useMultiFileAuthState 持久化登录态（多文件 auth state，存在 authDir 下）
  *  - makeWASocket 建立 WebSocket 长连接到 Meta
  *  - 监听 connection.update：将 status / QR 串通过 onConnectionUpdate 推到上层
@@ -11,15 +11,10 @@
  *  - disconnect 优雅关闭、isConnected 反映真实状态
  *  - 自动重连：被 Meta 主动断开（非 logged out）时延迟 3s 重连
  *
- * M2/M3 待补：messages.upsert 转发到 onMessage、sendMessage / sendImage / sendFile
- * 实际投递（目前仍 throw NOT_IMPLEMENTED 占位）。
- *
  * 风险：Baileys 是逆向 WhatsApp Web 协议的社区方案，封号率随 Meta 风控收紧上升。
  * 商用场景应使用官方 Cloud API。
  */
 import { mkdir, chmod } from 'node:fs/promises';
-import fs from 'node:fs';
-import path from 'node:path';
 import crypto from 'node:crypto';
 import qrcode from 'qrcode';
 import {
@@ -39,7 +34,6 @@ import { readFile } from 'node:fs/promises';
 import { logger } from './logger.js';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastNewMessage } from './web.js';
 import { markdownToPlainText, splitTextChunks } from './im-utils.js';
 import { saveDownloadedFile, FileTooLargeError } from './im-downloader.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
@@ -47,6 +41,11 @@ import {
   evaluateChannelAdmission,
   resolveAdmittedChannelRoute,
 } from './channel-admission.js';
+import { canonicalizeWhatsAppProviderConversationJid } from './whatsapp-jid.js';
+export {
+  getWhatsAppAuthDir,
+  migrateLegacyWhatsAppAuthDir,
+} from './whatsapp-auth.js';
 
 const CHANNEL_PREFIX = 'whatsapp:';
 /** WhatsApp text message safe limit. Baileys allows up to 64KB but UX clamps far below. */
@@ -106,6 +105,7 @@ export interface WhatsAppConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
   /** Bot added to a new group */
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   /** Bot removed from a group / group dissolved */
@@ -118,7 +118,7 @@ export interface WhatsAppConnectOpts {
   isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   /** WhatsApp 专属：连接状态变化回调（QR 出现、connected、断线等） */
   onConnectionUpdate?: (state: WhatsAppConnectionState) => void;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
 }
 
 export interface WhatsAppConnection {
@@ -281,10 +281,10 @@ export function createWhatsAppConnection(
         groupNameCache.set(remoteJid, subject);
         try {
           const rawJid = `${CHANNEL_PREFIX}${remoteJid}`;
-          updateChatName(
-            opts?.normalizeIncomingJid?.(rawJid) ?? rawJid,
-            subject,
-          );
+          const normalizedJid = opts?.normalizeIncomingJid
+            ? opts.normalizeIncomingJid(rawJid)
+            : rawJid;
+          if (normalizedJid) updateChatName(normalizedJid, subject);
         } catch (err) {
           logger.debug({ err, remoteJid }, 'Failed to persist group name');
         }
@@ -511,17 +511,16 @@ export function createWhatsAppConnection(
     nextSock.ev.on('group-participants.update', async (update) => {
       if (generation !== socketGeneration || sock !== nextSock) return;
       try {
-        const selfJid = sock?.user?.id ? jidNormalizedUser(sock.user.id) : null;
-        if (!selfJid) return;
-        const involvesSelf = update.participants.some(
-          (participant) =>
-            jidNormalizedUser(participant.phoneNumber ?? participant.id) ===
-            selfJid,
+        const involvesSelf = update.participants.some((participant) =>
+          isWhatsAppSelfParticipant(participant, sock?.user),
         );
         if (!involvesSelf) return;
 
         const rawJid = `${CHANNEL_PREFIX}${update.id}`;
-        const chatJid = opts?.normalizeIncomingJid?.(rawJid) ?? rawJid;
+        const chatJid = opts?.normalizeIncomingJid
+          ? opts.normalizeIncomingJid(rawJid)
+          : rawJid;
+        if (!chatJid) return;
         if (update.action === 'add') {
           let chatName = update.id;
           try {
@@ -657,6 +656,13 @@ export function createWhatsAppConnection(
       return;
     }
 
+    // Baileys normally normalizes legacy PN JIDs before `messages.upsert`, but
+    // placeholder-resend and other synthetic notify paths can retain raw
+    // `user:device@c.us`. Keep `remoteJid` untouched for provider acks/replies,
+    // while every HappyClaw identity uses one stable canonical conversation.
+    const logicalRemoteJid =
+      canonicalizeWhatsAppProviderConversationJid(remoteJid);
+
     // Global stale-message drop (>30min). Independent of reconnect filter
     // below; handles edge cases like webhook retries delivering an hour late.
     const tsMs = normalizeTimestamp(messageTimestamp);
@@ -669,10 +675,11 @@ export function createWhatsAppConnection(
     }
 
     // LRU dedup + in-flight lock: skip duplicates that re-arrive at reconnect
-    // / stream-switch boundaries. Keyed by (remoteJid, key.id) because Baileys
-    // reuses key.id across chats. Messages without key.id bypass both checks
-    // (no way to address them reliably).
-    const dedupKey = key.id ? `${remoteJid}|${key.id}` : '';
+    // / stream-switch boundaries. Keyed by (canonical remote JID, key.id) so a
+    // placeholder resend cannot bypass dedup by changing `@c.us` into
+    // `@s.whatsapp.net`; Baileys also reuses key.id across unrelated chats.
+    // Messages without key.id bypass both checks (no reliable address).
+    const dedupKey = key.id ? `${logicalRemoteJid}|${key.id}` : '';
     if (dedupKey) {
       if (isDuplicate(dedupKey)) {
         logger.debug(
@@ -704,12 +711,21 @@ export function createWhatsAppConnection(
       // detection all see the real inner message (they otherwise diverge).
       const inner = unwrapMessageContent(content);
       let text = extractMessageText(inner);
-      const rawChatJid = `${CHANNEL_PREFIX}${remoteJid}`;
-      const chatJid = opts.normalizeIncomingJid?.(rawChatJid) ?? rawChatJid;
+      const rawChatJid = `${CHANNEL_PREFIX}${logicalRemoteJid}`;
+      const chatJid = opts.normalizeIncomingJid
+        ? opts.normalizeIncomingJid(rawChatJid)
+        : rawChatJid;
+      if (!chatJid) {
+        logger.warn(
+          { remoteJid, msgId: key.id },
+          'WhatsApp inbound identity rejected before admission',
+        );
+        return;
+      }
       const isGroup = remoteJid.endsWith('@g.us');
       const senderRaw = isGroup ? key.participant || remoteJid : remoteJid;
       const senderImId = jidNormalizedUser(senderRaw);
-      const senderId = `${CHANNEL_PREFIX}${senderRaw}`;
+      const senderId = `${CHANNEL_PREFIX}${senderImId || senderRaw}`;
       const senderName = pushName || (isGroup ? '群成员' : remoteJid);
       const chatName =
         groupNameCache.get(remoteJid) || (isGroup ? remoteJid : senderName);
@@ -764,7 +780,7 @@ export function createWhatsAppConnection(
           return;
         }
 
-        const isBotMentioned = isMentioningBot(inner, sock?.user?.id);
+        const isBotMentioned = isMentioningBot(inner, sock?.user);
         if (
           opts.shouldProcessGroupMessage &&
           !isBotMentioned &&
@@ -788,7 +804,7 @@ export function createWhatsAppConnection(
           return;
         }
         if (isBotMentioned && text) {
-          text = stripLeadingWhatsAppBotMention(text, inner, sock?.user?.id);
+          text = stripLeadingWhatsAppBotMention(text, inner, sock?.user);
         }
       }
 
@@ -888,7 +904,7 @@ export function createWhatsAppConnection(
         { attachments: attachmentsJson, sourceJid: chatJid },
       );
 
-      broadcastNewMessage(
+      opts.onMessagePersisted?.(
         targetJid,
         {
           id,
@@ -1088,71 +1104,6 @@ export function createWhatsAppConnection(
   };
 }
 
-/** Compute the auth state directory for a given user / account. */
-const SAFE_AUTH_PATH_SEGMENT = /^[A-Za-z0-9_-]{1,64}$/;
-
-function safeAuthPathSegment(
-  value: string | undefined,
-  fallback?: string,
-): string {
-  const resolved = value || fallback;
-  if (!resolved || !SAFE_AUTH_PATH_SEGMENT.test(resolved)) {
-    throw new Error('Invalid WhatsApp auth path segment');
-  }
-  return resolved;
-}
-
-export function getWhatsAppAuthDir(
-  dataDir: string,
-  userId: string,
-  accountId = 'default',
-): string {
-  const safeUserId = safeAuthPathSegment(userId);
-  const safeAccountId = safeAuthPathSegment(accountId, 'default');
-  const root = path.resolve(
-    dataDir,
-    'config',
-    'user-im',
-    safeUserId,
-    'whatsapp-auth',
-  );
-  const candidate = path.resolve(root, safeAccountId);
-  if (!candidate.startsWith(`${root}${path.sep}`)) {
-    throw new Error('WhatsApp auth directory escaped its account root');
-  }
-  return candidate;
-}
-
-/** Move a legacy singleton auth state to the immutable channel-account id. */
-export function migrateLegacyWhatsAppAuthDir(
-  dataDir: string,
-  userId: string,
-  legacyAccountId: string | undefined,
-  channelAccountId: string,
-): boolean {
-  if (!legacyAccountId || legacyAccountId === channelAccountId) return false;
-  let source: string;
-  let destination: string;
-  try {
-    source = getWhatsAppAuthDir(dataDir, userId, legacyAccountId);
-    destination = getWhatsAppAuthDir(dataDir, userId, channelAccountId);
-  } catch {
-    // Legacy config is untrusted. Invalid paths are ignored without touching
-    // any filesystem location, especially paths outside the auth root.
-    return false;
-  }
-  if (!fs.existsSync(source) || fs.existsSync(destination)) return false;
-  fs.mkdirSync(path.dirname(destination), { recursive: true });
-  try {
-    fs.renameSync(source, destination);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error;
-    fs.cpSync(source, destination, { recursive: true });
-    fs.rmSync(source, { recursive: true, force: true });
-  }
-  return true;
-}
-
 /**
  * Strip ephemeral / view-once envelopes so the real inner message is exposed.
  * extractMessageText recurses through these on its own, but detectMedia and
@@ -1298,22 +1249,78 @@ export function stripChannelPrefix(chatId: string): string {
 }
 
 /**
+ * Baileys `sock.user` after the LID migration may expose both a phone-number
+ * JID (`id`) and a LID (`lid`). Group mentions and participant rows can use
+ * either form, plus hosted aliases (`@hosted` / `@hosted.lid`).
+ */
+export interface WhatsAppSelfIdentity {
+  id?: string | null;
+  lid?: string | null;
+}
+
+export type WhatsAppSelfRef = string | WhatsAppSelfIdentity | null | undefined;
+
+/**
+ * Collapse hosted aliases onto the corresponding PN/LID identity.
+ * Do not equate LID with PN: those user numbers are different ID spaces.
+ */
+export function canonicalizeWhatsAppUserJid(jid: string): string {
+  const norm = jidNormalizedUser(jid);
+  if (!norm) return '';
+  if (norm.endsWith('@hosted.lid')) {
+    return `${norm.slice(0, -'@hosted.lid'.length)}@lid`;
+  }
+  if (norm.endsWith('@hosted')) {
+    return `${norm.slice(0, -'@hosted'.length)}@s.whatsapp.net`;
+  }
+  return norm;
+}
+
+export function collectWhatsAppSelfJids(self: WhatsAppSelfRef): string[] {
+  const raws: Array<string | null | undefined> =
+    self && typeof self === 'object' ? [self.id, self.lid] : [self];
+  const identities = new Set<string>();
+  for (const raw of raws) {
+    if (!raw) continue;
+    const key = canonicalizeWhatsAppUserJid(raw);
+    if (key) identities.add(key);
+  }
+  return [...identities];
+}
+
+/** Membership events expose LID on `id` and PN on `phoneNumber` independently. */
+export function isWhatsAppSelfParticipant(
+  participant: { id?: string | null; phoneNumber?: string | null },
+  self: WhatsAppSelfRef,
+): boolean {
+  const identities = new Set(collectWhatsAppSelfJids(self));
+  if (identities.size === 0) return false;
+  for (const raw of [participant.id, participant.phoneNumber]) {
+    if (!raw) continue;
+    const key = canonicalizeWhatsAppUserJid(raw);
+    if (key && identities.has(key)) return true;
+  }
+  return false;
+}
+
+/**
  * Check if a baileys message @mentions the bot itself.
  *
  * Mentioning lives in `extendedTextMessage.contextInfo.mentionedJid` (string[]).
  * Self jid format from sock.user.id includes a device suffix
- * (e.g. `15551234567:42@s.whatsapp.net`) — normalize both sides before compare.
+ * (e.g. `15551234567:42@s.whatsapp.net`). Compare every known self identity
+ * after normalizing device suffixes and hosted aliases.
  */
 export function isMentioningBot(
   content: proto.IMessage,
-  selfJid: string | null | undefined,
+  self: WhatsAppSelfRef,
 ): boolean {
-  // Fail closed: 当 selfJid 暂时不可用（reconnect 间隙、auth 状态未就绪），
+  // Fail closed: 当 self 暂时不可用（reconnect 间隙、auth 状态未就绪），
   // 从前的 fail-open 让 require_mention 模式短暂被绕过——攻击者可在 socket
   // 启动毫秒级窗口中把所有群消息都被处理。一致性优先：没法确认时按"未被
   // mention"处理，主消息处理流会丢弃。和 feishu 实现的语义对齐。
-  if (!selfJid) return false;
-  const selfNorm = jidNormalizedUser(selfJid);
+  const identities = new Set(collectWhatsAppSelfJids(self));
+  if (identities.size === 0) return false;
   const ctx =
     content.extendedTextMessage?.contextInfo ||
     content.imageMessage?.contextInfo ||
@@ -1322,7 +1329,7 @@ export function isMentioningBot(
     content.audioMessage?.contextInfo;
   const mentioned = ctx?.mentionedJid;
   if (!mentioned || mentioned.length === 0) return false;
-  return mentioned.some((m) => jidNormalizedUser(m) === selfNorm);
+  return mentioned.some((m) => identities.has(canonicalizeWhatsAppUserJid(m)));
 }
 
 /** Remove a leading WhatsApp display token only when trusted message metadata
@@ -1331,18 +1338,26 @@ export function isMentioningBot(
 export function stripLeadingWhatsAppBotMention(
   text: string,
   content: proto.IMessage,
-  selfJid: string | null | undefined,
+  self: WhatsAppSelfRef,
 ): string {
-  if (!selfJid || !isMentioningBot(content, selfJid)) return text;
-  const selfSubject = jidNormalizedUser(selfJid).split('@', 1)[0];
-  if (!selfSubject) return text;
+  if (!isMentioningBot(content, self)) return text;
+  const subjects = [
+    ...new Set(
+      collectWhatsAppSelfJids(self)
+        .map((jid) => jid.split('@', 1)[0])
+        .filter(Boolean),
+    ),
+  ].sort((left, right) => right.length - left.length);
   const normalized = text.trimStart();
-  const displayToken = `@${selfSubject}`;
-  if (!normalized.startsWith(displayToken)) return text;
-  const next = normalized.charAt(displayToken.length);
-  if (next && !/\s/.test(next)) return text;
-  const remainder = normalized.slice(displayToken.length).trimStart();
-  return remainder || text;
+  for (const subject of subjects) {
+    const displayToken = `@${subject}`;
+    if (!normalized.startsWith(displayToken)) continue;
+    const next = normalized.charAt(displayToken.length);
+    if (next && !/\s/.test(next)) continue;
+    const remainder = normalized.slice(displayToken.length).trimStart();
+    return remainder || text;
+  }
+  return text;
 }
 
 /**

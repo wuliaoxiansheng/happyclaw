@@ -7,7 +7,6 @@ import {
   createWeChatHttpDispatcher,
   isWeChatConnectTimeout,
 } from './wechat-http.js';
-import { createWeComConnection } from './wecom.js';
 
 export interface ChannelAccountCredentialTestResult {
   success: boolean;
@@ -140,6 +139,7 @@ export async function testChannelAccountCredentials(
   }
 
   if (account.provider === 'wecom') {
+    const { createWeComConnection } = await import('./wecom.js');
     const connection = createWeComConnection({
       botId: secret.botId || '',
       secret: secret.secret || '',

@@ -275,7 +275,6 @@ export class DingTalkStreamingCardController {
   // Throttle
   private lastUpdateTime = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
-  private pendingFlush: (() => Promise<void>) | null = null;
 
   // Fallback: sendMessage callback when card fails
   private fallbackSend: ((text: string) => Promise<void>) | null;
@@ -727,6 +726,7 @@ export class DingTalkStreamingCardController {
 
         this.cardInstanceId = cardId;
         this.state = 'streaming';
+        this.onCardCreated?.(cardId);
         logger.info({ cardId }, 'DingTalk AI Card created and delivered');
       } catch (err: any) {
         logger.warn(

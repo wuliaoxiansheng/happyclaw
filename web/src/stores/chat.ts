@@ -397,6 +397,10 @@ interface ChatState {
   resetSession: (jid: string, agentId?: string) => Promise<boolean>;
   clearHistory: (jid: string) => Promise<boolean>;
   deleteMessage: (jid: string, messageId: string) => Promise<boolean>;
+  handleMessageDeleted: (
+    messageChatJid: string,
+    messageId: string,
+  ) => Promise<void>;
   createFlow: (
     name: string,
     options?: CreateWorkspaceOptions,
@@ -2275,20 +2279,77 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
+  handleMessageDeleted: async (messageChatJid, messageId) => {
+    const agentMarker = '#agent:';
+    const agentSep = messageChatJid.indexOf(agentMarker);
+    const workspaceJid =
+      agentSep >= 0 ? messageChatJid.slice(0, agentSep) : null;
+    const agentId =
+      agentSep >= 0
+        ? messageChatJid.slice(agentSep + agentMarker.length)
+        : null;
+
+    set((s) => {
+      const matchesDeletedRow = (message: Message) =>
+        message.id === messageId && message.chat_jid === messageChatJid;
+      const messages = { ...s.messages };
+      for (const [key, list] of Object.entries(messages)) {
+        if (list.some(matchesDeletedRow)) {
+          messages[key] = list.filter((message) => !matchesDeletedRow(message));
+        }
+      }
+
+      const agentMessages = { ...s.agentMessages };
+      for (const [key, list] of Object.entries(agentMessages)) {
+        if (list.some(matchesDeletedRow)) {
+          agentMessages[key] = list.filter(
+            (message) => !matchesDeletedRow(message),
+          );
+        }
+      }
+
+      if (!workspaceJid || !agentId) return { messages, agentMessages };
+
+      // The Session sidebar has its own latest-message projection. Update it
+      // immediately from the loaded page, then force an authoritative refresh
+      // below in case the previous message is outside that page.
+      const loaded = agentMessages[agentId];
+      const latest = loaded?.[loaded.length - 1];
+      const agents = { ...s.agents };
+      if (agents[workspaceJid]) {
+        agents[workspaceJid] = agents[workspaceJid].map((agent) =>
+          agent.id === agentId
+            ? {
+                ...agent,
+                latest_message: latest
+                  ? { content: latest.content, timestamp: latest.timestamp }
+                  : null,
+              }
+            : agent,
+        );
+      }
+      return { messages, agentMessages, agents };
+    });
+
+    if (workspaceJid && agentId) {
+      // A deleted sensitive message must not survive in the PWA's persisted
+      // hydrate cache. Await invalidation so an immediate reload cannot race it.
+      await deleteAgentMessageSnapshot(workspaceJid, agentId);
+      await get().loadAgents(workspaceJid, { force: true });
+    }
+  },
+
   deleteMessage: async (jid: string, messageId: string) => {
     try {
       await api.delete(
         `/api/groups/${encodeURIComponent(jid)}/messages/${encodeURIComponent(messageId)}`,
       );
-      set((s) => ({
-        messages: {
-          ...s.messages,
-          [jid]: (s.messages[jid] || []).filter((m) => m.id !== messageId),
-        },
-      }));
+      await get().handleMessageDeleted(jid, messageId);
       return true;
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      const message = extractErrorMessage(err) || '删除聊天记录失败';
+      set({ error: message });
+      showToast('删除失败', message);
       return false;
     }
   },

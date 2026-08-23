@@ -260,7 +260,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     let active = true;
     const fetchStatus = () => {
       api
-        .get<Record<string, boolean>>('/api/config/user-im/status')
+        .get<Record<string, boolean>>('/api/channel-accounts/status')
         .then((data) => {
           if (active) setImStatus(data);
         })

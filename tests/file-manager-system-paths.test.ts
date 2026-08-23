@@ -192,4 +192,31 @@ describe('descriptor-relative workspace mutations', () => {
     safeDeleteWorkspaceEntry(FOLDER, 'reports');
     expect(fs.existsSync(path.join(folderRoot, 'reports'))).toBe(false);
   });
+
+  test.skipIf(process.platform === 'win32')(
+    'atomic replacement preserves existing executable and private modes',
+    () => {
+      const executable = path.join(folderRoot, 'tool.sh');
+      const privateFile = path.join(folderRoot, 'private.txt');
+      fs.writeFileSync(executable, '#!/bin/sh\n', { mode: 0o700 });
+      fs.writeFileSync(privateFile, 'secret\n', { mode: 0o600 });
+
+      safeWriteWorkspaceFile(
+        FOLDER,
+        'tool.sh',
+        Buffer.from('#!/bin/sh\nexit 0\n'),
+        {
+          mustExist: true,
+          createParents: false,
+        },
+      );
+      safeWriteWorkspaceFile(FOLDER, 'private.txt', Buffer.from('updated\n'), {
+        mustExist: true,
+        createParents: false,
+      });
+
+      expect(fs.statSync(executable).mode & 0o7777).toBe(0o700);
+      expect(fs.statSync(privateFile).mode & 0o7777).toBe(0o600);
+    },
+  );
 });

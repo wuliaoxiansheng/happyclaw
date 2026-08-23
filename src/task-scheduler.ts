@@ -22,7 +22,6 @@ import {
 } from './container-runner.js';
 import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
 import {
-  advanceSkippedTask,
   cancelDeliveredGroupTaskRunWithWorkspaceIntent,
   cancelTaskRun,
   claimNextTaskRunNotification,
@@ -39,10 +38,8 @@ import {
   getAllTasks,
   cleanupOldTaskRunLogs,
   cleanupStaleRunningLogs,
-  clearStaleTaskLeases,
   claimTaskForRun,
   deleteGroupData,
-  getDueTasks,
   getDueTaskDefinitionsV2,
   getNextScheduledTaskWakeAt,
   getNextTaskRunWakeAt,

@@ -16,7 +16,6 @@ import fs from 'fs';
 import { fetch as undiciFetch, type Dispatcher } from 'undici';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import { detectImageMimeType } from './image-detector.js';
@@ -127,7 +126,8 @@ export interface WeChatConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
-  normalizeIncomingJid?: (jid: string) => string;
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
+  normalizeIncomingJid?: (jid: string) => string | null;
   /** No inbound message may register or download media before this passes. */
   isChatAuthorized?: (jid: string) => boolean;
   onPairAttempt?: (
@@ -168,6 +168,7 @@ export interface WeChatConnection {
 export interface WeChatConnectionDeps {
   fetch?: typeof undiciFetch;
   createDispatcher?: (bypassProxy: boolean) => Dispatcher;
+  uploadMediaBuffer?: typeof uploadMediaBuffer;
   random?: () => number;
   now?: () => number;
   contextTokenStore?: WeChatContextTokenStore | null;
@@ -513,6 +514,7 @@ export function createWeChatConnection(
   const bypassProxy = config.bypassProxy !== false;
   const fetchImpl = deps.fetch ?? undiciFetch;
   const createDispatcher = deps.createDispatcher ?? createWeChatHttpDispatcher;
+  const uploadMedia = deps.uploadMediaBuffer ?? uploadMediaBuffer;
   const random = deps.random ?? Math.random;
   const now = deps.now ?? Date.now;
   const logContext = {
@@ -1126,7 +1128,7 @@ export function createWeChatConnection(
         },
       );
 
-      broadcastNewMessage(
+      opts.onMessagePersisted?.(
         targetJid,
         {
           id,
@@ -1497,28 +1499,29 @@ export function createWeChatConnection(
       const captionChunks = caption
         ? splitTextChunks(markdownToPlainText(caption), MSG_SPLIT_LIMIT)
         : [];
-      const record = contextTokens.claim(userId, captionChunks.length + 1);
 
       try {
+        // Uploading does not consume context_token quota. Finish this
+        // independently fallible phase before durably reserving sendmessage
+        // calls, otherwise a CDN/getuploadurl failure burns scarce reply slots
+        // without making any provider send attempt.
+        const upload = await uploadMedia({
+          buf: imageBuffer,
+          fileName: resolvedFileName,
+          toUserId: userId,
+          baseUrl,
+          token: config.botToken,
+          cdnBaseUrl,
+          mediaType: 1, // MEDIA_IMAGE
+          dispatcher: ensureDispatcher(),
+        });
+        const record = contextTokens.claim(userId, captionChunks.length + 1);
         await sendWithReservedContext(record, async () => {
           // Optional caption is sent first as a separate text message —
           // WeChat's sendmessage API does not accept mixed text+image items.
           for (const chunk of captionChunks) {
             await sendMessageApi(userId, record.token, chunk);
           }
-
-          // Upload to WeChat CDN (getuploadurl → AES-128-ECB encrypt → PUT
-          // ciphertext).
-          const upload = await uploadMediaBuffer({
-            buf: imageBuffer,
-            fileName: resolvedFileName,
-            toUserId: userId,
-            baseUrl,
-            token: config.botToken,
-            cdnBaseUrl,
-            mediaType: 1, // MEDIA_IMAGE
-            dispatcher: ensureDispatcher(),
-          });
 
           const clientId = String(crypto.randomBytes(4).readUInt32BE(0));
           const resp = await apiPost<{
@@ -1577,22 +1580,23 @@ export function createWeChatConnection(
           `WeChat file size ${buf.length} exceeds max ${MAX_FILE_SIZE}`,
         );
       }
-      const record = contextTokens.claim(userId);
 
       try {
+        // Reserve the context token only once the pre-send CDN upload has
+        // succeeded. Ambiguous sendmessage failures remain conservatively
+        // charged by sendWithReservedContext below.
+        const upload = await uploadMedia({
+          buf,
+          fileName,
+          toUserId: userId,
+          baseUrl,
+          token: config.botToken,
+          cdnBaseUrl,
+          mediaType: 3, // MEDIA_FILE
+          dispatcher: ensureDispatcher(),
+        });
+        const record = contextTokens.claim(userId);
         await sendWithReservedContext(record, async () => {
-          // Upload raw bytes to WeChat CDN as FILE attachment (mediaType=3).
-          const upload = await uploadMediaBuffer({
-            buf,
-            fileName,
-            toUserId: userId,
-            baseUrl,
-            token: config.botToken,
-            cdnBaseUrl,
-            mediaType: 3, // MEDIA_FILE
-            dispatcher: ensureDispatcher(),
-          });
-
           const clientId = String(crypto.randomBytes(4).readUInt32BE(0));
           const resp = await apiPost<{
             ret?: number;

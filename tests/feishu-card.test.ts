@@ -1088,11 +1088,25 @@ describe('Feishu follow-up controls', () => {
     ).toEqual({ kind: 'steer', text: 'inspect this' });
     expect(
       parseFeishuRuntimeControl({
+        commandText: ' /clear ',
+        eligible: true,
+        hasAttachments: false,
+      }),
+    ).toEqual({ kind: 'clear' });
+    expect(
+      parseFeishuRuntimeControl({
         commandText: ' /break ',
         eligible: true,
         hasAttachments: false,
       }),
     ).toEqual({ kind: 'break' });
+    expect(
+      parseFeishuRuntimeControl({
+        commandText: '/queue later',
+        eligible: true,
+        hasAttachments: false,
+      }),
+    ).toBeUndefined();
     expect(
       parseFeishuRuntimeControl({
         commandText: '/break',

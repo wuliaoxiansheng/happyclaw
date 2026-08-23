@@ -12,8 +12,8 @@ export function resolveFeishuFollowUpMode(
 }
 
 export type FeishuRuntimeControl =
-  | { kind: 'queue'; text: string }
   | { kind: 'steer'; text: string }
+  | { kind: 'clear' }
   | { kind: 'break' };
 
 /**
@@ -29,18 +29,24 @@ export function parseFeishuRuntimeControl(input: {
 }): FeishuRuntimeControl | undefined {
   if (!input.eligible) return undefined;
   const commandText = input.commandText.trim();
+  if (!input.hasAttachments && commandText === '/clear') {
+    return { kind: 'clear' };
+  }
   if (!input.hasAttachments && commandText === '/break') {
     return { kind: 'break' };
   }
-  const followUp = commandText.match(/^\/(queue|steer)\s+([\s\S]*\S)$/);
+  const followUp = commandText.match(/^\/steer\s+([\s\S]*\S)$/);
   if (!followUp) return undefined;
   return {
-    kind: followUp[1] === 'steer' ? 'steer' : 'queue',
-    text: followUp[2].trim(),
+    kind: 'steer',
+    text: followUp[1].trim(),
   };
 }
 
 /** Keep invalid/case-variant control lookalikes out of the generic IM command handler. */
 export function isFeishuRuntimeControlLike(commandText: string): boolean {
-  return /^\/(?:queue|steer|break)(?:\s|$)/i.test(commandText.trim());
+  // `/queue` remains a lookalike only so legacy text bypasses the generic
+  // slash-command interceptor and reaches the Agent as ordinary default-queued
+  // input. It is intentionally not parsed as a runtime control above.
+  return /^\/(?:queue|steer|break|clear)(?:\s|$)/i.test(commandText.trim());
 }

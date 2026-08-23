@@ -23,12 +23,16 @@ import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
+  getWebDeps,
+  projectWebMessageDeleted,
+  projectWebNewMessage,
+} from '../web-context.js';
+import {
   canAccessGroup,
   canModifyGroup,
   canDeleteGroup,
-  MAX_GROUP_NAME_LEN,
-  getWebDeps,
-} from '../web-context.js';
+} from '../group-acl.js';
+import { MAX_GROUP_NAME_LEN } from '../group-constants.js';
 import {
   clearSessionChannelOwner,
   getRegisteredGroup,
@@ -94,8 +98,10 @@ import { getChannelType } from '../im-channel.js';
 import {
   buildNativeThreadWorkspaceUpdate,
   buildUnmountUpdate,
+  ensureDirectChannelSessionMount,
   resolveDefaultChannelMountForWorkspaceDeletion,
 } from '../channel-mount-service.js';
+import { resolveChannelConversationKind } from '../channel-conversation-kind.js';
 import {
   AdditionalMountValidationError,
   loadMountAllowlist,
@@ -110,8 +116,6 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 // SSRF helpers 抽到 ../url-safety.ts；本文件 re-export isPrivateHostname 以保留旧导入路径。
-import { z } from 'zod';
-import { broadcastNewMessage } from '../web.js';
 import { getStreamingSession } from '../feishu-streaming-card.js';
 import { attachSessionWorkflowRuns } from '../session-workflows.js';
 import {
@@ -148,6 +152,51 @@ export { isPrivateHostname };
 const groupRoutes = new Hono<{ Variables: Variables }>();
 
 // --- Helper functions ---
+
+type RegisteredGroupWithJid = RegisteredGroup & { jid: string };
+
+/**
+ * Resolve the workspace that owns execution for a physical message JID.
+ *
+ * Home's merged history keeps each message's physical IM chat_jid. Those IM
+ * rows commonly retain container defaults even when the Home workspace is
+ * host-mode, so authorization must follow the same binding/folder attribution
+ * as message display and broadcasts. A declared but stale binding fails
+ * closed: we cannot safely infer which workspace's execution policy applies.
+ */
+function resolveMessageExecutionGroup(
+  physicalJid: string,
+  physicalGroup: RegisteredGroupWithJid,
+): RegisteredGroupWithJid | null {
+  if (physicalJid.startsWith('web:')) return physicalGroup;
+
+  const attributionDeps = {
+    getRegisteredGroup,
+    getAgent,
+    getJidsByFolder,
+    getChannelMount,
+  };
+  const boundJid = resolveBoundWorkspaceJid(physicalJid, attributionDeps);
+  if (boundJid) return getRegisteredGroup(boundJid) ?? null;
+  if (hasBoundWorkspaceReference(physicalJid, attributionDeps)) return null;
+
+  for (const siblingJid of getJidsByFolder(physicalGroup.folder)) {
+    if (!siblingJid.startsWith('web:')) continue;
+    const sibling = getRegisteredGroup(siblingJid);
+    if (!sibling?.is_home) continue;
+    if (
+      physicalGroup.created_by &&
+      sibling.created_by !== physicalGroup.created_by
+    ) {
+      continue;
+    }
+    return sibling;
+  }
+
+  // Standalone legacy IM rows have no workspace projection. Preserve their
+  // own access/execution contract rather than making historical data undeletable.
+  return physicalGroup;
+}
 
 function normalizeGroupName(name: unknown): string {
   if (typeof name !== 'string') return '';
@@ -1790,37 +1839,51 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
       group: RegisteredGroup;
     }> = [];
     const nativeThreadTargets = new Set<string>();
-    if (confirmedChannelUnbind) {
-      for (const channelJid of freshBindingSummary.mountedChannelJids) {
-        const channelGroup = getRegisteredGroup(channelJid);
-        if (!channelGroup) continue;
-        const restored = resolveDefaultChannelMountForWorkspaceDeletion(
-          channelJid,
-          channelGroup,
-          channelGroup.created_by ?? authUser.id,
-          excludedWorkspaceJids,
-        );
-        if (restored.status === 'resolved') {
-          channelUpdates.push({
-            jid: channelJid,
-            group: restored.updated,
-          });
-          if (restored.routingMode === 'thread_map') {
-            nativeThreadTargets.add(restored.workspaceJid);
-          }
-        } else {
-          // A damaged legacy account may have no viable default workspace.
-          // Clearing its route is still safer than leaving a dangling pointer
-          // to the workspace that is about to disappear.
-          channelUpdates.push({
-            jid: channelJid,
-            group: buildUnmountUpdate(channelGroup),
-          });
-        }
-      }
-    }
 
-    deleteGroupData(jid, freshExisting.folder, { channelUpdates });
+    deleteGroupData(jid, freshExisting.folder, {
+      // Resolve and create any fallback direct sessions inside the same SQLite
+      // transaction as the workspace deletion. A crash must not leave a DM on
+      // a shared main mount or publish a half-created session route.
+      channelUpdates: () => {
+        if (!confirmedChannelUnbind) return channelUpdates;
+        for (const channelJid of freshBindingSummary.mountedChannelJids) {
+          const channelGroup = getRegisteredGroup(channelJid);
+          if (!channelGroup) continue;
+          const restored = resolveDefaultChannelMountForWorkspaceDeletion(
+            channelJid,
+            channelGroup,
+            channelGroup.created_by ?? authUser.id,
+            excludedWorkspaceJids,
+          );
+          if (restored.status === 'resolved') {
+            const updated =
+              resolveChannelConversationKind(channelJid) === 'direct'
+                ? ensureDirectChannelSessionMount({
+                    sourceJid: channelJid,
+                    group: restored.updated,
+                    workspaceJid: restored.workspaceJid,
+                    userId: channelGroup.created_by ?? authUser.id,
+                    force: true,
+                    mountOptions: { replyPolicy: 'source_only' },
+                  })
+                : restored.updated;
+            channelUpdates.push({ jid: channelJid, group: updated });
+            if (restored.routingMode === 'thread_map') {
+              nativeThreadTargets.add(restored.workspaceJid);
+            }
+          } else {
+            // A damaged legacy account may have no viable default workspace.
+            // Clearing its route is still safer than leaving a dangling pointer
+            // to the workspace that is about to disappear.
+            channelUpdates.push({
+              jid: channelJid,
+              group: buildUnmountUpdate(channelGroup),
+            });
+          }
+        }
+        return channelUpdates;
+      },
+    });
     deleteCommitted = true;
 
     const registeredGroups = deps.getRegisteredGroups();
@@ -1944,7 +2007,7 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
         timestamp,
         true,
       );
-      broadcastNewMessage(jid, {
+      projectWebNewMessage(jid, {
         id: messageId,
         chat_jid: jid,
         sender: '__system__',
@@ -2076,7 +2139,7 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
       true,
     );
 
-    broadcastNewMessage(targetJid, {
+    projectWebNewMessage(targetJid, {
       id: dividerMessageId,
       chat_jid: targetJid,
       sender: '__system__',
@@ -2434,22 +2497,58 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   return c.json({ messages, hasMore });
 });
 
-// DELETE /api/groups/:jid/messages/:messageId - 删除单条消息
+// DELETE /api/groups/:jid/messages/:messageId - 删除单条持久聊天记录。
+// This does not retract an input already admitted to a running model turn;
+// interruption/reset are separate lifecycle operations.
 groupRoutes.delete('/:jid/messages/:messageId', authMiddleware, (c) => {
-  const jid = c.req.param('jid');
+  // Runtime session messages are stored under the virtual chat JID
+  // `{workspaceJid}#agent:{sessionId}`, which is not a registered group. The
+  // client sends the message's own chat_jid, so resolve the owning workspace
+  // before the access check and keep deleting from the virtual JID the row
+  // actually lives in.
+  const chatJid = c.req.param('jid');
   const messageId = c.req.param('messageId');
-  const group = getRegisteredGroup(jid);
-  if (!group) {
+  const agentSep = chatJid.indexOf('#agent:');
+  const groupJid = agentSep >= 0 ? chatJid.slice(0, agentSep) : chatJid;
+  const agentId =
+    agentSep >= 0 ? chatJid.slice(agentSep + '#agent:'.length) : null;
+
+  const physicalGroup = getRegisteredGroup(groupJid);
+  if (!physicalGroup) {
     return c.json({ error: 'Group not found' }, 404);
   }
+  const executionGroup = resolveMessageExecutionGroup(groupJid, physicalGroup);
+  if (!executionGroup) return c.json({ error: 'Group not found' }, 404);
 
   const authUser = c.get('user') as AuthUser;
-  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+  if (
+    !canAccessGroup({ id: authUser.id, role: authUser.role }, physicalGroup) ||
+    !canAccessGroup({ id: authUser.id, role: authUser.role }, executionGroup)
+  ) {
     return c.json({ error: 'Group not found' }, 404);
+  }
+  // Same host-execution gate as GET /:jid/messages and POST /:jid/clear-history:
+  // a user who owns a host workspace but is no longer admin can neither read
+  // nor bulk-clear its history, so single-message deletes must not stay open.
+  if (
+    isHostExecutionGroup(executionGroup) &&
+    !hasHostExecutionPermission(authUser)
+  ) {
+    return c.json(
+      { error: 'Insufficient permissions for host execution mode' },
+      403,
+    );
+  }
+
+  if (agentId) {
+    const agent = getAgent(agentId);
+    if (!agent || agent.chat_jid !== groupJid) {
+      return c.json({ error: 'Message not found' }, 404);
+    }
   }
 
   // Ownership check: admin can delete any message, non-admin can only delete their own
-  const msg = getMessage(jid, messageId);
+  const msg = getMessage(chatJid, messageId);
   if (!msg) {
     return c.json({ error: 'Message not found' }, 404);
   }
@@ -2461,10 +2560,12 @@ groupRoutes.delete('/:jid/messages/:messageId', authMiddleware, (c) => {
     }
   }
 
-  const deleted = deleteMessage(jid, messageId);
+  const deleted = deleteMessage(chatJid, messageId);
   if (!deleted) {
     return c.json({ error: 'Message not found' }, 404);
   }
+
+  projectWebMessageDeleted(chatJid, messageId);
 
   return c.json({ success: true });
 });

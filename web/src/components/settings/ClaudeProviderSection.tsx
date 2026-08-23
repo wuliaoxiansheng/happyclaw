@@ -38,9 +38,6 @@ export function ClaudeProviderSection({
 }: ClaudeProviderSectionProps) {
   const [providers, setProviders] = useState<ProviderWithHealth[]>([]);
   const enabledCount = providers.filter((provider) => provider.enabled).length;
-  const [defaultProviderId, setDefaultProviderId] = useState<string | null>(
-    null,
-  );
   const [balancing, setBalancing] = useState<BalancingConfig | null>(null);
   const balancingRef = useRef<BalancingConfig | null>(null);
   const balancingRevisionRef = useRef(0);
@@ -74,7 +71,6 @@ export function ClaudeProviderSection({
         '/api/config/claude/providers',
       );
       setProviders(data.providers);
-      setDefaultProviderId(data.defaultProviderId);
       balancingRef.current = data.balancing;
       setBalancing(data.balancing);
     } catch (err) {
@@ -165,25 +161,6 @@ export function ClaudeProviderSection({
       }
     },
     [loadProviders, setNotice, setError],
-  );
-
-  const handleSetDefault = useCallback(
-    async (provider: ProviderWithHealth) => {
-      setTogglingId(provider.id);
-      try {
-        await api.put('/api/config/claude/default', {
-          providerId: provider.id,
-        });
-        await loadProviders();
-        setNotice(`已将「${provider.name}」设为系统默认模型`);
-      } catch (err) {
-        await loadProviders().catch(() => {});
-        setError(getErrorMessage(err, '设置默认模型失败'));
-      } finally {
-        setTogglingId(null);
-      }
-    },
-    [loadProviders, setError, setNotice],
   );
 
   // ─── 删除提供商 ───────────────────────────────────────────────
@@ -296,7 +273,6 @@ export function ClaudeProviderSection({
       {/* 提供商列表 */}
       <ProviderList
         providers={providers}
-        defaultProviderId={defaultProviderId}
         onEdit={(p) => {
           setEditingProvider(p);
           setEditorOpen(true);
@@ -304,7 +280,6 @@ export function ClaudeProviderSection({
         onDelete={(p) => setPendingDeleteProvider(p)}
         onToggle={handleToggle}
         onResetHealth={handleResetHealth}
-        onSetDefault={handleSetDefault}
         onDuplicate={handleDuplicate}
         onAdd={() => {
           setEditingProvider(null);

@@ -20,12 +20,8 @@ import {
   FileTooLargeError,
 } from './im-downloader.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastFollowUpUpdate, broadcastNewMessage } from './web.js';
 import { detectImageMimeType } from './image-detector.js';
-import {
-  resolveJidByMessageId,
-  getStreamingSession,
-} from './feishu-streaming-card.js';
+import { resolveJidByMessageId } from './feishu-streaming-card.js';
 import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
 import {
   buildAgentReplyCard,
@@ -41,11 +37,7 @@ import {
   resolveAdmittedChannelRoute,
   ChannelRouteRejectedError,
 } from './channel-admission.js';
-import {
-  extractProviderTarget,
-  parseChannelAddress,
-  scopeChannelJid,
-} from './channel-address.js';
+import { parseChannelAddress, scopeChannelJid } from './channel-address.js';
 import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
 import {
   isFeishuRuntimeControlLike,
@@ -140,6 +132,8 @@ export interface ConnectOptions {
   } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
+  onFollowUpsChanged?: import('./channel-contracts.js').OnChannelFollowUpsChanged;
   /** Decide whether an inbound message starts now, queues, or steers. */
   onFollowUpMessage?: (input: {
     targetJid: string;
@@ -151,6 +145,11 @@ export interface ConnectOptions {
   }) => FollowUpDisposition;
   /** Execute an exact, structurally authorized Feishu `/break` command. */
   onSessionBreak?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+  }) => Promise<string>;
+  onSessionClear?: (input: {
     sourceJid: string;
     targetJid?: string;
     senderImId: string;
@@ -186,7 +185,7 @@ export interface ConnectOptions {
   ) => FollowUpActionResult;
   /** P2P（私聊）消息到达时调用，用于自动检测 bot owner 的 open_id */
   onP2pSender?: (senderOpenId: string) => void;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
   /** Recovery gate: durable Inbox remains replayable instead of ignored. */
   shouldDeferInbound?: () => boolean;
 }
@@ -217,6 +216,8 @@ export interface FeishuConnection {
     fileName?: string,
   ): Promise<void>;
   sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
+  /** Add the "OnIt" reaction for the one message that owns an active batch. */
+  beginAckReaction(chatId: string, inputMessageId: string): Promise<void>;
   /** Clear the "OnIt" ack reaction owned by one exact inbound input. */
   clearAckReaction(chatId: string, inputMessageId: string): Promise<void>;
   isConnected(): boolean;
@@ -240,6 +241,14 @@ const FEISHU_WS_READY_STATE_OPEN = 1;
 const WS_HEALTH_CHECK_INTERVAL_MS = 15_000;
 const WS_RECONNECT_CHECK_THRESHOLD = 4;
 const WS_RECONNECT_MIN_INTERVAL_MS = 30_000;
+// Enable the lark SDK's ping/pong liveness watchdog. After the SDK sends a
+// keepalive ping it waits this many seconds for a pong (or any inbound frame);
+// if none arrives the socket is terminated so the normal reconnect flow runs.
+// Without it, a silently half-dead connection keeps readyState === OPEN forever
+// and the readyState-based health check never reconnects — the bot goes quiet
+// with no error until the process is restarted. Any inbound frame clears the
+// watchdog, so healthy idle connections are never terminated.
+const FEISHU_WS_PING_TIMEOUT_SEC = 10;
 const BACKFILL_LOOKBACK_MS = 5 * 60 * 1000;
 const BACKFILL_PAGE_SIZE = 50;
 const BACKFILL_MAX_PAGES_PER_CHAT = 5;
@@ -250,6 +259,7 @@ const FEISHU_INBOX_GATE_RETRY_DELAY_MS = 250;
 const FEISHU_INBOX_RECOVERY_LIMIT = 500;
 const FEISHU_RESOURCE_REQUEST_TIMEOUT_MS = 15_000;
 const FEISHU_RESOURCE_STREAM_TIMEOUT_MS = 30_000;
+const FEISHU_ACK_REACTION_TIMEOUT_MS = 10_000;
 const FEISHU_CURSOR_SCOPE = 'chat_messages';
 // 启动期 bot info 拉取的最大重试次数（指数退避 1s/2s/4s）
 const BOT_INFO_FETCH_MAX_ATTEMPTS = 4;
@@ -1699,17 +1709,41 @@ export function createFeishuConnection(
     return senderNameCache.get(openId) || openId;
   }
 
+  function withAckReactionTimeout<T>(
+    operation: 'add' | 'remove',
+    request: Promise<T>,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`Feishu ${operation} reaction timed out`)),
+        FEISHU_ACK_REACTION_TIMEOUT_MS,
+      );
+      timer.unref();
+      request.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
   async function addReaction(
     messageId: string,
     emojiType: string,
   ): Promise<string | null> {
     try {
-      const res = (await client!.im.messageReaction.create({
+      const request = client!.im.messageReaction.create({
         path: { message_id: messageId },
-        data: {
-          reaction_type: { emoji_type: emojiType },
-        },
-      })) as { data?: { reaction_id?: string } };
+        data: { reaction_type: { emoji_type: emojiType } },
+      });
+      const res = (await withAckReactionTimeout('add', request)) as {
+        data?: { reaction_id?: string };
+      };
       return res.data?.reaction_id || null;
     } catch (err) {
       logger.debug({ err, messageId, emojiType }, 'Failed to add reaction');
@@ -1721,9 +1755,10 @@ export function createFeishuConnection(
     messageId: string,
     reactionId: string,
   ): Promise<void> {
-    await client!.im.messageReaction.delete({
+    const request = client!.im.messageReaction.delete({
       path: { message_id: messageId, reaction_id: reactionId },
     });
+    await withAckReactionTimeout('remove', request);
   }
 
   function clearAckForInput(
@@ -1733,6 +1768,22 @@ export function createFeishuConnection(
     const target = parseFeishuRouteTarget(rawTarget);
     return ackReactions.clear(
       processingIndicatorKey(target.raw, inputMessageId),
+    );
+  }
+
+  function beginAckForInput(
+    rawTarget: string,
+    inputMessageId: string,
+  ): Promise<void> {
+    const target = parseFeishuRouteTarget(rawTarget);
+    return ackReactions.attach(
+      processingIndicatorKey(target.raw, inputMessageId),
+      async () => {
+        const reactionId = await addReaction(inputMessageId, 'OnIt');
+        return reactionId ? { messageId: inputMessageId, reactionId } : null;
+      },
+      ({ messageId, reactionId }) =>
+        removeReactionStrict(messageId, reactionId),
     );
   }
 
@@ -1929,8 +1980,11 @@ export function createFeishuConnection(
       resolveGroupFolder,
       resolveEffectiveChatJid,
       onAgentMessage,
+      onMessagePersisted,
+      onFollowUpsChanged,
       onFollowUpMessage,
       onSessionBreak,
+      onSessionClear,
       shouldProcessGroupMessage,
       resolveFeishuConversationPlan,
       isGroupOwnerMessage,
@@ -2032,6 +2086,16 @@ export function createFeishuConnection(
         chatJid,
         rawMessageMeta,
       );
+      const routedMessageMeta: FeishuMessageMeta = {
+        ...rawMessageMeta,
+        nativeContextType:
+          conversationPlan?.independentContext ||
+          (!conversationPlan && !!threadId)
+            ? 'thread'
+            : undefined,
+        contextId: conversationPlan?.contextId || threadId,
+        rootId: conversationPlan?.rootMessageId || rootId,
+      };
       const rootMessageId =
         conversationPlan?.rootMessageId || rootId || messageId;
       const deliveryRootMessageId = conversationPlan?.independentContext
@@ -2098,11 +2162,8 @@ export function createFeishuConnection(
           Boolean(extracted.fileInfos?.length) ||
           (messageType !== 'text' && messageType !== 'post'),
       });
-      if (
-        runtimeControl?.kind === 'queue' ||
-        runtimeControl?.kind === 'steer'
-      ) {
-        requestedFollowUpMode = runtimeControl.kind;
+      if (runtimeControl?.kind === 'steer') {
+        requestedFollowUpMode = 'steer';
         text = runtimeControl.text;
         textForSlash = runtimeControl.text;
       }
@@ -2111,7 +2172,9 @@ export function createFeishuConnection(
       if (
         slashMatch &&
         !requestedFollowUpMode &&
-        (runtimeControl?.kind === 'break' || (onCommand && !runtimeControlLike))
+        (runtimeControl?.kind === 'break' ||
+          runtimeControl?.kind === 'clear' ||
+          (onCommand && !runtimeControlLike))
       ) {
         const cmdBody = (slashMatch[1] + slashMatch[2]).trim();
         const persistedCommand = parseFeishuSlashCommandCheckpoint(
@@ -2203,7 +2266,10 @@ export function createFeishuConnection(
               );
               return;
             }
-            if (runtimeControl?.kind === 'break') {
+            if (
+              runtimeControl?.kind === 'break' ||
+              runtimeControl?.kind === 'clear'
+            ) {
               let targetJid: string | undefined;
               // Group routes are already registered and may carry a native
               // thread/topic target. A first-contact P2P route is deliberately
@@ -2213,20 +2279,30 @@ export function createFeishuConnection(
                 try {
                   targetJid = resolveEffectiveChatJid(
                     chatJid,
-                    rawMessageMeta,
+                    routedMessageMeta,
                   )?.effectiveJid;
                 } catch (error) {
                   if (!(error instanceof ChannelRouteRejectedError))
                     throw error;
                 }
               }
-              reply = onSessionBreak
-                ? await onSessionBreak({
-                    sourceJid: chatJid,
-                    targetJid,
-                    senderImId: senderOpenId,
-                  })
-                : '当前运行环境不支持 /break。';
+              if (runtimeControl?.kind === 'break') {
+                reply = onSessionBreak
+                  ? await onSessionBreak({
+                      sourceJid: chatJid,
+                      targetJid,
+                      senderImId: senderOpenId,
+                    })
+                  : '当前运行环境不支持 /break。';
+              } else {
+                reply = onSessionClear
+                  ? await onSessionClear({
+                      sourceJid: chatJid,
+                      targetJid,
+                      senderImId: senderOpenId,
+                    })
+                  : '当前运行环境不支持 /clear。';
+              }
             } else {
               reply = await onCommand!(
                 chatJid,
@@ -2511,22 +2587,7 @@ export function createFeishuConnection(
       const admittedRoute = resolveAdmittedChannelRoute<FeishuMessageMeta>(
         chatJid,
         resolveEffectiveChatJid,
-        {
-          provider: 'feishu',
-          chatType: normalizedChatType,
-          mentionedBot,
-          nativeContextType:
-            conversationPlan?.independentContext ||
-            (!conversationPlan && !!threadId)
-              ? 'thread'
-              : undefined,
-          contextId: conversationPlan?.contextId || threadId,
-          threadId,
-          rootId: conversationPlan?.rootMessageId || rootId,
-          parentId,
-          messageId,
-          text,
-        },
+        { ...routedMessageMeta, text },
       );
       if (!admittedRoute) {
         logger.warn(
@@ -2844,27 +2905,6 @@ export function createFeishuConnection(
           ? feishuRouteToJid(messageRouteTarget, chatJid)
           : chatJid);
 
-      // ── Ack Reaction：确认已收到消息（在 mention 过滤之后，避免对未处理的消息加表情） ──
-      if (source === 'ws') {
-        // The registry is owned by one channel-account instance. Keep its key
-        // provider-native on both attach and clear; account scoping belongs to
-        // ImManager's instance lookup, not to the provider target.
-        const ackTarget = parseFeishuRouteTarget(
-          extractProviderTarget(routeSourceJid),
-        );
-        ackReactions
-          .attach(
-            processingIndicatorKey(ackTarget.raw, messageId),
-            async () => {
-              const reactionId = await addReaction(messageId, 'OnIt');
-              return reactionId ? { messageId, reactionId } : null;
-            },
-            ({ messageId: ackMessageId, reactionId }) =>
-              removeReactionStrict(ackMessageId, reactionId),
-          )
-          .catch(() => {});
-      }
-
       // Store message and broadcast to WebSocket clients
       const targetJid = admittedRoute.targetJid;
 
@@ -3016,7 +3056,7 @@ export function createFeishuConnection(
                 delivery_updated_at: timestamp,
               }
             : {};
-      broadcastNewMessage(
+      onMessagePersisted?.(
         targetJid,
         {
           id: messageId,
@@ -3047,7 +3087,7 @@ export function createFeishuConnection(
         return;
       }
       if (followUp.disposition === 'queued') {
-        broadcastFollowUpUpdate(targetJid);
+        onFollowUpsChanged?.(targetJid);
         logger.info(
           {
             chatJid,
@@ -3366,6 +3406,9 @@ export function createFeishuConnection(
         appId: config.appId,
         appSecret: config.appSecret,
         loggerLevel: lark.LoggerLevel.info,
+        // Detect silently-dead long connections instead of hanging on a
+        // stale-but-OPEN socket (see FEISHU_WS_PING_TIMEOUT_SEC).
+        wsConfig: { pingTimeout: FEISHU_WS_PING_TIMEOUT_SEC },
       });
       await wsClient.start({ eventDispatcher });
 
@@ -3506,6 +3549,11 @@ export function createFeishuConnection(
             logger.error({ err }, 'Error handling Feishu message');
           }
         },
+        // The Bot's own create/delete calls are echoed as events. Registering
+        // no-op handlers prevents the Lark SDK from logging one warning per
+        // processing indicator mutation.
+        'im.message.reaction.created_v1': () => undefined,
+        'im.message.reaction.deleted_v1': () => undefined,
         'im.chat.member.bot.added_v1': async (data) => {
           try {
             const chatId = data.chat_id;
@@ -3627,6 +3675,9 @@ export function createFeishuConnection(
         appId: config.appId,
         appSecret: config.appSecret,
         loggerLevel: lark.LoggerLevel.info,
+        // Detect silently-dead long connections instead of hanging on a
+        // stale-but-OPEN socket (see FEISHU_WS_PING_TIMEOUT_SEC).
+        wsConfig: { pingTimeout: FEISHU_WS_PING_TIMEOUT_SEC },
       });
 
       try {
@@ -3894,6 +3945,10 @@ export function createFeishuConnection(
       }
     },
 
+    beginAckReaction(chatId: string, inputMessageId: string): Promise<void> {
+      return beginAckForInput(chatId, inputMessageId);
+    },
+
     clearAckReaction(chatId: string, inputMessageId: string): Promise<void> {
       return clearAckForInput(chatId, inputMessageId);
     },
@@ -4008,90 +4063,4 @@ export function createFeishuConnection(
   };
 
   return connection;
-}
-
-// ─── Backward-compatible global singleton ──────────────────────
-// @deprecated — 旧的顶层导出函数，内部使用一个默认全局实例。
-// 后续由 imManager 替代。
-
-let _defaultInstance: FeishuConnection | null = null;
-
-export interface ConnectFeishuOptions {
-  onReady: () => void;
-  /** 收到消息后调用，让主模块自动注册未知的飞书聊天到主容器 */
-  onNewChat?: (chatJid: string, chatName: string) => void;
-  /** 热重连时设置：丢弃 create_time 早于此时间戳（epoch ms）的消息，避免处理渠道关闭期间的堆积消息 */
-  ignoreMessagesBefore?: number;
-}
-
-/**
- * @deprecated Use createFeishuConnection() factory instead. Will be replaced by imManager.
- * Connect to Feishu via WebSocket and start receiving messages.
- */
-export async function connectFeishu(
-  opts: ConnectFeishuOptions,
-): Promise<boolean> {
-  const { getFeishuProviderConfigWithSource } =
-    await import('./runtime-config.js');
-  const { config, source } = getFeishuProviderConfigWithSource();
-  if (!config.appId || !config.appSecret) {
-    logger.warn(
-      { source },
-      'Feishu config is empty, running in Web-only mode (set it in Settings -> Feishu config)',
-    );
-    return false;
-  }
-
-  _defaultInstance = createFeishuConnection({
-    appId: config.appId,
-    appSecret: config.appSecret,
-  });
-
-  return _defaultInstance.connect(opts);
-}
-
-/**
- * @deprecated Use FeishuConnection.sendMessage() instead.
- */
-export async function sendFeishuMessage(
-  chatId: string,
-  text: string,
-  localImagePaths?: string[],
-): Promise<void> {
-  if (!_defaultInstance) {
-    logger.warn(
-      { chatId },
-      'Feishu client not initialized, skip sending message',
-    );
-    return;
-  }
-  return _defaultInstance.sendMessage(chatId, text, localImagePaths);
-}
-
-/**
- * @deprecated Use FeishuConnection.syncGroups() instead.
- */
-export async function syncFeishuGroups(): Promise<void> {
-  if (!_defaultInstance) {
-    logger.debug('Feishu client not initialized, skip group sync');
-    return;
-  }
-  return _defaultInstance.syncGroups();
-}
-
-/**
- * @deprecated Use FeishuConnection.isConnected() instead.
- */
-export function isFeishuConnected(): boolean {
-  return _defaultInstance?.isConnected() ?? false;
-}
-
-/**
- * @deprecated Use FeishuConnection.stop() instead.
- */
-export async function stopFeishu(): Promise<void> {
-  if (_defaultInstance) {
-    await _defaultInstance.stop();
-    _defaultInstance = null;
-  }
 }

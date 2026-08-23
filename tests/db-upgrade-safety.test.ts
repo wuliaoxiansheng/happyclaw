@@ -149,6 +149,25 @@ describe('database upgrade safety gate', () => {
     afterFailure.close();
 
     process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR = migrationBackups;
+    const backupsBeforeCurrentOnlyRefusal = fs.readdirSync(migrationBackups);
+    expect(() => db.initDatabase({ requireCurrentSchema: true })).toThrow(
+      'Database must already be schema v73',
+    );
+    expect(fs.readdirSync(migrationBackups)).toEqual(
+      backupsBeforeCurrentOnlyRefusal,
+    );
+    const afterCurrentOnlyRefusal = new Database(dbPath, { readonly: true });
+    expect(
+      (
+        afterCurrentOnlyRefusal
+          .prepare(
+            "SELECT value FROM router_state WHERE key = 'schema_version'",
+          )
+          .get() as { value: string }
+      ).value,
+    ).toBe('50');
+    afterCurrentOnlyRefusal.close();
+
     db.initDatabase();
     db.closeDatabase();
     const backupCountAfterRetry = fs.readdirSync(migrationBackups).length;
@@ -171,8 +190,10 @@ describe('schema version head', () => {
     // one assertion that fails when the head moves, forcing whoever bumps it
     // to confirm the matching migration block — and a test covering it —
     // actually landed. Update the literal in the same commit as the migration.
-    // v71: persists provider message identity/order for WeChat token replay; see
-    // tests/schema-v70-wechat-context-token.test.ts for migration coverage.
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(71);
+    // v73: generalizes the v72 WeCom DM remount to other JID-classifiable
+    // DMs (QQ / DingTalk / Discord / WhatsApp / Telegram / WeChat leftover
+    // target_main_jid collisions). See
+    // tests/schema-v73-classifiable-direct-mount.test.ts. Do not rewrite v72.
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(73);
   });
 });

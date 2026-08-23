@@ -21,7 +21,6 @@ import {
   updateChatName,
 } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import { detectImageMimeTypeStrict } from './image-detector.js';
@@ -291,7 +290,8 @@ export interface QQConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
-  normalizeIncomingJid?: (jid: string) => string;
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
+  normalizeIncomingJid?: (jid: string) => string | null;
 }
 
 export interface QQConnection {
@@ -1694,7 +1694,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           { attachments: attachmentsJson, sourceJid: jid },
         );
 
-        broadcastNewMessage(
+        opts.onMessagePersisted?.(
           targetJid,
           {
             id,
@@ -1902,7 +1902,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           { attachments: attachmentsJson, sourceJid: jid },
         );
 
-        broadcastNewMessage(
+        opts.onMessagePersisted?.(
           targetJid,
           {
             id,

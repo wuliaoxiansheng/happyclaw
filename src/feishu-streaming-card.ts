@@ -24,7 +24,10 @@ import {
   buildStreamingAgentCard,
 } from './feishu-cards/builder.js';
 import type { CardStatus, ToolCallStat } from './feishu-cards/types.js';
-import { formatFeishuUsageNote } from './feishu-usage-display.js';
+import {
+  formatFeishuUsageNote,
+  type FeishuUsageNoteInput,
+} from './feishu-usage-display.js';
 import {
   CARD_ELEMENT_IDS,
   statusHeadline,
@@ -852,17 +855,6 @@ function buildStreamingModeCard(initialText: string): object {
   // + FOOTER_NOTE. Each panel wraps a markdown element with its own element_id
   // so the controller can patch slots independently.
   return buildStreamingAgentCard({ initialText, rich: true });
-}
-
-/**
- * Serialize auxiliary element array into a single markdown string.
- * Reuses output from buildAuxiliaryElements().
- */
-function serializeAuxContent(elements: Array<Record<string, unknown>>): string {
-  return elements
-    .map((e) => (e as { content?: string }).content || '')
-    .filter(Boolean)
-    .join('\n\n');
 }
 
 // ─── Flush Controller ─────────────────────────────────────────
@@ -2079,6 +2071,21 @@ export class StreamingCardController {
   /** True when finalize split content across multiple cards — patchUsageNote
    * must not rebuild a single card or it would overwrite the first card. */
   private finalizedAsSplit = false;
+  /** Handle to the LAST card produced by splitOnFinalize. Without it a split
+   * reply silently loses its usage note. `render` rather than a backend handle
+   * because the tail is the reused streaming card (updateCardFull) for a
+   * single-group split and a CardKitBackend continuation card otherwise. */
+  private lastSplitCard: {
+    render: (cardJson: object) => Promise<void>;
+    text: string;
+    state: Schema2State;
+    titlePrefix: string;
+    title?: string;
+  } | null = null;
+  /** Usage that arrived before finalize settled, parked for redelivery. */
+  private pendingUsage: FeishuUsageNoteInput | null = null;
+  /** True once complete() has finished writing the terminal card(s). */
+  private finalizeSettled = false;
   /** Serializes legacy im.v1.message.patch calls — that API has no sequence
    * number, so an in-flight「生成中」patch landing AFTER the terminal patch
    * would permanently revert the card to streaming state. */
@@ -2496,24 +2503,28 @@ export class StreamingCardController {
       this.emitLifecycle('failed', err);
       throw err;
     }
+
+    this.finalizeSettled = true;
+    if (this.pendingUsage) {
+      const parked = this.pendingUsage;
+      this.pendingUsage = null;
+      await this.patchUsageNote(parked);
+    }
   }
 
   /**
    * Patch a completed card to append a usage note at the bottom.
    * Called AFTER complete() because agent-runner emits usage after the final result.
    */
-  async patchUsageNote(usage: {
-    inputTokens: number;
-    outputTokens: number;
-    costUSD: number;
-    durationMs: number;
-    numTurns: number;
-    cacheReadInputTokens?: number;
-    cacheCreationInputTokens?: number;
-    reasoningTokens?: number;
-    modelUsage?: Record<string, { outputTokens?: number }>;
-  }): Promise<void> {
-    if (this.state !== 'completed') return;
+  async patchUsageNote(usage: FeishuUsageNoteInput): Promise<void> {
+    if (this.state === 'aborted' || this.state === 'error') {
+      this.pendingUsage = null;
+      return;
+    }
+    if (this.state !== 'completed' || !this.finalizeSettled) {
+      this.pendingUsage = usage;
+      return;
+    }
 
     try {
       if (this.backendMode === 'streaming' && this.streamingBackend) {
@@ -2521,24 +2532,67 @@ export class StreamingCardController {
         // would overwrite the first card with full text while continuation
         // cards remain. The explicit flag matters: for ASCII long replies the
         // truncated JSON is small, so a byte-size check alone never trips.
-        if (this.finalizedAsSplit) return;
+        if (this.finalizedAsSplit) {
+          await this.patchUsageNoteOnSplitTail(usage);
+          return;
+        }
         const cardJson = this.buildStructuredFinalCard('completed', usage);
         const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
-        if (cardSize > CARD_SIZE_LIMIT) return;
+        if (cardSize > CARD_SIZE_LIMIT) {
+          logger.warn(
+            { chatId: this.chatId, cardSize, limit: CARD_SIZE_LIMIT },
+            'Streaming card: usage note skipped, rebuilt card exceeds size limit',
+          );
+          return;
+        }
         await this.streamingBackend.updateCardFull(cardJson);
       } else if (this.messageId || this.multiCard) {
-        // For CardKit v1 / legacy: skip if multiCard has split content
-        if (this.multiCard && this.multiCard.getCardCount() > 1) return;
         const note = this.mergeFooterNote(formatFeishuUsageNote(usage));
         if (!note) return;
         await this.patchCard('completed', note);
       }
     } catch (err) {
-      logger.debug(
+      logger.warn(
         { err, chatId: this.chatId },
         'Streaming card: patchUsageNote failed (non-fatal)',
       );
     }
+  }
+
+  /**
+   * Re-render the tail card of a split finalize so the usage note still
+   * reaches the reader. Only the last card is touched.
+   */
+  private async patchUsageNoteOnSplitTail(
+    usage: FeishuUsageNoteInput,
+  ): Promise<void> {
+    const tail = this.lastSplitCard;
+    if (!tail) {
+      logger.warn(
+        { chatId: this.chatId, finalizedAsSplit: this.finalizedAsSplit },
+        'Streaming card: split usage note skipped, tail card handle missing',
+      );
+      return;
+    }
+    const note = this.mergeFooterNote(formatFeishuUsageNote(usage));
+    if (!note) return;
+    const cardJson = buildSchema2Card(
+      tail.text,
+      tail.state,
+      tail.titlePrefix,
+      tail.title,
+      undefined,
+      note,
+    );
+    const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
+    if (cardSize > CARD_SIZE_LIMIT) {
+      logger.warn(
+        { chatId: this.chatId, cardSize, limit: CARD_SIZE_LIMIT },
+        'Streaming card: split-tail usage note skipped, card exceeds size limit',
+      );
+      return;
+    }
+    await tail.render(cardJson);
   }
 
   /**
@@ -2551,6 +2605,7 @@ export class StreamingCardController {
     const creationInFlight =
       this.state === 'creating' ? this.creationPromise : null;
     this.state = 'aborted';
+    this.pendingUsage = null;
     this.flushCtrl.dispose();
     this.textFlushCtrl?.dispose();
     this.auxFlushCtrl?.dispose();
@@ -3399,6 +3454,14 @@ export class StreamingCardController {
         // override title so their first line stays in the body.
         const firstCard = buildSchema2Card(text, state, '');
         await backend.updateCardFull(firstCard);
+        if (isLast) {
+          this.lastSplitCard = {
+            render: (cardJson) => backend.updateCardFull(cardJson),
+            text,
+            state,
+            titlePrefix: '',
+          };
+        }
       } else {
         const contCard = new CardKitBackend(this.client);
         const contCardJson = buildSchema2Card(text, state, '(续) ', title);
@@ -3409,6 +3472,15 @@ export class StreamingCardController {
           this.replyInThread,
         );
         this.onCardCreated?.(newMsgId);
+        if (isLast) {
+          this.lastSplitCard = {
+            render: (cardJson) => contCard.updateCard(cardJson),
+            text,
+            state,
+            titlePrefix: '(续) ',
+            title,
+          };
+        }
       }
     }
   }

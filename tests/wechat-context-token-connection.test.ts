@@ -1,4 +1,7 @@
 import type { Dispatcher } from 'undici';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import type {
@@ -110,6 +113,69 @@ function waitUntilAborted(signal?: AbortSignal | null): Promise<Response> {
 }
 
 describe('WeChat connection durable context_token integration', () => {
+  test('does not consume send quota when media upload fails before sendmessage', async () => {
+    const store = new SharedStore();
+    store.record = {
+      accountId: 'account',
+      userId: 'peer',
+      token: 'durable-secret',
+      refreshedAtMs: Date.now(),
+      sourceMessageId: 'inbound-1',
+      sourceSequence: 1,
+      sendCount: 0,
+      lastSentAtMs: null,
+    };
+    const dispatcher = {
+      close: vi.fn(async () => undefined),
+    } as unknown as Dispatcher;
+    const uploadFailure = new Error('CDN unavailable');
+    const uploadMedia = vi.fn(async () => {
+      throw uploadFailure;
+    });
+    const connection = createWeChatConnection(
+      {
+        botToken: 'bot-token',
+        ilinkBotId: 'bot-id',
+        logContext: { accountId: 'account' },
+      },
+      {
+        fetch: vi.fn((_url, init) =>
+          waitUntilAborted(init?.signal),
+        ) as typeof fetch,
+        createDispatcher: () => dispatcher,
+        contextTokenStore: store,
+        uploadMediaBuffer: uploadMedia,
+      },
+    );
+    await connection.connect({ onNewChat: vi.fn() });
+
+    await expect(
+      connection.sendImage(
+        'peer',
+        Buffer.from('image'),
+        'image/png',
+        'caption',
+      ),
+    ).rejects.toBe(uploadFailure);
+    expect(store.record?.sendCount).toBe(0);
+    const filePath = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-wechat-upload-')),
+      'report.txt',
+    );
+    fs.writeFileSync(filePath, 'report');
+    try {
+      await expect(
+        connection.sendFile('peer', filePath, 'report.txt'),
+      ).rejects.toBe(uploadFailure);
+      expect(store.record?.sendCount).toBe(0);
+      expect(uploadMedia).toHaveBeenCalledTimes(2);
+    } finally {
+      fs.rmSync(path.dirname(filePath), { recursive: true, force: true });
+    }
+
+    await connection.disconnect();
+  });
+
   test('persists inbound token, restores after restart, and invalidates ret=-2 without tokenless retry', async () => {
     const store = new SharedStore();
     const dispatcher = {

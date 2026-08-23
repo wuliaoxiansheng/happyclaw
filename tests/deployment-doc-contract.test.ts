@@ -13,11 +13,12 @@ describe('Mac mini production deployment contract', () => {
     expect(agents).toContain('[DEPLOYMENT.md](DEPLOYMENT.md)');
     expect(deployment).toContain('/Users/riba2534/airepo/happyclaw');
     expect(deployment).toContain('com.riba2534.happyclaw');
-    expect(deployment).toContain(
+    expect(agents).toContain('opted out of deployment backups');
+    expect(deployment).toContain('不得运行 `make backup`');
+    expect(deployment).not.toContain(
       'BACKUP_DIR="$HOME/happyclaw-deploy-backups" make backup',
     );
-    expect(deployment).toContain("require.resolve('better-sqlite3')");
-    expect(deployment).toContain('npm ci');
+    expect(deployment).not.toContain('env-before-$HAPPYCLAW_EXPECTED_SHA');
     expect(deployment).toContain('npm run build:all');
     expect(deployment).toContain('launchctl kickstart -k');
     expect(deployment).toContain('/api/health');

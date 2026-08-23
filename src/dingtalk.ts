@@ -19,11 +19,9 @@ import {
   TOPIC_ROBOT,
   type RobotMessage as DTRobotMessage,
   type DWClientDownStream,
-  EventAck,
 } from 'dingtalk-stream';
-import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
+import { storeChatMetadata, storeMessageDirect } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import { GROUPS_DIR } from './config.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
@@ -82,6 +80,7 @@ export interface DingTalkConnectOpts {
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   onBotRemovedFromGroup?: (chatJid: string) => void;
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
@@ -90,7 +89,7 @@ export interface DingTalkConnectOpts {
   resolveRegisteredGroup?: (
     jid: string,
   ) => { activation_mode?: string } | undefined;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
 }
 
 export interface DingTalkConnection {
@@ -129,6 +128,31 @@ export interface DingTalkGroupMessageSuccess {
   errmsg?: string;
   code?: string | number;
   message?: string;
+}
+
+/** Timeout / 5xx / 429: the first send may already have left the client. */
+function isUncertainFormatFallbackError(err: unknown): boolean {
+  let current: unknown = err;
+  const seen = new Set<unknown>();
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const rec = current as Record<string, unknown>;
+    const code = String(rec.code ?? rec.errno ?? '');
+    const status = Number(rec.error_code ?? rec.statusCode ?? rec.status);
+    const message = String(rec.message ?? '');
+    if (
+      /ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|UND_ERR_|timed out|AbortError/i.test(
+        `${code} ${message}`,
+      ) ||
+      status === 429 ||
+      (status >= 500 && status <= 599) ||
+      /HTTP failed \((429|5\d\d)\)/.test(message)
+    ) {
+      return true;
+    }
+    current = rec.cause ?? rec.error;
+  }
+  return false;
 }
 
 /** Validate the persistent groupMessages endpoint's transport and envelope. */
@@ -374,7 +398,6 @@ export function createDingTalkConnection(
   // SDK client state
   let client: DWClient | null = null;
   let stopping = false;
-  let readyFired = false;
 
   // Token state for REST API
   let tokenInfo: DingTalkAccessToken | null = null;
@@ -392,7 +415,6 @@ export function createDingTalkConnection(
 
   // Session webhook expiry per chat
   const sessionWebhookExpiry = new Map<string, number>();
-  const SESSION_WEBHOOK_TTL = 5 * 60 * 1000; // 5 minutes
 
   // Sender ID per chat (for sending files back to user)
   const lastSenderIds = new Map<string, string>();
@@ -1932,7 +1954,7 @@ export function createDingTalkConnection(
           { attachments: attachmentsJson, sourceJid: jid },
         );
 
-        broadcastNewMessage(
+        opts.onMessagePersisted?.(
           targetJid,
           {
             id,
@@ -1990,7 +2012,6 @@ export function createDingTalkConnection(
       }
 
       stopping = false;
-      readyFired = false;
 
       try {
         // 🔧 Fix proxy issue: dingtalk-stream SDK uses axios internally, which can be
@@ -2057,7 +2078,6 @@ export function createDingTalkConnection(
         // disconnect-reconnect loop every 15 seconds, killing working connections.
         // Removed the monitor — the SDK is self-healing.
 
-        readyFired = true;
         opts.onReady?.();
         return true;
       } catch (err) {
@@ -2192,7 +2212,14 @@ export function createDingTalkConnection(
             'sampleMarkdown',
             msgParam,
           );
-        } catch {
+        } catch (err) {
+          if (isUncertainFormatFallbackError(err)) {
+            throw err;
+          }
+          logger.debug(
+            { err, chatId },
+            'DingTalk markdown failed, fallback to plain',
+          );
           // Fall back to plain text
           const plainContent = markdownToPlainText(chunk);
           const plainMsgParam = JSON.stringify({ content: plainContent });

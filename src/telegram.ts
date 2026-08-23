@@ -7,7 +7,6 @@ import { ProxyAgent } from 'proxy-agent';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { createDedupCache } from './im-utils.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import {
   saveDownloadedFile,
@@ -25,7 +24,7 @@ import {
   extractProviderTarget,
 } from './channel-address.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
-import type { ChannelMessageMeta } from './types.js';
+import type { ChannelMessageMeta, NewMessage } from './types.js';
 import {
   ExactAsyncIndicatorRegistry,
   processingIndicatorKey,
@@ -73,6 +72,12 @@ export interface TelegramConnectOpts {
   } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用，触发 agent 处理 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  /** Project a message that has already committed to the host-owned store. */
+  onMessagePersisted?: (
+    chatJid: string,
+    message: NewMessage & { is_from_me?: boolean },
+    agentId?: string,
+  ) => void;
   /** Bot 被添加到群聊时调用（仅 group/supergroup） */
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   /** Bot 被移出群聊或群被解散时调用 */
@@ -82,7 +87,7 @@ export interface TelegramConnectOpts {
     chatJid: string,
     contextType: 'thread',
   ) => boolean | void | Promise<boolean | void>;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
 }
 
 /**
@@ -225,6 +230,33 @@ export interface TelegramConnection {
 }
 
 // ─── Shared Helpers (pure functions, no instance state) ────────
+
+/**
+ * Only real HTML parse failures should fall back to a second plain send.
+ * Timeout / 5xx / 429 / other transport errors are wrapped by grammy as
+ * HttpError (inner error on `.error`, not `.cause`) and must be rethrown so
+ * the already-attempted chunk is not duplicated.
+ */
+function isTelegramHtmlParseError(err: unknown): boolean {
+  let current: unknown = err;
+  const seen = new Set<unknown>();
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const rec = current as Record<string, unknown>;
+    const code = Number(rec.error_code);
+    const description = String(rec.description ?? rec.message ?? '');
+    if (
+      code === 400 &&
+      /parse entities|unclosed|unsupported start tag|can't find end tag/i.test(
+        description,
+      )
+    ) {
+      return true;
+    }
+    current = rec.cause ?? rec.error;
+  }
+  return false;
+}
 
 function escapeHtml(text: string): string {
   return text
@@ -824,8 +856,8 @@ export function createTelegramConnection(
               { sourceJid },
             );
 
-            // 广播到 Web 客户端
-            broadcastNewMessage(
+            // The connector owns persistence; the host decides how to project it.
+            opts.onMessagePersisted?.(
               targetJid,
               {
                 id,
@@ -1025,7 +1057,7 @@ export function createTelegramConnection(
               { attachments: attachmentsJson, sourceJid },
             );
 
-            broadcastNewMessage(
+            opts.onMessagePersisted?.(
               targetJid,
               {
                 id,
@@ -1140,7 +1172,7 @@ export function createTelegramConnection(
                 false,
                 { sourceJid },
               );
-              broadcastNewMessage(
+              opts.onMessagePersisted?.(
                 targetJid,
                 {
                   id,
@@ -1221,7 +1253,7 @@ export function createTelegramConnection(
               { sourceJid },
             );
 
-            broadcastNewMessage(
+            opts.onMessagePersisted?.(
               targetJid,
               {
                 id,
@@ -1465,6 +1497,9 @@ export function createTelegramConnection(
               ...threadOptions,
             });
           } catch (err) {
+            if (!isTelegramHtmlParseError(err)) {
+              throw err;
+            }
             // HTML parse failed (e.g. unclosed tags), fallback to plain text
             logger.debug(
               { err, chatId },
@@ -1653,66 +1688,4 @@ export function createTelegramConnection(
   };
 
   return connection;
-}
-
-// ─── Backward-compatible global singleton ──────────────────────
-// @deprecated — 旧的顶层导出函数，内部使用一个默认全局实例。
-// 后续由 imManager 替代。
-
-let _defaultInstance: TelegramConnection | null = null;
-
-/**
- * @deprecated Use createTelegramConnection() factory instead. Will be replaced by imManager.
- */
-export async function connectTelegram(
-  opts: TelegramConnectOpts,
-): Promise<void> {
-  const { getTelegramProviderConfig } = await import('./runtime-config.js');
-  const config = getTelegramProviderConfig();
-  if (!config.botToken) {
-    logger.info('Telegram bot token not configured, skipping');
-    return;
-  }
-
-  _defaultInstance = createTelegramConnection({
-    botToken: config.botToken,
-    proxyUrl: config.proxyUrl,
-  });
-
-  await _defaultInstance.connect(opts);
-}
-
-/**
- * @deprecated Use TelegramConnection.sendMessage() instead.
- */
-export async function sendTelegramMessage(
-  chatId: string,
-  text: string,
-  localImagePaths?: string[],
-): Promise<void> {
-  if (!_defaultInstance) {
-    logger.warn(
-      { chatId },
-      'Telegram bot not initialized, skip sending message',
-    );
-    return;
-  }
-  return _defaultInstance.sendMessage(chatId, text, localImagePaths);
-}
-
-/**
- * @deprecated Use TelegramConnection.disconnect() instead.
- */
-export async function disconnectTelegram(): Promise<void> {
-  if (_defaultInstance) {
-    await _defaultInstance.disconnect();
-    _defaultInstance = null;
-  }
-}
-
-/**
- * @deprecated Use TelegramConnection.isConnected() instead.
- */
-export function isTelegramConnected(): boolean {
-  return _defaultInstance?.isConnected() ?? false;
 }

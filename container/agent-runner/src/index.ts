@@ -63,6 +63,7 @@ import {
   extractSessionHistory as extractSessionHistoryImpl,
   parseTranscript,
 } from './session-history.js';
+import { trimSessionJsonl } from './session-trim.js';
 import { StreamEventProcessor } from './stream-processor.js';
 import {
   acknowledgeHappyClawOwnerProfileFirstWake,
@@ -235,8 +236,9 @@ function loadPrompt(...segments: string[]): string {
 
 // 解析本地依赖 @anthropic-ai/claude-code 的真实 CLI binary 路径。
 // 该包 postinstall 会把平台对应的 native binary 落地到其 `bin` 字段指向的位置
-// （Windows / macOS / Linux 一致），作为 SDK 的 pathToClaudeCodeExecutable 最可靠来源——
-// 它不依赖 PATH，也不会命中 SDK optionalDependencies 里那些空的 native binary 占位包。
+// （Windows / macOS / Linux 一致），作为 SDK 的 pathToClaudeCodeExecutable 最可靠来源。
+// The image deliberately removes the SDK's duplicate platform packages after
+// verifying this binary, so every runtime must prefer it before PATH fallbacks.
 function resolveBundledClaudeCli(): string | undefined {
   try {
     const require = createRequire(import.meta.url);
@@ -940,100 +942,6 @@ function getSessionSummary(
 }
 
 /**
- * Trim session JSONL file by removing all entries before the last compact_boundary.
- * After compaction, entries before the boundary are already summarized and no longer
- * needed for session reconstruction. This prevents unbounded file growth.
- *
- * Safety: uses atomic write (tmp + rename) to avoid data loss on crash.
- */
-function trimSessionJsonl(jsonlPath: string): void {
-  try {
-    const content = fs.readFileSync(jsonlPath, 'utf-8');
-    const lines = content.split('\n');
-    const nonEmptyLines: { index: number; line: string }[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].trim()) nonEmptyLines.push({ index: i, line: lines[i] });
-    }
-
-    // Find the last compact_boundary entry (and any preserved segment it references)
-    let lastBoundaryPos = -1;
-    let preservedHeadUuid: string | undefined;
-    let parseSkipped = 0;
-    for (let i = nonEmptyLines.length - 1; i >= 0; i--) {
-      try {
-        const entry = JSON.parse(nonEmptyLines[i].line);
-        if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
-          lastBoundaryPos = i;
-          preservedHeadUuid =
-            entry.compact_metadata?.preserved_segment?.head_uuid;
-          break;
-        }
-      } catch {
-        parseSkipped++;
-      }
-    }
-    if (parseSkipped > 0) {
-      log(`Session trim: skipped ${parseSkipped} unparseable JSONL lines`);
-    }
-
-    if (lastBoundaryPos <= 0) {
-      // No boundary found or it's already the first entry — nothing to trim
-      log('Session trim: no compact_boundary found or already minimal');
-      return;
-    }
-
-    // partial compaction 时 boundary 带 preserved_segment{head_uuid, anchor_uuid, tail_uuid}：
-    // 保留段内容是 head_uuid..tail_uuid，SDK 的 resume loader 会在 anchor_uuid 处把它拼回。
-    // 若裁切越过 head_uuid，会连同这些消息及其 uuid 一起删掉，导致 loader 找不到锚点、resume
-    // 丢上下文。因此把裁切起点回退到 head_uuid 所在行，保住整段保留消息。
-    let trimStartPos = lastBoundaryPos;
-    if (preservedHeadUuid) {
-      const preservedPos = nonEmptyLines.findIndex((e) => {
-        try {
-          return JSON.parse(e.line).uuid === preservedHeadUuid;
-        } catch {
-          return false;
-        }
-      });
-      if (preservedPos >= 0 && preservedPos < trimStartPos) {
-        trimStartPos = preservedPos;
-        log(
-          `Session trim: preserving segment from head_uuid=${preservedHeadUuid.slice(0, 8)} (pos ${preservedPos} < boundary ${lastBoundaryPos})`,
-        );
-      }
-    }
-
-    // Keep entries from trimStartPos onwards
-    const trimmedLines = nonEmptyLines.slice(trimStartPos).map((e) => e.line);
-    const removedCount = trimStartPos;
-
-    const TRIM_MIN_ENTRIES = 50; // Skip trimming if fewer entries before boundary (not worth the I/O)
-    if (removedCount < TRIM_MIN_ENTRIES) {
-      log(
-        `Session trim: only ${removedCount} entries before boundary, skipping`,
-      );
-      return;
-    }
-
-    // Atomic write: temp file + rename
-    const tmpPath = jsonlPath + '.trim-tmp';
-    fs.writeFileSync(tmpPath, trimmedLines.join('\n') + '\n');
-    fs.renameSync(tmpPath, jsonlPath);
-
-    const sizeBefore = Buffer.byteLength(content, 'utf-8');
-    const sizeAfter = fs.statSync(jsonlPath).size;
-    log(
-      `Session trim: ${nonEmptyLines.length} → ${trimmedLines.length} entries (removed ${removedCount}), ` +
-        `${(sizeBefore / 1024 / 1024).toFixed(1)}MB → ${(sizeAfter / 1024 / 1024).toFixed(1)}MB`,
-    );
-  } catch (err) {
-    log(
-      `Session trim failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-}
-
-/**
  * Archive the full transcript to conversations/ before compaction.
  * Also flush any accumulated streaming text as a compact_partial message
  * so users don't lose the response that was being generated.
@@ -1118,7 +1026,7 @@ function createPreCompactHook(deps: {
     // ── Trim session JSONL to prevent unbounded growth ──
     // Remove entries before the last compact_boundary (already summarized).
     // Must run AFTER archiving (archive needs full transcript).
-    trimSessionJsonl(transcriptPath);
+    trimSessionJsonl(transcriptPath, log);
 
     // Flag compaction so the query loop auto-continues instead of
     // waiting for user input (non-blocking compaction #229).
@@ -2284,7 +2192,7 @@ async function runQueryAttempt(
 
   const processor = new StreamEventProcessor(emit, log);
 
-  const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
+  const { isHome } = normalizeHomeFlags(containerInput);
   const agentBuilderEnabled = resolveAgentBuilderEnabled(
     containerInput,
     isHome,
@@ -2571,14 +2479,16 @@ async function runQueryAttempt(
     }
   }
   // Resolve the actual claude CLI path for the SDK.
-  // SDK 的 optionalDependencies（@anthropic-ai/claude-agent-sdk-{platform} 等）不保证被安装，
-  // pathToClaudeCodeExecutable 留空、且 SDK 自带平台包缺失时会报
-  // "Claude Code native binary not found at .../claude-agent-sdk-win32-x64/claude"（Windows 宿主机模式）。
-  // 仅在 Windows 上优先解析本地依赖 @anthropic-ai/claude-code 里 postinstall 落地的真实 binary
-  // （Windows 没有 which、SDK 平台包又常缺失，故需此兜底）；Linux 容器 / macOS 宿主机
-  // 保持原有 which 解析逻辑不变，避免改变既有 claude 解析来源。
+  // Container builds remove the SDK's duplicate native optionalDependencies,
+  // so the image requires its verified @anthropic-ai/claude-code binary.
+  // Windows keeps the same bundled-first fallback it has always needed. Other
+  // host runtimes retain their existing PATH resolution contract.
+  const requireBundledClaude =
+    process.env.HAPPYCLAW_REQUIRE_BUNDLED_CLAUDE === '1';
   let pathToClaudeCodeExecutable: string | undefined =
-    process.platform === 'win32' ? resolveBundledClaudeCli() : undefined;
+    requireBundledClaude || process.platform === 'win32'
+      ? resolveBundledClaudeCli()
+      : undefined;
   if (!pathToClaudeCodeExecutable) {
     try {
       // `which` 在 Windows 上不存在，改用 `where`；其多行输出取第一行。
@@ -3910,6 +3820,21 @@ async function main(): Promise<void> {
       error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`,
     });
     process.exit(1);
+  }
+
+  if (process.env.HAPPYCLAW_IMAGE_PREFLIGHT === '1') {
+    const cli = resolveBundledClaudeCli();
+    if (!cli || typeof query !== 'function' || SECURITY_RULES.length === 0) {
+      writeOutput({
+        status: 'error',
+        result: null,
+        error: 'Immutable image preflight failed',
+      });
+      forceExitWithSafetyNet(1);
+    }
+    execFileSync(cli, ['--version'], { stdio: 'ignore' });
+    writeOutput({ status: 'closed', result: 'IMAGE_RUNNER_PREFLIGHT_OK' });
+    forceExitWithSafetyNet(0);
   }
 
   setCurrentChannelTurn(

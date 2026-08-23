@@ -146,7 +146,7 @@ describe('durable follow-up queue', () => {
     expect(db.claimNextQueuedFollowUpBatch(jid, 'run-empty')).toEqual([]);
   });
 
-  test('keeps an explicit steer as a single-message barrier', () => {
+  test('merges an explicit steer with the Session pending batch', () => {
     const jid = 'web:follow-up-steer-barrier';
     db.ensureChatExists(jid);
     for (const [index, id] of ['first', 'second', 'third'].entries()) {
@@ -173,10 +173,8 @@ describe('durable follow-up queue', () => {
     ).toMatchObject({ delivery_mode: 'steer' });
     expect(
       db.claimNextQueuedFollowUpBatch(jid, 'run-steer').map((item) => item.id),
-    ).toEqual(['second']);
-    expect(
-      db.claimNextQueuedFollowUpBatch(jid, 'run-queued').map((item) => item.id),
-    ).toEqual(['first', 'third']);
+    ).toEqual(['second', 'first', 'third']);
+    expect(db.claimNextQueuedFollowUpBatch(jid, 'run-empty')).toEqual([]);
   });
 
   test('leaves messages admitted after a snapshot for the following turn', () => {

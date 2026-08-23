@@ -328,7 +328,8 @@ export function checkImOwnerCommand(
  *   - qq:        `qq:c2c:{openid}`            (group → `qq:group:...`)
  *   - dingtalk:  `dingtalk:c2c:{staffId}`     (group → `dingtalk:{cid...}`)
  *   - discord:   `discord:dm:{userId}`        (guild → `discord:{channelId}`)
- *   - whatsapp:  `...@s.whatsapp.net`         (group → `...@g.us`)
+ *   - whatsapp:  `...@s.whatsapp.net` / `...@lid` / `...@c.us`
+ *                (group → `...@g.us`)
  *   - wechat:    `wechat:{userId}`            (1:1 only — no group support)
  *   - telegram:  `telegram:{chatId}`          (private chat id is positive;
  *                groups/supergroups are negative — a stable Bot API guarantee)

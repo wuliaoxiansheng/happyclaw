@@ -1412,24 +1412,6 @@ export function retryChannelTurnRun(
   return changed.changes === 1;
 }
 
-/**
- * Release a live execution fence for a retry without turning the logical input
- * into a terminal receipt. The next queue attempt reclaims the same run id and
- * therefore preserves provider/idempotency history across retries.
- */
-export function retryChannelTurnRunNow(
-  claim: Pick<ClaimedChannelTurnRun, 'id' | 'leaseOwner' | 'leaseToken'>,
-  error: string,
-  nowInput?: Date | string,
-): boolean {
-  const now = isoNow(nowInput);
-  return retryChannelTurnRun(claim, {
-    availableAt: now,
-    error,
-    now,
-  });
-}
-
 export function completeChannelTurnRun(
   claim: Pick<ClaimedChannelTurnRun, 'id' | 'leaseOwner' | 'leaseToken'>,
   input: {
@@ -1797,23 +1779,6 @@ function claimChannelOutbox(
         .get(candidate.id) as OutboxRow,
     ) as ClaimedChannelOutboxItem;
   })();
-}
-
-export function renewChannelOutboxLease(
-  claim: Pick<ClaimedChannelOutboxItem, 'id' | 'leaseOwner' | 'leaseToken'>,
-  leaseMs: number,
-  nowInput?: Date | string,
-): boolean {
-  const now = isoNow(nowInput);
-  const expires = addMilliseconds(now, leaseMs);
-  const changed = requireDatabase()
-    .prepare(
-      `UPDATE channel_outbox SET lease_expires_at = ?, updated_at = ?
-       WHERE id = ? AND status IN ('claimed','uploading','uploaded','sending')
-         AND lease_owner = ? AND lease_token = ? AND lease_expires_at > ?`,
-    )
-    .run(expires, now, claim.id, claim.leaseOwner, claim.leaseToken, now);
-  return changed.changes === 1;
 }
 
 function transitionClaimedOutbox(

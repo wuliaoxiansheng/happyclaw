@@ -29,9 +29,11 @@ export HAPPYCLAW_EXPECTED_SHA='replace-with-full-commit-sha'
 export HAPPYCLAW_PUBLIC_URL_PRIMARY='https://claw.riba2534.cn'
 export HAPPYCLAW_PUBLIC_URL_SECONDARY='https://claw.home.riba2534.cn:23333'
 export HAPPYCLAW_AGENT_IMAGE='riba2534/happyclaw-agent:latest'
+# 分支不可变镜像会自动派生同 SHA 的 `-headroom` 能力标签；只有实际配置
+# headroom MCP 时 Docker 才按需拉取它。
 ```
 
-## 2. 只读预检与一致性备份
+## 2. 只读预检与目标校验
 
 远程工作树不干净时立即停止，不要 stash、覆盖或删除未知文件：
 
@@ -49,30 +51,8 @@ git fetch --prune origin \
 test "$(git rev-parse "origin/$HAPPYCLAW_DEPLOY_REF")" = "$HAPPYCLAW_EXPECTED_SHA"
 ```
 
-在切换代码前创建 SQLite 一致性快照和完整运行数据备份。备份目录位于仓库外，避免
-Git 切换、构建或清理操作影响备份：
-
-```bash
-# 在线 SQLite 快照依赖根项目的 better-sqlite3。生产进程可能仍在运行、但部署目录的
-# node_modules 已被运维清理；这种情况下先按当前已部署 lockfile 恢复根依赖。该步骤
-# 不写 data/、不切换代码，也不重启服务。
-if ! node -e "require.resolve('better-sqlite3')" >/dev/null 2>&1; then
-  npm ci
-fi
-
-mkdir -p "$HOME/happyclaw-deploy-backups"
-BACKUP_DIR="$HOME/happyclaw-deploy-backups" make backup
-export HAPPYCLAW_DEPLOY_BACKUP="$(
-  find "$HOME/happyclaw-deploy-backups" -type f \
-    -name 'happyclaw-backup-*.tar.gz' -exec stat -f '%m %N' {} + |
-    sort -nr | head -1 | cut -d' ' -f2-
-)"
-test -n "$HAPPYCLAW_DEPLOY_BACKUP"
-test "$(stat -f '%Lp' "$HAPPYCLAW_DEPLOY_BACKUP")" = 600
-printf 'Rollback backup: %s\n' "$HAPPYCLAW_DEPLOY_BACKUP"
-```
-
-必须确认依赖恢复（如有）和 `make backup` 均成功退出，并生成权限为 `0600` 的归档，再继续部署。禁止运行
+所有者已明确选择不保留部署备份。部署期间不得运行 `make backup`，不得创建 SQLite
+快照、完整运行数据归档或 `.env` 备份副本，除非所有者在未来明确撤销该策略。禁止运行
 `make reset-init`、`git clean`、`git reset --hard`，也不要用带 `--delete` 的 rsync 同步
 生产目录。
 
@@ -89,14 +69,10 @@ test "$(git rev-parse HEAD)" = "$HAPPYCLAW_EXPECTED_SHA"
 /bin/zsh -lic "docker pull '$HAPPYCLAW_AGENT_IMAGE'"
 ```
 
-若本次使用不可变分支镜像，在重启前先备份现有 `.env`（如果存在），再只更新其中的
-`CONTAINER_IMAGE`；不得覆盖其他环境变量或把 `.env` 提交到 Git：
+若本次使用不可变分支镜像，只原地更新现有 `.env` 中的 `CONTAINER_IMAGE`；不得创建
+备份副本、覆盖其他环境变量或把 `.env` 提交到 Git：
 
 ```bash
-if [ -f .env ]; then
-  cp -p .env "$HOME/happyclaw-deploy-backups/env-before-$HAPPYCLAW_EXPECTED_SHA"
-  chmod 600 "$HOME/happyclaw-deploy-backups/env-before-$HAPPYCLAW_EXPECTED_SHA"
-fi
 if grep -q '^CONTAINER_IMAGE=' .env 2>/dev/null; then
   sed -i '' "s|^CONTAINER_IMAGE=.*$|CONTAINER_IMAGE=$HAPPYCLAW_AGENT_IMAGE|" .env
 else
@@ -158,15 +134,6 @@ launchctl kickstart -k "gui/$(id -u)/com.riba2534.happyclaw"
 curl -fsS http://127.0.0.1:3000/api/health
 ```
 
-只有数据库迁移导致旧代码无法启动时，才恢复本次部署前的备份。恢复会覆盖部署后的全部
-运行数据，必须先取得用户明确确认并停止服务，然后执行：
-
-```bash
-make stop
-BACKUP_DIR="$HOME/happyclaw-deploy-backups" make restore \
-  FILE="$HAPPYCLAW_DEPLOY_BACKUP"
-launchctl kickstart -k "gui/$(id -u)/com.riba2534.happyclaw"
-curl -fsS http://127.0.0.1:3000/api/health
-```
-
-回滚后重复第 4 节的健康检查与真实功能测试，并报告代码回滚和数据恢复是否分别发生。
+所有者选择不保留数据备份，因此数据库迁移后不存在数据恢复路径。若迁移导致旧代码
+不兼容，应停止继续切换并以前向修复恢复服务，不得自行创建或恢复备份。回滚后重复第 4
+节的健康检查与真实功能测试，并明确报告仅发生了代码回滚。

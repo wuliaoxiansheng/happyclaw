@@ -12,6 +12,7 @@ const {
   loadAgentMessageSnapshotMock,
   saveAgentMessageSnapshotMock,
   notifyIfHiddenMock,
+  showToastMock,
   showNotificationPromptToastMock,
 } = vi.hoisted(() => ({
   apiGetMock: vi.fn(),
@@ -23,6 +24,7 @@ const {
   loadAgentMessageSnapshotMock: vi.fn(),
   saveAgentMessageSnapshotMock: vi.fn(),
   notifyIfHiddenMock: vi.fn(),
+  showToastMock: vi.fn(),
   showNotificationPromptToastMock: vi.fn(),
 }));
 
@@ -62,7 +64,7 @@ vi.mock('../web/src/stores/auth', () => ({
 }));
 
 vi.mock('../web/src/utils/toast', () => ({
-  showToast: vi.fn(),
+  showToast: showToastMock,
   notifyIfHidden: notifyIfHiddenMock,
   shouldEmitBackgroundTaskNotice: vi.fn(() => false),
   showNotificationPromptToast: showNotificationPromptToastMock,
@@ -225,6 +227,137 @@ describe('loadAgentMessages', () => {
     expect(useChatStore.getState().agentHasMore[agentId]).toBe(false);
     expect(saveAgentMessageSnapshotMock).not.toHaveBeenCalled();
     expect(deleteAgentMessageSnapshotMock).toHaveBeenCalledWith(jid, agentId);
+  });
+});
+
+describe('deleteMessage', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    apiDeleteMock.mockReset();
+    apiGetMock.mockReset();
+    deleteAgentMessageSnapshotMock.mockReset();
+    deleteAgentMessageSnapshotMock.mockResolvedValue(undefined);
+    loadAgentMessageSnapshotMock.mockReset();
+    loadAgentMessageSnapshotMock.mockResolvedValue(null);
+    resetChatStore();
+  });
+
+  it('removes only the exact composite-key row and invalidates Session projections', async () => {
+    const jid = 'web:delete-workspace';
+    const agentId = 'delete-agent';
+    const virtualJid = `${jid}#agent:${agentId}`;
+    const otherVirtualJid = 'web:other#agent:other-agent';
+    const duplicateId = 'provider-message-id';
+    const older = {
+      ...message('older-message', '2026-08-20T10:00:00.000Z'),
+      chat_jid: virtualJid,
+      content: 'previous preview',
+    };
+    const target = {
+      ...message(duplicateId, '2026-08-20T11:00:00.000Z'),
+      chat_jid: virtualJid,
+      content: 'delete me',
+    };
+    const sameIdElsewhere = {
+      ...message(duplicateId, '2026-08-20T12:00:00.000Z'),
+      chat_jid: otherVirtualJid,
+      content: 'keep me',
+    };
+    let snapshotInvalidated = false;
+    deleteAgentMessageSnapshotMock.mockImplementation(async () => {
+      snapshotInvalidated = true;
+    });
+    loadAgentMessageSnapshotMock.mockImplementation(async () =>
+      snapshotInvalidated ? null : { messages: [target], hasMore: false },
+    );
+    apiDeleteMock.mockResolvedValue({ success: true });
+    // The local sidebar projection must remain correct even if the authoritative
+    // refresh is temporarily offline.
+    apiGetMock.mockRejectedValue(new Error('offline'));
+
+    useChatStore.setState({
+      messages: {
+        [jid]: [target, sameIdElsewhere],
+        'web:other': [sameIdElsewhere],
+      },
+      agentMessages: {
+        [agentId]: [older, target],
+        'other-agent': [sameIdElsewhere],
+      },
+      agents: {
+        [jid]: [
+          {
+            id: agentId,
+            name: 'Delete Session',
+            prompt: '',
+            status: 'idle',
+            kind: 'conversation',
+            created_at: '2026-08-20T09:00:00.000Z',
+            latest_message: {
+              content: target.content,
+              timestamp: target.timestamp,
+            },
+          },
+        ],
+      },
+    });
+
+    const deleted = await useChatStore
+      .getState()
+      .deleteMessage(virtualJid, duplicateId);
+
+    expect(deleted).toBe(true);
+    expect(useChatStore.getState().messages[jid]).toEqual([sameIdElsewhere]);
+    expect(useChatStore.getState().messages['web:other']).toEqual([
+      sameIdElsewhere,
+    ]);
+    expect(useChatStore.getState().agentMessages[agentId]).toEqual([older]);
+    expect(useChatStore.getState().agentMessages['other-agent']).toEqual([
+      sameIdElsewhere,
+    ]);
+    expect(useChatStore.getState().agents[jid]?.[0]?.latest_message).toEqual({
+      content: older.content,
+      timestamp: older.timestamp,
+    });
+    expect(deleteAgentMessageSnapshotMock).toHaveBeenCalledWith(jid, agentId);
+    expect(apiGetMock).toHaveBeenCalledWith(
+      `/api/groups/${encodeURIComponent(jid)}/agents`,
+    );
+
+    // Simulate a fresh PWA store: the invalidated snapshot cannot resurrect the
+    // deleted row even while the network is unavailable.
+    useChatStore.setState({ agentMessages: {} });
+    await useChatStore.getState().hydrateAgentMessages(jid, agentId);
+    expect(useChatStore.getState().agentMessages[agentId]).toBeUndefined();
+  });
+
+  it('shows a user-visible error when deletion is rejected', async () => {
+    apiDeleteMock.mockRejectedValue({
+      status: 403,
+      message: 'Permission denied',
+    });
+
+    const deleted = await useChatStore
+      .getState()
+      .deleteMessage('web:main', 'protected-message');
+
+    expect(deleted).toBe(false);
+    expect(useChatStore.getState().error).toBe('Permission denied');
+    expect(showToastMock).toHaveBeenCalledWith('删除失败', 'Permission denied');
+  });
+
+  it('applies a remote deletion without issuing a second DELETE request', async () => {
+    const jid = 'web:remote-delete';
+    const target = {
+      ...message('remote-message', '2026-08-20T11:00:00.000Z'),
+      chat_jid: jid,
+    };
+    useChatStore.setState({ messages: { [jid]: [target] } });
+
+    await useChatStore.getState().handleMessageDeleted(jid, target.id);
+
+    expect(useChatStore.getState().messages[jid]).toEqual([]);
+    expect(apiDeleteMock).not.toHaveBeenCalled();
   });
 });
 

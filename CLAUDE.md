@@ -222,6 +222,23 @@ Host 模式没有 `maxConcurrentHostProcesses`。旧客户端提交该字段时�
 破坏性命令受 `OWNER_REQUIRED_IM_COMMANDS` 和渠道原生 sender ID 约束。
 响应对象策略不能因服务重启、同步聊天或恢复绑定而回退成默认值。
 
+飞书另有三个精确的 Session 运行时控制命令。群聊必须由渠道结构证明真实 `@Bot`，
+命令大小写敏感；私聊可直接使用：
+
+- `/steer <非空消息>`：先可靠进入当前 Session 的 durable pending，再 clean interrupt
+  当前 generation；当前已 pending 的普通消息与 steer 按可见顺序在下一轮合批，命令前缀
+  不进入 Agent Prompt，也不额外发送框架确认。可携带图片。
+- `/break`：必须无附件且正文精确匹配；以到达时为截止点取消此前 pending 并中断 active
+  Loop，保留 transcript，之后到达的消息继续运行；固定回复 `Current task stopped.` 或
+  `No active task to stop.`。
+- `/clear`：必须无附件且正文精确匹配；重置当前逻辑 Session 并固定回复
+  `Session context cleared.`。
+
+普通消息默认就是 durable queue，不存在显式 `/queue` 控制命令。旧的 `/queue ...`
+按普通 Agent 输入处理。飞书 Reaction 属于真正执行的 batch，而不是入站消息：同一 batch
+最多在最后一条飞书输入上显示一个 `OnIt`，queued 消息不显示；同一 Session 的上一批必须
+完成清理后才能为下一批添加，彼此独立的 Session 可以并发显示。
+
 ## 7. 数据与目录
 
 运行时数据默认位于 `data/`，不进入 Git：

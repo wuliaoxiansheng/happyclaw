@@ -400,9 +400,9 @@ describe('entrypoint permission contract', () => {
       'runuser -u node -- env HOME=/home/node /usr/bin/git',
     );
     expect(dockerfile).toContain('session-permissions-rescan-queue.mjs');
-    expect(dockerfile).toContain('chown -R root:root /app/prompts');
-    expect(dockerfile).toContain('find /app/prompts -type d -exec chmod 0555');
-    expect(dockerfile).toContain('find /app/prompts -type f -exec chmod 0444');
+    expect(dockerfile).toContain('chown -R root:root dist prompts');
+    expect(dockerfile).toContain('find dist prompts -type d -exec chmod 0555');
+    expect(dockerfile).toContain('find dist prompts -type f -exec chmod 0444');
   });
 
   test('contains no world-permission fallback', () => {

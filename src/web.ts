@@ -14,20 +14,17 @@ import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
 import {
   type WebDeps,
   type Variables,
-  type WsClientInfo,
   setWebDeps,
   getWebDeps,
   wsClients,
   lastActiveCache,
   LAST_ACTIVE_DEBOUNCE_MS,
-  parseCookie,
   isHostExecutionGroup,
   hasHostExecutionPermission,
-  canAccessGroup,
-  canModifyGroup,
   getCachedSessionWithUser,
   invalidateSessionCache,
 } from './web-context.js';
+import { canAccessGroup, canModifyGroup } from './group-acl.js';
 
 // Schemas
 import {
@@ -101,7 +98,6 @@ import type {
   NewMessage,
   FollowUpMode,
   FollowUpTransition,
-  QueuedFollowUp,
   WsMessageOut,
   WsMessageIn,
   AuthUser,
@@ -123,6 +119,10 @@ import type { ExpandContext } from './plugin-expander-context.js';
 import { PLUGIN_EXPANSION_ATTACHMENT_TYPE } from './plugin-expander-sentinel.js';
 import { persistPluginExpansion } from './plugin-expander-store.js';
 import { logger } from './logger.js';
+import {
+  createWebSocketHeartbeat,
+  startWebSocketHeartbeat,
+} from './ws-heartbeat.js';
 import { recordRunContextSnapshot } from './run-context-snapshot.js';
 import { RunStreamFence } from './run-stream-fence.js';
 import {
@@ -1384,6 +1384,30 @@ function setupWebSocket(server: any): WebSocketServer {
     maxPayload: 8 * 1024 * 1024,
   });
 
+  // 心跳：保活反代/NAT 会掐掉的空闲 upgraded 连接，并回收 TCP 半开的死连接。
+  // 取值与完整背景见 src/ws-heartbeat.ts。
+  // 注意：此前死连接是靠反代的读超时（nginx 默认 60s）兜底回收的——调大
+  // proxy_read_timeout 必须在心跳上线之后做，否则死连接会堆积到新的超时时长。
+  const heartbeat = createWebSocketHeartbeat();
+  startWebSocketHeartbeat(wss, heartbeat, (result) => {
+    for (const failure of result.failures) {
+      const context = { operation: failure.operation, err: failure.error };
+      if (failure.operation === 'terminate') {
+        logger.error(context, 'WebSocket heartbeat operation failed');
+      } else {
+        logger.warn(context, 'WebSocket heartbeat operation failed');
+      }
+    }
+
+    const { terminated } = result;
+    if (terminated > 0) {
+      logger.info(
+        { terminated, maxMissedPongs: heartbeat.maxMissedPongs },
+        'WebSocket heartbeat timeout, terminated dead connections',
+      );
+    }
+  });
+
   server.on('upgrade', (request: any, socket: any, head: any) => {
     const { pathname } = new URL(request.url, `http://${request.headers.host}`);
 
@@ -1495,6 +1519,8 @@ function setupWebSocket(server: any): WebSocketServer {
   wss.on('connection', (ws, request: any) => {
     const sessionId = request?.__happyclawSessionId as string | undefined;
     logger.info('WebSocket client connected');
+    // 心跳状态：浏览器由协议栈自动回 pong，前端无需改动。
+    heartbeat.track(ws);
     const connSession = sessionId
       ? getCachedSessionWithUser(sessionId)
       : undefined;
@@ -2302,6 +2328,30 @@ export function broadcastNewMessage(
     ...(source ? { source } : {}),
   };
   safeBroadcast(wsMsg, isHostGroupJid(baseChatJid), allowedUserIds);
+}
+
+/** Broadcast one committed message-row deletion by its full composite key. */
+export function broadcastMessageDeleted(
+  messageChatJid: string,
+  messageId: string,
+): void {
+  const markerIndex = messageChatJid.indexOf('#agent:');
+  const baseChatJid =
+    markerIndex >= 0 ? messageChatJid.slice(0, markerIndex) : messageChatJid;
+  const agentId =
+    markerIndex >= 0
+      ? messageChatJid.slice(markerIndex + '#agent:'.length)
+      : undefined;
+  const jid = normalizeHomeJid(baseChatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseChatJid);
+  const wsMsg: WsMessageOut = {
+    type: 'message_deleted',
+    chatJid: jid,
+    messageChatJid,
+    messageId,
+    ...(agentId ? { agentId } : {}),
+  };
+  safeBroadcast(wsMsg, isHostGroupJid(jid), allowedUserIds);
 }
 
 export function broadcastFollowUpUpdate(
@@ -3263,6 +3313,10 @@ let wss: WebSocketServer | null = null;
  * needs only `queue.stopGroup` / `getSessions` / `setLastAgentTimestamp`.
  */
 export function createAppForTest(webDeps: WebDeps): typeof app {
+  webDeps.broadcastNewMessage = broadcastNewMessage;
+  webDeps.broadcastMessageDeleted = broadcastMessageDeleted;
+  webDeps.broadcastAgentStatus = broadcastAgentStatus;
+  webDeps.broadcastAgentRemoved = broadcastAgentRemoved;
   deps = webDeps;
   setWebDeps(webDeps);
   injectConfigDeps(webDeps);
@@ -3275,6 +3329,10 @@ export function createAppForTest(webDeps: WebDeps): typeof app {
 }
 
 export function startWebServer(webDeps: WebDeps): void {
+  webDeps.broadcastNewMessage = broadcastNewMessage;
+  webDeps.broadcastMessageDeleted = broadcastMessageDeleted;
+  webDeps.broadcastAgentStatus = broadcastAgentStatus;
+  webDeps.broadcastAgentRemoved = broadcastAgentRemoved;
   deps = webDeps;
   setWebDeps(webDeps);
   injectConfigDeps(webDeps);

@@ -27,7 +27,7 @@ import {
   Check,
   Trash2,
 } from 'lucide-react';
-import { useFileStore } from '../../stores/files';
+import { formatUploadRetryStatus, useFileStore } from '../../stores/files';
 import {
   useChatStore,
   type FollowUpMode,
@@ -131,6 +131,7 @@ export function MessageInput({
   // 窄 selector：这是 1200+ 行常驻组件，无 selector 的整 store 订阅会让它在
   // 流式输出的每一帧（rAF 级 set()）都重渲染一次。actions 引用稳定。
   const uploadFiles = useFileStore((s) => s.uploadFiles);
+  const cancelUpload = useFileStore((s) => s.cancelUpload);
   const uploading = useFileStore((s) => s.uploading);
   const uploadProgress = useFileStore((s) => s.uploadProgress);
   const drafts = useChatStore((s) => s.drafts);
@@ -787,6 +788,9 @@ export function MessageInput({
           (uploadProgress.uploadedBytes / uploadProgress.totalBytes) * 100,
         )
       : 0;
+  const uploadRetryStatus = uploadProgress
+    ? formatUploadRetryStatus(uploadProgress)
+    : null;
 
   return (
     <div
@@ -822,10 +826,22 @@ export function MessageInput({
             <div className="flex items-center justify-between mb-1.5">
               <span className="text-xs text-foreground/70 truncate max-w-[65%]">
                 {uploadProgress.currentFile || '完成'}
+                {uploadRetryStatus ? (
+                  <span data-upload-retry-status>（{uploadRetryStatus}）</span>
+                ) : null}
               </span>
-              <span className="text-xs text-muted-foreground">
+              <span className="flex items-center gap-2 text-xs text-muted-foreground">
                 {uploadProgress.completed}/{uploadProgress.total} ·{' '}
                 {progressPercent}%
+                <button
+                  type="button"
+                  data-upload-cancel
+                  onClick={cancelUpload}
+                  className="inline-flex items-center gap-0.5 hover:text-foreground"
+                >
+                  <X className="h-3 w-3" />
+                  取消
+                </button>
               </span>
             </div>
             <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden">

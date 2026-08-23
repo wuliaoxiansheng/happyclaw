@@ -4,8 +4,8 @@ import { authMiddleware } from '../middleware/auth.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
-  canAccessGroup,
 } from '../web-context.js';
+import { canAccessGroup } from '../group-acl.js';
 import type { AuthUser } from '../types.js';
 import type { RegisteredGroup } from '../types.js';
 import { getRegisteredGroup } from '../db.js';
@@ -32,6 +32,41 @@ import { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+
+// Serialize Web uploads per workspace so two concurrent requests cannot both
+// pass a quota check against the same pre-upload usage. The secure write helper
+// still revalidates paths descriptor-relatively against non-HTTP writers.
+const uploadMutationTails = new Map<string, Promise<void>>();
+
+async function withUploadMutationLock<T>(
+  workspaceRoot: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = uploadMutationTails.get(workspaceRoot) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => current);
+  uploadMutationTails.set(workspaceRoot, tail);
+
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (uploadMutationTails.get(workspaceRoot) === tail) {
+      uploadMutationTails.delete(workspaceRoot);
+    }
+  }
+}
+
+function uploadTargetKey(absolutePath: string): string {
+  const normalized = path.resolve(absolutePath);
+  return process.platform === 'darwin' || process.platform === 'win32'
+    ? normalized.toLowerCase()
+    : normalized;
+}
 
 // MIME 类型映射（预览和编辑端点共用）
 const MIME_MAP: Record<string, string> = {
@@ -309,70 +344,132 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
       return c.json({ error: 'No files provided' }, 400);
     }
 
-    // 支持单文件和多文件上传
+    // 支持单文件和多文件上传。锁内先验证整批并计算最终净增量，再开始写入：
+    // 配额拒绝或后续文件路径非法时，不会留下半批文件。
     const fileList = Array.isArray(files) ? files : [files];
-    const uploadedFiles: string[] = [];
+    const workspaceRoot = path.resolve(getFileRoot(group.folder, rootOverride));
 
-    // Billing: check storage limit before uploading
-    if (isBillingEnabled() && group.created_by) {
-      const totalUploadSize = fileList.reduce(
-        (sum, f) => sum + (f instanceof File ? f.size : 0),
-        0,
+    if (!fs.existsSync(workspaceRoot)) {
+      logger.error(
+        { jid, folder: group.folder, workspaceRoot },
+        'Workspace directory missing on disk during upload',
       );
-      const currentUsage = getGroupStorageUsage(group.folder, rootOverride);
-      const storageCheck = checkStorageLimit(
-        group.created_by,
-        authUser.role,
-        currentUsage,
-        totalUploadSize,
+      return c.json(
+        {
+          error:
+            'Workspace directory not initialized yet. Please try again in a moment, or re-login and retry.',
+        },
+        409,
       );
-      if (!storageCheck.allowed) {
-        return c.json({ error: storageCheck.reason }, 403);
-      }
     }
 
-    for (const file of fileList) {
-      if (!(file instanceof File)) continue;
+    return await withUploadMutationLock(workspaceRoot, async () => {
+      const uploads: Array<{ file: File; relativePath: string }> = [];
+      const quotaTargets = new Map<
+        string,
+        { existingSize: number; finalSize: number }
+      >();
 
-      // 检查文件大小
-      if (file.size > MAX_FILE_SIZE) {
-        return c.json(
-          {
-            error: `File ${file.name} exceeds maximum size of ${MAX_FILE_SIZE_MB}MB`,
-          },
-          400,
+      for (const file of fileList) {
+        if (!(file instanceof File)) continue;
+
+        if (file.size > MAX_FILE_SIZE) {
+          return c.json(
+            {
+              error: `File ${file.name} exceeds maximum size of ${MAX_FILE_SIZE_MB}MB`,
+            },
+            400,
+          );
+        }
+
+        // 保留原有文件名、系统路径与 symlink 防护；配额只能在这些验证之后计算。
+        if (file.name.includes('..') || file.name.startsWith('/')) {
+          return c.json({ error: `Invalid file name: ${file.name}` }, 400);
+        }
+
+        const fullRelativePath = path.join(targetPath, file.name);
+        if (isSystemPath(targetPath) || isSystemPath(fullRelativePath)) {
+          return c.json({ error: 'Cannot upload to system path' }, 403);
+        }
+
+        const absolutePath = validateAndResolvePath(
+          group.folder,
+          fullRelativePath,
+          rootOverride,
         );
+        let existingSize = 0;
+        try {
+          const stats = fs.lstatSync(absolutePath);
+          if (stats.isSymbolicLink()) {
+            return c.json({ error: 'Cannot overwrite symbolic link' }, 403);
+          }
+          if (!stats.isFile()) {
+            return c.json(
+              { error: `Upload target is not a regular file: ${file.name}` },
+              400,
+            );
+          }
+          existingSize = stats.size;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+
+        uploads.push({ file, relativePath: fullRelativePath });
+        const key = uploadTargetKey(absolutePath);
+        const prior = quotaTargets.get(key);
+        quotaTargets.set(key, {
+          // Repeated names in one multipart batch replace the same original
+          // inode; charge only the size of the final value, never each part.
+          existingSize: prior?.existingSize ?? existingSize,
+          finalSize: file.size,
+        });
       }
 
-      // 验证文件名，防止路径遍历攻击
-      if (file.name.includes('..') || file.name.startsWith('/')) {
-        return c.json({ error: `Invalid file name: ${file.name}` }, 400);
+      if (isBillingEnabled() && group.created_by) {
+        const totalDelta = Array.from(quotaTargets.values()).reduce(
+          (sum, target) => sum + target.finalSize - target.existingSize,
+          0,
+        );
+        const additionalBytes = Math.max(0, totalDelta);
+        if (additionalBytes > 0) {
+          const currentUsage = getGroupStorageUsage(group.folder, rootOverride);
+          const storageCheck = checkStorageLimit(
+            group.created_by,
+            authUser.role,
+            currentUsage,
+            additionalBytes,
+          );
+          if (!storageCheck.allowed) {
+            return c.json({ error: storageCheck.reason }, 403);
+          }
+        }
       }
 
-      // 禁止写入系统路径
-      const relativeFilePath = path.join(targetPath, file.name);
-      if (isSystemPath(targetPath) || isSystemPath(relativeFilePath)) {
-        return c.json({ error: 'Cannot upload to system path' }, 403);
+      const uploadedFiles: string[] = [];
+      let wroteAnyFile = false;
+      try {
+        for (const { file, relativePath } of uploads) {
+          const data = Buffer.from(await file.arrayBuffer());
+          safeWriteWorkspaceFile(
+            group.folder,
+            relativePath,
+            data,
+            { mustExist: false, createParents: true },
+            rootOverride,
+          );
+          wroteAnyFile = true;
+          uploadedFiles.push(file.name);
+        }
+      } finally {
+        // The batch is not transactional: if a later read/write fails, earlier
+        // files remain on disk. Never leave the pre-upload quota snapshot cached.
+        if (wroteAnyFile) {
+          invalidateGroupStorageUsage(group.folder, rootOverride);
+        }
       }
 
-      // 验证目标路径 + 文件名的完整路径（防止 file.name 含 ../../ 绕过）
-      const fullRelativePath = path.join(targetPath, file.name);
-      validateAndResolvePath(group.folder, fullRelativePath, rootOverride);
-      const buffer = await file.arrayBuffer();
-      const data = Buffer.from(buffer);
-      safeWriteWorkspaceFile(
-        group.folder,
-        fullRelativePath,
-        data,
-        { mustExist: false, createParents: true },
-        rootOverride,
-      );
-
-      uploadedFiles.push(file.name);
-    }
-
-    invalidateGroupStorageUsage(group.folder, rootOverride);
-    return c.json({ success: true, files: uploadedFiles });
+      return c.json({ success: true, files: uploadedFiles });
+    });
   } catch (error) {
     logger.error({ err: error }, `Failed to upload files for ${jid}`);
     return c.json({ error: 'Failed to upload files' }, 500);

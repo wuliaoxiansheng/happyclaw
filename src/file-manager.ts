@@ -116,15 +116,23 @@ function runSafeWorkspaceMutation(request: SafeWorkspaceMutationRequest): void {
       throw new Error('File not found');
     }
     verifyInsideRoot(target);
-    if (fs.existsSync(target) && fs.lstatSync(target).isSymbolicLink()) {
-      throw new Error('Refusing to overwrite symbolic link');
+    let existingMode: number | undefined;
+    if (fs.existsSync(target)) {
+      const existing = fs.lstatSync(target);
+      if (existing.isSymbolicLink()) {
+        throw new Error('Refusing to overwrite symbolic link');
+      }
+      if (!existing.isFile()) {
+        throw new Error('Target is not a regular file');
+      }
+      existingMode = existing.mode & 0o700;
     }
     const temporary = `${target}.happyclaw-${process.pid}-${Date.now()}.tmp`;
     try {
       fs.writeFileSync(
         temporary,
         Buffer.from(request.dataBase64 || '', 'base64'),
-        { flag: 'wx', mode: 0o644 },
+        { flag: 'wx', mode: existingMode ?? 0o644 },
       );
       fs.renameSync(temporary, target);
     } finally {

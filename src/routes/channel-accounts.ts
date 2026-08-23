@@ -102,7 +102,7 @@ interface PendingWeChatQr {
 
 const pendingWeChatQr = new Map<string, PendingWeChatQr>();
 
-export const PAIRING_CHANNEL_PROVIDERS = new Set<ChannelProvider>([
+const PAIRING_CHANNEL_PROVIDERS = new Set<ChannelProvider>([
   'telegram',
   'qq',
   'wechat',
@@ -112,9 +112,7 @@ export const PAIRING_CHANNEL_PROVIDERS = new Set<ChannelProvider>([
   'whatsapp',
 ]);
 
-export function channelProviderSupportsPairing(
-  provider: ChannelProvider,
-): boolean {
+function channelProviderSupportsPairing(provider: ChannelProvider): boolean {
   return PAIRING_CHANNEL_PROVIDERS.has(provider);
 }
 
@@ -501,7 +499,7 @@ function legacyCredentialsFor(
 }
 
 /** Lazy, idempotent projection of legacy per-user/provider singleton configs. */
-export function ensureLegacyDefaultChannelAccounts(userId: string): void {
+function ensureLegacyDefaultChannelAccounts(userId: string): void {
   const providers = Object.keys(PROVIDER_NAMES) as ChannelProvider[];
   for (const provider of providers) {
     const legacy = legacyCredentialsFor(userId, provider);
@@ -522,6 +520,24 @@ routes.get('/', authMiddleware, (c) => {
   return c.json({
     accounts: listChannelAccountsForUser(user.id).map(publicAccount),
   });
+});
+
+routes.get('/status', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  ensureLegacyDefaultChannelAccounts(user.id);
+  const connected = new Set(
+    listChannelAccountsForUser(user.id)
+      .filter((account) => account.enabled && account.status === 'connected')
+      .map((account) => account.provider),
+  );
+  return c.json(
+    Object.fromEntries(
+      (Object.keys(PROVIDER_NAMES) as ChannelProvider[]).map((provider) => [
+        provider,
+        connected.has(provider),
+      ]),
+    ),
+  );
 });
 
 routes.post('/', authMiddleware, async (c) => {

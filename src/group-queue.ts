@@ -1,4 +1,4 @@
-import { ChildProcess, exec, execFile } from 'child_process';
+import { ChildProcess, execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'node:crypto';

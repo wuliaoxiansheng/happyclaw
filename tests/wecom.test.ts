@@ -45,7 +45,6 @@ vi.mock('../src/db.js', () => ({
 vi.mock('../src/message-notifier.js', () => ({
   notifyNewImMessage: vi.fn(),
 }));
-vi.mock('../src/web.js', () => ({ broadcastNewMessage: vi.fn() }));
 vi.mock('../src/logger.js', () => ({
   logger: {
     debug: vi.fn(),
@@ -61,7 +60,6 @@ import {
   storeMessageDirect,
 } from '../src/db.js';
 import { notifyNewImMessage } from '../src/message-notifier.js';
-import { broadcastNewMessage } from '../src/web.js';
 import { createWeComConnection, splitWeComMarkdown } from '../src/wecom.js';
 import {
   truncateWeComUtf8,
@@ -113,6 +111,7 @@ async function connect(overrides: Record<string, unknown> = {}): Promise<{
       effectiveJid: jid,
       agentId: null,
     })),
+    onMessagePersisted: vi.fn(),
     ...overrides,
   };
   const pending = connection.connect(opts);
@@ -198,7 +197,7 @@ describe('WeCom connection security and delivery', () => {
     expect(unauthorized.opts.onNewChat).not.toHaveBeenCalled();
     expect(unauthorized.opts.resolveEffectiveChatJid).not.toHaveBeenCalled();
     expect(storeMessageDirect).not.toHaveBeenCalled();
-    expect(broadcastNewMessage).not.toHaveBeenCalled();
+    expect(unauthorized.opts.onMessagePersisted).not.toHaveBeenCalled();
     expect(notifyNewImMessage).not.toHaveBeenCalled();
 
     await unauthorized.connection.disconnect();
@@ -270,13 +269,13 @@ describe('WeCom connection security and delivery', () => {
     connected.client.emit('message.text', retry);
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(1));
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(broadcastNewMessage).not.toHaveBeenCalled();
+    expect(connected.opts.onMessagePersisted).not.toHaveBeenCalled();
     expect(notifyNewImMessage).not.toHaveBeenCalled();
 
     connected.client.emit('message.text', retry);
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(2));
     await vi.waitFor(() =>
-      expect(broadcastNewMessage).toHaveBeenCalledTimes(1),
+      expect(connected.opts.onMessagePersisted).toHaveBeenCalledTimes(1),
     );
     expect(notifyNewImMessage).toHaveBeenCalledTimes(1);
     expect(connected.opts.onNewChat).toHaveBeenCalledTimes(1);
@@ -306,13 +305,13 @@ describe('WeCom connection security and delivery', () => {
     await vi.waitFor(() => expect(onAgentMessage).toHaveBeenCalledTimes(1));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(storeMessageDirect).toHaveBeenCalledTimes(1);
-    expect(broadcastNewMessage).toHaveBeenCalledTimes(1);
+    expect(connected.opts.onMessagePersisted).toHaveBeenCalledTimes(1);
     expect(notifyNewImMessage).toHaveBeenCalledTimes(1);
 
     connected.client.emit('message.text', retry);
     await vi.waitFor(() => expect(onAgentMessage).toHaveBeenCalledTimes(2));
     expect(storeMessageDirect).toHaveBeenCalledTimes(1);
-    expect(broadcastNewMessage).toHaveBeenCalledTimes(1);
+    expect(connected.opts.onMessagePersisted).toHaveBeenCalledTimes(1);
     expect(notifyNewImMessage).toHaveBeenCalledTimes(1);
   });
 
@@ -361,10 +360,10 @@ describe('WeCom connection security and delivery', () => {
     expect(vi.mocked(storeMessageDirect).mock.calls[1][5]).toBe(
       secondTimestamp,
     );
-    expect(vi.mocked(broadcastNewMessage).mock.calls[0][1]).toMatchObject({
+    expect(connected.opts.onMessagePersisted.mock.calls[0][1]).toMatchObject({
       timestamp: firstTimestamp,
     });
-    expect(vi.mocked(broadcastNewMessage).mock.calls[1][1]).toMatchObject({
+    expect(connected.opts.onMessagePersisted.mock.calls[1][1]).toMatchObject({
       timestamp: secondTimestamp,
     });
   });

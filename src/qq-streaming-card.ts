@@ -24,8 +24,7 @@
  *   - systemStatus
  *   - tools (Map) + purgeOldTools()
  *   - recentEvents
- *   - auxFlushTimer / lastAuxFlushTime / AUX_FLUSH_INTERVAL
- *   - buildAuxPrefix() / formatElapsed()
+ *   - auxiliary prefix rendering
  *   - setThinking() / appendThinking() / setSystemStatus()
  *   - startTool() / endTool() / updateToolSummary() / pushRecentEvent()
  *
@@ -98,10 +97,7 @@ export class QQStreamingController {
   private fallbackUsed = false;
   private passiveMsgId: string | undefined;
 
-  // Auxiliary state (thinking, tools, status)
-  private thinking = false;
-  private thinkingText = '';
-  private systemStatus: string | null = null;
+  // Tool state remains available to the shared streaming-session interface.
   private tools = new Map<
     string,
     {
@@ -111,18 +107,7 @@ export class QQStreamingController {
       summary?: string;
     }
   >();
-  private recentEvents: string[] = [];
-
-  // Auxiliary flush throttle
-  private auxFlushTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastAuxFlushTime = 0;
-  private static readonly AUX_FLUSH_INTERVAL = 1500; // ms
-
   // Display limits
-  private static readonly MAX_THINKING_CHARS = 500;
-  private static readonly MAX_TOOLS_DISPLAY = 5;
-  private static readonly MAX_TOOL_SUMMARY_CHARS = 60;
-  private static readonly MAX_RECENT_EVENTS = 5;
 
   constructor(opts: {
     openid: string;
@@ -151,8 +136,6 @@ export class QQStreamingController {
     if (!this.isActive()) return;
     const isFirst = this.accumulatedText.length === 0;
     this.accumulatedText = text;
-    this.thinkingText = '';
-    this.thinking = false;
     if (isFirst) {
       logger.info(
         { openid: this.openid, textLen: text.length },
@@ -291,27 +274,15 @@ export class QQStreamingController {
   // ─── Auxiliary display methods ──────────────────────────────
 
   setThinking(): void {
-    this.thinking = true;
+    // QQ's prefix-stable stream has no auxiliary presentation surface.
   }
 
-  appendThinking(text: string): void {
-    this.thinkingText += text;
-    if (this.thinkingText.length > QQStreamingController.MAX_THINKING_CHARS) {
-      this.thinkingText =
-        '...' +
-        this.thinkingText.slice(-(QQStreamingController.MAX_THINKING_CHARS - 3));
-    }
-    this.thinking = true;
-
-    // Show thinking state via streaming if already active
-    if (this.state === 'streaming') {
-      this.scheduleAuxFlush();
-    }
+  appendThinking(_text: string): void {
+    // Intentionally hidden; emitting it would violate QQ prefix stability.
   }
 
-  setSystemStatus(status: string | null): void {
-    this.systemStatus = status;
-    if (this.state === 'streaming') this.scheduleAuxFlush();
+  setSystemStatus(_status: string | null): void {
+    // Intentionally hidden; emitting it would violate QQ prefix stability.
   }
 
   setHook(_hook: { hookName: string; hookEvent: string } | null): void {
@@ -324,13 +295,8 @@ export class QQStreamingController {
     // Too verbose for plain text
   }
 
-  pushRecentEvent(text: string): void {
-    this.recentEvents.push(text);
-    if (this.recentEvents.length > QQStreamingController.MAX_RECENT_EVENTS) {
-      this.recentEvents = this.recentEvents.slice(
-        -QQStreamingController.MAX_RECENT_EVENTS,
-      );
-    }
+  pushRecentEvent(_text: string): void {
+    // Intentionally hidden; emitting it would violate QQ prefix stability.
   }
 
   startTool(toolId: string, toolName: string): void {
@@ -373,54 +339,6 @@ export class QQStreamingController {
 
   getAllMessageIds(): string[] {
     return [];
-  }
-
-  // ─── Internal: auxiliary prefix ─────────────────────────────
-
-  private buildAuxPrefix(): string {
-    const parts: string[] = [];
-
-    if (this.systemStatus) {
-      parts.push(`⏳ ${this.systemStatus}`);
-    }
-
-    if (this.thinkingText) {
-      const label = this.thinking ? '💭 思考中...' : '💭 思考完成';
-      const truncated =
-        this.thinkingText.length > QQStreamingController.MAX_THINKING_CHARS
-          ? '...' +
-            this.thinkingText.slice(-(QQStreamingController.MAX_THINKING_CHARS - 3))
-          : this.thinkingText;
-      parts.push(`${label}\n${truncated}`);
-    } else if (this.thinking) {
-      parts.push('💭 思考中...');
-    }
-
-    const now = Date.now();
-    const display: string[] = [];
-    for (const [, tc] of this.tools) {
-      if (display.length >= QQStreamingController.MAX_TOOLS_DISPLAY) break;
-      const elapsed = QQStreamingController.formatElapsed(now - tc.startTime);
-      const icon =
-        tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
-      const summary = tc.summary
-        ? `  ${tc.summary.length > QQStreamingController.MAX_TOOL_SUMMARY_CHARS ? tc.summary.slice(0, QQStreamingController.MAX_TOOL_SUMMARY_CHARS) + '...' : tc.summary}`
-        : '';
-      display.push(`${icon} ${tc.name} (${elapsed})${summary}`);
-    }
-    if (display.length > 0) {
-      parts.push(display.join('\n'));
-    }
-
-    return parts.length > 0 ? parts.join('\n\n') + '\n\n---\n\n' : '';
-  }
-
-  private static formatElapsed(ms: number): string {
-    if (ms < 1000) return `${ms}ms`;
-    const sec = ms / 1000;
-    if (sec < 60) return `${sec.toFixed(1)}s`;
-    const min = Math.floor(sec / 60);
-    return `${min}m ${Math.floor(sec % 60)}s`;
   }
 
   private purgeOldTools(): void {
@@ -503,7 +421,10 @@ export class QQStreamingController {
         await this.doSendChunk(rawText, 1); // GENERATING
         this.lastUpdateTime = Date.now();
       } catch (err: any) {
-        logger.warn({ err: err.message, contentLen: rawText.length }, 'QQ streaming chunk failed');
+        logger.warn(
+          { err: err.message, contentLen: rawText.length },
+          'QQ streaming chunk failed',
+        );
       }
     }
   }
@@ -576,7 +497,10 @@ export class QQStreamingController {
     try {
       await this.fallbackSend(text);
     } catch (err: any) {
-      logger.warn({ err: err.message }, 'QQ streaming fallback send also failed');
+      logger.warn(
+        { err: err.message },
+        'QQ streaming fallback send also failed',
+      );
     }
   }
 
@@ -584,10 +508,6 @@ export class QQStreamingController {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
-    }
-    if (this.auxFlushTimer) {
-      clearTimeout(this.auxFlushTimer);
-      this.auxFlushTimer = null;
     }
   }
 }

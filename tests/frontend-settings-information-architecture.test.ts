@@ -141,8 +141,8 @@ describe('settings information architecture', () => {
     expect(providerModel).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW');
     expect(provider).toContain('1M 上下文');
     expect(provider).toContain('系统预填 Claude Code 运行环境');
-    expect(providerList).toContain('设为默认');
-    expect(providerList).toContain('系统默认');
+    expect(providerList).not.toContain('设为默认');
+    expect(providerList).not.toContain('系统默认');
     expect(providerList).not.toContain('权重');
     expect(settings).toContain('toast.success(message)');
     expect(settings).toContain('toast.error(message)');

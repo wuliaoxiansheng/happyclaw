@@ -34,6 +34,7 @@
 <p align="center">
   <a href="https://happyclaw.cc/"><strong>访问官网</strong></a> ·
   <a href="docs/API.md">API 文档</a> ·
+  <a href="docs/RUNTIME-ARCHITECTURE.md">运行时架构</a> ·
   <a href="docs/ACL-MATRIX.md">权限矩阵</a> ·
   <a href="DEPLOYMENT.md">生产部署</a> ·
   <a href="https://github.com/riba2534/happyclaw/issues">问题反馈</a>
@@ -282,10 +283,12 @@ docker pull riba2534/happyclaw-agent:latest
 `main` 分支每次推送都会重新构建
 `riba2534/happyclaw-agent`（amd64/arm64）。两个架构会分别在 GitHub 原生 x64
 与 ARM64 Hosted Runner 上并行构建，不使用 QEMU 模拟。每个 runner 先推送没有
-用户标签的 digest candidate，使用真实容器入口启动 Chromium，并通过 HTTP 请求
-`/json/version`；两边都验证通过后才合并、签名并提升 `git-<sha>` 和 `latest`
-manifest。镜像构建时会解析 Claude Code、Claude Agent SDK、agent-browser、
-feishu-cli、uv 和 Headroom 的最新稳定版；实际安装版本记录在镜像内的
+用户标签的 digest candidate，真实启动不可变 Runner、执行本地 fake provider
+SDK/CLI query，并在首次调用 agent-browser 后验证 `/json/version`；两边都验证通过
+后才合并、签名并提升 `git-<sha>` 和 `latest` manifest。默认 core 镜像不携带未启用
+的 Headroom Python 依赖；配置了 `headroom` MCP 的智能体会选择同版本
+`-headroom` 镜像。Claude Code、Claude Agent SDK、agent-browser、feishu-cli、uv
+和 Headroom 均使用源码锁定版本；实际安装版本记录在镜像内的
 `/usr/local/share/happyclaw-tool-versions.txt`，需要回滚时也可以通过 Docker
 build args 在发布工作流中指定精确版本。
 
@@ -312,6 +315,7 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | `WEB_PORT`                   | `3000`                            | Web、REST API 与 WebSocket 端口                                                    |
 | `WEB_SESSION_SECRET`         | 自动生成并持久化                  | Web 登录会话签名密钥                                                               |
 | `CONTAINER_IMAGE`            | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                                                                     |
+| `CONTAINER_IMAGE_HEADROOM`   | 从 core 标签派生 `-headroom`      | 启用 Headroom MCP 时使用的同版本能力镜像                                           |
 | `CONTAINER_TIMEOUT`          | `1800000`                         | 容器硬超时，毫秒                                                                   |
 | `IDLE_TIMEOUT`               | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
 | `ADMIN_HOST_ONLY_MODE`       | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
@@ -383,7 +387,7 @@ flowchart LR
 | ---------------- | -------------------------------------------------------------------------------------------------------- |
 | **主服务**       | Node.js、TypeScript、Hono、WebSocket、SQLite                                                             |
 | **智能体运行时** | Claude Agent SDK、Claude Code CLI、MCP、文件 IPC                                                         |
-| **Web**          | React 19、Vite、Tailwind CSS、Radix UI、Zustand、Recharts、xterm.js                                      |
+| **Web**          | React 19、Vite、Tailwind CSS、Radix UI、Zustand、原生 SVG 图表、xterm.js                                 |
 | **渠道**         | Feishu SDK、grammY、QQ Bot API、DingTalk Stream、企业微信智能机器人 SDK、Discord.js、Baileys、微信 iLink |
 | **隔离执行**     | Docker、非 root Node.js 容器、Chromium、常用开发与浏览器工具                                             |
 | **质量保障**     | TypeScript、Vitest、Prettier、GitHub Actions                                                             |
@@ -402,6 +406,33 @@ HappyClaw 会执行代码和访问第三方消息平台，部署前请理解以�
 - 对公网开放时，建议使用 HTTPS 反向代理、强密码、关闭开放注册，并定期备份 `data/`。
 
 完整接口权限见 [ACL 权限矩阵](docs/ACL-MATRIX.md)。
+
+### 反向代理配置
+
+Web 界面依赖 `/ws` 上的 WebSocket 推送流式输出和运行状态。反向代理必须放行
+Upgrade 并把该连接的读超时设得足够长，否则前端会周期性弹出「连接中断，正在重连...」。
+
+服务端已内置 30 秒心跳（ping/pong），既用于保活，也用于回收半开的死连接，
+因此代理侧只需把读超时设得高于心跳间隔即可。nginx 示例：
+
+```nginx
+location /ws {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 3600s;   # 默认 60s 会掐断长连接
+    proxy_send_timeout 3600s;
+}
+```
+
+注意 `Connection` 应固定为 `"upgrade"`，不要写成 `$http_connection`——后者依赖
+客户端如实发送该头部，行为不稳定。
+
+若代理位于 Cloudflare 等平台之后，还需确认其空闲超时高于 30 秒心跳间隔。
+上传大文件时另需放宽 `client_max_body_size`（不小于 `MAX_FILE_SIZE_MB`，并预留
+multipart 开销）与 `client_body_timeout`。
 
 ## 开发与测试
 
@@ -452,6 +483,7 @@ happyclaw/
 | 文档                                                                  | 用途                                               |
 | --------------------------------------------------------------------- | -------------------------------------------------- |
 | [Web API](docs/API.md)                                                | REST API、认证、任务、渠道账号、智能体、用量等接口 |
+| [运行时架构](docs/RUNTIME-ARCHITECTURE.md)                            | 模块边界、依赖规则和性能预算                       |
 | [ACL 权限矩阵](docs/ACL-MATRIX.md)                                    | HTTP、WebSocket 与 IM 命令的权限要求               |
 | [Workspace Memory v2](docs/workspace-memory-v2.md)                    | Workspace 知识边界、数据模型、并发和 UI 语义       |
 | [智能体优先架构记录](docs/agent-first-architecture-plan.md)           | 智能体、工作区、运行会话与渠道挂载的迁移背景       |
@@ -495,6 +527,26 @@ Claude Code，并把实际版本写入
 <summary><strong>如何修改服务端口？</strong></summary>
 
 生产模式运行 `WEB_PORT=8080 make start`。开发模式需要同时设置后端端口和 Vite 的 API/WebSocket 代理目标。
+
+</details>
+
+<details>
+<summary><strong>如何检查旧版本遗留的私聊挂载？</strong></summary>
+
+两类旧安装可能需要此工具：一是 #666 之前的受支持版本曾把 WhatsApp `@c.us`
+及 device `@c.us` 私聊留在 workspace main；二是曾在 #659 的 WhatsApp LID 分类
+修复之前单独部署或 cherry-pick #655/schema v73 的非正式安装。升级到当前版本后运行
+`make leftover-direct-mounts`。诊断严格只读，并且只接受当前 schema；发现残留或
+存在无法自动判定的 WhatsApp alias 路由冲突时以退出码 2 返回。为保证读取完整且绝不
+创建 SQLite sidecar，诊断前也必须先干净停止 HappyClaw。
+
+修复前还必须停止 launchd/systemd 等进程守护，然后运行
+`make leftover-direct-mounts APPLY=1`。修复会把可判定私聊迁到独立
+`channel_direct` session，并永久清除受污染 workspace main 的模型恢复资格和
+SDK/runtime session；不会创建备份，也不能安全撤销。工具若无法确认数据库无人占用，
+会拒绝执行。如果同一 WhatsApp canonical 用户的多个 alias 指向不同 owner、workspace
+或 session，工具会 fail closed；请按诊断输出人工解绑冲突 alias 后重试，不会自动猜测
+应保留哪条路由。
 
 </details>
 

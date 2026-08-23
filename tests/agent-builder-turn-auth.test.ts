@@ -644,6 +644,7 @@ describe('paired direct conversation identity', () => {
       'whatsapp:15551234:42@s.whatsapp.net#account:bot-a',
       '15551234@s.whatsapp.net',
     ],
+    ['whatsapp:15551234@c.us#account:bot-a', '15551234@s.whatsapp.net'],
   ])('derives the native owner from %s', (jid, owner) => {
     expect(ownerImIdFromDirectConversationJid(jid)).toBe(owner);
   });
