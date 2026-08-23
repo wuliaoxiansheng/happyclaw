@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { fetch as undiciFetch, type Dispatcher } from 'undici';
+import { type Dispatcher } from 'undici';
 
 import { logger } from './logger.js';
 import { fetchWeChatDirect } from './wechat-direct-fetch.js';

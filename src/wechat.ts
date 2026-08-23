@@ -512,7 +512,7 @@ export function createWeChatConnection(
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
   const cdnBaseUrl = config.cdnBaseUrl || DEFAULT_CDN_BASE_URL;
   const bypassProxy = config.bypassProxy !== false;
-  const fetchImpl = deps.fetch ?? undiciFetch;
+  const fetchImpl = deps.fetch ?? (fetchWeChatDirect as typeof undiciFetch);
   const createDispatcher = deps.createDispatcher ?? createWeChatHttpDispatcher;
   const uploadMedia = deps.uploadMediaBuffer ?? uploadMediaBuffer;
   const random = deps.random ?? Math.random;
@@ -620,7 +620,7 @@ export function createWeChatConnection(
       : undefined;
 
     try {
-      const res = await fetchWeChatDirect(url.toString(), {
+      const res = await fetchImpl(url.toString(), {
         method: 'POST',
         headers: {
           ...headers,
