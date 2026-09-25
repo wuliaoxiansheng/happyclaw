@@ -7,6 +7,7 @@ export interface TimelineMessageLike {
     | 'promoting'
     | 'released'
     | 'cancelled'
+    | 'awaiting_companion'
     | 'subsumed'
     | null;
   delivery_updated_at?: string | null;

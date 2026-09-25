@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from 'vitest';
 
 import {
   FEISHU_FORWARD_COMPANION_MAX_GAP_MS,
+  FEISHU_MEDIA_TOPIC_COMPANION_MAX_GAP_MS,
   FEISHU_RAPID_TOPIC_COMPANION_MAX_GAP_MS,
   FeishuForwardBundleResolver,
   TransientFeishuForwardLookupError,
@@ -69,6 +70,38 @@ function rapidTopicNote(
   };
 }
 
+function mediaTopicRoot(
+  overrides: Partial<FeishuForwardCandidate> = {},
+): FeishuForwardCandidate {
+  return {
+    messageId: 'om_media_root',
+    messageType: 'image',
+    content: JSON.stringify({ image_key: 'img_media' }),
+    threadId: 'omt_media',
+    senderOpenId: 'ou_sender',
+    createTimeMs: 1_700_000_000_000,
+    chatType: 'group',
+    ...overrides,
+  };
+}
+
+function mediaTopicNote(
+  overrides: Partial<FeishuForwardCandidate> = {},
+): FeishuForwardCandidate {
+  return {
+    messageId: 'om_media_note',
+    messageType: 'text',
+    content: JSON.stringify({ text: '理解一下这张图' }),
+    rootId: 'om_media_root',
+    parentId: 'om_media_root',
+    threadId: 'omt_media',
+    senderOpenId: 'ou_sender',
+    createTimeMs: 1_700_000_001_500,
+    chatType: 'group',
+    ...overrides,
+  };
+}
+
 function lookupResponse(
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> {
@@ -88,6 +121,44 @@ function lookupResponse(
 }
 
 describe('Feishu merged-forward companion detection', () => {
+  test('holds an image topic root and links its immediate direct caption', async () => {
+    const lookup = vi.fn();
+    const resolver = new FeishuForwardBundleResolver(lookup);
+
+    expect(resolver.observeRoot(mediaTopicRoot())).toEqual({
+      kind: 'forward_bundle',
+      bundleId: 'om_media_root',
+      role: 'forwarded_content',
+    });
+    await expect(resolver.resolveCompanion(mediaTopicNote())).resolves.toEqual({
+      kind: 'forward_bundle',
+      bundleId: 'om_media_root',
+      role: 'forwarder_comment',
+      relatedMessageId: 'om_media_root',
+    });
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  test('does not merge an image reply outside the exact thread, sender or 3s window', async () => {
+    const variants: Array<Partial<FeishuForwardCandidate>> = [
+      { chatType: 'p2p' },
+      { threadId: 'omt_other' },
+      { parentId: 'om_middle' },
+      { senderOpenId: 'ou_other' },
+      {
+        createTimeMs:
+          1_700_000_000_000 + FEISHU_MEDIA_TOPIC_COMPANION_MAX_GAP_MS + 1,
+      },
+    ];
+    for (const overrides of variants) {
+      const resolver = new FeishuForwardBundleResolver(vi.fn());
+      resolver.observeRoot(mediaTopicRoot());
+      await expect(
+        resolver.resolveCompanion(mediaTopicNote(overrides)),
+      ).resolves.toBeUndefined();
+    }
+  });
+
   test('links the production rapid topic root+reply shape without reclassifying the root alone', async () => {
     const lookup = vi.fn();
     const resolver = new FeishuForwardBundleResolver(lookup);

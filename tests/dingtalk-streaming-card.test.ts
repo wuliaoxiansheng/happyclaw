@@ -10,6 +10,64 @@ vi.mock('../src/logger.js', () => ({
   },
 }));
 
+const dingtalkHttps = vi.hoisted(() => ({
+  request(options: { path?: string; method?: string }, cb: (res: any) => void) {
+    const requestListeners: Record<string, Array<(arg?: unknown) => void>> = {};
+    const req = {
+      on(event: string, handler: (arg?: unknown) => void) {
+        (requestListeners[event] ??= []).push(handler);
+        return req;
+      },
+      write() {},
+      end() {
+        const responseListeners: Record<
+          string,
+          Array<(arg?: unknown) => void>
+        > = {};
+        const res = {
+          statusCode: 200,
+          on(event: string, handler: (arg?: unknown) => void) {
+            (responseListeners[event] ??= []).push(handler);
+            return res;
+          },
+        };
+        queueMicrotask(() => {
+          cb(res);
+          queueMicrotask(() => {
+            const requestPath = String(options.path);
+            // Official card_1_0 response bodies for CREATE and DELIVER.
+            const payload = requestPath.includes('/gettoken')
+              ? { errcode: 0, access_token: 'test-token', expires_in: 7200 }
+              : requestPath === '/v1.0/card/instances/deliver'
+                ? {
+                    success: true,
+                    result: [
+                      {
+                        spaceId: 'cidXXXX',
+                        spaceType: 'IM_GROUP',
+                        success: true,
+                      },
+                    ],
+                  }
+                : options.method === 'POST' &&
+                    requestPath === '/v1.0/card/instances'
+                  ? { success: true, result: 'provider-card-result' }
+                  : { success: true };
+            const body = Buffer.from(JSON.stringify(payload));
+            for (const handler of responseListeners.data ?? []) handler(body);
+            for (const handler of responseListeners.end ?? []) handler();
+          });
+        });
+      },
+    };
+    return req;
+  },
+}));
+
+vi.mock('node:https', () => ({
+  default: { request: dingtalkHttps.request },
+}));
+
 import {
   DingTalkStreamingCardController,
   type DingTalkStreamingCardConfig,
@@ -40,7 +98,13 @@ function makeController(
   return new DingTalkStreamingCardController(
     makeConfig(),
     target ?? makeGroupTarget(),
-    opts,
+    {
+      // Production adapters always provide a strict-ACK plain fallback. Keep
+      // lifecycle-only tests on that real call shape instead of relying on a
+      // missing fallback being treated as successful delivery.
+      fallbackSend: async () => {},
+      ...opts,
+    },
   );
 }
 
@@ -154,7 +218,10 @@ describe('DingTalkStreamingCardController', () => {
       const ctrl = makeController();
       ctrl.startTool('tool-1', 'ReadFile');
       ctrl.endTool('tool-1', false);
-      expect(ctrl.getToolInfo('tool-1')).toMatchObject({ name: 'ReadFile', status: 'complete' });
+      expect(ctrl.getToolInfo('tool-1')).toMatchObject({
+        name: 'ReadFile',
+        status: 'complete',
+      });
     });
 
     test('tracks multiple tools independently', () => {
@@ -164,7 +231,10 @@ describe('DingTalkStreamingCardController', () => {
       expect(ctrl.getToolInfo('tool-1')).toMatchObject({ name: 'ReadFile' });
       expect(ctrl.getToolInfo('tool-2')).toMatchObject({ name: 'WriteFile' });
       ctrl.endTool('tool-1', false);
-      expect(ctrl.getToolInfo('tool-1')).toMatchObject({ name: 'ReadFile', status: 'complete' });
+      expect(ctrl.getToolInfo('tool-1')).toMatchObject({
+        name: 'ReadFile',
+        status: 'complete',
+      });
       expect(ctrl.getToolInfo('tool-2')).toMatchObject({ name: 'WriteFile' });
     });
   });

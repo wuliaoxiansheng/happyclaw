@@ -120,6 +120,8 @@ export interface EnrichedFeishuInboundContent {
   }>;
   richMessageResolved: boolean;
   referencedMessages: number;
+  /** The current merged-forward shell was expanded without truncation. */
+  currentMaterialResolved?: boolean;
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
@@ -430,6 +432,7 @@ async function resolveCurrentRichMessage(
   | {
       text: string;
       imageRefs: Array<{ messageId: string; imageKey: string }>;
+      materialResolved: boolean;
     }
   | undefined
 > {
@@ -449,9 +452,9 @@ async function resolveCurrentRichMessage(
   const forward =
     input.messageType === 'merge_forward' ||
     items.some((item) => !!item.upper_message_id);
-  const normalized = items
-    .filter((item) => item.msg_type !== 'merge_forward')
-    .slice(0, limits.maxForwardItems)
+  const candidates = items.filter((item) => item.msg_type !== 'merge_forward');
+  const boundedCandidates = candidates.slice(0, limits.maxForwardItems);
+  const normalized = boundedCandidates
     .map((item) => normalizeItem(item, input.parseContent, limits))
     .filter((item): item is NormalizedItem => !!item);
   if (normalized.length === 0) return undefined;
@@ -485,6 +488,11 @@ async function resolveCurrentRichMessage(
   return {
     text: text.slice(0, limits.maxTextChars),
     imageRefs,
+    materialResolved:
+      forward &&
+      candidates.length <= limits.maxForwardItems &&
+      normalized.length === boundedCandidates.length &&
+      normalized.every((item) => item.materialComplete),
   };
 }
 
@@ -652,6 +660,7 @@ export async function enrichFeishuInboundContent(
             : {}),
           richMessageResolved: !!rich,
           referencedMessages: references.length,
+          ...(rich?.materialResolved ? { currentMaterialResolved: true } : {}),
         };
       })(),
       limits.totalTimeoutMs,

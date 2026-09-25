@@ -94,7 +94,7 @@ describe('durable follow-up queue', () => {
     ).toBe(true);
   });
 
-  test('snapshots ordinary Web and Feishu forward messages into one turn', () => {
+  test('separates a Web turn from the subsequent Feishu forward bundle', () => {
     const jid = 'web:follow-up-forward-boundary';
     db.ensureChatExists(jid);
     for (const [index, id] of ['ordinary', 'om_root', 'om_note'].entries()) {
@@ -142,8 +142,33 @@ describe('durable follow-up queue', () => {
       db
         .claimNextQueuedFollowUpBatch(jid, 'run-ordinary')
         .map((item) => item.id),
-    ).toEqual(['ordinary', 'om_root', 'om_note']);
+    ).toEqual(['ordinary']);
+    expect(
+      db.claimNextQueuedFollowUpBatch(jid, 'run-feishu').map((item) => item.id),
+    ).toEqual(['om_root', 'om_note']);
     expect(db.claimNextQueuedFollowUpBatch(jid, 'run-empty')).toEqual([]);
+  });
+
+  test('keeps durable FIFO when a later arrival carries an older provider timestamp', () => {
+    const jid = 'web:follow-up-late-clock';
+    db.ensureChatExists(jid);
+    for (const [id, timestamp] of [
+      ['first-arrival', '2026-08-31T06:00:00.000Z'],
+      ['late-old-clock', '2020-01-01T00:00:00.000Z'],
+    ]) {
+      db.storeMessageDirect(id, jid, 'user-1', 'User', id, timestamp, false, {
+        meta: { deliveryMode: 'queue', deliveryStatus: 'queued' },
+      });
+    }
+
+    const claimed = db.claimNextQueuedFollowUpBatch(jid, 'run-late-clock');
+    expect(claimed.map((item) => item.id)).toEqual([
+      'first-arrival',
+      'late-old-clock',
+    ]);
+    expect(claimed[0].ingest_sequence).toBeLessThan(
+      claimed[1].ingest_sequence!,
+    );
   });
 
   test('merges an explicit steer with the Session pending batch', () => {

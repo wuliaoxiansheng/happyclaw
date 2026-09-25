@@ -15,8 +15,10 @@
  *   - `finish`  : false for incremental chunks, true exactly once at the end.
  *
  * Lifecycle: idle → streaming → completing/aborting → completed/aborted
- * Fallback : if replyStream fails (e.g. no inbound frame / rate limit), falls
- *            back to a plain `sendMessage` with the final text.
+ * Fallback : the controller never sends a second plain message itself. A
+ *            terminal failure is returned to the durable host, which may use
+ *            static delivery only when the error proves that no provider
+ *            output became visible.
  *
  * Transient status vs final text
  * ──────────────────────────────
@@ -29,6 +31,11 @@
  */
 
 import { logger } from './logger.js';
+import { PartialChannelDeliveryError } from './im-delivery-progress.js';
+import {
+  classifyImSendFailure,
+  preAcceptImDeliveryError,
+} from './im-send-retry-policy.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -98,8 +105,7 @@ export class WeComStreamingController {
   // Dependencies
   private readonly chatId: string;
   private readonly sendStream: WeComSendStreamFn;
-  private readonly fallbackSend: WeComFallbackSendFn;
-  private fallbackPromise: Promise<void> | null = null;
+  private terminalDeliveryError: unknown;
 
   // Transient status (rendered in streaming view only, NEVER in final text)
   private systemStatus: string | null = null;
@@ -128,17 +134,28 @@ export class WeComStreamingController {
   }) {
     this.chatId = opts.chatId;
     this.sendStream = opts.sendStream;
-    this.fallbackSend = opts.fallbackSend;
   }
 
   // ─── StreamingSession interface ─────────────────────────────
 
   isActive(): boolean {
-    return this.state === 'idle' || this.state === 'streaming';
+    return (
+      this.acceptsStreamingUpdates() ||
+      (this.state === 'aborted' &&
+        this.terminalDeliveryError !== undefined &&
+        classifyImSendFailure(this.terminalDeliveryError) === 'uncertain')
+    );
+  }
+
+  getAcknowledgedProviderOutputCount(): number {
+    return this.sentChunkCount;
   }
 
   append(text: string): void {
-    if (!this.isActive()) return;
+    // `isActive()` also exposes a sticky uncertain failure so the host can
+    // hand it to the durable finalizer. That evidence must never reopen the
+    // provider stream or accept a late delta.
+    if (!this.acceptsStreamingUpdates()) return;
     const isFirst = this.accumulatedText.length === 0;
     this.accumulatedText = text;
     // Real text has arrived — the thinking indicator is no longer relevant.
@@ -154,6 +171,9 @@ export class WeComStreamingController {
   }
 
   async complete(finalText: string): Promise<void> {
+    if (this.state === 'aborted' && this.terminalDeliveryError !== undefined) {
+      throw this.terminalDeliveryError;
+    }
     if (
       this.state === 'completed' ||
       this.state === 'aborted' ||
@@ -167,6 +187,10 @@ export class WeComStreamingController {
     this.clearTimers();
     if (this.currentFlushPromise)
       await this.currentFlushPromise.catch(() => {});
+    if (this.terminalDeliveryError !== undefined) {
+      this.state = 'aborted';
+      throw this.terminalDeliveryError;
+    }
 
     this.accumulatedText = finalText;
     logger.info(
@@ -184,7 +208,18 @@ export class WeComStreamingController {
       // Nothing to say. If we already opened a stream, close it empty so the
       // bubble is finalized; otherwise there is simply nothing to send.
       if (this.sentChunkCount > 0) {
-        await this.sendStream(this.accumulatedText || '', true);
+        try {
+          await this.sendStream(this.accumulatedText || '', true);
+        } catch (error) {
+          const partial = new PartialChannelDeliveryError(
+            this.sentChunkCount,
+            this.sentChunkCount + 1,
+            error,
+          );
+          this.terminalDeliveryError = partial;
+          this.state = 'aborted';
+          throw partial;
+        }
       }
       this.state = 'completed';
       return;
@@ -195,18 +230,29 @@ export class WeComStreamingController {
     // ACK-governed proactive pagination path.
     if (utf8Bytes(finalBody) > WECOM_MARKDOWN_MAX_BYTES) {
       if (this.sentChunkCount > 0) {
-        await this.sendStream('内容较长，完整回复将分段发送。', true).catch(
-          (err: any) => {
-            logger.warn(
-              { err: err?.message, chatId: this.chatId },
-              'WeCom oversized stream close failed; continuing with pagination',
-            );
-          },
-        );
+        try {
+          await this.sendStream('内容较长，完整回复将分段发送。', true);
+        } catch (error) {
+          logger.warn(
+            { err: (error as Error)?.message, chatId: this.chatId },
+            'WeCom oversized stream close failed; refusing duplicate pagination fallback',
+          );
+          const partial = new PartialChannelDeliveryError(
+            this.sentChunkCount,
+            this.sentChunkCount + 1,
+            error,
+          );
+          this.terminalDeliveryError = partial;
+          this.state = 'aborted';
+          throw partial;
+        }
       }
-      await this.tryFallback(finalBody);
-      this.state = 'completed';
-      return;
+      const fallbackRequired = preAcceptImDeliveryError(
+        'WeCom streaming final exceeds the provider limit; use durable static pagination',
+      );
+      this.terminalDeliveryError = fallbackRequired;
+      this.state = 'aborted';
+      throw fallbackRequired;
     }
 
     try {
@@ -220,14 +266,30 @@ export class WeComStreamingController {
     } catch (err: any) {
       logger.warn(
         { err: err?.message, chatId: this.chatId },
-        'WeCom streaming finalize failed, using fallback',
+        'WeCom streaming finalize failed; delegating any safe fallback to the durable host',
       );
-      await this.tryFallback(finalBody);
-      this.state = 'completed';
+      // Preview bubble already exists. A plain sendMessage would deliver a
+      // second full copy of the same reply.
+      if (this.sentChunkCount === 0) {
+        this.terminalDeliveryError = err;
+        this.state = 'aborted';
+        throw err;
+      }
+      const partial = new PartialChannelDeliveryError(
+        this.sentChunkCount,
+        this.sentChunkCount + 1,
+        err,
+      );
+      this.terminalDeliveryError = partial;
+      this.state = 'aborted';
+      throw partial;
     }
   }
 
   async abort(reason?: string): Promise<void> {
+    if (this.state === 'aborted' && this.terminalDeliveryError !== undefined) {
+      throw this.terminalDeliveryError;
+    }
     if (
       this.state === 'completed' ||
       this.state === 'aborted' ||
@@ -240,20 +302,41 @@ export class WeComStreamingController {
     this.clearTimers();
     if (this.currentFlushPromise)
       await this.currentFlushPromise.catch(() => {});
+    if (this.terminalDeliveryError !== undefined) {
+      this.state = 'aborted';
+      throw this.terminalDeliveryError;
+    }
 
     const notice = `⚠️ 已中断: ${reason ?? '用户取消'}`;
     const body = this.accumulatedText.trim()
       ? `${this.accumulatedText}\n\n${notice}`
       : notice;
+    // With no preview there is nothing to terminalize. Do not create a fresh
+    // abort bubble: returning with zero provider progress lets the durable
+    // host choose the one safe static delivery.
+    if (this.sentChunkCount === 0) {
+      this.state = 'aborted';
+      return;
+    }
     try {
       await this.sendStream(body, true); // DONE
       this.sentChunkCount++;
     } catch (err: any) {
       logger.debug(
         { err: err?.message, chatId: this.chatId },
-        'WeCom streaming abort chunk failed, using fallback',
+        'WeCom streaming abort chunk failed; refusing controller fallback',
       );
-      await this.tryFallback(body);
+      const terminalError =
+        this.sentChunkCount > 0
+          ? new PartialChannelDeliveryError(
+              this.sentChunkCount,
+              this.sentChunkCount + 1,
+              err,
+            )
+          : err;
+      this.terminalDeliveryError = terminalError;
+      this.state = 'aborted';
+      throw terminalError;
     }
     this.state = 'aborted';
   }
@@ -374,20 +457,31 @@ export class WeComStreamingController {
       this.flushPending = false;
       this.currentFlushPromise = this.doFlush()
         .catch((err: any) => {
+          const terminalError =
+            this.sentChunkCount > 0
+              ? new PartialChannelDeliveryError(
+                  this.sentChunkCount,
+                  this.sentChunkCount + 1,
+                  err,
+                )
+              : err;
+          this.terminalDeliveryError ??= terminalError;
+          this.state = 'aborted';
           logger.debug(
             { err: err?.message, chatId: this.chatId },
-            'WeCom streaming flush failed',
+            'WeCom streaming flush failed; terminalizing delivery evidence',
           );
         })
         .finally(() => {
           this.currentFlushPromise = null;
-          if (this.flushPending && this.isActive()) this.scheduleFlush();
+          if (this.flushPending && this.acceptsStreamingUpdates())
+            this.scheduleFlush();
         });
     }, delay);
   }
 
   private async doFlush(): Promise<void> {
-    if (!this.isActive()) return;
+    if (!this.acceptsStreamingUpdates()) return;
     const content = this.renderStreaming();
     if (!content.trim()) return;
     await this.sendStream(truncateWeComUtf8(content), false); // GENERATING
@@ -396,23 +490,14 @@ export class WeComStreamingController {
     if (this.state === 'idle') this.state = 'streaming';
   }
 
-  private async tryFallback(text: string): Promise<void> {
-    this.fallbackPromise ??= this.fallbackSend(text);
-    try {
-      await this.fallbackPromise;
-    } catch (err: any) {
-      logger.warn(
-        { err: err?.message, chatId: this.chatId },
-        'WeCom streaming fallback send also failed',
-      );
-      throw err;
-    }
-  }
-
   private clearTimers(): void {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+  }
+
+  private acceptsStreamingUpdates(): boolean {
+    return this.state === 'idle' || this.state === 'streaming';
   }
 }

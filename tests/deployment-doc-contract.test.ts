@@ -15,6 +15,7 @@ describe('Mac mini production deployment contract', () => {
     expect(deployment).toContain('com.riba2534.happyclaw');
     expect(agents).toContain('opted out of deployment backups');
     expect(deployment).toContain('不得运行 `make backup`');
+    expect(deployment).toContain('HAPPYCLAW_SKIP_MIGRATION_BACKUP=1');
     expect(deployment).not.toContain(
       'BACKUP_DIR="$HOME/happyclaw-deploy-backups" make backup',
     );

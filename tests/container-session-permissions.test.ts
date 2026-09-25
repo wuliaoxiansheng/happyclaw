@@ -480,6 +480,14 @@ try {
 
 describe.skipIf(!integrationImageAvailable)(
   'permission helper behavior in the branch image',
+  {
+    // Every test below starts one or more real Docker containers. Hosted
+    // runner scheduling and cold-overlay setup have exceeded Vitest's generic
+    // 5s unit-test budget on both amd64 and arm64 even though the command then
+    // completed successfully. Keep a per-test bound, but size it for an image
+    // integration contract rather than an in-process unit test.
+    timeout: 30_000,
+  },
   () => {
     const helperPath = path.join(
       repoRoot,

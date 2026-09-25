@@ -11,7 +11,7 @@ describe('Feishu route safety integration', () => {
 
     expect(source).toContain('resolveAdmittedChannelRoute<FeishuMessageMeta>');
     expect(source).toContain(
-      'Feishu binding resolver rejected route; dropping message',
+      'Feishu binding resolver rejected route; ignoring without retry',
     );
     expect(source).not.toContain('agentRouting?.effectiveJid ?? chatJid');
   });

@@ -54,8 +54,10 @@ import {
   shellQuoteEnvLines,
   writeCredentialsFile,
   buildClaudeAiOauthPayload,
+  providerToConfig,
   updateProviderOAuthCredentialsIfCurrent,
 } from './runtime-config.js';
+import { updateProviderSessionCredentials } from './provider-session-credentials.js';
 import {
   removeClaudeKeychainOAuth,
   syncClaudeKeychainOAuth,
@@ -71,11 +73,23 @@ import { releaseHappyClawOwnerIntroductionLease } from './owner-profile-store.js
 import { applyProviderSwitchToInput } from './provider-switch-context.js';
 import {
   getUserById,
+  getTaskRunById,
+  isDatabaseInitialized,
   getSessionProviderId,
   setSessionProviderId,
 } from './db.js';
 import { isApiError } from './agent-output-parser.js';
-import type { ClaudeProviderConfig } from './runtime-config.js';
+import {
+  DEFAULT_MAX_TRANSIENT_RETRIES,
+  TransientRetryLedger,
+  resolveProviderFailureClass,
+  resolveTerminalProviderFailureNotice,
+  resolveTransientRetryKey,
+} from './provider-failure.js';
+import type {
+  ClaudeOAuthCredentials,
+  ClaudeProviderConfig,
+} from './runtime-config.js';
 import {
   loadManagedMcpLayers,
   resolveManagedMcpPolicy,
@@ -113,6 +127,16 @@ import { validateSkillId, validateSkillPath } from './skill-utils.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 import type { ContainerOutput } from './agent-runtime-contracts.js';
 export type { ContainerOutput } from './agent-runtime-contracts.js';
+import {
+  captureProviderQuotaObservationEpoch,
+  consumeProviderQuotaControlOutput,
+} from './provider-quota-observation.js';
+import {
+  dockerOAuthCredentialsEqual,
+  readDockerClaudeOAuthCredentials,
+  reconcileDockerOAuthCredentials,
+  type DockerOAuthReconcileOutcome,
+} from './docker-oauth-credentials.js';
 import {
   resolveHostSkillPolicy,
   type HostSkillPolicy,
@@ -520,8 +544,18 @@ function quarantineFromOutput(
     | 'providerRateLimitScope'
     | 'providerRateLimitModel'
     | 'providerRateLimitResetsAt'
+    | 'providerFailureClass'
+    | 'providerLivenessTimeout'
   >,
 ): void {
+  // Only an account-class verdict may change account health.
+  //
+  // A transient failure says nothing about the account — the stream stalled, or
+  // the upstream returned 529/5xx — and quarantining on it is what turned an
+  // upstream hiccup into a fake "quota exhausted" verdict for single-account
+  // pools. A config failure would fail identically on every account, so
+  // quarantining would drain the whole pool over one unservable model name.
+  if (resolveProviderFailureClass(output) !== 'account') return;
   // Fail safe: a model-scope report with no model name cannot be recorded as a
   // tier quarantine, and silently dropping it would let the same failing pair
   // be selected forever. Degrade to an account-scope quarantine instead.
@@ -557,11 +591,70 @@ function poolCanStillServe(): boolean {
   return !!fallbackModel && providerPool.hasCandidateForTier(fallbackModel);
 }
 
-function applyProviderFailureDisposition(
+/** Host-process replay budget; each transient retry runs a fresh runner. */
+const transientRetries = new TransientRetryLedger();
+
+export function transientRetryProfileForInput(
+  inputTurnId: string | undefined,
+): string | null {
+  return transientRetries.pinnedProfileId(inputTurnId);
+}
+
+/**
+ * Exported for tests: the transient escalation spans this function, the
+ * host-process retry ledger and the provider pool, so asserting it on source
+ * text alone would not prove that a second failure actually quarantines the
+ * account or that the pool then decides failover.
+ */
+export function applyProviderFailureDisposition(
   output: ContainerOutput,
   selectedProfileId: string | null,
   allowFailover = true,
 ): boolean {
+  const failureClass = resolveProviderFailureClass(output);
+  // Transient failures never consult the pool: no account was judged, so the
+  // only question is whether this input still has a retry left. This is
+  // identical for single- and multi-account installs by design — a 529 is not a
+  // reason to move the conversation to a different account.
+  if (failureClass === 'transient') {
+    if (
+      transientRetries.consume(
+        resolveTransientRetryKey(output),
+        selectedProfileId,
+      )
+    ) {
+      applyKnownProviderFailureDisposition(output, false);
+      return false;
+    }
+    // The bounded same-provider replay is spent. Repetition does not turn a
+    // 529/5xx or a silent transport stall into evidence about account health:
+    // end this input visibly, but leave every configured account selectable.
+    logger.warn(
+      {
+        providerId: selectedProfileId,
+        livenessTimeout: output.providerLivenessTimeout === true,
+      },
+      'Transient provider failure repeated after its replay; ending input without quarantining the account',
+    );
+    applyKnownProviderFailureDisposition(output, true);
+    return true;
+  }
+  // A pinned model configuration is authoritative, so model_not_found ends
+  // there. In an automatic multi-provider pool, however, each member may use a
+  // different endpoint and configured model. Quarantine only the rejected
+  // (provider, model) pair and let the pool try another member.
+  if (failureClass === 'config') {
+    const model = output.providerRateLimitModel?.trim();
+    if (!allowFailover || selectedProfileId === null || !model) {
+      applyKnownProviderFailureDisposition(output, true);
+      return true;
+    }
+    providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
+    providerPool.reportModelFailure(selectedProfileId, model);
+    const terminal = !poolCanStillServe();
+    applyKnownProviderFailureDisposition(output, terminal);
+    return terminal;
+  }
   providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
   providerPool.refreshRecoveryState();
   // Ask the pool across both dimensions. A model wall leaves the account
@@ -584,6 +677,44 @@ function applyKnownProviderFailureDisposition(
   output.result = null;
   output.providerFailureTerminal = terminal;
   output.inputTurnCompleted = terminal;
+  // Set here rather than in the disposition helper so every path that forces a
+  // non-account failure terminal — including the scheduled replay loop's
+  // no-progress bail-out — names the real cause instead of a quota verdict.
+  if (terminal) {
+    const notice = resolveTerminalProviderFailureNotice(output);
+    if (notice) output.providerFailureNotice = notice;
+  }
+}
+
+export function hasNonReplayableTaskNotificationEvidence(
+  summary: { succeeded: number; uncertain?: number } | null | undefined,
+): boolean {
+  return Boolean(
+    summary && (summary.succeeded > 0 || (summary.uncertain ?? 0) > 0),
+  );
+}
+
+function scheduledInputHasPhysicalSideEffect(input: ContainerInput): boolean {
+  if (!input.isScheduledTask || !input.taskRunId || !isDatabaseInitialized())
+    return false;
+  return hasNonReplayableTaskNotificationEvidence(
+    getTaskRunById(input.taskRunId)?.notification_summary,
+  );
+}
+
+function providerFailureDispositionLogMessage(
+  output: ContainerOutput,
+  terminal: boolean,
+): string {
+  if (terminal) return 'Provider options exhausted; surfacing terminal failure';
+  switch (resolveProviderFailureClass(output)) {
+    case 'transient':
+      return 'Transient provider failure; preserving input for bounded same-provider replay';
+    case 'config':
+      return 'Provider model tier rejected; preserving input for automatic-pool failover';
+    default:
+      return 'Provider account quarantined; preserving input for failover replay';
+  }
 }
 
 export interface VolumeMount {
@@ -1065,6 +1196,7 @@ export function trySelectPoolProvider(
   groupFolder: string,
   agentId?: string | null,
   modelConfigId?: string | null,
+  transientRetryProfileId?: string | null,
 ): {
   profileId: string;
   resolved: ResolvedProvider;
@@ -1133,6 +1265,67 @@ export function trySelectPoolProvider(
     new Map(
       enabledProviders.map((p) => [p.id, providerModelTier(p.anthropicModel)]),
     );
+
+  // A transient verdict authorizes one replay of the same provider attempt,
+  // not one extra pool rotation. Honor that pin even for round-robin/weighted
+  // strategies, but only while the member remains enabled, account-healthy,
+  // and able to serve the current model tier.
+  if (transientRetryProfileId) {
+    const pinned = enabledProviders.find(
+      (provider) => provider.id === transientRetryProfileId,
+    );
+    const healthy = providerPool.getHealthStatus(
+      transientRetryProfileId,
+    ).healthy;
+    const tierAvailable =
+      !!pinned &&
+      stickyBindingCanServeTier(
+        transientRetryProfileId,
+        enabledProviders,
+        tierModel,
+      );
+    if (pinned && healthy && tierAvailable) {
+      try {
+        const resolved = resolveProviderById(transientRetryProfileId);
+        providerPool.acquireSession(transientRetryProfileId);
+        setSessionProviderId(groupFolder, agentId, transientRetryProfileId);
+        logger.info(
+          {
+            groupFolder,
+            agentId: agentId || null,
+            providerId: transientRetryProfileId,
+          },
+          'Reusing provider selected by transient replay fence',
+        );
+        return {
+          profileId: transientRetryProfileId,
+          resolved: {
+            config: resolved.config,
+            customEnv: resolved.customEnv,
+          },
+          previousProviderId: existingBoundId,
+          resetSession:
+            !!existingBoundId && existingBoundId !== transientRetryProfileId,
+          ...(tierModel ? { modelOverride: tierModel } : {}),
+        };
+      } catch (err) {
+        logger.warn(
+          { err, providerId: transientRetryProfileId },
+          'Transient replay provider could not be resolved; returning to pool selection',
+        );
+      }
+    } else {
+      logger.warn(
+        {
+          providerId: transientRetryProfileId,
+          enabled: !!pinned,
+          healthy,
+          tierAvailable,
+        },
+        'Transient replay provider is no longer eligible; returning to pool selection',
+      );
+    }
+  }
 
   // Sticky path: respect previous session→provider binding when the bound
   // provider is still enabled. Only the failover strategy is sticky — the
@@ -1391,11 +1584,17 @@ export function cleanupContainerTaskRuntimeEnvDirs(
   }
 }
 
+export interface DockerOauthLaunchSnapshot {
+  credentialsFilePath: string;
+  launchCredentials: ClaudeOAuthCredentials;
+}
+
 interface PreparedVolumeMounts {
   mounts: VolumeMount[];
   claudeContextPlan: ReturnType<typeof buildClaudeContextPlan>;
   runtimeMcpServers: Record<string, Record<string, unknown>>;
   hostPlugins: SdkPluginConfig[];
+  dockerOauthLaunch: DockerOauthLaunchSnapshot | null;
 }
 
 function prepareVolumeMounts(
@@ -1447,6 +1646,7 @@ function prepareVolumeMounts(
 
   const mounts: VolumeMount[] = [];
   let feishuCliBinding: FeishuCliRuntimeBinding | null = null;
+  let dockerOauthLaunch: PreparedVolumeMounts['dockerOauthLaunch'] = null;
   const projectRoot = process.cwd();
   const ownerId = group.created_by;
 
@@ -1764,6 +1964,13 @@ function prepareVolumeMounts(
   if (mergedConfig.claudeOAuthCredentials) {
     try {
       writeCredentialsFile(groupSessionsDir, mergedConfig);
+      const launchCredentials = buildClaudeAiOauthPayload(mergedConfig);
+      if (launchCredentials) {
+        dockerOauthLaunch = {
+          credentialsFilePath: path.join(groupSessionsDir, '.credentials.json'),
+          launchCredentials,
+        };
+      }
     } catch (err) {
       logger.warn(
         { group: group.name, err },
@@ -1846,6 +2053,7 @@ function prepareVolumeMounts(
     claudeContextPlan,
     runtimeMcpServers,
     hostPlugins: pluginSkills,
+    dockerOauthLaunch,
   };
 }
 
@@ -2102,6 +2310,78 @@ export function buildContainerArgs(
   return args;
 }
 
+/**
+ * Reconcile a Docker SDK credential rotation at a safe output/exit boundary.
+ * The lower-level helper performs the launch-snapshot CAS; on success, fan the
+ * adopted credential out to other persisted sessions so the next runner does
+ * not start from an invalidated refresh token.
+ */
+export function reconcileDockerOAuthAfterExit(
+  providerId: string | null,
+  launch: DockerOauthLaunchSnapshot | null,
+  dependencies: {
+    reconcile?: typeof reconcileDockerOAuthCredentials;
+    fanOutUpdatedCredentials?: (providerId: string) => void;
+  } = {},
+): DockerOAuthReconcileOutcome | 'error' | null {
+  if (!providerId || !launch) return null;
+  try {
+    const outcome = (dependencies.reconcile ?? reconcileDockerOAuthCredentials)(
+      {
+        providerId,
+        credentialsFilePath: launch.credentialsFilePath,
+        launchCredentials: launch.launchCredentials,
+      },
+    );
+    if (outcome === 'updated') {
+      const adopted = readDockerClaudeOAuthCredentials(
+        launch.credentialsFilePath,
+      );
+      if (adopted) launch.launchCredentials = adopted;
+      const fanOut =
+        dependencies.fanOutUpdatedCredentials ??
+        ((updatedProviderId: string) => {
+          const provider = getProviders().find(
+            (candidate) => candidate.id === updatedProviderId,
+          );
+          if (provider) {
+            updateProviderSessionCredentials(
+              updatedProviderId,
+              providerToConfig(provider),
+            );
+          }
+        });
+      fanOut(providerId);
+    } else if (outcome === 'stale') {
+      // A sibling Runner may already have adopted this exact rotation and
+      // fanned it into our mounted file. Advance this warm Runner's CAS base
+      // only when disk and current Provider agree; an administrator change or
+      // unrelated account can never be treated as our credential lineage.
+      const diskCredentials = readDockerClaudeOAuthCredentials(
+        launch.credentialsFilePath,
+      );
+      const currentProvider = getProviders().find(
+        (candidate) => candidate.id === providerId,
+      );
+      const currentCredentials = currentProvider
+        ? buildClaudeAiOauthPayload(providerToConfig(currentProvider))
+        : null;
+      if (
+        diskCredentials &&
+        currentCredentials &&
+        dockerOAuthCredentialsEqual(diskCredentials, currentCredentials)
+      ) {
+        launch.launchCredentials = diskCredentials;
+      }
+    }
+    return outcome;
+  } catch {
+    // Credential reconciliation is post-run best effort. It must never escape
+    // the EventEmitter close callback or prevent the completed turn settling.
+    return 'error';
+  }
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
@@ -2124,8 +2404,12 @@ export async function runContainerAgent(
     group.folder,
     sessionAgentId,
     input.agentProfile?.modelConfigId,
+    transientRetryProfileForInput(input.turnId),
   );
   const selectedProfileId = poolResult?.profileId ?? null;
+  const selectedProviderQuotaEpoch = selectedProfileId
+    ? captureProviderQuotaObservationEpoch(selectedProfileId)
+    : null;
   const resolvedProvider = poolResult?.resolved;
   const modelSelectionPinned = !!resolvePinnedModelConfigId(
     input.agentProfile?.modelConfigId,
@@ -2313,121 +2597,171 @@ export async function runContainerAgent(
         clearTimeout(timeout);
         timeout = setTimeout(killOnTimeout, timeoutMs);
       };
-      const handleOutput = onOutput
-        ? async (output: ContainerOutput): Promise<void> => {
-            if (
-              !output.providerFailure &&
-              output.inputTurnCompleted !== undefined
-            ) {
-              healthyInputTurnCompleted = output.inputTurnCompleted;
-            }
-            if (output.providerFailureRetrying) {
-              if (output.providerFailure && selectedProfileId) {
-                if (!providerFailureReported) {
-                  providerFailureReported = true;
-                  quarantineFromOutput(selectedProfileId, output);
-                  logger.warn(
-                    {
-                      group: group.name,
-                      containerName,
-                      providerId: selectedProfileId,
-                    },
-                    'Provider failure detected; agent runner is retrying the failed turn with fallback model',
-                  );
-                }
-              }
-              // This is host-control metadata, never a user-visible output.
-              return;
-            }
-            if (output.providerFailure && selectedProfileId) {
-              if (!providerFailureReported) {
-                providerFailureReported = true;
-                quarantineFromOutput(selectedProfileId, output);
-                logger.warn(
-                  {
-                    group: group.name,
-                    containerName,
-                    providerId: selectedProfileId,
-                    result: output.result,
-                  },
-                  'Provider failure detected from streamed output, stopping container',
-                );
-              }
-            }
-            if (
-              output.providerFailureMaintenance &&
-              healthyInputTurnCompleted
-            ) {
-              providerFailureMaintenance = true;
+      const reconcileDockerOAuth = (
+        phase: 'output' | 'exit',
+      ): DockerOAuthReconcileOutcome | 'error' | null => {
+        const outcome = reconcileDockerOAuthAfterExit(
+          selectedProfileId,
+          preparedLaunch.dockerOauthLaunch,
+        );
+        if (outcome === 'updated') {
+          logger.info(
+            { group: group.name, providerId: selectedProfileId, phase },
+            'Persisted Docker SDK-refreshed OAuth credentials',
+          );
+        } else if (outcome === 'invalid' || outcome === 'not_newer') {
+          logger.warn(
+            {
+              group: group.name,
+              providerId: selectedProfileId,
+              outcome,
+              phase,
+            },
+            'Ignored invalid Docker OAuth credential rewrite',
+          );
+        } else if (outcome === 'stale') {
+          logger.info(
+            { group: group.name, providerId: selectedProfileId, phase },
+            'Ignored Docker OAuth refresh after Provider credentials changed',
+          );
+        } else if (outcome === 'error') {
+          logger.warn(
+            { group: group.name, providerId: selectedProfileId, phase },
+            'Docker OAuth credential reconciliation failed',
+          );
+        }
+        return outcome;
+      };
+      const handleOutput = async (output: ContainerOutput): Promise<void> => {
+        if (
+          output.providerQuotaObservation ||
+          output.inputTurnCompleted === true ||
+          output.status === 'success' ||
+          output.status === 'error'
+        ) {
+          reconcileDockerOAuth('output');
+        }
+        if (
+          consumeProviderQuotaControlOutput(
+            selectedProfileId,
+            output,
+            selectedProviderQuotaEpoch,
+          )
+        ) {
+          // Let the caller refresh its warm-runner activity clock, but keep
+          // the frame on the control path (callers return before projection).
+          if (onOutput) await onOutput(output);
+          resetTimeout();
+          return;
+        }
+        if (!onOutput) return;
+        if (
+          !output.providerFailure &&
+          output.inputTurnCompleted !== undefined
+        ) {
+          healthyInputTurnCompleted = output.inputTurnCompleted;
+        }
+        if (output.providerFailureRetrying) {
+          if (output.providerFailure && selectedProfileId) {
+            if (!providerFailureReported) {
+              providerFailureReported = true;
+              quarantineFromOutput(selectedProfileId, output);
               logger.warn(
                 {
                   group: group.name,
                   containerName,
                   providerId: selectedProfileId,
                 },
-                'Provider failed during internal maintenance; quarantining without user projection or replay',
+                'Provider failure detected; agent runner is retrying the failed turn with fallback model',
               );
-              exec(`docker stop ${containerName}`, (err) => {
-                if (err) {
-                  logger.warn(
-                    { group: group.name, containerName, err },
-                    'Failed to stop container after maintenance provider failure',
-                  );
-                  container.kill('SIGTERM');
-                }
-              });
-              return;
-            }
-            if (output.providerFailureMaintenance) {
-              logger.warn(
-                {
-                  group: group.name,
-                  containerName,
-                  providerId: selectedProfileId,
-                },
-                'Maintenance query failed before durable input completion; treating as replayable provider failure',
-              );
-            }
-            if (output.providerFailure) {
-              const terminal = applyProviderFailureDisposition(
-                output,
-                selectedProfileId,
-                !modelSelectionPinned,
-              );
-              providerFailureTerminal = terminal;
-              logger.warn(
-                {
-                  group: group.name,
-                  containerName,
-                  providerId: selectedProfileId,
-                  terminal,
-                },
-                terminal
-                  ? 'Provider pool exhausted; surfacing terminal failure'
-                  : 'Provider quarantined; preserving input for failover replay',
-              );
-            }
-            // Quarantine and classify before awaiting any IM/card projection so
-            // concurrent sessions cannot keep selecting a provider that just
-            // returned an account-level failure.
-            await onOutput(output);
-            // The foreground projection resets its idle-close timer during
-            // onOutput. Reset the outer watchdog afterwards so graceful idle
-            // reclamation always wins, even when provider delivery was slow.
-            resetTimeout();
-            if (output.providerFailure) {
-              exec(`docker stop ${containerName}`, (err) => {
-                if (err) {
-                  logger.warn(
-                    { group: group.name, containerName, err },
-                    'Failed to stop container after provider failure',
-                  );
-                  container.kill('SIGTERM');
-                }
-              });
             }
           }
-        : undefined;
+          // This is host-control metadata, never a user-visible output.
+          return;
+        }
+        if (output.providerFailure && selectedProfileId) {
+          if (!providerFailureReported) {
+            providerFailureReported = true;
+            quarantineFromOutput(selectedProfileId, output);
+            logger.warn(
+              {
+                group: group.name,
+                containerName,
+                providerId: selectedProfileId,
+                result: output.result,
+              },
+              'Provider failure detected from streamed output, stopping container',
+            );
+          }
+        }
+        if (output.providerFailureMaintenance && healthyInputTurnCompleted) {
+          providerFailureMaintenance = true;
+          logger.warn(
+            {
+              group: group.name,
+              containerName,
+              providerId: selectedProfileId,
+            },
+            'Provider failed during internal maintenance; quarantining without user projection or replay',
+          );
+          exec(`docker stop ${containerName}`, (err) => {
+            if (err) {
+              logger.warn(
+                { group: group.name, containerName, err },
+                'Failed to stop container after maintenance provider failure',
+              );
+              container.kill('SIGTERM');
+            }
+          });
+          return;
+        }
+        if (output.providerFailureMaintenance) {
+          logger.warn(
+            {
+              group: group.name,
+              containerName,
+              providerId: selectedProfileId,
+            },
+            'Maintenance query failed before durable input completion; treating as replayable provider failure',
+          );
+        }
+        if (output.providerFailure) {
+          const terminal = applyProviderFailureDisposition(
+            output,
+            selectedProfileId,
+            !modelSelectionPinned,
+          );
+          providerFailureTerminal = terminal;
+          logger.warn(
+            {
+              group: group.name,
+              containerName,
+              providerId: selectedProfileId,
+              terminal,
+            },
+            providerFailureDispositionLogMessage(output, terminal),
+          );
+        }
+        // Quarantine and classify before awaiting any IM/card projection so
+        // concurrent sessions cannot keep selecting a provider that just
+        // returned an account-level failure.
+        await onOutput(output);
+        // The foreground projection resets its idle-close timer during
+        // onOutput. Reset the outer watchdog afterwards so graceful idle
+        // reclamation always wins, even when provider delivery was slow.
+        resetTimeout();
+        if (output.providerFailure) {
+          exec(`docker stop ${containerName}`, (err) => {
+            if (err) {
+              logger.warn(
+                { group: group.name, containerName, err },
+                'Failed to stop container after provider failure',
+              );
+              container.kill('SIGTERM');
+            }
+          });
+        }
+      };
 
       // Attach stdout/stderr handlers using shared parser
       attachStdoutHandler(container.stdout, stdoutState, {
@@ -2443,6 +2777,7 @@ export async function runContainerAgent(
       container.on('close', (code, signal) => {
         clearTimeout(timeout);
         const duration = Date.now() - startTime;
+        reconcileDockerOAuth('exit');
 
         const closeCtx: CloseHandlerContext = {
           groupName: group.name,
@@ -2659,6 +2994,297 @@ export function killProcessTree(
     }
   }
   return false;
+}
+
+export interface HostProcessSnapshot {
+  pid: number;
+  ppid: number;
+  pgid: number;
+  startIdentity: string;
+  executable: string;
+  argv: string[];
+}
+
+interface HostBrowserCleanupDeps {
+  snapshot?: (processGroupId: number) => HostProcessSnapshot[];
+  signal?: (pid: number, signal: NodeJS.Signals) => void;
+  schedule?: (callback: () => void, delayMs: number) => { unref?: () => void };
+}
+
+function splitPsArgs(value: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  for (const char of value.trim()) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === '\\' && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      else current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) tokens.push(current);
+      current = '';
+      continue;
+    }
+    current += char;
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function readHostProcessLaunch(pid: number): {
+  executable: string;
+  argv: string[];
+} {
+  try {
+    const executable = fs.readlinkSync(`/proc/${pid}/exe`);
+    const argv = fs
+      .readFileSync(`/proc/${pid}/cmdline`)
+      .toString('utf8')
+      .split('\0')
+      .filter(Boolean);
+    return { executable, argv };
+  } catch {
+    // macOS has no /proc. Query `comm` separately so paths containing spaces
+    // (notably Google Chrome.app) remain unambiguous.
+  }
+  const executable = execFileSync('ps', ['-p', String(pid), '-o', 'comm='], {
+    encoding: 'utf8',
+  }).trim();
+  const argsText = execFileSync('ps', ['-p', String(pid), '-o', 'args='], {
+    encoding: 'utf8',
+  }).trim();
+  const tail = argsText.startsWith(executable)
+    ? argsText.slice(executable.length).trim()
+    : argsText;
+  return { executable, argv: [executable, ...splitPsArgs(tail)] };
+}
+
+function hostProcessGroupSnapshot(
+  processGroupId: number,
+): HostProcessSnapshot[] {
+  if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) return [];
+  try {
+    const output = execFileSync(
+      'ps',
+      ['-ax', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'lstart='],
+      { encoding: 'utf8' },
+    );
+    return output
+      .split('\n')
+      .map((line) => line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/))
+      .filter((match): match is RegExpMatchArray => !!match)
+      .filter((match) => Number(match[3]) === processGroupId)
+      .flatMap((match) => {
+        try {
+          return [
+            {
+              pid: Number(match[1]),
+              ppid: Number(match[2]),
+              pgid: Number(match[3]),
+              startIdentity: match[4].trim(),
+              ...readHostProcessLaunch(Number(match[1])),
+            },
+          ];
+        } catch {
+          // Process exited between the group listing and identity reads.
+          return [];
+        }
+      });
+  } catch (err) {
+    logger.warn(
+      { processGroupId, err },
+      'Failed to inspect host process group for browser cleanup',
+    );
+    return [];
+  }
+}
+
+const MANAGED_BROWSER_EXECUTABLES = new Set([
+  'agent-browser',
+  'agent-browser.js',
+  'google chrome',
+  'chromium',
+  'chromium-browser',
+  'chrome',
+  'chrome_crashpad_handler',
+]);
+
+function normalizedExecutableName(value: string): string {
+  return path.basename(value).trim().toLowerCase();
+}
+
+function interpreterScript(argv: readonly string[]): string | undefined {
+  const executable = normalizedExecutableName(argv[0] ?? '');
+  const shell = new Set(['bash', 'sh', 'zsh', 'dash']);
+  const interpreter = new Set([
+    'node',
+    'nodejs',
+    'bun',
+    'deno',
+    'python',
+    'python3',
+  ]);
+  if (!shell.has(executable) && !interpreter.has(executable)) return undefined;
+  // Process listings flatten shell quoting, so once an interpreter option is
+  // present we cannot safely distinguish its operand from the real script.
+  // Fail closed instead of scanning later arguments and risking an unrelated
+  // background job. Managed browser CLIs are launched with the script as the
+  // immediate first argv operand.
+  const value = argv[1];
+  if (!value || value.startsWith('-')) return undefined;
+
+  // macOS `ps -o args=` also flattens an immediate script path such as
+  // `.../Google Chrome` into two tokens. Recover that one exact shape only
+  // when the unjoined prefix is not itself a real script, the joined path is
+  // real, and its basename is explicitly managed.
+  const next = argv[2];
+  if (next) {
+    const joined = `${value} ${next}`;
+    if (
+      !fs.existsSync(value) &&
+      MANAGED_BROWSER_EXECUTABLES.has(normalizedExecutableName(joined)) &&
+      fs.existsSync(joined)
+    ) {
+      return joined;
+    }
+  }
+  return value;
+}
+
+/** Match executable/script identity, never arbitrary command arguments. */
+export function isManagedHostBrowserProcess(
+  process: Pick<HostProcessSnapshot, 'executable' | 'argv'>,
+): boolean {
+  if (
+    MANAGED_BROWSER_EXECUTABLES.has(
+      normalizedExecutableName(process.executable),
+    )
+  ) {
+    return true;
+  }
+  const script = interpreterScript(process.argv);
+  if (!script) return false;
+  const scriptName = normalizedExecutableName(script);
+  if (MANAGED_BROWSER_EXECUTABLES.has(scriptName)) return true;
+  const normalized = script.replaceAll('\\', '/').toLowerCase();
+  return (
+    normalized.includes('/agent-browser/') &&
+    ['agent-browser.js', 'cli.js', 'index.js'].includes(scriptName)
+  );
+}
+
+function managedHostBrowserProcesses(
+  members: HostProcessSnapshot[],
+): HostProcessSnapshot[] {
+  const selected = new Set(
+    members
+      .filter((member) => isManagedHostBrowserProcess(member))
+      .map((member) => member.pid),
+  );
+  // Browser helpers do not all carry a recognizable executable name. Once a
+  // managed root is identified, include only its descendants; unrelated
+  // background jobs remain siblings and survive the runner's clean exit.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const member of members) {
+      if (!selected.has(member.pid) && selected.has(member.ppid)) {
+        selected.add(member.pid);
+        changed = true;
+      }
+    }
+  }
+  return members.filter((member) => selected.has(member.pid));
+}
+
+function processIdentity(process: HostProcessSnapshot): string {
+  return JSON.stringify([
+    process.pid,
+    process.pgid,
+    process.startIdentity,
+    process.executable,
+    process.argv,
+  ]);
+}
+
+function signalOriginalBrowserTargets(
+  originalTargets: ReadonlyMap<number, string>,
+  current: HostProcessSnapshot[],
+  signal: NodeJS.Signals,
+  sendSignal: (pid: number, signal: NodeJS.Signals) => void,
+): void {
+  for (const process of current) {
+    if (originalTargets.get(process.pid) !== processIdentity(process)) continue;
+    try {
+      sendSignal(process.pid, signal);
+    } catch {
+      // already gone
+    }
+  }
+}
+
+/**
+ * Reap only browser resources left by a successful host-mode turn.
+ *
+ * The runner owns a detached process group, but Agent-authored background
+ * shell jobs are allowed to outlive a turn. Killing the whole PGID here would
+ * destroy those jobs. Browser roots and their descendants receive a graceful
+ * TERM first; processes that are still the same PGID/command one second later
+ * receive KILL.
+ */
+export function cleanupHostBrowserResources(
+  processGroupId: number,
+  killDelayMs = 1_000,
+  deps: HostBrowserCleanupDeps = {},
+): number {
+  const snapshot = deps.snapshot ?? hostProcessGroupSnapshot;
+  const sendSignal =
+    deps.signal ?? ((pid, signal) => process.kill(pid, signal));
+  const schedule =
+    deps.schedule ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+  const targets = managedHostBrowserProcesses(snapshot(processGroupId));
+  if (targets.length === 0) return 0;
+  const originalTargets = new Map(
+    targets.map((target) => [target.pid, processIdentity(target)] as const),
+  );
+  // Re-read before TERM too: a short-lived browser PID can be reused between
+  // discovery and signalling. Exact start/launch identity must still match.
+  signalOriginalBrowserTargets(
+    originalTargets,
+    snapshot(processGroupId),
+    'SIGTERM',
+    sendSignal,
+  );
+  const killTimer = schedule(
+    () => {
+      // Never expand the delayed target set. A newly-launched browser or a
+      // reused PID belongs to a later lifecycle and must not be killed.
+      signalOriginalBrowserTargets(
+        originalTargets,
+        snapshot(processGroupId),
+        'SIGKILL',
+        sendSignal,
+      );
+    },
+    Math.max(0, killDelayMs),
+  );
+  killTimer.unref?.();
+  return targets.length;
 }
 
 /**
@@ -2894,8 +3520,12 @@ export async function runHostAgent(
     group.folder,
     sessionAgentId,
     input.agentProfile?.modelConfigId,
+    transientRetryProfileForInput(input.turnId),
   );
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
+  const hostProviderQuotaEpoch = hostSelectedProfileId
+    ? captureProviderQuotaObservationEpoch(hostSelectedProfileId)
+    : null;
   const hostModelSelectionPinned = !!resolvePinnedModelConfigId(
     input.agentProfile?.modelConfigId,
   );
@@ -3280,103 +3910,111 @@ export async function runHostAgent(
         clearTimeout(timeout);
         timeout = setTimeout(killOnTimeout, timeoutMs);
       };
-      const handleOutput = onOutput
-        ? async (output: ContainerOutput): Promise<void> => {
-            if (
-              !output.providerFailure &&
-              output.inputTurnCompleted !== undefined
-            ) {
-              hostHealthyInputTurnCompleted = output.inputTurnCompleted;
-            }
-            if (output.providerFailureRetrying) {
-              if (output.providerFailure && hostSelectedProfileId) {
-                if (!hostProviderFailureReported) {
-                  hostProviderFailureReported = true;
-                  quarantineFromOutput(hostSelectedProfileId, output);
-                  logger.warn(
-                    {
-                      group: group.name,
-                      processId,
-                      providerId: hostSelectedProfileId,
-                    },
-                    'Provider failure detected; agent runner is retrying the failed turn with fallback model',
-                  );
-                }
-              }
-              // This is host-control metadata, never a user-visible output.
-              return;
-            }
-            if (output.providerFailure && hostSelectedProfileId) {
-              if (!hostProviderFailureReported) {
-                hostProviderFailureReported = true;
-                quarantineFromOutput(hostSelectedProfileId, output);
-                logger.warn(
-                  {
-                    group: group.name,
-                    processId,
-                    providerId: hostSelectedProfileId,
-                    result: output.result,
-                  },
-                  'Provider failure detected from streamed output, stopping host agent',
-                );
-              }
-            }
-            if (
-              output.providerFailureMaintenance &&
-              hostHealthyInputTurnCompleted
-            ) {
-              hostProviderFailureMaintenance = true;
+      const handleOutput = async (output: ContainerOutput): Promise<void> => {
+        if (
+          consumeProviderQuotaControlOutput(
+            hostSelectedProfileId,
+            output,
+            hostProviderQuotaEpoch,
+          )
+        ) {
+          if (onOutput) await onOutput(output);
+          resetTimeout();
+          return;
+        }
+        if (!onOutput) return;
+        if (
+          !output.providerFailure &&
+          output.inputTurnCompleted !== undefined
+        ) {
+          hostHealthyInputTurnCompleted = output.inputTurnCompleted;
+        }
+        if (output.providerFailureRetrying) {
+          if (output.providerFailure && hostSelectedProfileId) {
+            if (!hostProviderFailureReported) {
+              hostProviderFailureReported = true;
+              quarantineFromOutput(hostSelectedProfileId, output);
               logger.warn(
                 {
                   group: group.name,
                   processId,
                   providerId: hostSelectedProfileId,
                 },
-                'Provider failed during internal maintenance; quarantining without user projection or replay',
+                'Provider failure detected; agent runner is retrying the failed turn with fallback model',
               );
-              killProcessTree(proc, 'SIGTERM');
-              return;
-            }
-            if (output.providerFailureMaintenance) {
-              logger.warn(
-                {
-                  group: group.name,
-                  processId,
-                  providerId: hostSelectedProfileId,
-                },
-                'Maintenance query failed before durable input completion; treating as replayable provider failure',
-              );
-            }
-            if (output.providerFailure) {
-              const terminal = applyProviderFailureDisposition(
-                output,
-                hostSelectedProfileId,
-                !hostModelSelectionPinned,
-              );
-              hostProviderFailureTerminal = terminal;
-              logger.warn(
-                {
-                  group: group.name,
-                  processId,
-                  providerId: hostSelectedProfileId,
-                  terminal,
-                },
-                terminal
-                  ? 'Provider pool exhausted; surfacing terminal failure'
-                  : 'Provider quarantined; preserving input for failover replay',
-              );
-            }
-            // Keep provider selection safe while the user-facing projection is
-            // awaiting a network ACK.
-            await onOutput(output);
-            // See the container path above: start the watchdog after the
-            // foreground projection has reset its graceful idle timer.
-            resetTimeout();
-            if (output.providerFailure) {
-              killProcessTree(proc, 'SIGTERM');
             }
           }
-        : undefined;
+          // This is host-control metadata, never a user-visible output.
+          return;
+        }
+        if (output.providerFailure && hostSelectedProfileId) {
+          if (!hostProviderFailureReported) {
+            hostProviderFailureReported = true;
+            quarantineFromOutput(hostSelectedProfileId, output);
+            logger.warn(
+              {
+                group: group.name,
+                processId,
+                providerId: hostSelectedProfileId,
+                result: output.result,
+              },
+              'Provider failure detected from streamed output, stopping host agent',
+            );
+          }
+        }
+        if (
+          output.providerFailureMaintenance &&
+          hostHealthyInputTurnCompleted
+        ) {
+          hostProviderFailureMaintenance = true;
+          logger.warn(
+            {
+              group: group.name,
+              processId,
+              providerId: hostSelectedProfileId,
+            },
+            'Provider failed during internal maintenance; quarantining without user projection or replay',
+          );
+          killProcessTree(proc, 'SIGTERM');
+          return;
+        }
+        if (output.providerFailureMaintenance) {
+          logger.warn(
+            {
+              group: group.name,
+              processId,
+              providerId: hostSelectedProfileId,
+            },
+            'Maintenance query failed before durable input completion; treating as replayable provider failure',
+          );
+        }
+        if (output.providerFailure) {
+          const terminal = applyProviderFailureDisposition(
+            output,
+            hostSelectedProfileId,
+            !hostModelSelectionPinned,
+          );
+          hostProviderFailureTerminal = terminal;
+          logger.warn(
+            {
+              group: group.name,
+              processId,
+              providerId: hostSelectedProfileId,
+              terminal,
+            },
+            providerFailureDispositionLogMessage(output, terminal),
+          );
+        }
+        // Keep provider selection safe while the user-facing projection is
+        // awaiting a network ACK.
+        await onOutput(output);
+        // See the container path above: start the watchdog after the
+        // foreground projection has reset its graceful idle timer.
+        resetTimeout();
+        if (output.providerFailure) {
+          killProcessTree(proc, 'SIGTERM');
+        }
+      };
 
       // 10. stdout/stderr 解析
       attachStdoutHandler(proc.stdout, stdoutState, {
@@ -3393,6 +4031,9 @@ export async function runHostAgent(
       proc.on('close', (code, signal) => {
         clearTimeout(timeout);
         if (killTimer) clearTimeout(killTimer);
+        // Reap browser daemons without killing unrelated Agent-authored
+        // background jobs that intentionally outlive this turn.
+        if (proc.pid) cleanupHostBrowserResources(proc.pid);
         const duration = Date.now() - startTime;
 
         const closeCtx: CloseHandlerContext = {
@@ -3535,6 +4176,16 @@ export async function runAgentWithModelFallback(
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
+  // Isolated scheduled tasks historically omitted turnId. Give the whole
+  // outer fallback loop one stable logical identity so the transient ledger
+  // can pin its authorized replay to the first attempted provider. Reuse the
+  // durable task occurrence when available; otherwise generate exactly once.
+  if (input.isScheduledTask && !input.turnId) {
+    input = {
+      ...input,
+      turnId: input.taskRunId?.trim() || randomUUID(),
+    };
+  }
   // A top-level Agent owns exactly one complete model configuration. Retrying
   // through other enabled configurations would violate that contract and can
   // send a Workspace to a different gateway or official subscription. An
@@ -3560,8 +4211,21 @@ export async function runAgentWithModelFallback(
     : Math.max(1, enabledProviders.length + fallbackOnlyCombinations);
   let lastOutput: ContainerOutput | undefined;
   let availabilityState = providerPool.getAvailabilityStateKey();
+  // A transient replay is not a distinct combination — it re-runs the same
+  // (account, tier) on purpose — so it must not consume the combination budget.
+  // Without this a single-account install computes maxAttempts = 1 and a
+  // scheduled task could never use the retry the disposition granted it, while
+  // adding the headroom up front would instead hand a pinned Agent a second
+  // attempt it must not get for an account failure. Granted only after an
+  // observed transient failure, and capped independently of the per-input
+  // ledger that is the real bound.
+  let transientReplayBudget = 0;
 
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < maxAttempts + transientReplayBudget;
+    attempt += 1
+  ) {
     let completedInputBeforeProviderFailure = false;
     let attemptedProviderId: string | null = null;
     const gatedOnOutput = onOutput
@@ -3613,6 +4277,24 @@ export async function runAgentWithModelFallback(
       };
     }
     if (
+      input.isScheduledTask &&
+      lastOutput.providerFailure &&
+      scheduledInputHasPhysicalSideEffect(input)
+    ) {
+      logger.warn(
+        { group: group.name, taskRunId: input.taskRunId },
+        'Scheduled input produced an acknowledged or uncertain physical side effect; suppressing whole-prompt provider replay',
+      );
+      return {
+        ...lastOutput,
+        status: 'success',
+        result: null,
+        providerFailure: false,
+        providerFailureTerminal: undefined,
+        inputTurnCompleted: true,
+      };
+    }
+    if (
       !input.isScheduledTask ||
       !lastOutput.providerFailure ||
       lastOutput.providerFailureTerminal === true
@@ -3621,8 +4303,23 @@ export async function runAgentWithModelFallback(
     }
 
     const nextAvailabilityState = providerPool.getAvailabilityStateKey();
+    // A transient failure deliberately leaves availability untouched, so the
+    // no-progress guard below would read "nothing changed" and stop — burning
+    // the replay budget the disposition just granted without ever using it.
+    // Reaching here already proves the failure was non-terminal, i.e. the
+    // bounded ledger allowed one more attempt, so the same-provider replay this
+    // guard normally prevents is exactly the intended behaviour here.
+    const replayableTransient =
+      resolveProviderFailureClass(lastOutput) === 'transient';
+    if (
+      replayableTransient &&
+      transientReplayBudget < DEFAULT_MAX_TRANSIENT_RETRIES
+    ) {
+      transientReplayBudget += 1;
+    }
     if (
       attemptedProviderId !== null &&
+      !replayableTransient &&
       nextAvailabilityState === availabilityState
     ) {
       logger.error(
@@ -3644,7 +4341,9 @@ export async function runAgentWithModelFallback(
         attempt: attempt + 1,
         maxAttempts,
       },
-      'Scheduled task provider failed; retrying the same prompt on another provider',
+      replayableTransient
+        ? 'Scheduled task hit a transient provider failure; replaying the same prompt on the same provider'
+        : 'Scheduled task provider failed; retrying the same prompt on another provider',
     );
   }
 

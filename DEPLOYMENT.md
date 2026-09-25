@@ -47,14 +47,16 @@ test -z "$(git status --porcelain)" || {
 export HAPPYCLAW_PREVIOUS_SHA="$(git rev-parse HEAD)"
 printf 'Rollback commit: %s\n' "$HAPPYCLAW_PREVIOUS_SHA"
 git fetch --prune origin \
-  "refs/heads/$HAPPYCLAW_DEPLOY_REF:refs/remotes/origin/$HAPPYCLAW_DEPLOY_REF"
+  "refs/heads/${HAPPYCLAW_DEPLOY_REF}:refs/remotes/origin/${HAPPYCLAW_DEPLOY_REF}"
 test "$(git rev-parse "origin/$HAPPYCLAW_DEPLOY_REF")" = "$HAPPYCLAW_EXPECTED_SHA"
 ```
 
 所有者已明确选择不保留部署备份。部署期间不得运行 `make backup`，不得创建 SQLite
 快照、完整运行数据归档或 `.env` 备份副本，除非所有者在未来明确撤销该策略。禁止运行
 `make reset-init`、`git clean`、`git reset --hard`，也不要用带 `--delete` 的 rsync 同步
-生产目录。
+生产目录。Mac mini 的现有 `.env` 必须原地配置
+`HAPPYCLAW_SKIP_MIGRATION_BACKUP=1`；它只关闭启动时的 schema 迁移快照，其他安装默认仍会
+在迁移前创建并校验快照。
 
 ## 3. 构建与切换
 
@@ -63,6 +65,13 @@ test "$(git rev-parse "origin/$HAPPYCLAW_DEPLOY_REF")" = "$HAPPYCLAW_EXPECTED_SH
 ```bash
 git switch --detach "$HAPPYCLAW_EXPECTED_SHA"
 test "$(git rev-parse HEAD)" = "$HAPPYCLAW_EXPECTED_SHA"
+
+if grep -q '^HAPPYCLAW_SKIP_MIGRATION_BACKUP=' .env 2>/dev/null; then
+  sed -i '' 's/^HAPPYCLAW_SKIP_MIGRATION_BACKUP=.*$/HAPPYCLAW_SKIP_MIGRATION_BACKUP=1/' .env
+else
+  printf '\nHAPPYCLAW_SKIP_MIGRATION_BACKUP=1\n' >> .env
+fi
+chmod 600 .env
 
 /bin/zsh -lic 'make install'
 /bin/zsh -lic 'npm run build:all'

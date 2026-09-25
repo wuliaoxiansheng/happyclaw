@@ -152,9 +152,18 @@ describe('Telegram HTML format fallback must not duplicate after timeout', () =>
       throw grammyTooManyRequests();
     });
 
-    await expect(
-      telegram.sendMessage('12345', 'hello **world**'),
-    ).rejects.toMatchObject({ error_code: 429 });
+    // 429 proves no message became visible, so it surfaces as a terminal
+    // definitive rejection instead of fencing the turn. No retryAt: nothing
+    // in production reclaims a retry_wait row.
+    const failure = await telegram
+      .sendMessage('12345', 'hello **world**')
+      .then(() => null)
+      .catch((err: unknown) => err);
+    expect(failure).toMatchObject({
+      name: 'DefinitiveChannelDeliveryError',
+      cause: { error_code: 429 },
+    });
+    expect((failure as { retryAt?: unknown }).retryAt).toBeUndefined();
     expect(telegramControls.sendMessage).toHaveBeenCalledTimes(1);
   });
 });
@@ -162,7 +171,15 @@ describe('Telegram HTML format fallback must not duplicate after timeout', () =>
 describe('DingTalk markdown format fallback must not duplicate after timeout', () => {
   let requestSpy: ReturnType<typeof vi.spyOn> | undefined;
   const groupSends: Array<{ msgKey?: string; msgParam?: string }> = [];
-  let groupFailure: 'timeout' | 'http503' = 'timeout';
+  let groupFailure:
+    | 'timeout'
+    | 'reset'
+    | 'http503'
+    | 'empty200'
+    | 'invalid200'
+    | 'unknown200'
+    | 'formatRejected'
+    | 'tailEmpty200' = 'timeout';
 
   function timedOutAfterSend(): Error {
     return Object.assign(new Error('connect ETIMEDOUT 203.0.113.10:443'), {
@@ -186,6 +203,7 @@ describe('DingTalk markdown format fallback must not duplicate after timeout', (
           write: (chunk: string) => boolean;
           end: () => void;
           destroy: () => void;
+          setTimeout: (ms: number, callback?: () => void) => typeof req;
           body: string;
         };
         req.body = '';
@@ -194,6 +212,7 @@ describe('DingTalk markdown format fallback must not duplicate after timeout', (
           return true;
         };
         req.destroy = () => undefined;
+        req.setTimeout = () => req;
         req.end = () => {
           queueMicrotask(() => {
             if (path.includes('gettoken')) {
@@ -226,13 +245,51 @@ describe('DingTalk markdown format fallback must not duplicate after timeout', (
                 req.emit('error', timedOutAfterSend());
                 return;
               }
+              if (groupFailure === 'reset') {
+                req.emit(
+                  'error',
+                  Object.assign(new Error('socket reset after request write'), {
+                    code: 'ECONNRESET',
+                  }),
+                );
+                return;
+              }
+              let responseBody: string;
+              let statusCode = 200;
+              if (groupFailure === 'empty200') {
+                responseBody = '';
+              } else if (groupFailure === 'invalid200') {
+                responseBody = '{broken';
+              } else if (groupFailure === 'unknown200') {
+                responseBody = '{}';
+              } else if (
+                groupFailure === 'formatRejected' &&
+                groupSends.length === 1
+              ) {
+                responseBody = JSON.stringify({
+                  code: 'InvalidParameter',
+                  message: 'sampleMarkdown msgParam format is invalid',
+                });
+              } else if (
+                groupFailure === 'tailEmpty200' &&
+                groupSends.length === 2
+              ) {
+                responseBody = '';
+              } else if (groupFailure === 'http503') {
+                statusCode = 503;
+                responseBody = '{"message":"internal error"}';
+              } else {
+                responseBody = JSON.stringify({
+                  processQueryKey: `ack-${groupSends.length}`,
+                });
+              }
               const res = new Readable({
                 read() {
-                  this.push(Buffer.from('{"message":"internal error"}'));
+                  if (responseBody) this.push(Buffer.from(responseBody));
                   this.push(null);
                 },
               }) as Readable & { statusCode: number };
-              res.statusCode = 503;
+              res.statusCode = statusCode;
               (callback as ((res: typeof res) => void) | undefined)?.(res);
               return;
             }
@@ -277,5 +334,66 @@ describe('DingTalk markdown format fallback must not duplicate after timeout', (
 
     expect(groupSends).toHaveLength(1);
     expect(groupSends[0]?.msgKey).toBe('sampleMarkdown');
+  });
+
+  test.each([
+    ['empty200', /empty response/],
+    ['invalid200', /invalid JSON/],
+    ['unknown200', /unrecognized success envelope/],
+    ['reset', /socket reset/],
+  ] as const)(
+    'does not plain-resend after an uncertain %s acknowledgement',
+    async (failure, expectedError) => {
+      groupFailure = failure;
+      const dingtalk = createDingTalkConnection({
+        clientId: 'ding-client',
+        clientSecret: 'ding-secret',
+      });
+
+      await expect(
+        dingtalk.sendMessage('dingtalk:group:cidXXXX', 'hello **world**'),
+      ).rejects.toThrow(expectedError);
+
+      expect(groupSends).toHaveLength(1);
+      expect(groupSends[0]?.msgKey).toBe('sampleMarkdown');
+    },
+  );
+
+  test('falls back once after an authoritative markdown format rejection', async () => {
+    groupFailure = 'formatRejected';
+    const dingtalk = createDingTalkConnection({
+      clientId: 'ding-client',
+      clientSecret: 'ding-secret',
+    });
+
+    await expect(
+      dingtalk.sendMessage('dingtalk:group:cidXXXX', 'hello **world**'),
+    ).resolves.toBeUndefined();
+
+    expect(groupSends.map((send) => send.msgKey)).toEqual([
+      'sampleMarkdown',
+      'sampleText',
+    ]);
+  });
+
+  test('an ACKed first chunk plus an unknown tail ACK is partial without plain resend', async () => {
+    groupFailure = 'tailEmpty200';
+    const dingtalk = createDingTalkConnection({
+      clientId: 'ding-client',
+      clientSecret: 'ding-secret',
+    });
+
+    await expect(
+      dingtalk.sendMessage('dingtalk:group:cidXXXX', 'x'.repeat(4500)),
+    ).rejects.toMatchObject({
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+      deliveredChunks: 1,
+      totalChunks: 2,
+    });
+
+    expect(groupSends.map((send) => send.msgKey)).toEqual([
+      'sampleMarkdown',
+      'sampleMarkdown',
+    ]);
   });
 });

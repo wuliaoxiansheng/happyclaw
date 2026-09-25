@@ -14,6 +14,8 @@ export const FEISHU_FORWARD_COMPANION_MAX_GAP_MS = 60_000;
  * requests.
  */
 export const FEISHU_RAPID_TOPIC_COMPANION_MAX_GAP_MS = 2_000;
+/** A directly-authored caption/reply that immediately follows an image root. */
+export const FEISHU_MEDIA_TOPIC_COMPANION_MAX_GAP_MS = 3_000;
 const FEISHU_FORWARD_FACT_TTL_MS = 60_000;
 const FEISHU_FORWARD_FACT_MAX_ENTRIES = 1_000;
 const FEISHU_FORWARD_LOOKUP_TIMEOUT_MS = 5_000;
@@ -32,6 +34,7 @@ export interface FeishuForwardCandidate {
 
 interface ForwardRootFact {
   kind: ChannelContentLink['kind'];
+  shape: 'merge_forward' | 'rapid_topic' | 'media_topic';
   messageId: string;
   senderOpenId: string;
   createTimeMs: number;
@@ -202,6 +205,16 @@ function rootContentLink(messageId: string): ChannelContentLink {
   };
 }
 
+function isMediaTopicRoot(candidate: FeishuForwardCandidate): boolean {
+  return (
+    candidate.chatType === 'group' &&
+    candidate.messageType === 'image' &&
+    Boolean(candidate.threadId) &&
+    !candidate.rootId &&
+    !candidate.parentId
+  );
+}
+
 function isRapidTopicRoot(candidate: FeishuForwardCandidate): boolean {
   return (
     candidate.chatType === 'group' &&
@@ -252,14 +265,20 @@ export class FeishuForwardBundleResolver {
   ): ChannelContentLink | undefined {
     const mergeForward = candidate.messageType === 'merge_forward';
     const rapidTopic = isRapidTopicRoot(candidate);
-    if (!mergeForward && !rapidTopic) return undefined;
+    const mediaTopic = isMediaTopicRoot(candidate);
+    if (!mergeForward && !rapidTopic && !mediaTopic) return undefined;
     if (
       candidate.senderOpenId &&
       Number.isFinite(candidate.createTimeMs) &&
       candidate.createTimeMs > 0
     ) {
       const fact: ForwardRootFact = {
-        kind: mergeForward ? 'forward_bundle' : 'rapid_topic_bundle',
+        kind: rapidTopic ? 'rapid_topic_bundle' : 'forward_bundle',
+        shape: mergeForward
+          ? 'merge_forward'
+          : rapidTopic
+            ? 'rapid_topic'
+            : 'media_topic',
         messageId: candidate.messageId,
         senderOpenId: candidate.senderOpenId,
         createTimeMs: candidate.createTimeMs,
@@ -274,7 +293,9 @@ export class FeishuForwardBundleResolver {
     // A plain topic root is only a provisional candidate. It must remain an
     // ordinary current request unless a provider-structured companion arrives
     // inside the tight compatibility window.
-    return mergeForward ? rootContentLink(candidate.messageId) : undefined;
+    return mergeForward || mediaTopic
+      ? rootContentLink(candidate.messageId)
+      : undefined;
   }
 
   private lookupRoot(messageId: string): Promise<ForwardRootFact | undefined> {
@@ -294,6 +315,12 @@ export class FeishuForwardBundleResolver {
         return { definitive: false, fact: undefined } as const;
       }
       const mergeForward = item.msg_type === 'merge_forward';
+      const mediaTopic =
+        item.msg_type === 'image' &&
+        Boolean(item.thread_id) &&
+        !item.root_id &&
+        !item.parent_id &&
+        (!item.chat_type || item.chat_type === 'group');
       const rapidTopic =
         item.msg_type === 'text' &&
         Boolean(item.thread_id) &&
@@ -302,7 +329,7 @@ export class FeishuForwardBundleResolver {
         (!item.chat_type || item.chat_type === 'group') &&
         typeof item.body?.content === 'string' &&
         hasAuthoredFeishuText('text', item.body.content);
-      if (!mergeForward && !rapidTopic) {
+      if (!mergeForward && !rapidTopic && !mediaTopic) {
         return { definitive: true, fact: undefined } as const;
       }
       const senderOpenId = item.sender?.id ?? item.sender?.sender_id?.open_id;
@@ -317,7 +344,12 @@ export class FeishuForwardBundleResolver {
       return {
         definitive: true,
         fact: {
-          kind: mergeForward ? 'forward_bundle' : 'rapid_topic_bundle',
+          kind: rapidTopic ? 'rapid_topic_bundle' : 'forward_bundle',
+          shape: mergeForward
+            ? 'merge_forward'
+            : rapidTopic
+              ? 'rapid_topic'
+              : 'media_topic',
           messageId: item.message_id || messageId,
           senderOpenId,
           createTimeMs,
@@ -376,7 +408,7 @@ export class FeishuForwardBundleResolver {
     const latest = this.facts.get(rootId)?.value;
     if (!fact && latest && latest !== lookup) fact = await latest;
     if (!fact || fact.senderOpenId !== candidate.senderOpenId) return undefined;
-    if (fact.kind === 'rapid_topic_bundle') {
+    if (fact.shape === 'rapid_topic') {
       if (
         candidate.messageType !== 'text' ||
         !isParagraphWrappedText(candidate.content) ||
@@ -394,11 +426,22 @@ export class FeishuForwardBundleResolver {
     ) {
       return undefined;
     }
+    if (
+      fact.shape === 'media_topic' &&
+      (candidate.chatType !== 'group' ||
+        !fact.threadId ||
+        !candidate.threadId ||
+        fact.threadId !== candidate.threadId)
+    ) {
+      return undefined;
+    }
     const gapMs = candidate.createTimeMs - fact.createTimeMs;
     const maxGapMs =
-      fact.kind === 'rapid_topic_bundle'
+      fact.shape === 'rapid_topic'
         ? FEISHU_RAPID_TOPIC_COMPANION_MAX_GAP_MS
-        : FEISHU_FORWARD_COMPANION_MAX_GAP_MS;
+        : fact.shape === 'media_topic'
+          ? FEISHU_MEDIA_TOPIC_COMPANION_MAX_GAP_MS
+          : FEISHU_FORWARD_COMPANION_MAX_GAP_MS;
     if (gapMs < 0 || gapMs > maxGapMs) {
       return undefined;
     }

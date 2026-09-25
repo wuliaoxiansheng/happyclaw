@@ -10,6 +10,12 @@ import {
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { settleTaskNotificationDeliveries } from '../src/task-notification.js';
+import {
+  ImDeliveryPhaseError,
+  preAcceptImDeliveryError,
+  retryUnscopedImSend,
+} from '../src/im-send-retry-policy.js';
 
 const tmpDir = fs.mkdtempSync(
   path.join(os.tmpdir(), 'task-scheduler-contract-'),
@@ -29,9 +35,13 @@ vi.mock(import('../src/config.js'), async (importOriginal) => {
   };
 });
 
-vi.mock('../src/logger.js', () => ({
-  logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+const loggerMock = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
 }));
+vi.mock('../src/logger.js', () => ({ logger: loggerMock }));
 
 const { runContainerAgentMock, runHostAgentMock, runScriptMock } = vi.hoisted(
   () => ({
@@ -100,6 +110,7 @@ const { runContainerAgentMock, runHostAgentMock, runScriptMock } = vi.hoisted(
       stdout: 'script result',
       stderr: '',
       exitCode: 0,
+      signal: null,
       timedOut: false,
       aborted: false,
       durationMs: 10,
@@ -813,6 +824,55 @@ describe('scheduled task workspace/session contract', () => {
       notification_status: 'success',
     });
     expect(runContainerAgentMock).toHaveBeenCalledOnce();
+  });
+
+  test('treats Provider quota control frames as activity-only scheduler output', async () => {
+    const taskId = createTask({ id: 'task-provider-quota-control-frame' });
+    const groups = {
+      [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+    };
+    runContainerAgentMock.mockImplementationOnce(
+      async (_group, input, onProcess, onOutput) => {
+        onProcess?.({} as never, `container-${input.taskRunId}`, null);
+        await onOutput?.({
+          status: 'stream',
+          result: 'must-not-project',
+          streamEvent: { type: 'text', text: 'must-not-broadcast' },
+          providerQuotaObservation: {
+            source: 'sdk_rate_limit_event',
+            observedAt: Date.now(),
+            status: 'allowed_warning',
+            utilization: 0.75,
+          },
+        });
+        return {
+          status: 'success',
+          result: 'task result after quota control',
+          inputTurnCompleted: true,
+        };
+      },
+    );
+    const { deps, waitForRun } = makeDeps(groups);
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await waitForRun();
+
+    expect(trigger.success).toBe(true);
+    expect(deps.broadcastStreamEvent).not.toHaveBeenCalled();
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'success',
+      result: 'task result after quota control',
+    });
+    expect(deps.storeResultAndNotify).toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringContaining('task result after quota control'),
+      expect.any(Object),
+    );
+    expect(deps.storeResultAndNotify).not.toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringContaining('must-not-project'),
+      expect.any(Object),
+    );
   });
 
   test('persists and retries a failed canonical workspace result without rerunning isolated Agent work', async () => {
@@ -2264,6 +2324,84 @@ describe('scheduled task workspace/session contract', () => {
     });
   });
 
+  test('accepted-timeout source receipt stays uncertain and is never resent', async () => {
+    const ownerId = 'script-source-accepted-timeout-owner';
+    const sourceJid = 'feishu:script-source-accepted-timeout';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: ownerId,
+      username: ownerId,
+      password_hash: 'hash',
+      display_name: ownerId,
+      role: 'admin',
+      status: 'active',
+      must_change_password: false,
+      created_at: now,
+      updated_at: now,
+    });
+    const scriptGroup = {
+      ...db.getRegisteredGroup(GROUP_JID)!,
+      jid: sourceJid,
+      created_by: ownerId,
+      executionMode: 'host' as const,
+    };
+    db.setRegisteredGroup(sourceJid, scriptGroup);
+    const taskId = createTask({
+      id: 'script-source-accepted-timeout',
+      execution_type: 'script',
+      execution_mode: 'host',
+      script_command: 'printf ok',
+      created_by: ownerId,
+      chat_jid: sourceJid,
+    });
+    const { deps, waitForRun } = makeDeps({ [sourceJid]: scriptGroup });
+    deps.sendMessage.mockRejectedValue(
+      new ImDeliveryPhaseError(
+        'uncertain',
+        'provider accepted but acknowledgement timed out',
+      ),
+    );
+    deps.storeResultAndNotify.mockResolvedValue({
+      status: 'skipped',
+      summary: {
+        attempted: 0,
+        succeeded: 0,
+        failed: 0,
+        failed_channels: [],
+      },
+    });
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await waitForRun();
+    await vi.waitFor(() => {
+      expect(db.getTaskRunById(trigger.runId!)?.status).not.toBe('running');
+    });
+
+    expect(deps.sendMessage).toHaveBeenCalledOnce();
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'success',
+      notification_status: 'uncertain',
+      notification_summary: {
+        uncertain: 1,
+        uncertain_channels: [sourceJid],
+      },
+    });
+    expect(
+      (
+        db.getTaskRunById(trigger.runId!) as unknown as {
+          notification_payload: string | null;
+        }
+      ).notification_payload,
+    ).toBeNull();
+    expect(
+      db.claimTaskRunNotificationById(
+        trigger.runId!,
+        'must-not-resend-accepted-timeout',
+        60_000,
+      ),
+    ).toBeUndefined();
+  });
+
   test('an owner-revoked script abort is recorded as failed and never sends a success notification', async () => {
     const ownerId = 'revoked-running-script-owner';
     const sourceJid = 'web:revoked-running-script';
@@ -2298,6 +2436,7 @@ describe('scheduled task workspace/session contract', () => {
       stdout: '',
       stderr: '',
       exitCode: null,
+      signal: 'SIGKILL',
       timedOut: false,
       aborted: true,
       durationMs: 25,
@@ -2322,6 +2461,87 @@ describe('scheduled task workspace/session contract', () => {
     expect(deps.sendMessage).not.toHaveBeenCalled();
     expect(deps.storeResultAndNotify).not.toHaveBeenCalled();
   });
+
+  test.each([
+    { name: 'without stderr', stderr: '', error: '脚本被信号终止: SIGKILL' },
+    {
+      name: 'with stderr',
+      stderr: 'worker: out of memory\n',
+      error: '脚本被信号终止: SIGKILL\nworker: out of memory',
+    },
+  ])(
+    'external SIGKILL / close(null, signal) script death $name is failed, not SUCCESS',
+    async ({ name, stderr, error }) => {
+      const suffix = name.replace(/\s+/g, '-');
+      const ownerId = `sigkill-script-owner-${suffix}`;
+      const sourceJid = `web:sigkill-script-${suffix}`;
+      const now = new Date().toISOString();
+      db.createUser({
+        id: ownerId,
+        username: ownerId,
+        password_hash: 'hash',
+        display_name: ownerId,
+        role: 'admin',
+        status: 'active',
+        must_change_password: false,
+        created_at: now,
+        updated_at: now,
+      });
+      const scriptGroup = {
+        ...db.getRegisteredGroup(GROUP_JID)!,
+        jid: sourceJid,
+        created_by: ownerId,
+        executionMode: 'host' as const,
+      };
+      db.setRegisteredGroup(sourceJid, scriptGroup);
+      const taskId = createTask({
+        id: `external-sigkill-script-${suffix}`,
+        execution_type: 'script',
+        execution_mode: 'host',
+        script_command: 'sleep 60',
+        created_by: ownerId,
+        chat_jid: sourceJid,
+      });
+      // Live runScript close(null, 'SIGKILL') shape — aborted/timedOut false.
+      runScriptMock.mockResolvedValueOnce({
+        stdout: 'partial before death',
+        stderr,
+        exitCode: null,
+        signal: 'SIGKILL',
+        timedOut: false,
+        aborted: false,
+        durationMs: 40,
+      });
+      loggerMock.info.mockClear();
+      const { deps, waitForRun } = makeDeps({ [sourceJid]: scriptGroup });
+
+      const trigger = triggerTaskNow(taskId, deps);
+      await waitForRun();
+      await vi.waitFor(() => {
+        expect(db.getTaskRunById(trigger.runId!)?.status).not.toBe('running');
+      });
+
+      // The signal leads even when stderr has output of its own.
+      expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+        status: 'failed',
+        error,
+      });
+      expect(db.getTaskRunLogs(taskId, 1)[0]).toMatchObject({
+        status: 'error',
+        error,
+        result: 'partial before death',
+      });
+      // Failure notify may include partial stdout, but must not be a bare success.
+      expect(deps.sendMessage).toHaveBeenCalled();
+      const sent = String(deps.sendMessage.mock.calls[0]?.[1] ?? '');
+      expect(sent).toContain('执行失败');
+      expect(sent).toContain('SIGKILL');
+      expect(loggerMock.info).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId, exitCode: null, signal: 'SIGKILL' }),
+        'Script task completed',
+      );
+    },
+  );
 
   test('persists a strict source failure before finish and fallback success consumes only that retry item', async () => {
     const ownerId = 'script-source-crash-window-owner';
@@ -2594,6 +2814,180 @@ describe('scheduled task workspace/session contract', () => {
       summary: { failed_channels: ['web:notification-retry-source'] },
     });
     expect(result.retryPayload).toEqual(payload);
+  });
+
+  test('persisted retry worker never requeues an uncertain provider outcome', async () => {
+    const payload: db.TaskRunNotificationPayload = {
+      kind: 'im_message',
+      targetJid: 'feishu:uncertain',
+      text: 'scheduled output',
+      localImagePaths: [],
+    };
+    const result = await deliverPersistedNotificationPayload(payload, {
+      retryTaskNotification: vi.fn(async () => ({
+        status: 'uncertain' as const,
+        summary: {
+          attempted: 1,
+          succeeded: 0,
+          failed: 1,
+          failed_channels: ['feishu'],
+          uncertain: 1,
+          uncertain_channels: ['feishu'],
+        },
+        error: 'provider acceptance is unknown',
+      })),
+      sendMessage: vi.fn(),
+    } as never);
+
+    expect(result.receipt.status).toBe('uncertain');
+    expect(result.retryPayload).toBeUndefined();
+  });
+
+  test.each(['im_image', 'im_file'] as const)(
+    '%s accepted-timeout removes durable retry work after one physical attempt',
+    async (kind) => {
+      const taskId = createTask({ id: `media-accepted-timeout-${kind}` });
+      const task = db.getTaskById(taskId)!;
+      const created = db.createTaskRun({ task, triggerType: 'manual' });
+      const execution = db.claimNextTaskRun(
+        `media-accepted-timeout-executor-${kind}`,
+        60_000,
+      )!;
+      expect(
+        db.completeTaskRun(
+          execution.id,
+          execution.lease_owner,
+          execution.lease_token,
+          { status: 'success', notificationStatus: 'pending' },
+        ),
+      ).toBe(true);
+
+      let sends = 0;
+      const transport = await retryUnscopedImSend(async () => {
+        sends += 1;
+        throw Object.assign(new Error('provider accepted; ACK timed out'), {
+          code: 'ETIMEDOUT',
+        });
+      });
+      const payload: db.TaskRunAtomicNotificationPayload =
+        kind === 'im_image'
+          ? {
+              kind,
+              targetJid: 'feishu:media-timeout',
+              workspaceFolder: GROUP_FOLDER,
+              filePath: 'same-artifact.png',
+              mimeType: 'image/png',
+              fileName: 'same-artifact.png',
+            }
+          : {
+              kind,
+              targetJid: 'feishu:media-timeout',
+              workspaceFolder: GROUP_FOLDER,
+              filePath: 'same-artifact.bin',
+              fileName: 'same-artifact.bin',
+            };
+      const initial = await settleTaskNotificationDeliveries([
+        {
+          channel: 'feishu',
+          payload,
+          failure: {
+            error: transport.error,
+            outcome:
+              transport.outcome === 'delivered' ? undefined : transport.outcome,
+          },
+          deliver: async () => transport.ok,
+        },
+      ]);
+
+      expect(sends).toBe(1);
+      expect(initial.receipt.status).toBe('uncertain');
+      expect(initial.retryPayload).toBeUndefined();
+      expect(
+        db.recordTaskRunNotificationReceipt(
+          created.run.id,
+          initial.receipt,
+          initial.retryPayload,
+        ),
+      ).toBe(true);
+      expect(
+        db.claimTaskRunNotificationById(
+          created.run.id,
+          `must-not-resend-${kind}`,
+          60_000,
+        ),
+      ).toBeUndefined();
+      expect(db.getTaskRunById(created.run.id)).toMatchObject({
+        notification_status: 'uncertain',
+        notification_payload: null,
+      });
+    },
+  );
+
+  test('typed pre-send failure survives the DB scheduler retry chain', async () => {
+    const taskId = createTask({ id: 'typed-pre-send-retry-chain' });
+    const task = db.getTaskById(taskId)!;
+    const created = db.createTaskRun({ task, triggerType: 'manual' });
+    const execution = db.claimNextTaskRun('typed-pre-send-executor', 60_000)!;
+    expect(
+      db.completeTaskRun(
+        execution.id,
+        execution.lease_owner,
+        execution.lease_token,
+        { status: 'success', notificationStatus: 'pending' },
+      ),
+    ).toBe(true);
+    const payload: db.TaskRunNotificationPayload = {
+      kind: 'im_message',
+      targetJid: 'feishu:missing-binding',
+      text: 'scheduled output',
+      localImagePaths: [],
+    };
+    const error = preAcceptImDeliveryError('No connected binding');
+    const initial = await settleTaskNotificationDeliveries([
+      {
+        channel: 'feishu',
+        payload,
+        failure: { error, outcome: error.deliveryPhase },
+        deliver: async () => false,
+      },
+    ]);
+    expect(initial.receipt.status).toBe('failed');
+    expect(initial.retryPayload).toEqual(payload);
+    expect(
+      db.recordTaskRunNotificationReceipt(
+        created.run.id,
+        initial.receipt,
+        initial.retryPayload,
+      ),
+    ).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
+    const claim = db.claimTaskRunNotificationById(
+      created.run.id,
+      'typed-pre-send-notifier',
+      60_000,
+    )!;
+    const retryTaskNotification = vi.fn(async () => ({
+      status: 'success' as const,
+      summary: {
+        attempted: 1,
+        succeeded: 1,
+        failed: 0,
+        failed_channels: [],
+      },
+    }));
+    expect(
+      await processClaimedTaskRunNotification(
+        claim,
+        { retryTaskNotification, sendMessage: vi.fn() } as never,
+        60_000,
+      ),
+    ).toBe(true);
+    expect(retryTaskNotification).toHaveBeenCalledWith(payload);
+    expect(db.getTaskRunById(created.run.id)).toMatchObject({
+      notification_status: 'success',
+      notification_payload: null,
+    });
   });
 
   test('persists unresolved explicit channel work until a binding can be resolved', async () => {

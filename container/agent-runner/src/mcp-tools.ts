@@ -20,6 +20,14 @@ import {
   type ChannelTurnContext,
 } from './types.js';
 import { signWorkspaceMemoryMutation } from './workspace-memory-auth.js';
+import {
+  PROACTIVE_FINAL_DELIVERED_SENTINEL,
+  proactiveFinalWasDeliveredForInput,
+} from './proactive-turn-protocol.js';
+import {
+  captureWorkspaceSnapshot,
+  formatFreshWindowHandoff,
+} from './fresh-window.js';
 
 /** Context required by MCP tools. Passed at construction time. */
 export interface McpContext {
@@ -46,6 +54,10 @@ export interface McpContext {
    * Cold starts use the triggering message id; IPC turns use the host-issued
    * delivery id from their receipt. */
   currentInputTurnId?: string | null;
+  /** Exact Proactive input whose final native utterance received a physical
+   * Host ACK. This is a per-runner latch used to seal the turn and suppress a
+   * second final if an older CLI injects a no-visible-output companion. */
+  proactiveFinalDeliveredInputTurnId?: string | null;
   /** Current provider session id, used only as server-side provenance. */
   currentSessionId?: string | null;
   /** Runner-private HMAC material. Never expose through a tool schema/result. */
@@ -90,7 +102,7 @@ function writeIpcFile(dir: string, data: object): string {
  * Fixes TOCTOU by directly attempting readFileSync and catching ENOENT.
  * Returns the parsed JSON result, or throws on timeout.
  */
-async function pollIpcResult(
+export async function pollIpcResult(
   dir: string,
   data: Record<string, unknown> & { requestId: string },
   resultFilePrefix: string,
@@ -106,18 +118,37 @@ async function pollIpcResult(
   const pollInterval = 500;
   const deadline = Date.now() + timeoutMs;
 
-  while (Date.now() < deadline) {
+  const readResult = (): Record<string, unknown> | undefined => {
     try {
       const raw = fs.readFileSync(resultFilePath, 'utf-8');
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
       fs.unlinkSync(resultFilePath);
-      return JSON.parse(raw) as Record<string, unknown>;
+      return parsed;
     } catch (err) {
       // File not ready yet — only swallow ENOENT
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      return undefined;
     }
-    await new Promise((resolve) => setTimeout(resolve, pollInterval));
+  };
+
+  while (Date.now() < deadline) {
+    const result = readResult();
+    if (result) return result;
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(pollInterval, remainingMs)),
+    );
   }
-  throw new Error(`Timeout waiting for IPC result (${timeoutMs / 1000}s)`);
+
+  // A Host result can land during the final sleep (especially when its own
+  // fallback poll period equals this timeout). Always perform one deadline
+  // read before declaring the request unavailable.
+  const finalResult = readResult();
+  if (finalResult) return finalResult;
+  throw new Error(
+    `IPC result timeout: requestId=${data.requestId} type=${String(data.type ?? 'unknown')} action=${String(data.action ?? 'unknown')} timeoutMs=${timeoutMs} requestDir=${dir} resultDir=${resultDir} expected=${resultFileName}`,
+  );
 }
 
 function newRequestId(): string {
@@ -350,7 +381,7 @@ export async function acknowledgeHappyClawOwnerProfileFirstWake(
 
 export async function fetchHappyClawOwnerProfileTurn(
   ctx: McpContext,
-  timeoutMs: number = 5_000,
+  timeoutMs: number = 8_000,
   inputTurnId: string | null | undefined = ctx.currentInputTurnId,
 ): Promise<HappyClawOwnerProfileTurnResult | null> {
   if (!ctx.ownerProfileEnabled || !inputTurnId) return null;
@@ -409,10 +440,13 @@ export async function fetchWorkspaceMemorySnapshot(
         limit: Math.min(Math.max(options.limit ?? 8, 1), 20),
         maxChars: Math.min(Math.max(options.maxChars ?? 6000, 500), 12_000),
       },
-      options.timeoutMs ?? 5_000,
+      options.timeoutMs ?? 8_000,
     );
     return parseWorkspaceMemorySnapshot(result.snapshot);
-  } catch {
+  } catch (err) {
+    console.error(
+      `[agent-runner:warn] Workspace memory snapshot unavailable: ${err instanceof Error ? err.message : String(err)}`,
+    );
     return null;
   }
 }
@@ -770,6 +804,18 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
           : ctx.interactionMode === 'proactive'
             ? (args.delivery_role ?? 'progress')
             : (args.delivery_role ?? 'final');
+        if (
+          usesProactiveInteractiveContract &&
+          deliveryRole === 'final' &&
+          proactiveFinalWasDeliveredForInput(
+            ctx.proactiveFinalDeliveredInputTurnId,
+            ctx.currentInputTurnId,
+          )
+        ) {
+          throw new Error(
+            'This input turn is already sealed by a delivered final message; a second final was rejected.',
+          );
+        }
         const data = buildSendMessageData(ctx, {
           type: 'message',
           text: args.text,
@@ -793,6 +839,14 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
               : 'Message delivery failed.',
           );
         }
+        if (
+          usesProactiveInteractiveContract &&
+          deliveryRole === 'final' &&
+          ctx.currentInputTurnId?.trim()
+        ) {
+          ctx.proactiveFinalDeliveredInputTurnId =
+            ctx.currentInputTurnId.trim();
+        }
         const disposition =
           typeof result.disposition === 'string'
             ? result.disposition
@@ -806,7 +860,7 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
                 ? deliveryRole === 'progress'
                   ? 'Progress message delivered. This does not complete the user-visible answer. Continue the work, then call send_message(delivery_role=final) with the last substantive result before ending. Do not put a conclusion, completion phrase, or closing message only in SDK final text.'
                   : deliveryRole === 'final'
-                    ? 'Final message delivered. End the turn now without any user-facing SDK final text. Do not repeat, summarize, acknowledge, or append a closing phrase.'
+                    ? `Final message delivered. End the turn now by returning exactly ${PROACTIVE_FINAL_DELIVERED_SENTINEL} as the non-user-visible SDK control text. Do not repeat, summarize, acknowledge, or append anything else.`
                     : 'Separate message delivered. Continue the work; if this turn needs a final answer, call send_message(delivery_role=final) before ending.'
                 : 'Message sent separately.';
         return {
@@ -2649,6 +2703,93 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
               isError: true,
             };
           }
+        },
+      ),
+    );
+  }
+
+  // Optional zero-summary window switch. Does not replace SDK auto-compact.
+  // Scheduled/task turns already isolate context; do not let them reset the
+  // interactive session that owns this workspace.
+  if (!ctx.isScheduledTask && !ctx.currentTaskId) {
+    tools.push(
+      tool(
+        'fresh_window',
+        'Open a clean new SDK session/window without summarizing history. Use when a stage of work is complete or context pressure is high and you want a structured handoff (notes + next focus + a light git snapshot) instead of continuing in the current window. Old history stays in the database. This does not disable auto-compact. After a successful submit the current session is replaced; do not keep working in this window.',
+        {
+          notes: z
+            .string()
+            .trim()
+            .min(1)
+            .describe(
+              'What was accomplished, decided, or left unfinished. Do not dump or summarize the full transcript.',
+            ),
+          next_focus: z
+            .string()
+            .trim()
+            .min(1)
+            .optional()
+            .describe('What the next window should do first.'),
+        },
+        async (args) => {
+          const snapshot = await captureWorkspaceSnapshot(ctx.workspaceGroup);
+          const handoff = formatFreshWindowHandoff({
+            notes: args.notes,
+            nextFocus: args.next_focus,
+            snapshot,
+          });
+          const requestId = newRequestId();
+          const data: Record<string, unknown> & { requestId: string } = {
+            type: 'fresh_window',
+            chatJid: ctx.chatJid,
+            groupFolder: ctx.groupFolder,
+            notes: args.notes,
+            next_focus: args.next_focus,
+            handoff,
+            requestId,
+            timestamp: new Date().toISOString(),
+          };
+          try {
+            const result = await pollIpcResult(
+              TASKS_DIR,
+              data,
+              'fresh_window_result',
+              30_000,
+            );
+            if (!result.success) {
+              return {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `零摘要换窗失败：${typeof result.error === 'string' ? result.error : 'host rejected the request'}`,
+                  },
+                ],
+                isError: true,
+              };
+            }
+          } catch (err) {
+            console.warn(
+              '[fresh_window] IPC poll did not confirm host acceptance',
+              err,
+            );
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `零摘要换窗未确认提交：${err instanceof Error ? err.message : String(err)}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: '已提交零摘要换窗。新窗口将携带交接说明；历史仍在库中，未做摘要。',
+              },
+            ],
+          };
         },
       ),
     );

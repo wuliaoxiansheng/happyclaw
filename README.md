@@ -102,7 +102,7 @@ HappyClaw 使用统一的 `智能体 → Workspace → Runtime Session` 层级�
   保留。
 - **Workspace Memory** 是该工作区跨 Session 复用的结构化知识，不是用户全局记忆，也不是任意文件或日期归档。主人称呼由 Home 专用 Owner Profile facade 管理，不出现在通用 Memory 搜索、快照或修改接口中。
 - **Runtime Session** 是工作区内的一段独立对话上下文，不是另一个顶层智能体；Session 历史与 Workspace Memory 分开保存，忘记一条 Memory 不会删除聊天历史。
-- **Channel Mount** 把 IM 群聊、私聊或原生话题挂载到工作区或具体会话。
+- **Channel Mount** 将私聊、普通群显式绑定到具体 Session，将话题群绑定到 Workspace，再按话题映射 Session。完整规则见[业务模型](docs/BUSINESS-MODEL.md)。
 
 ### 执行模式
 
@@ -148,38 +148,36 @@ HappyClaw 区分不同层级的能力来源：
 
 ## 渠道接入
 
-每个用户都可以为同一渠道创建多个 Bot 账号，为每个账号设置默认工作区，再按群聊、
-私聊或原生话题覆盖绑定目标。账号身份会写入渠道地址和 mount，发送时不会借用其他
-Bot 的凭据。
+每个用户都可以为同一渠道创建多个 Bot 账号，并为渠道会话显式选择绑定目标。
+连接账号或发现聊天不会自动绑定，也不会触发回复。账号身份会写入渠道地址和 mount，
+发送时不会借用其他 Bot 的凭据。
 
-| 渠道         | 接入方式                          | 主要能力                                              |
-| ------------ | --------------------------------- | ----------------------------------------------------- |
-| **飞书**     | App ID / App Secret，WebSocket    | 流式卡片、图片与文件、Reaction、群聊 @ 控制、话题映射 |
-| **Telegram** | Bot Token，Long Polling           | Markdown/HTML、长消息分片、图片与文件、代理配置       |
-| **QQ**       | App ID / App Secret，WebSocket    | 私聊、群聊 @Bot、图片消息、配对码绑定                 |
-| **钉钉**     | Client ID / Client Secret，Stream | AI Card 流式回复、图片与文件、群聊 @ 控制             |
-| **微信**     | Web 界面扫码，iLink               | 二维码授权、媒体收发、Typing、断线恢复                |
-| **企业微信** | Bot ID / Secret，WebSocket        | Markdown 流式回复、群聊 @ 控制、配对码绑定            |
-| **Discord**  | Bot Token，Gateway                | 私聊与服务器频道路由、多账号隔离、频道信息查询        |
-| **WhatsApp** | Web 界面扫码，Baileys             | 二维码登录、文本与媒体、会话持久化、断线恢复          |
-| **Web**      | 浏览器与 WebSocket                | 实时 Markdown、文件、终端、工具轨迹、PWA              |
+| 渠道         | 接入方式                          | 主要能力                                               |
+| ------------ | --------------------------------- | ------------------------------------------------------ |
+| **飞书**     | App ID / App Secret，WebSocket    | 流式卡片、图片与文件、Reaction、群聊 @ 控制、话题映射  |
+| **Telegram** | Bot Token，Long Polling           | Markdown/HTML、长消息分片、图片与文件、代理配置        |
+| **QQ**       | App ID / App Secret，WebSocket    | 私聊、群聊 @Bot、图片消息、配对码绑定                  |
+| **钉钉**     | Client ID / Client Secret，Stream | AI Card 流式回复、图片与文件、群聊 @ 控制              |
+| **微信**     | Web 界面扫码，iLink               | 二维码授权、媒体收发、Typing、断线恢复                 |
+| **企业微信** | Bot ID / Secret，WebSocket        | Markdown 流式回复、图片与文件、群聊 @ 控制、配对码绑定 |
+| **Discord**  | Bot Token，Gateway                | 私聊与服务器频道路由、多账号隔离、频道信息查询         |
+| **WhatsApp** | Web 界面扫码，Baileys             | 二维码登录、文本与媒体、会话持久化、断线恢复           |
+| **Web**      | 浏览器与 WebSocket                | 实时 Markdown、文件、终端、工具轨迹、PWA               |
 
-渠道账号的凭据和扫码会话按用户、账号隔离。当前绑定边界为：
+渠道账号的凭据和扫码会话按用户、账号隔离。绑定规则为：
 
-1. 渠道账号的默认智能体/工作区。
-2. 群聊绑定到工作区；一个工作区可以绑定多个账号下的多个群聊。
-3. 私聊绑定到工作区内的指定 Runtime Session。
-4. 飞书话题群、Telegram Forum 等原生线程自动映射为独立 Runtime Session。
+1. 私聊和普通群绑定到工作区内的指定 Session，也可以选择主会话。
+2. 飞书话题群、Telegram Forum 绑定到 Workspace，每个原生话题映射独立 Session。
+3. 未绑定或已经解绑的渠道保持静默；默认工作区和历史话题记录不会恢复绑定。
 
-飞书的“是否需要 @”与“响应所有人/仅主人”是两个独立维度。普通群在免 @ 模式下
-共享群上下文；需要 @ 时，首次 @ 消息建立原生话题和独立 Session，后续在该话题内
-无需再次 @。话题群始终按话题隔离上下文。
+飞书的“是否需要 @”与“响应所有人/仅主人”是两个独立维度。普通群始终沿用所绑定的
+Session，需要 @ 时也不会另建话题 Session。话题群按话题隔离上下文。
 
-一个 Runtime Session 第一次由原生 IM 触发后会持久记住渠道归属。后续即使从 Web
-继续回复，也会保留原渠道上下文，文件和图片使用当前 Turn 的精确聊天、话题与 Bot
-账号投递。
+每条输入独立保存回复来源：私聊、群聊、话题回复回到收到该输入的同一聊天、话题和
+Bot 账号；Web 输入只在对应 Web Session 回复。多个渠道可以共享一个 Session，
+但不同来源的输入分批执行，旧渠道归属或后续输入不能改写当前回复目标。
 
-在支持斜杠命令的渠道中，可以使用 `/list`、`/status`、`/where`、`/bind`、`/unbind`、`/new` 和 `/clear` 管理当前上下文。飞书里，Agent 忙碌时的普通消息会静默自然排队；在群聊中真实 `@Bot /steer <消息>` 可立即引导当前任务，真实 `@Bot /break` 可停止当前任务并取消此前已经排队的消息。两条 Runtime 控制命令只接受精确小写形式。写操作受工作区 owner 和渠道发言者策略约束。
+在已经绑定且支持斜杠命令的渠道中，可以使用 `/list`、`/status`、`/where`、`/bind`、`/unbind`、`/new`、`/clear` 和 `/fresh` 管理当前上下文。`/fresh [备注]` 会开启新的 SDK 窗口并写入零摘要交接说明，旧历史仍留在库中。飞书里，Agent 忙碌时的普通消息会静默自然排队；在群聊中真实 `@Bot /steer <消息>` 可立即引导当前任务，真实 `@Bot /break` 可停止当前任务并取消此前已经排队的消息。两条 Runtime 控制命令只接受精确小写形式。写操作受工作区 owner 和渠道发言者策略约束。
 
 ## 模型与提供商
 
@@ -301,7 +299,7 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | 页面                    | 内容                                                  |
 | ----------------------- | ----------------------------------------------------- |
 | **设置 → 模型与提供商** | 官方/第三方 Provider、密钥、模型、1M 上下文和负载均衡 |
-| **设置 → 消息渠道**     | 渠道账号、扫码登录、连接状态、默认工作区和会话绑定    |
+| **设置 → 消息渠道**     | 渠道账号、扫码登录、连接状态和会话绑定                |
 | **设置 → 主 HappyClaw** | 默认智能体的 Skills 与 MCP                            |
 | **设置 → 执行与容量**   | 超时、并发、上下文窗口和运行限制                      |
 | **设置 → 宿主机集成**   | 管理员纯宿主机模式、Host 目录与 Claude 上下文来源     |
@@ -310,22 +308,23 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 
 ### 可选环境变量
 
-| 变量                         | 默认值                            | 说明                                                                               |
-| ---------------------------- | --------------------------------- | ---------------------------------------------------------------------------------- |
-| `WEB_PORT`                   | `3000`                            | Web、REST API 与 WebSocket 端口                                                    |
-| `WEB_SESSION_SECRET`         | 自动生成并持久化                  | Web 登录会话签名密钥                                                               |
-| `CONTAINER_IMAGE`            | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                                                                     |
-| `CONTAINER_IMAGE_HEADROOM`   | 从 core 标签派生 `-headroom`      | 启用 Headroom MCP 时使用的同版本能力镜像                                           |
-| `CONTAINER_TIMEOUT`          | `1800000`                         | 容器硬超时，毫秒                                                                   |
-| `IDLE_TIMEOUT`               | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
-| `ADMIN_HOST_ONLY_MODE`       | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
-| `MAX_CONCURRENT_CONTAINERS`  | `20`                              | 最大并发容器数                                                                     |
-| `MAX_FILE_SIZE_MB`           | `50`                              | Web 和 IM 入站文件大小上限                                                         |
-| `CORS_ALLOWED_ORIGINS`       | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                 |
-| `TRUST_PROXY`                | `false`                           | 位于可信反向代理后时设为 `true`                                                    |
-| `TZ`                         | 系统时区                          | 日志与定时任务时区                                                                 |
-| `HTTPS_PROXY` / `HTTP_PROXY` | 未设置                            | 独立配置 HTTPS/HTTP 出站代理；主进程与每个智能体容器都会使用，也接受对应的小写变量 |
-| `NO_PROXY`                   | 未设置                            | 独立配置不走代理的地址列表，也接受 `no_proxy`                                      |
+| 变量                                 | 默认值                            | 说明                                                                               |
+| ------------------------------------ | --------------------------------- | ---------------------------------------------------------------------------------- |
+| `WEB_PORT`                           | `3000`                            | Web、REST API 与 WebSocket 端口                                                    |
+| `WEB_SESSION_SECRET`                 | 自动生成并持久化                  | Web 登录会话签名密钥                                                               |
+| `CONTAINER_IMAGE`                    | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                                                                     |
+| `CONTAINER_IMAGE_HEADROOM`           | 从 core 标签派生 `-headroom`      | 启用 Headroom MCP 时使用的同版本能力镜像                                           |
+| `CONTAINER_TIMEOUT`                  | `1800000`                         | 容器硬超时，毫秒                                                                   |
+| `IDLE_TIMEOUT`                       | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
+| `STUCK_RUNNER_FORCE_RESTART_MINUTES` | `10`                              | IPC 债务强制恢复上限（整数分钟，范围 4–120；非法值回退默认）                       |
+| `ADMIN_HOST_ONLY_MODE`               | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
+| `MAX_CONCURRENT_CONTAINERS`          | `20`                              | 最大并发容器数                                                                     |
+| `MAX_FILE_SIZE_MB`                   | `50`                              | Web 和 IM 入站文件大小上限                                                         |
+| `CORS_ALLOWED_ORIGINS`               | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                 |
+| `TRUST_PROXY`                        | `false`                           | 位于可信反向代理后时设为 `true`                                                    |
+| `TZ`                                 | 系统时区                          | 日志与定时任务时区（建议 IANA 名称，如 `Asia/Shanghai`）；无效值回退并告警         |
+| `HTTPS_PROXY` / `HTTP_PROXY`         | 未设置                            | 独立配置 HTTPS/HTTP 出站代理；主进程与每个智能体容器都会使用，也接受对应的小写变量 |
+| `NO_PROXY`                           | 未设置                            | 独立配置不走代理的地址列表，也接受 `no_proxy`                                      |
 
 Provider 与渠道凭据建议只在 Web 设置中填写。它们使用 AES-256-GCM 加密存储，相关 API 只返回是否已配置，不返回密钥明文。
 

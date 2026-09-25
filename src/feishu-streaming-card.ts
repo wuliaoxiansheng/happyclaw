@@ -2,18 +2,18 @@
  * Feishu Streaming Card Controller
  *
  * Three-level degradation chain:
- *   Level 0: Streaming mode — cardElement.content() with native typewriter effect (70ms/char)
+ *   Level 0: Streaming mode — cardElement.content() with native typewriter effect
  *   Level 1: CardKit v1 — card.update() full JSON replacement (≥1000ms interval)
  *   Level 2: Legacy — im.message.create + im.message.patch
  *
  * Features:
  * - Native typewriter effect via Feishu streaming_mode (Level 0)
- * - Dual-track flushing: text (300ms) / auxiliary (800ms) in streaming mode
+ * - Dual-track flushing: text (600ms) / auxiliary (1500ms) in streaming mode
  * - Auto-degradation on API failures (streaming → v1 → legacy)
  * - Code-block-safe text splitting (no truncation inside fenced code blocks)
  * - Schema 2.0 card format with body.elements
  * - Multi-card support for extremely long outputs (auto-split at ~45 elements)
- * - Conservative 30K character live-element budget with full-content finalization
+ * - Measured CardKit capacity with lossless, adaptive continuation pages
  */
 import * as lark from '@larksuiteoapi/node-sdk';
 import { createHash } from 'crypto';
@@ -22,12 +22,28 @@ import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
 import {
   buildAgentReplyCard,
   buildStreamingAgentCard,
+  buildStreamingContentElements,
+  STREAMING_CONFIG,
 } from './feishu-cards/builder.js';
+import { splitCardPages, type CardPage } from './feishu-cards/pagination.js';
+import {
+  CARDKIT_JSON_MAX_BYTES,
+  fitsCardCapacity,
+} from './feishu-cards/capacity.js';
 import type { CardStatus, ToolCallStat } from './feishu-cards/types.js';
 import {
   formatFeishuUsageNote,
   type FeishuUsageNoteInput,
 } from './feishu-usage-display.js';
+import {
+  definitiveFeishuHttpRejection,
+  definitiveFeishuPreAcceptanceFailure,
+} from './feishu-capability.js';
+import { PartialChannelDeliveryError } from './im-delivery-progress.js';
+import {
+  explicitImDeliveryPhase,
+  ImDeliveryPhaseError,
+} from './im-send-retry-policy.js';
 import {
   CARD_ELEMENT_IDS,
   statusHeadline,
@@ -38,6 +54,8 @@ import {
   buildAskQuestionText,
   collectAskQuestions,
   buildTimelineText,
+  buildStreamingDetails,
+  formatRuntimeDetail,
   type StreamingPhase,
   type TodoItemView,
   type ToolCallView,
@@ -72,6 +90,8 @@ export interface StreamingCardOptions {
 
 export interface StreamingCardLifecycleSnapshot {
   text: string;
+  /** Visible page only; canonical text remains available separately. */
+  visibleText?: string;
   thinking: string;
   state: StreamingState;
   backendMode: 'streaming' | 'v1' | 'legacy';
@@ -104,6 +124,41 @@ export interface InterruptedStreamingCardInput {
   version: number;
   snapshot?: unknown;
   reason?: string;
+}
+
+const DEFAULT_INTERRUPT_REASON = '上次服务中断，本次任务未完成';
+
+/** Visible body stored on a leftover streaming-card snapshot. */
+export function streamingCardSnapshotText(snapshot: unknown): string {
+  if (!snapshot || typeof snapshot !== 'object') return '';
+  const data = snapshot as { text?: unknown; visibleText?: unknown };
+  const text =
+    typeof data.visibleText === 'string' ? data.visibleText : data.text;
+  return typeof text === 'string' ? text.trim() : '';
+}
+
+function streamingCardRecoveryCompleted(snapshot: unknown): boolean {
+  if (!snapshot || typeof snapshot !== 'object') return false;
+  const recovery = (snapshot as { recovery?: { completed?: unknown } })
+    .recovery;
+  return recovery?.completed === true;
+}
+
+/** Crash recovery rewrite: only an explicitly completed recovery looks done. */
+export function resolveInterruptedStreamingCardRewrite(input: {
+  snapshot?: unknown;
+  reason?: string;
+}): { text: string; status: 'done' | 'warning'; hasBody: boolean } {
+  const body = streamingCardSnapshotText(input.snapshot);
+  if (streamingCardRecoveryCompleted(input.snapshot)) {
+    return { text: body, status: 'done', hasBody: body.length > 0 };
+  }
+  const reason = input.reason?.trim() || DEFAULT_INTERRUPT_REASON;
+  return {
+    text: body ? `${body}\n\n> ⚠️ ${reason}` : `> ⚠️ ${reason}`,
+    status: 'warning',
+    hasBody: body.length > 0,
+  };
 }
 
 /** Extract the platform error code from both rejected SDK calls and resolved
@@ -286,15 +341,6 @@ function splitCodeBlockSafe(text: string, maxLen: number): string[] {
 const CARD_MD_LIMIT = 4000;
 const CARD_SIZE_LIMIT = 25 * 1024; // Feishu limit ~30KB, 5KB safety margin
 /**
- * Raw-char threshold above which the finalize path must split into multiple
- * cards. buildAgentReplyCard truncates the body to ~16K chars (4 sections ×
- * 4000); judging "fits in one card" by the byte size of the ALREADY-truncated
- * JSON can never trigger the split for ASCII/code replies — the tail would
- * silently vanish at completion.
- */
-const MAX_FINAL_SINGLE_CARD_CHARS = 15000;
-
-/**
  * Per-card BODY byte budget for rollover/finalize splitting. Must be measured
  * in UTF-8 BYTES, not chars: CJK is 3 bytes/char, so an 18000-CHAR budget
  * yields ~54KB cards that the Feishu ~30KB API rejects — the exact failure
@@ -400,31 +446,7 @@ const ELEMENT_IDS = {
   STATUS_NOTE: 'status_note',
 } as const;
 
-const STREAMING_CONFIG = {
-  print_frequency_ms: { default: 50 },
-  print_step: { default: 2 },
-  print_strategy: 'fast' as const,
-};
-
-/**
- * CardKit may accept larger values, but the official SDK uses a conservative
- * 30K live-element budget. Staying below it also leaves room for Markdown
- * fence repair and avoids a late provider rejection after a long run.
- * Finalization still renders the complete accumulated text across cards.
- */
-const MAX_STREAMING_CONTENT = 30000;
-const STREAMING_PLACEHOLDER = '> 正在分析请求，最终结论完成后会显示在这里。';
-
-function limitStreamingContent(text: string): string {
-  if (text.length <= MAX_STREAMING_CONTENT) return text;
-  const hint = '\n\n> ⚠️ 内容较长，完成后将展示完整结果';
-  // Reserve space for splitCodeBlockSafe's synthetic closing fence.
-  const [head] = splitCodeBlockSafe(
-    text,
-    MAX_STREAMING_CONTENT - hint.length - 16,
-  );
-  return `${head}${hint}`;
-}
+const STREAMING_PLACEHOLDER = '> 正在处理请求…';
 
 // ─── Tool Progress & Elapsed Helpers ─────────────────────────
 
@@ -433,6 +455,7 @@ interface ToolCallState {
   name: string;
   status: 'running' | 'complete' | 'error';
   startTime: number;
+  endTime?: number;
   toolInputSummary?: string;
   /** When wrapping a Skill, the concrete skill name for display. */
   skillName?: string;
@@ -555,7 +578,7 @@ function buildAuxiliaryElements(aux: AuxiliaryState): {
     const lines = display.map(([, tc]) => {
       const icon =
         tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
-      const elapsed = formatElapsed(now - tc.startTime);
+      const elapsed = formatElapsed((tc.endTime ?? now) - tc.startTime);
       let summary = '';
       if (tc.toolInputSummary) {
         const s =
@@ -966,18 +989,137 @@ class CardKitRejectedError extends Error {
   }
 }
 
-function assertCardKitAcknowledged(response: unknown, operation: string): void {
-  const envelope = response as { code?: unknown; msg?: unknown } | undefined;
+function standaloneFeishuProviderErrorCode(value: unknown): number | undefined {
   if (
-    envelope?.code !== undefined &&
-    envelope.code !== null &&
-    Number(envelope.code) !== 0
+    value &&
+    typeof value === 'object' &&
+    (value as { response?: unknown }).response
   ) {
+    // HTTP 408/5xx responses are deliberately excluded by
+    // definitiveFeishuHttpRejection: their body code must not re-authorize a
+    // second presentation after an intermediary/upstream ambiguous response.
+    return undefined;
+  }
+  return feishuErrorCode(value);
+}
+
+function feishuCardResourceError(operation: string, error: unknown): Error {
+  const phase = explicitImDeliveryPhase(error);
+  if (phase) return error as Error;
+  const rejection =
+    error instanceof CardKitRejectedError
+      ? error
+      : definitiveFeishuHttpRejection(error);
+  return new ImDeliveryPhaseError(
+    rejection ? 'rejected' : 'pre_accept',
+    `${operation} failed before any visible Feishu card message was sent`,
+    { cause: rejection ?? error },
+  );
+}
+
+function feishuVisibleCardMutationError(
+  operation: string,
+  error: unknown,
+): Error {
+  const phase = explicitImDeliveryPhase(error);
+  if (phase) return error as Error;
+  const preAccept = definitiveFeishuPreAcceptanceFailure(error);
+  if (preAccept) {
+    return new ImDeliveryPhaseError(
+      'pre_accept',
+      `${operation} failed before Feishu could accept the card message`,
+      { cause: preAccept },
+    );
+  }
+  const rejection =
+    error instanceof CardKitRejectedError
+      ? error
+      : definitiveFeishuHttpRejection(error);
+  if (rejection || standaloneFeishuProviderErrorCode(error) !== undefined) {
+    return new ImDeliveryPhaseError(
+      'rejected',
+      `${operation} was definitively rejected by Feishu`,
+      { cause: rejection ?? error },
+    );
+  }
+  return new ImDeliveryPhaseError(
+    'uncertain',
+    `${operation} may have been accepted; refusing a second card presentation`,
+    { cause: error },
+  );
+}
+
+function canSwitchFeishuCardBackend(error: unknown): boolean {
+  const phase = explicitImDeliveryPhase(error);
+  if (phase) return phase === 'pre_accept' || phase === 'rejected';
+  return Boolean(
+    error instanceof CardKitRejectedError ||
+    definitiveFeishuPreAcceptanceFailure(error) ||
+    definitiveFeishuHttpRejection(error) ||
+    standaloneFeishuProviderErrorCode(error) !== undefined,
+  );
+}
+
+function isNativeCardCapacityRejection(error: unknown): boolean {
+  if (!canSwitchFeishuCardBackend(error)) return false;
+  let cause: unknown = error;
+  for (let depth = 0; cause && depth < 8; depth++) {
+    if (feishuErrorCode(cause) === 200860) return true;
+    cause = (cause as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+function requireFeishuCardMessageId(
+  response: unknown,
+  operation: string,
+): string {
+  const code = feishuErrorCode(response);
+  if (code !== undefined && code !== 0) {
     throw new CardKitRejectedError(
       operation,
-      Number(envelope.code),
-      String(envelope.msg ?? ''),
+      code,
+      String((response as { msg?: unknown })?.msg ?? ''),
     );
+  }
+  const messageId = (response as { data?: { message_id?: unknown } })?.data
+    ?.message_id;
+  if (typeof messageId !== 'string' || !messageId.trim()) {
+    throw new Error(`${operation} returned no provider message_id`);
+  }
+  return messageId.trim();
+}
+
+function visibleFeishuCardProgressError(error: unknown): Error {
+  if (
+    error &&
+    typeof error === 'object' &&
+    (error as { code?: unknown }).code === 'CHANNEL_DELIVERY_PARTIAL'
+  ) {
+    return error as Error;
+  }
+  return new PartialChannelDeliveryError(1, 2, error);
+}
+
+function assertCardKitAcknowledged(response: unknown, operation: string): void {
+  const envelope = response as { code?: unknown; msg?: unknown } | undefined;
+  if (envelope?.code === undefined || envelope.code === null) {
+    throw new ImDeliveryPhaseError(
+      'uncertain',
+      `${operation} returned no explicit provider acknowledgement`,
+      { cause: response },
+    );
+  }
+  const code = Number(envelope.code);
+  if (!Number.isFinite(code)) {
+    throw new ImDeliveryPhaseError(
+      'uncertain',
+      `${operation} returned an invalid provider acknowledgement`,
+      { cause: response },
+    );
+  }
+  if (code !== 0) {
+    throw new CardKitRejectedError(operation, code, String(envelope.msg ?? ''));
   }
 }
 
@@ -1011,6 +1153,35 @@ function collectElementContentHashes(
   }
 }
 
+/** Per-card request pacing, including diagnostic fallback and interaction-lock retries. */
+class CardMutationGate {
+  private lastStartedAt = 0;
+
+  async request<T>(send: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      const delay = Math.max(0, 120 - (Date.now() - this.lastStartedAt));
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+      this.lastStartedAt = Date.now();
+      try {
+        const response = await send();
+        assertCardKitAcknowledged(response, 'CardKit mutation');
+        return response;
+      } catch (error) {
+        const code = feishuErrorCode(error);
+        // These are explicit non-acceptance responses. Do not retry ambiguous
+        // network errors or schema/auth failures with a fresh sequence.
+        if (
+          attempt >= 3 ||
+          ![200810, 99991400, 99991401].includes(code ?? -1)
+        ) {
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** attempt));
+      }
+    }
+  }
+}
+
 class CardKitBackend {
   private cardId: string | null = null;
   private _messageId: string | null = null;
@@ -1026,7 +1197,10 @@ class CardKitBackend {
    */
   private chain: Promise<unknown> = Promise.resolve();
 
-  constructor(client: lark.Client) {
+  constructor(
+    client: lark.Client,
+    readonly mutations = new CardMutationGate(),
+  ) {
     this.client = client;
   }
 
@@ -1056,20 +1230,29 @@ class CardKitBackend {
    * Returns the card_id for subsequent updates.
    */
   async createCard(cardJson: object): Promise<string> {
-    const resp = await this.client.cardkit.v1.card.create({
-      data: {
-        type: 'card_json',
-        data: JSON.stringify(cardJson),
-      },
-    });
+    let cardId: string;
+    try {
+      const resp = await this.client.cardkit.v1.card.create({
+        data: {
+          type: 'card_json',
+          data: JSON.stringify(cardJson),
+        },
+      });
 
-    const cardId = resp?.data?.card_id;
-    if (!cardId) {
-      const code = (resp as any)?.code;
-      const msg = (resp as any)?.msg;
-      throw new Error(
-        `CardKit card.create returned no card_id (code=${code}, msg=${msg})`,
-      );
+      const rawCardId = resp?.data?.card_id;
+      if (!rawCardId) {
+        const code = (resp as any)?.code;
+        const msg = (resp as any)?.msg;
+        if (typeof code === 'number' && code !== 0) {
+          throw new CardKitRejectedError('CardKit card.create', code, msg);
+        }
+        throw new Error(
+          `CardKit card.create returned no card_id (code=${code}, msg=${msg})`,
+        );
+      }
+      cardId = rawCardId;
+    } catch (error) {
+      throw feishuCardResourceError('CardKit card.create', error);
     }
 
     this.cardId = cardId;
@@ -1098,28 +1281,26 @@ class CardKitBackend {
       data: { card_id: this.cardId },
     });
 
-    let resp: any;
-    if (replyToMsgId) {
-      resp = await replyInteractiveCard(
-        this.client,
-        replyToMsgId,
-        content,
-        replyInThread,
-      );
-    } else {
-      resp = await this.client.im.v1.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: chatId,
-          msg_type: 'interactive',
-          content,
-        },
-      });
-    }
-
-    const messageId = resp?.data?.message_id;
-    if (!messageId) {
-      throw new Error('No message_id in sendCard response');
+    let messageId: string;
+    try {
+      const resp = replyToMsgId
+        ? await replyInteractiveCard(
+            this.client,
+            replyToMsgId,
+            content,
+            replyInThread,
+          )
+        : await this.client.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'interactive',
+              content,
+            },
+          });
+      messageId = requireFeishuCardMessageId(resp, 'CardKit sendCard');
+    } catch (error) {
+      throw feishuVisibleCardMutationError('CardKit sendCard', error);
     }
 
     this._messageId = messageId;
@@ -1139,14 +1320,16 @@ class CardKitBackend {
       if (hash === this.lastContentHash) return; // no change
 
       const sequence = ++this.sequence;
-      const response = await this.client.cardkit.v1.card.update({
-        path: { card_id: this.cardId! },
-        data: {
-          card: { type: 'card_json', data: dataStr },
-          sequence,
-          uuid: cardMutationUuid(this.cardId!, sequence, 'card.update', hash),
-        },
-      });
+      const response = await this.mutations.request(() =>
+        this.client.cardkit.v1.card.update({
+          path: { card_id: this.cardId! },
+          data: {
+            card: { type: 'card_json', data: dataStr },
+            sequence,
+            uuid: cardMutationUuid(this.cardId!, sequence, 'card.update', hash),
+          },
+        }),
+      );
       assertCardKitAcknowledged(response, 'card.update');
       this.acknowledgedSequence = sequence;
 
@@ -1167,13 +1350,20 @@ class CardKitBackend {
 
 // ─── Streaming Mode Backend ───────────────────────────────────
 
+const DETAIL_CONTENT_IDS: Set<string> = new Set([
+  CARD_ELEMENT_IDS.PROGRESS_CONTENT,
+  CARD_ELEMENT_IDS.TASK_CONTENT,
+  CARD_ELEMENT_IDS.TOOLS_CONTENT,
+  CARD_ELEMENT_IDS.THINKING_CONTENT,
+  CARD_ELEMENT_IDS.TIMELINE_CONTENT,
+]);
+
 class StreamingModeBackend {
   private cardId: string | null = null;
   private _messageId: string | null = null;
   private sequence = 0;
   /** Highest provider-acknowledged sequence exposed to durable lifecycle. */
   private acknowledgedSequence = 0;
-  private lastMainHash = '';
   private lastAuxBeforeHash = '';
   private lastAuxAfterHash = '';
   private readonly richSlotHashes = new Map<string, string>();
@@ -1186,13 +1376,36 @@ class StreamingModeBackend {
    * patchFailCount toward degradation even though nothing is wrong.
    */
   private chain: Promise<unknown> = Promise.resolve();
+  /** An unresolved auxiliary ACK also fences work already queued behind it. */
+  private uncertainAuxiliaryError: unknown;
 
-  constructor(client: lark.Client) {
+  hasRuntimeDetails(): boolean {
+    return this.richSlotHashes.has(CARD_ELEMENT_IDS.PROGRESS_CONTENT);
+  }
+
+  constructor(
+    client: lark.Client,
+    readonly mutations = new CardMutationGate(),
+  ) {
     this.client = client;
   }
 
-  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.chain.then(fn, fn);
+  private enqueue<T>(
+    fn: () => Promise<T>,
+    fenceUncertainAuxiliary = false,
+  ): Promise<T> {
+    const execute = async (): Promise<T> => {
+      if (this.uncertainAuxiliaryError !== undefined)
+        throw this.uncertainAuxiliaryError;
+      try {
+        return await fn();
+      } catch (error) {
+        if (fenceUncertainAuxiliary && !canSwitchFeishuCardBackend(error))
+          this.uncertainAuxiliaryError ??= error;
+        throw error;
+      }
+    };
+    const run = this.chain.then(execute, execute);
     this.chain = run.then(
       () => undefined,
       () => undefined,
@@ -1231,27 +1444,35 @@ class StreamingModeBackend {
    * Create a CardKit card instance with streaming_mode enabled.
    */
   async createCard(cardJson: object): Promise<string> {
-    const resp = await this.client.cardkit.v1.card.create({
-      data: {
-        type: 'card_json',
-        data: JSON.stringify(cardJson),
-      },
-    });
+    let cardId: string;
+    try {
+      const resp = await this.client.cardkit.v1.card.create({
+        data: {
+          type: 'card_json',
+          data: JSON.stringify(cardJson),
+        },
+      });
 
-    const cardId = resp?.data?.card_id;
-    if (!cardId) {
-      const code = (resp as any)?.code;
-      const msg = (resp as any)?.msg;
-      throw new Error(
-        `Streaming card.create returned no card_id (code=${code}, msg=${msg})`,
-      );
+      const rawCardId = resp?.data?.card_id;
+      if (!rawCardId) {
+        const code = (resp as any)?.code;
+        const msg = (resp as any)?.msg;
+        if (typeof code === 'number' && code !== 0) {
+          throw new CardKitRejectedError('Streaming card.create', code, msg);
+        }
+        throw new Error(
+          `Streaming card.create returned no card_id (code=${code}, msg=${msg})`,
+        );
+      }
+      cardId = rawCardId;
+    } catch (error) {
+      throw feishuCardResourceError('Streaming card.create', error);
     }
 
     this.cardId = cardId;
     this.sequence = 1;
     this.acknowledgedSequence = 1;
     collectElementContentHashes(cardJson, this.richSlotHashes);
-    this.lastMainHash = this.richSlotHashes.get(ELEMENT_IDS.MAIN_CONTENT) ?? '';
     this.lastAuxBeforeHash =
       this.richSlotHashes.get(ELEMENT_IDS.AUX_BEFORE) ?? '';
     this.lastAuxAfterHash =
@@ -1275,24 +1496,23 @@ class StreamingModeBackend {
       data: { card_id: this.cardId },
     });
 
-    let resp: any;
-    if (replyToMsgId) {
-      resp = await replyInteractiveCard(
-        this.client,
-        replyToMsgId,
-        content,
-        replyInThread,
-      );
-    } else {
-      resp = await this.client.im.v1.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: { receive_id: chatId, msg_type: 'interactive', content },
-      });
+    let messageId: string;
+    try {
+      const resp = replyToMsgId
+        ? await replyInteractiveCard(
+            this.client,
+            replyToMsgId,
+            content,
+            replyInThread,
+          )
+        : await this.client.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: { receive_id: chatId, msg_type: 'interactive', content },
+          });
+      messageId = requireFeishuCardMessageId(resp, 'Streaming mode sendCard');
+    } catch (error) {
+      throw feishuVisibleCardMutationError('Streaming mode sendCard', error);
     }
-
-    const messageId = resp?.data?.message_id;
-    if (!messageId)
-      throw new Error('No message_id in streaming sendCard response');
 
     this._messageId = messageId;
     return messageId;
@@ -1303,29 +1523,89 @@ class StreamingModeBackend {
    * MD5 dedup to avoid redundant pushes.
    * Auto-retries once on streaming timeout/closed errors.
    */
-  async streamContent(text: string): Promise<void> {
+  async streamBody(text: string): Promise<void> {
+    const elements = buildStreamingContentElements(text);
+    await this.enqueue(async () => {
+      const ids = elements.map((element) => String(element.element_id));
+      const existing = [...this.richSlotHashes.keys()].filter(
+        (id) =>
+          id === ELEMENT_IDS.MAIN_CONTENT || /^main_content_\d+$/.test(id),
+      );
+      const missing = elements.filter(
+        (element) => !this.richSlotHashes.has(String(element.element_id)),
+      );
+      const removed = existing.filter((id) => !ids.includes(id));
+      const actions: object[] = [];
+      if (missing.length)
+        actions.push({
+          action: 'add_elements',
+          params: {
+            type: 'insert_after',
+            target_element_id: existing.at(-1) ?? ELEMENT_IDS.MAIN_CONTENT,
+            elements: missing.map((element) => ({ ...element, content: '' })),
+          },
+        });
+      if (removed.length)
+        actions.push({
+          action: 'delete_elements',
+          params: { element_ids: removed },
+        });
+      if (!actions.length) return;
+      const data = JSON.stringify(actions);
+      const mutation = this.mutationIdentity(
+        'card.batchUpdate:body-slots',
+        quickHash(data),
+      );
+      const response = await this.mutations.request(() =>
+        this.client.cardkit.v1.card.batchUpdate({
+          path: { card_id: this.cardId! },
+          data: { actions: data, ...mutation },
+        }),
+      );
+      assertCardKitAcknowledged(response, 'card.batchUpdate:body-slots');
+      this.acknowledgedSequence = mutation.sequence;
+      for (const element of missing)
+        this.richSlotHashes.set(String(element.element_id), quickHash(''));
+      for (const id of removed) this.richSlotHashes.delete(id);
+    });
+    for (const element of elements)
+      await this.streamContent(
+        String(element.content),
+        String(element.element_id),
+      );
+  }
+
+  async streamContent(
+    text: string,
+    elementId: string = ELEMENT_IDS.MAIN_CONTENT,
+  ): Promise<void> {
     if (!this.cardId) return;
 
-    // Bound the live element conservatively. Finalization uses accumulatedText
-    // and therefore still publishes the complete answer across cards.
-    const content = limitStreamingContent(text);
+    // The controller budgets the complete page against measured CardKit limits.
+    // Never truncate an accepted canonical page inside the transport.
+    const content = text;
 
     return this.enqueue(async () => {
       const hash = quickHash(content);
-      if (hash === this.lastMainHash) return;
+      if (hash === this.richSlotHashes.get(elementId)) return;
       const mutation = this.mutationIdentity(
-        `cardElement.content:${ELEMENT_IDS.MAIN_CONTENT}`,
+        `cardElement.content:${elementId}`,
         hash,
       );
 
       try {
-        const response = await this.client.cardkit.v1.cardElement.content({
-          path: { card_id: this.cardId!, element_id: ELEMENT_IDS.MAIN_CONTENT },
-          data: { content, ...mutation },
-        });
+        const response = await this.mutations.request(() =>
+          this.client.cardkit.v1.cardElement.content({
+            path: {
+              card_id: this.cardId!,
+              element_id: elementId,
+            },
+            data: { content, ...mutation },
+          }),
+        );
         assertCardKitAcknowledged(response, 'cardElement.content');
         this.acknowledgedSequence = mutation.sequence;
-        this.lastMainHash = hash;
+        this.richSlotHashes.set(elementId, hash);
       } catch (err: any) {
         const code = err?.code ?? err?.response?.data?.code;
         // 200850 = streaming timeout, 300309 = streaming closed
@@ -1343,19 +1623,21 @@ class StreamingModeBackend {
           // ambiguous transport timeout; the first content mutation was not
           // accepted.
           const retryMutation = this.mutationIdentity(
-            `cardElement.content:${ELEMENT_IDS.MAIN_CONTENT}:reenabled`,
+            `cardElement.content:${elementId}:reenabled`,
             hash,
           );
-          const response = await this.client.cardkit.v1.cardElement.content({
-            path: {
-              card_id: this.cardId!,
-              element_id: ELEMENT_IDS.MAIN_CONTENT,
-            },
-            data: { content, ...retryMutation },
-          });
+          const response = await this.mutations.request(() =>
+            this.client.cardkit.v1.cardElement.content({
+              path: {
+                card_id: this.cardId!,
+                element_id: elementId,
+              },
+              data: { content, ...retryMutation },
+            }),
+          );
           assertCardKitAcknowledged(response, 'cardElement.content retry');
           this.acknowledgedSequence = retryMutation.sequence;
-          this.lastMainHash = hash;
+          this.richSlotHashes.set(elementId, hash);
         } else {
           throw err;
         }
@@ -1391,10 +1673,12 @@ class StreamingModeBackend {
         `cardElement.update:${elementId}`,
         hash,
       );
-      const response = await this.client.cardkit.v1.cardElement.update({
-        path: { card_id: this.cardId!, element_id: elementId },
-        data: { element, ...mutation },
-      });
+      const response = await this.mutations.request(() =>
+        this.client.cardkit.v1.cardElement.update({
+          path: { card_id: this.cardId!, element_id: elementId },
+          data: { element, ...mutation },
+        }),
+      );
       assertCardKitAcknowledged(response, 'cardElement.update');
       this.acknowledgedSequence = mutation.sequence;
       this[hashField] = hash;
@@ -1418,10 +1702,12 @@ class StreamingModeBackend {
         `cardElement.content:${elementId}`,
         hash,
       );
-      const response = await this.client.cardkit.v1.cardElement.content({
-        path: { card_id: this.cardId!, element_id: elementId },
-        data: { content, ...mutation },
-      });
+      const response = await this.mutations.request(() =>
+        this.client.cardkit.v1.cardElement.content({
+          path: { card_id: this.cardId!, element_id: elementId },
+          data: { content, ...mutation },
+        }),
+      );
       assertCardKitAcknowledged(response, 'cardElement.content');
       this.acknowledgedSequence = mutation.sequence;
       this.richSlotHashes.set(elementId, hash);
@@ -1435,36 +1721,79 @@ class StreamingModeBackend {
    */
   async updateMarkdownContents(
     patches: ReadonlyArray<{ elementId: string; content: string }>,
+    details?: object | null,
   ): Promise<{ updated: string[]; failed: string[] }> {
     if (!this.cardId) return { updated: [], failed: [] };
     return this.enqueue(async () => {
+      const hadDetails = this.richSlotHashes.has(
+        CARD_ELEMENT_IDS.PROGRESS_CONTENT,
+      );
+      const inserting =
+        details !== undefined && details !== null && !hadDetails;
+      const removing = details === null && hadDetails;
+      const structural: Array<Record<string, unknown>> = inserting
+        ? [
+            {
+              action: 'add_elements',
+              params: {
+                type: 'insert_before',
+                target_element_id: CARD_ELEMENT_IDS.INTERRUPT_BTN,
+                elements: [details],
+              },
+            },
+          ]
+        : removing
+          ? [
+              {
+                action: 'delete_elements',
+                params: { element_ids: [CARD_ELEMENT_IDS.DETAILS_PANEL] },
+              },
+            ]
+          : [];
       const changed = patches
+        .map((patch) => ({
+          ...patch,
+          content:
+            details !== undefined && DETAIL_CONTENT_IDS.has(patch.elementId)
+              ? formatRuntimeDetail(patch.elementId, patch.content)
+              : patch.content,
+        }))
+        .filter(
+          (patch) =>
+            details === undefined ||
+            !DETAIL_CONTENT_IDS.has(patch.elementId) ||
+            (!inserting && !removing && hadDetails),
+        )
         .map((patch) => ({ ...patch, hash: quickHash(patch.content) }))
         .filter(
           (patch) => this.richSlotHashes.get(patch.elementId) !== patch.hash,
         );
-      if (changed.length === 0) return { updated: [], failed: [] };
+      if (changed.length === 0 && structural.length === 0)
+        return { updated: [], failed: [] };
 
       // Normal path: one CardKit mutation for every auxiliary slot. This
       // prevents a single semantic event from becoming an 8-request QPS burst.
-      const actions = JSON.stringify(
-        changed.map((patch) => ({
+      const actions = JSON.stringify([
+        ...structural,
+        ...changed.map((patch) => ({
           action: 'partial_update_element',
           params: {
             element_id: patch.elementId,
-            partial_element: JSON.stringify({ content: patch.content }),
+            partial_element: { content: patch.content },
           },
         })),
-      );
+      ]);
       const mutation = this.mutationIdentity(
         'card.batchUpdate:rich-slots',
         quickHash(actions),
       );
       const runBatch = async (): Promise<void> => {
-        const response = await this.client.cardkit.v1.card.batchUpdate({
-          path: { card_id: this.cardId! },
-          data: { actions, ...mutation },
-        });
+        const response = await this.mutations.request(() =>
+          this.client.cardkit.v1.card.batchUpdate({
+            path: { card_id: this.cardId! },
+            data: { actions, ...mutation },
+          }),
+        );
         assertCardKitAcknowledged(response, 'card.batchUpdate');
       };
 
@@ -1482,12 +1811,24 @@ class StreamingModeBackend {
             // call reached CardKit but its acknowledgement was lost.
             await runBatch();
           } catch (retryError) {
-            batchFailure = retryError;
+            // A rejected retry cannot prove the first request was rejected.
+            // Only an ACK for the identical mutation resolves its uncertainty.
+            batchFailure = canSwitchFeishuCardBackend(firstError)
+              ? retryError
+              : firstError;
           }
         }
       }
 
       if (batchFailure !== undefined) {
+        // A structural batch must not fall back to content requests against
+        // slots that have not been created (or may have been removed).
+        if (
+          structural.length > 0 ||
+          isNativeCardCapacityRejection(batchFailure) ||
+          !canSwitchFeishuCardBackend(batchFailure)
+        )
+          throw batchFailure;
         logger.debug(
           {
             err: batchFailure,
@@ -1506,18 +1847,21 @@ class StreamingModeBackend {
             patch.hash,
           );
           try {
-            const response = await this.client.cardkit.v1.cardElement.content({
-              path: {
-                card_id: this.cardId!,
-                element_id: patch.elementId,
-              },
-              data: { content: patch.content, ...slotMutation },
-            });
+            const response = await this.mutations.request(() =>
+              this.client.cardkit.v1.cardElement.content({
+                path: {
+                  card_id: this.cardId!,
+                  element_id: patch.elementId,
+                },
+                data: { content: patch.content, ...slotMutation },
+              }),
+            );
             assertCardKitAcknowledged(response, 'cardElement.content');
             this.acknowledgedSequence = slotMutation.sequence;
             this.richSlotHashes.set(patch.elementId, patch.hash);
             updated.push(patch.elementId);
           } catch (error) {
+            if (!canSwitchFeishuCardBackend(error)) throw error;
             failed.push(patch.elementId);
             logger.debug(
               {
@@ -1533,14 +1877,21 @@ class StreamingModeBackend {
       }
 
       this.acknowledgedSequence = mutation.sequence;
+      if (inserting) collectElementContentHashes(details, this.richSlotHashes);
+      if (removing) {
+        for (const id of DETAIL_CONTENT_IDS) this.richSlotHashes.delete(id);
+      }
       for (const patch of changed) {
         this.richSlotHashes.set(patch.elementId, patch.hash);
       }
       return {
-        updated: changed.map((patch) => patch.elementId),
+        updated: [
+          ...changed.map((patch) => patch.elementId),
+          ...(structural.length ? [CARD_ELEMENT_IDS.DETAILS_PANEL] : []),
+        ],
         failed: [],
       };
-    });
+    }, true);
   }
 
   /**
@@ -1555,13 +1906,15 @@ class StreamingModeBackend {
         `cardElement.update:${elementId}`,
         quickHash(element),
       );
-      const response = await this.client.cardkit.v1.cardElement.update({
-        path: { card_id: this.cardId!, element_id: elementId },
-        data: {
-          element,
-          ...mutation,
-        },
-      });
+      const response = await this.mutations.request(() =>
+        this.client.cardkit.v1.cardElement.update({
+          path: { card_id: this.cardId!, element_id: elementId },
+          data: {
+            element,
+            ...mutation,
+          },
+        }),
+      );
       assertCardKitAcknowledged(response, 'cardElement.update');
       this.acknowledgedSequence = mutation.sequence;
     });
@@ -1580,13 +1933,15 @@ class StreamingModeBackend {
       'card.settings:enable',
       quickHash(settings),
     );
-    const response = await this.client.cardkit.v1.card.settings({
-      path: { card_id: this.cardId },
-      data: {
-        settings,
-        ...mutation,
-      },
-    });
+    const response = await this.mutations.request(() =>
+      this.client.cardkit.v1.card.settings({
+        path: { card_id: this.cardId! },
+        data: {
+          settings,
+          ...mutation,
+        },
+      }),
+    );
     assertCardKitAcknowledged(response, 'card.settings enable');
     this.acknowledgedSequence = mutation.sequence;
   }
@@ -1612,13 +1967,15 @@ class StreamingModeBackend {
         'card.settings:disable',
         quickHash(settings),
       );
-      const response = await this.client.cardkit.v1.card.settings({
-        path: { card_id: this.cardId! },
-        data: {
-          settings,
-          ...mutation,
-        },
-      });
+      const response = await this.mutations.request(() =>
+        this.client.cardkit.v1.card.settings({
+          path: { card_id: this.cardId! },
+          data: {
+            settings,
+            ...mutation,
+          },
+        }),
+      );
       assertCardKitAcknowledged(response, 'card.settings disable');
       this.acknowledgedSequence = mutation.sequence;
     });
@@ -1632,15 +1989,23 @@ class StreamingModeBackend {
     return this.enqueue(async () => {
       const data = JSON.stringify(cardJson);
       const mutation = this.mutationIdentity('card.update', quickHash(data));
-      const response = await this.client.cardkit.v1.card.update({
-        path: { card_id: this.cardId! },
-        data: {
-          card: { type: 'card_json', data },
-          ...mutation,
-        },
-      });
+      const response = await this.mutations.request(() =>
+        this.client.cardkit.v1.card.update({
+          path: { card_id: this.cardId! },
+          data: {
+            card: { type: 'card_json', data },
+            ...mutation,
+          },
+        }),
+      );
       assertCardKitAcknowledged(response, 'card.update');
       this.acknowledgedSequence = mutation.sequence;
+      this.richSlotHashes.clear();
+      collectElementContentHashes(cardJson, this.richSlotHashes);
+      this.lastAuxBeforeHash =
+        this.richSlotHashes.get(ELEMENT_IDS.AUX_BEFORE) ?? '';
+      this.lastAuxAfterHash =
+        this.richSlotHashes.get(ELEMENT_IDS.AUX_AFTER) ?? '';
     });
   }
 
@@ -1696,6 +2061,11 @@ class MultiCardManager {
 
   getCardCount(): number {
     return this.cards.length;
+  }
+
+  /** The unfrozen tail represented by this manager's current card. */
+  getVisibleText(fullText: string): string {
+    return this.activeView(fullText);
   }
 
   /** The slice of the full text still owned by the current (last) card. */
@@ -2065,23 +2435,22 @@ export class StreamingCardController {
 
   // Streaming mode (Level 0)
   private streamingBackend: StreamingModeBackend | null = null;
+  private backendTransition: Promise<void> | null = null;
+  private nativeCards: Array<{
+    backend: StreamingModeBackend;
+    text: string;
+    streaming: boolean;
+    rawEnd: number;
+  }> = [];
+  private nativeCanonicalText = '';
+  private nativeCapacityScale = 1;
+  private nativePageChain: Promise<unknown> = Promise.resolve();
+  private nativeFullUpdates = false;
+  /** Hidden provider rendering limits may require omitting optional details. */
+  private nativeSuppressDetails = false;
   private textFlushCtrl: FlushController | null = null;
   private auxFlushCtrl: FlushController | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  /** True when finalize split content across multiple cards — patchUsageNote
-   * must not rebuild a single card or it would overwrite the first card. */
-  private finalizedAsSplit = false;
-  /** Handle to the LAST card produced by splitOnFinalize. Without it a split
-   * reply silently loses its usage note. `render` rather than a backend handle
-   * because the tail is the reused streaming card (updateCardFull) for a
-   * single-group split and a CardKitBackend continuation card otherwise. */
-  private lastSplitCard: {
-    render: (cardJson: object) => Promise<void>;
-    text: string;
-    state: Schema2State;
-    titlePrefix: string;
-    title?: string;
-  } | null = null;
   /** Usage that arrived before finalize settled, parked for redelivery. */
   private pendingUsage: FeishuUsageNoteInput | null = null;
   /** True once complete() has finished writing the terminal card(s). */
@@ -2094,11 +2463,17 @@ export class StreamingCardController {
    * fails AFTER complete() returned doesn't end as "no card AND no static
    * fallback" (silent reply loss). */
   private creationPromise: Promise<void> | null = null;
+  /** Sticky physical-delivery evidence. Once a visible card mutation becomes
+   * uncertain, neither complete(), abort(), nor a backend switch may create a
+   * second presentation for the same logical reply. */
+  private terminalDeliveryError: unknown;
 
   // Streaming state
   private thinking = false;
   private thinkingText = '';
   private toolCalls = new Map<string, ToolCallState>();
+  private toolTotals = new Map<string, number>();
+  private countedToolIds = new Set<string>();
   private tasks = new Map<string, TaskRunState>();
   private startTime = 0;
   private backendMode: 'streaming' | 'v1' | 'legacy' = 'v1';
@@ -2155,12 +2530,24 @@ export class StreamingCardController {
   ): void {
     if (!this.lifecycle) return;
     const identity = this.lifecycleIdentity();
+    const visibleText =
+      this.backendMode === 'streaming' && this.nativeCards.length > 0
+        ? this.nativeCards.find(
+            (page) => page.backend === this.streamingBackend,
+          )?.text
+        : this.backendMode === 'v1' && this.multiCard
+          ? this.multiCard.getVisibleText(this.accumulatedText)
+          : undefined;
     try {
       this.lifecycle.onEvent({
         status,
         ...identity,
         snapshot: {
           text: this.accumulatedText,
+          ...(typeof visibleText === 'string' &&
+          visibleText !== this.accumulatedText
+            ? { visibleText }
+            : {}),
           thinking: this.thinkingText,
           state: this.state,
           backendMode: this.backendMode,
@@ -2183,9 +2570,10 @@ export class StreamingCardController {
     this.emitLifecycle('creating');
     this.creationPromise = this.createInitialCard();
     this.creationPromise.catch((err) => {
+      this.terminalDeliveryError ??= err;
       logger.warn(
         { err, chatId: this.chatId },
-        'Streaming card: initial create failed, will use fallback',
+        'Streaming card: initial create failed',
       );
       this.state = 'error';
       this.emitLifecycle('failed', err);
@@ -2204,17 +2592,29 @@ export class StreamingCardController {
   }
 
   isActive(): boolean {
-    return this.state === 'streaming' || this.state === 'creating';
+    return (
+      this.state === 'streaming' ||
+      this.state === 'creating' ||
+      (this.state === 'error' && this.terminalDeliveryError !== undefined)
+    );
   }
 
   /**
    * Get all messageIds across all cards (for multi-card cleanup).
    */
   getAllMessageIds(): string[] {
+    if (this.backendMode === 'streaming' && this.nativeCards.length)
+      return this.nativeCards
+        .map((page) => page.backend.messageId!)
+        .filter(Boolean);
     if (this.streamingBackend?.messageId)
       return [this.streamingBackend.messageId];
     if (this.multiCard) return this.multiCard.getAllMessageIds();
     return this.messageId ? [this.messageId] : [];
+  }
+
+  getAcknowledgedProviderOutputCount(): number {
+    return this.getAllMessageIds().length;
   }
 
   /**
@@ -2239,6 +2639,14 @@ export class StreamingCardController {
       // thinking while the card is explicitly waiting for input.
       this.thinking = false;
       this.emitLifecycle('waiting_user');
+    }
+    if (
+      !this.countedToolIds.has(toolId) &&
+      toolName !== 'Task' &&
+      !toolName.startsWith('Task:')
+    ) {
+      this.countedToolIds.add(toolId);
+      this.toolTotals.set(toolName, (this.toolTotals.get(toolName) ?? 0) + 1);
     }
     this.toolCalls.set(toolId, {
       name: toolName,
@@ -2281,6 +2689,7 @@ export class StreamingCardController {
       const wasWaiting =
         tc.name === 'AskUserQuestion' && tc.status === 'running';
       tc.status = isError ? 'error' : 'complete';
+      tc.endTime ??= Date.now();
       if (wasWaiting) this.emitLifecycle('running');
       this.stateVersion++;
       this.purgeOldTools();
@@ -2298,7 +2707,7 @@ export class StreamingCardController {
   private purgeOldTools(): void {
     const cutoff = Date.now() - MAX_COMPLETED_TOOL_AGE;
     for (const [id, tc] of this.toolCalls) {
-      if (tc.status !== 'running' && tc.startTime < cutoff) {
+      if (tc.status !== 'running' && (tc.endTime ?? tc.startTime) < cutoff) {
         this.toolCalls.delete(id);
       }
     }
@@ -2446,6 +2855,7 @@ export class StreamingCardController {
    * Creates the card on first call, then patches on subsequent calls.
    */
   append(text: string): void {
+    if (this.terminalDeliveryError !== undefined) return;
     this.heldOpen = null; // 新 turn 文本到达，退出挂起态
     this.accumulatedText = text;
     this.thinking = false; // Text arrived, no longer just thinking
@@ -2467,6 +2877,13 @@ export class StreamingCardController {
    * Complete the streaming card with final text.
    */
   async complete(finalText: string): Promise<void> {
+    await this.backendTransition;
+    if (
+      this.terminalDeliveryError !== undefined &&
+      (this.state === 'error' || this.state === 'aborted')
+    ) {
+      throw this.terminalDeliveryError;
+    }
     if (this.state !== 'streaming' && this.state !== 'creating') return;
 
     // Card creation still in flight — wait for it to settle first. Returning
@@ -2476,12 +2893,14 @@ export class StreamingCardController {
     if (this.state === 'creating' && this.creationPromise) {
       await this.creationPromise.catch(() => {});
       if ((this.state as StreamingState) === 'error') {
-        throw new Error('streaming card creation failed during complete()');
+        throw (
+          this.terminalDeliveryError ??
+          new Error('streaming card creation failed during complete()')
+        );
       }
     }
     if (this.state !== 'streaming' && this.state !== 'creating') return;
 
-    const prevState = this.state;
     this.accumulatedText = finalText;
     this.emitLifecycle('finalizing');
     this.state = 'completed';
@@ -2498,10 +2917,16 @@ export class StreamingCardController {
       }
       this.emitLifecycle('completed');
     } catch (err) {
-      // Revert state so abort() doesn't bail on the 'completed' check
-      this.state = prevState;
-      this.emitLifecycle('failed', err);
-      throw err;
+      const deliveryError =
+        this.messageId || this.streamingBackend?.messageId || this.multiCard
+          ? visibleFeishuCardProgressError(err)
+          : err;
+      this.terminalDeliveryError ??= deliveryError;
+      // A provider-visible card already exists. Keep abort() from issuing a
+      // second terminal mutation after an unknown final ACK.
+      this.state = 'error';
+      this.emitLifecycle('failed', deliveryError);
+      throw deliveryError;
     }
 
     this.finalizeSettled = true;
@@ -2528,24 +2953,16 @@ export class StreamingCardController {
 
     try {
       if (this.backendMode === 'streaming' && this.streamingBackend) {
-        // Skip if card was split during finalization — rebuilding a single card
-        // would overwrite the first card with full text while continuation
-        // cards remain. The explicit flag matters: for ASCII long replies the
-        // truncated JSON is small, so a byte-size check alone never trips.
-        if (this.finalizedAsSplit) {
-          await this.patchUsageNoteOnSplitTail(usage);
-          return;
-        }
-        const cardJson = this.buildStructuredFinalCard('completed', usage);
-        const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
-        if (cardSize > CARD_SIZE_LIMIT) {
-          logger.warn(
-            { chatId: this.chatId, cardSize, limit: CARD_SIZE_LIMIT },
-            'Streaming card: usage note skipped, rebuilt card exceeds size limit',
-          );
-          return;
-        }
-        await this.streamingBackend.updateCardFull(cardJson);
+        const note = this.mergeFooterNote(formatFeishuUsageNote(usage));
+        if (!note) return;
+        // The terminal skeleton reserves this footer. Updating only its
+        // content keeps the answer, scroll position and expanded details intact.
+        await this.streamingBackend.updateMarkdownContents([
+          {
+            elementId: CARD_ELEMENT_IDS.FOOTER_NOTE,
+            content: `<font color='grey'>${note}</font>`,
+          },
+        ]);
       } else if (this.messageId || this.multiCard) {
         const note = this.mergeFooterNote(formatFeishuUsageNote(usage));
         if (!note) return;
@@ -2560,45 +2977,20 @@ export class StreamingCardController {
   }
 
   /**
-   * Re-render the tail card of a split finalize so the usage note still
-   * reaches the reader. Only the last card is touched.
-   */
-  private async patchUsageNoteOnSplitTail(
-    usage: FeishuUsageNoteInput,
-  ): Promise<void> {
-    const tail = this.lastSplitCard;
-    if (!tail) {
-      logger.warn(
-        { chatId: this.chatId, finalizedAsSplit: this.finalizedAsSplit },
-        'Streaming card: split usage note skipped, tail card handle missing',
-      );
-      return;
-    }
-    const note = this.mergeFooterNote(formatFeishuUsageNote(usage));
-    if (!note) return;
-    const cardJson = buildSchema2Card(
-      tail.text,
-      tail.state,
-      tail.titlePrefix,
-      tail.title,
-      undefined,
-      note,
-    );
-    const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
-    if (cardSize > CARD_SIZE_LIMIT) {
-      logger.warn(
-        { chatId: this.chatId, cardSize, limit: CARD_SIZE_LIMIT },
-        'Streaming card: split-tail usage note skipped, card exceeds size limit',
-      );
-      return;
-    }
-    await tail.render(cardJson);
-  }
-
-  /**
    * Abort the streaming card (e.g., user interrupted).
    */
   async abort(reason?: string): Promise<void> {
+    await this.backendTransition;
+    if (this.terminalDeliveryError !== undefined) {
+      this.state = 'aborted';
+      this.pendingUsage = null;
+      this.flushCtrl.dispose();
+      this.textFlushCtrl?.dispose();
+      this.auxFlushCtrl?.dispose();
+      this.stopHeartbeat();
+      this.emitLifecycle('failed', this.terminalDeliveryError);
+      throw this.terminalDeliveryError;
+    }
     if (this.state === 'completed' || this.state === 'aborted') return;
 
     const wasActive = this.isActive();
@@ -2660,10 +3052,16 @@ export class StreamingCardController {
         );
       }
     }
-    this.emitLifecycle(
-      finalizationError === undefined ? 'aborted' : 'failed',
-      finalizationError,
-    );
+    if (finalizationError !== undefined) {
+      const deliveryError =
+        this.messageId || this.streamingBackend?.messageId || this.multiCard
+          ? visibleFeishuCardProgressError(finalizationError)
+          : finalizationError;
+      this.terminalDeliveryError ??= deliveryError;
+      this.emitLifecycle('failed', this.terminalDeliveryError);
+      throw this.terminalDeliveryError;
+    }
+    this.emitLifecycle('aborted');
   }
 
   dispose(): void {
@@ -2676,15 +3074,27 @@ export class StreamingCardController {
   // ─── Internal Methods ──────────────────────────────────
 
   private async createInitialCard(): Promise<void> {
-    const initialText = limitStreamingContent(
+    // Keep the independent fallback transports on their existing small budget.
+    const initialText = splitCardPages(
       this.accumulatedText || STREAMING_PLACEHOLDER,
-    );
+      { maxBytes: 12000 },
+    )[0].text;
 
     // ── Level 0: Try streaming mode (cardElement.content typewriter) ──
     try {
       const backend = new StreamingModeBackend(this.client);
-      const cardJson = buildStreamingModeCard(initialText);
-      await backend.createCard(cardJson);
+      let page: CardPage;
+      for (;;) {
+        page = this.planNativePages(
+          this.accumulatedText || STREAMING_PLACEHOLDER,
+        )[0];
+        try {
+          await backend.createCard(buildStreamingModeCard(page.text));
+          break;
+        } catch (error) {
+          if (!this.reduceNativeCapacity(error)) throw error;
+        }
+      }
       const messageId = await backend.sendCard(
         this.chatId,
         this.replyToMsgId,
@@ -2692,12 +3102,21 @@ export class StreamingCardController {
       );
 
       this.streamingBackend = backend;
+      this.nativeCards = [
+        {
+          backend,
+          text: page.text,
+          streaming: true,
+          rawEnd: this.accumulatedText ? page.rawEnd : 0,
+        },
+      ];
+      this.nativeCanonicalText = this.accumulatedText;
       this.messageId = messageId;
       this.backendMode = 'streaming';
       this.useCardKit = true;
       this.startTime = Date.now();
       // Streaming mode: 600ms text flush, 1500ms aux flush.
-      // Feishu caps card updates at ~5 QPS per card; text (1.7/s) + aux
+      // Keep ordinary traffic below the per-card 10 QPS ceiling; text (1.7/s) + aux
       // (banner/footer/panels, ≤2-3 calls per flush after hash dedup) must
       // stay under that together, or pushes start failing and the controller
       // wrongly degrades. The native typewriter effect keeps 600ms smooth.
@@ -2713,9 +3132,10 @@ export class StreamingCardController {
       this.finishCardCreation();
       return;
     } catch (streamingErr) {
+      if (!canSwitchFeishuCardBackend(streamingErr)) throw streamingErr;
       logger.info(
         { err: streamingErr, chatId: this.chatId },
-        'Streaming mode unavailable, falling back to CardKit v1',
+        'Streaming mode was rejected before visibility, falling back to CardKit v1',
       );
       this.streamingBackend = null;
     }
@@ -2745,10 +3165,11 @@ export class StreamingCardController {
         'Streaming card created via CardKit v1',
       );
     } catch (v1Err) {
+      if (!canSwitchFeishuCardBackend(v1Err)) throw v1Err;
       // ── Level 2: Legacy message.create + message.patch ──
       logger.info(
         { err: v1Err, chatId: this.chatId },
-        'CardKit full-update unavailable, falling back to message.patch',
+        'CardKit full-update was rejected before visibility, falling back to message.patch',
       );
       this.multiCard = null;
       this.useCardKit = false;
@@ -2768,30 +3189,26 @@ export class StreamingCardController {
     const content = JSON.stringify(card);
 
     try {
-      let resp: any;
-
-      if (this.replyToMsgId) {
-        resp = await replyInteractiveCard(
-          this.client,
-          this.replyToMsgId,
-          content,
-          this.replyInThread,
-        );
-      } else {
-        resp = await this.client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: this.chatId,
-            msg_type: 'interactive',
+      const resp = this.replyToMsgId
+        ? await replyInteractiveCard(
+            this.client,
+            this.replyToMsgId,
             content,
-          },
-        });
-      }
+            this.replyInThread,
+          )
+        : await this.client.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: this.chatId,
+              msg_type: 'interactive',
+              content,
+            },
+          });
 
-      this.messageId = resp?.data?.message_id || null;
-      if (!this.messageId) {
-        throw new Error('No message_id in response');
-      }
+      this.messageId = requireFeishuCardMessageId(
+        resp,
+        'Legacy streaming card create',
+      );
 
       logger.info(
         { chatId: this.chatId, messageId: this.messageId, mode: 'legacy' },
@@ -2801,7 +3218,7 @@ export class StreamingCardController {
       this.finishCardCreation();
     } catch (err) {
       this.state = 'error';
-      throw err;
+      throw feishuVisibleCardMutationError('Legacy streaming card create', err);
     }
   }
 
@@ -2840,6 +3257,21 @@ export class StreamingCardController {
     }
   }
 
+  private fenceVisibleCardMutation(error: unknown): Error {
+    const deliveryError = visibleFeishuCardProgressError(error);
+    this.terminalDeliveryError ??= deliveryError;
+    if (this.state === 'streaming' || this.state === 'creating') {
+      this.state = 'error';
+      this.flushCtrl.dispose();
+      this.textFlushCtrl?.dispose();
+      this.auxFlushCtrl?.dispose();
+      this.stopHeartbeat();
+      this.emitLifecycle('failed', this.terminalDeliveryError);
+      this.onFallback?.();
+    }
+    return this.terminalDeliveryError as Error;
+  }
+
   private schedulePatch(): void {
     // Terminal guard: a late/in-flight flush failure after complete()/abort()
     // must never re-render the finalized card back to「生成中」(the patchCard
@@ -2848,19 +3280,11 @@ export class StreamingCardController {
     if (this.patchFailCount >= this.maxPatchFailures) {
       logger.info(
         { chatId: this.chatId, useCardKit: this.useCardKit },
-        'Streaming card: too many patch failures, falling back',
+        'Streaming card: too many patch failures, fencing visible delivery',
       );
-      this.state = 'error';
-      this.emitLifecycle('failed', 'too many streaming card patch failures');
-      this.flushCtrl.dispose();
-      // Best-effort terminal patch — without it the card stays frozen on
-      // 「生成中...」forever (zombie card). Updates have been failing, so this
-      // may fail too; that's fine, it's the last attempt before giving up.
-      this.patchCard(
-        'aborted',
-        '<font color="grey">⚠️ 流式更新中断，完整回复将以普通消息发送</font>',
-      ).catch(() => {});
-      this.onFallback?.();
+      this.fenceVisibleCardMutation(
+        new Error('too many streaming card patch failures'),
+      );
       return;
     }
 
@@ -2948,14 +3372,38 @@ export class StreamingCardController {
       // Terminal guard: the controller may have completed/aborted between
       // scheduling and execution — don't push stale streaming content, and
       // never let a post-finalize failure count toward degradation.
-      if (this.state !== 'streaming' || !this.streamingBackend) return;
+      if (
+        this.state !== 'streaming' ||
+        !this.streamingBackend ||
+        this.backendTransition
+      )
+        return;
       try {
-        await this.streamingBackend.streamContent(this.liveDisplayText());
+        const run = this.nativePageChain.then(async () => {
+          if (this.terminalDeliveryError !== undefined)
+            throw this.terminalDeliveryError;
+          if (this.state !== 'streaming' || this.backendTransition) return;
+          await this.syncNativePages(this.liveDisplayText());
+        });
+        this.nativePageChain = run.catch((error) => {
+          // A continuation send can lose its ACK while complete()/abort() is
+          // waiting for this drain. Record uncertainty before resolving the
+          // drain; terminal guards must not erase that visible-send boundary.
+          if (!canSwitchFeishuCardBackend(error)) {
+            this.terminalDeliveryError ??=
+              visibleFeishuCardProgressError(error);
+          }
+        });
+        await run;
         this.textFlushCtrl!.markFlushed(this.accumulatedText.length);
         this.patchFailCount = 0;
         this.emitLifecycle('streaming');
       } catch (err) {
         if (this.state !== 'streaming') return;
+        if (!canSwitchFeishuCardBackend(err)) {
+          this.fenceVisibleCardMutation(err);
+          return;
+        }
         this.patchFailCount++;
         logger.debug(
           {
@@ -2977,6 +3425,265 @@ export class StreamingCardController {
    * Schedule an auxiliary content flush for streaming mode.
    * Falls back to schedulePatch() if streaming backend is not available.
    */
+  /** Explicit platform size rejections are safe to repartition; uncertain
+   * visible ACKs must escape unchanged to the existing sticky delivery fence. */
+  private reduceNativeCapacity(error: unknown): boolean {
+    if (
+      !isNativeCardCapacityRejection(error) ||
+      this.nativeCapacityScale < 0.08
+    )
+      return false;
+    this.nativeCapacityScale *= 0.8;
+    logger.info(
+      { chatId: this.chatId, code: 200860, scale: this.nativeCapacityScale },
+      'CardKit rejected page capacity; retrying smaller canonical pages',
+    );
+    return true;
+  }
+
+  /** Size optional diagnostics against the actual visible answer, including
+   * JSON escaping. Growing process details must not evict accepted prose. */
+  private nativePanelPatches(text: string) {
+    const panels = this.buildRichPanelPatches();
+    const keys = [
+      'progressContent',
+      'taskContent',
+      'toolsContent',
+      'thinkingContent',
+      'timelineContent',
+    ] as const;
+    if (this.nativeSuppressDetails || keys.every((key) => !panels[key])) {
+      for (const key of keys) panels[key] = '';
+      return panels;
+    }
+    const budget =
+      Math.floor(CARDKIT_JSON_MAX_BYTES * this.nativeCapacityScale) - 3000;
+    const card = buildStreamingAgentCard({ initialText: text, panels });
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    for (let attempt = 0; attempt < 7; attempt++) {
+      if (attempt === 6) {
+        for (const key of keys) panels[key] = '';
+        return panels;
+      }
+      if (fitsCardCapacity(card, { maxBytes: budget })) return panels;
+      for (const key of keys) {
+        const plain = (panels[key] ?? '').replace(/<[^>]*>/g, '');
+        const points = Array.from(plain);
+        panels[key] =
+          points.length > 80
+            ? points.slice(0, Math.floor(points.length / 2)).join('') + '…'
+            : '';
+      }
+      body.elements = body.elements.filter(
+        (element) => element.element_id !== CARD_ELEMENT_IDS.DETAILS_PANEL,
+      );
+      body.elements.push(...buildStreamingDetails(panels));
+    }
+    return panels;
+  }
+
+  private planNativePages(
+    text: string,
+    frozenBoundaries: number[] = [],
+  ): CardPage[] {
+    const budget = Math.floor(
+      CARDKIT_JSON_MAX_BYTES * this.nativeCapacityScale,
+    );
+    return splitCardPages(text, {
+      frozenBoundaries,
+      preserveFrozenCapacity: true,
+      fits: (pageText) => {
+        if (byteLen(JSON.stringify(pageText)) > budget - 3000) return false;
+        const live = buildStreamingAgentCard({
+          initialText: pageText,
+          panels: this.nativePanelPatches(pageText),
+        });
+        const final = this.buildStructuredFinalCard(
+          'completed',
+          undefined,
+          pageText,
+        );
+        // Current diagnostics are measured; reserve room for later diagnostic
+        // growth, the warning state and the in-place usage/footer update.
+        return (
+          fitsCardCapacity(live, { maxBytes: budget - 3000 }) &&
+          fitsCardCapacity(final, { maxBytes: budget - 3000 })
+        );
+      },
+    });
+  }
+
+  /** Keep accepted prefix boundaries stable on append. On a definite size
+   * rejection only the rejected page and following pages are repartitioned. */
+  private async syncNativePages(
+    text: string,
+    terminal?: 'completed' | 'aborted',
+  ): Promise<void> {
+    let boundaries = text.startsWith(this.nativeCanonicalText)
+      ? this.nativeCards
+          .filter((entry) => entry.text !== '')
+          .slice(0, -1)
+          .map((entry) => entry.rawEnd)
+      : [];
+    let retryFrom = 0;
+    for (;;) {
+      const pages = this.planNativePages(text, boundaries);
+      let pageIndex = 0;
+      try {
+        await this.applyNativePages(pages, terminal, retryFrom, (index) => {
+          pageIndex = index;
+        });
+        this.nativeCanonicalText = text;
+        return;
+      } catch (error) {
+        if (!this.reduceNativeCapacity(error)) throw error;
+        boundaries = pages.slice(0, pageIndex).map((page) => page.rawEnd);
+        retryFrom = pageIndex;
+      }
+    }
+  }
+
+  private async applyNativePages(
+    pages: CardPage[],
+    terminal: 'completed' | 'aborted' | undefined,
+    startAt: number,
+    onPage: (index: number) => void,
+  ): Promise<void> {
+    for (let i = startAt; i < pages.length; i++) {
+      onPage(i);
+      const page = pages[i];
+      const tail = i === pages.length - 1;
+      const live = tail && !terminal;
+      let entry = this.nativeCards[i];
+      if (!entry) {
+        const backend = new StreamingModeBackend(this.client);
+        await backend.createCard(
+          buildStreamingAgentCard({ initialText: page.text }),
+        );
+        const messageId = await backend.sendCard(
+          this.chatId,
+          this.replyToMsgId,
+          this.replyInThread,
+        );
+        entry = {
+          backend,
+          text: page.text,
+          streaming: true,
+          rawEnd: page.rawEnd,
+        };
+        this.nativeCards.push(entry);
+        this.streamingBackend = backend;
+        this.messageId = messageId;
+        this.onCardCreated?.(messageId);
+        this.emitLifecycle('streaming');
+      }
+      if (!live) {
+        const wasStreaming = entry.streaming;
+        if (entry.streaming) {
+          await entry.backend.drain();
+          await entry.backend.disableStreamingMode();
+          entry.streaming = false;
+        }
+        if (terminal || wasStreaming || entry.text !== page.text) {
+          const card =
+            tail && terminal
+              ? this.buildStructuredFinalCard(terminal, undefined, page.text)
+              : buildAgentReplyCard({
+                  text: page.text,
+                  status:
+                    terminal === 'aborted'
+                      ? 'warning'
+                      : terminal
+                        ? 'done'
+                        : 'running',
+                  title: terminal ? undefined : '回复继续中',
+                  footer: terminal
+                    ? undefined
+                    : '后续内容将在下一张卡片继续显示',
+                });
+          await entry.backend.updateCardFull(card);
+        }
+      } else if (!entry.streaming || this.nativeFullUpdates) {
+        const card = buildStreamingAgentCard({
+          initialText: page.text,
+          panels: this.nativePanelPatches(page.text),
+        });
+        if (this.nativeFullUpdates) {
+          (card.config as Record<string, unknown>).streaming_mode = false;
+        }
+        await entry.backend.updateCardFull(card);
+        entry.streaming = !this.nativeFullUpdates;
+      } else {
+        if (entry.backend.hasRuntimeDetails()) {
+          // Existing details occupy provider capacity until their shrink is
+          // acknowledged. Reserve space before increasing the main body.
+          const candidates = [entry.text, page.text].map((text) => {
+            const panels = this.nativePanelPatches(text);
+            const details = buildStreamingDetails(panels)[0] ?? null;
+            return { panels, details, size: byteLen(JSON.stringify(details)) };
+          });
+          const { panels, details } = candidates.sort(
+            (a, b) => a.size - b.size,
+          )[0];
+          try {
+            await entry.backend.updateMarkdownContents(
+              [
+                {
+                  elementId: CARD_ELEMENT_IDS.PROGRESS_CONTENT,
+                  content: panels.progressContent ?? '',
+                },
+                {
+                  elementId: CARD_ELEMENT_IDS.TASK_CONTENT,
+                  content: panels.taskContent,
+                },
+                {
+                  elementId: CARD_ELEMENT_IDS.TOOLS_CONTENT,
+                  content: panels.toolsContent,
+                },
+                {
+                  elementId: CARD_ELEMENT_IDS.THINKING_CONTENT,
+                  content: panels.thinkingContent ?? '',
+                },
+                {
+                  elementId: CARD_ELEMENT_IDS.TIMELINE_CONTENT,
+                  content: panels.timelineContent ?? '',
+                },
+              ],
+              details,
+            );
+          } catch (error) {
+            if (!isNativeCardCapacityRejection(error)) throw error;
+            // Hidden Markdown expansion can reject even the locally bounded
+            // detail projection. Drop diagnostics before shrinking prose.
+            this.nativeSuppressDetails = true;
+            await entry.backend.updateMarkdownContents([], null);
+          }
+        }
+        await entry.backend.streamBody(page.text);
+      }
+      entry.text = page.text;
+      entry.rawEnd = page.rawEnd;
+    }
+    // The canonical reducer can retract provisional text. Never leave stale
+    // output on previously visible continuation cards after such a revision.
+    for (let i = pages.length; i < this.nativeCards.length; i++) {
+      const entry = this.nativeCards[i];
+      if (entry.text === '') continue;
+      if (entry.streaming) await entry.backend.disableStreamingMode();
+      await entry.backend.updateCardFull(
+        buildAgentReplyCard({
+          text: '此页内容已更新，请查看前面的回复。',
+          status: 'done',
+        }),
+      );
+      entry.text = '';
+      entry.streaming = false;
+    }
+    const tail = this.nativeCards[pages.length - 1];
+    this.streamingBackend = tail.backend;
+    this.messageId = tail.backend.messageId;
+  }
+
   private derivePhase(): StreamingPhase {
     // 挂起完成态优先：本 turn 已答复、等后台任务/续写。放在最前是有意的——
     // backgrounded Bash 等工具的 tool_use 可能永远等不到 end 事件而滞留
@@ -3053,6 +3760,7 @@ export class StreamingCardController {
     timelineContent?: string;
     footerNote: string;
   } {
+    this.purgeOldTools();
     const phase = this.derivePhase();
     // Bucket elapsed to 5s so the banner text doesn't change on every single
     // aux flush — sub-second precision would defeat the hash dedup and turn
@@ -3066,8 +3774,7 @@ export class StreamingCardController {
       detail: this.deriveBannerDetail(phase),
       elapsedMs,
     });
-    // Footer is the short status echo only — recent events have their own panel.
-    const footerNote = `<font color='grey'>${statusBanner.replace(/<[^>]+>/g, '').trim()}</font>`;
+    const footerNote = this.traceFooterLink() ?? '';
 
     const progressContent =
       this.todos && this.todos.length > 0
@@ -3115,7 +3822,7 @@ export class StreamingCardController {
               return `<text_tag color='${tagColor}'>${tagText}</text_tag> **${task.title.slice(0, 80)}**${type}${last}${summary}`;
             })
             .join('\n')
-        : "<font color='grey'>暂无子任务</font>";
+        : '';
 
     // Filter out AskUserQuestion from the tools timeline — it gets its own panel.
     const toolViews: ToolCallView[] = Array.from(this.toolCalls.values())
@@ -3123,12 +3830,14 @@ export class StreamingCardController {
       .map((tc) => ({
         name: tc.name,
         status: tc.status,
-        durationMs: now - tc.startTime,
+        durationMs: (tc.endTime ?? now) - tc.startTime,
         summary: tc.toolInputSummary,
         skillName: tc.skillName,
         isNested: tc.isNested,
       }));
-    const toolsContent = buildToolsTimelineText(toolViews);
+    const toolsContent = toolViews.length
+      ? buildToolsTimelineText(toolViews)
+      : '';
 
     const thinkingContent = this.thinkingText
       ? buildThinkingBlockquote(this.thinkingText)
@@ -3149,14 +3858,26 @@ export class StreamingCardController {
         ? buildTimelineText(this.recentEvents.map((e) => ({ text: e.text })))
         : undefined;
 
+    const bounded = (content: string | undefined): string => {
+      if (!content) return '';
+      if (byteLen(content) <= 1800) return content;
+      let prefix = '';
+      // Truncated diagnostic text must not leave an unterminated Feishu tag.
+      const plain = content.replace(/<[^>]*>/g, '');
+      for (const point of plain) {
+        if (byteLen(prefix + point) > 1650) break;
+        prefix += point;
+      }
+      return `${prefix}\n… 已省略部分过程详情`;
+    };
     return {
       statusBanner,
-      progressContent,
-      taskContent,
-      toolsContent,
-      thinkingContent,
+      progressContent: bounded(progressContent),
+      taskContent: bounded(taskContent),
+      toolsContent: bounded(toolsContent),
+      thinkingContent: bounded(thinkingContent),
       askContent,
-      timelineContent,
+      timelineContent: bounded(timelineContent),
       footerNote,
     };
   }
@@ -3168,49 +3889,87 @@ export class StreamingCardController {
     }
 
     this.auxFlushCtrl.schedule(this.stateVersion * 1000, async () => {
+      await this.nativePageChain;
       // Terminal guard — mirror of scheduleTextFlush.
-      if (this.state !== 'streaming' || !this.streamingBackend) return;
-      const patches = this.buildRichPanelPatches();
+      if (
+        this.state !== 'streaming' ||
+        !this.streamingBackend ||
+        this.backendTransition
+      )
+        return;
+      const visibleText =
+        this.nativeCards.find(
+          (entry) => entry.backend === this.streamingBackend,
+        )?.text ?? this.liveDisplayText();
+      const patches = this.nativePanelPatches(visibleText);
+      const details = buildStreamingDetails(patches)[0] ?? null;
 
-      const result = await this.streamingBackend!.updateMarkdownContents([
-        {
-          elementId: CARD_ELEMENT_IDS.STATUS_BANNER,
-          content: patches.statusBanner,
-        },
-        {
-          elementId: CARD_ELEMENT_IDS.ASK_CONTENT,
-          content: patches.askContent ?? '',
-        },
-        {
-          elementId: CARD_ELEMENT_IDS.PROGRESS_CONTENT,
-          content:
-            patches.progressContent ??
-            "<font color='grey'>等待任务规划…</font>",
-        },
-        {
-          elementId: CARD_ELEMENT_IDS.TASK_CONTENT,
-          content: patches.taskContent,
-        },
-        {
-          elementId: CARD_ELEMENT_IDS.TOOLS_CONTENT,
-          content: patches.toolsContent,
-        },
-        {
-          elementId: CARD_ELEMENT_IDS.THINKING_CONTENT,
-          content:
-            patches.thinkingContent ??
-            "<font color='grey'>尚未开始思考…</font>",
-        },
-        {
-          elementId: CARD_ELEMENT_IDS.TIMELINE_CONTENT,
-          content:
-            patches.timelineContent ?? "<font color='grey'>暂无调用记录</font>",
-        },
-        {
-          elementId: CARD_ELEMENT_IDS.FOOTER_NOTE,
-          content: patches.footerNote,
-        },
-      ]);
+      let result: { updated: string[]; failed: string[] };
+      try {
+        result = await this.streamingBackend!.updateMarkdownContents(
+          [
+            {
+              elementId: CARD_ELEMENT_IDS.STATUS_BANNER,
+              content: patches.statusBanner,
+            },
+            {
+              elementId: CARD_ELEMENT_IDS.ASK_CONTENT,
+              content: patches.askContent ?? '',
+            },
+            {
+              elementId: CARD_ELEMENT_IDS.PROGRESS_CONTENT,
+              content: patches.progressContent ?? '',
+            },
+            {
+              elementId: CARD_ELEMENT_IDS.TASK_CONTENT,
+              content: patches.taskContent,
+            },
+            {
+              elementId: CARD_ELEMENT_IDS.TOOLS_CONTENT,
+              content: patches.toolsContent,
+            },
+            {
+              elementId: CARD_ELEMENT_IDS.THINKING_CONTENT,
+              content: patches.thinkingContent ?? '',
+            },
+            {
+              elementId: CARD_ELEMENT_IDS.TIMELINE_CONTENT,
+              content: patches.timelineContent ?? '',
+            },
+            {
+              elementId: CARD_ELEMENT_IDS.FOOTER_NOTE,
+              content: patches.footerNote,
+            },
+          ],
+          details,
+        );
+      } catch (error) {
+        // complete()/abort() may already be draining this auxiliary mutation.
+        // Preserve unknown acceptance before applying the terminal-state guard.
+        if (!canSwitchFeishuCardBackend(error)) {
+          this.fenceVisibleCardMutation(error);
+          return;
+        }
+        if (this.state !== 'streaming') return;
+        if (isNativeCardCapacityRejection(error)) {
+          if (!this.nativeSuppressDetails) {
+            this.nativeSuppressDetails = true;
+            this.scheduleAuxFlush();
+            return;
+          }
+          if (this.reduceNativeCapacity(error)) {
+            // The text path owns native page changes and preserves its sticky
+            // unknown-ACK fence. Never hand a capacity-only failure to v1.
+            this.scheduleTextFlush();
+            return;
+          }
+          this.fenceVisibleCardMutation(error);
+          return;
+        }
+        this.patchFailCount++;
+        if (this.patchFailCount >= this.maxPatchFailures) this.degradeToV1();
+        return;
+      }
       if (result.updated.length > 0) {
         // Persist the provider-acknowledged sequence. Without this, a crash
         // after heartbeat/auxiliary mutations would leave recovery using an
@@ -3234,62 +3993,76 @@ export class StreamingCardController {
    * Degrade from streaming mode to v1 full-update mode.
    */
   private degradeToV1(): void {
-    // Re-entrancy guard: two failed flushes can both reach the degradation
-    // threshold; the second call would null-deref streamingBackend.
-    if (!this.streamingBackend) return;
-    // Terminal guard: degrading AFTER complete()/abort() would build a fresh
-    // MultiCardManager (frozenPrefixChars=0) over the full final text and
-    // schedule a 'streaming' patch — overwriting the finalized card back to
-    // 「生成中」and, for long replies, spraying (续) cards post-completion.
+    if (!this.streamingBackend || this.backendTransition) return;
     if (this.state !== 'streaming' && this.state !== 'creating') return;
-    logger.warn(
-      { chatId: this.chatId },
-      'Streaming mode: degrading to v1 full-update',
-    );
-
-    // Save card_id and sequence from streaming backend before clearing
-    const existingCardId = this.streamingBackend.getCardId();
-    const existingSeq = this.streamingBackend.getSequence();
-
-    // Try to disable streaming mode gracefully (fire and forget)
-    this.streamingBackend?.disableStreamingMode().catch(() => {});
-
-    this.backendMode = 'v1';
-    this.streamingBackend = null;
     this.textFlushCtrl?.dispose();
-    this.textFlushCtrl = null;
     this.auxFlushCtrl?.dispose();
-    this.auxFlushCtrl = null;
     this.stopHeartbeat();
-    this.patchFailCount = 0;
 
-    // Set up v1 flush controller
-    this.flushCtrl.dispose();
-    this.flushCtrl = new FlushController(1000, 50);
-
-    // Adopt the existing streaming card into a CardKitBackend (reuses card_id, no new message)
-    const adoptedCard = new CardKitBackend(this.client);
-    adoptedCard.adoptCard(existingCardId!, this.messageId!, existingSeq);
-
-    this.multiCard = new MultiCardManager(
-      this.client,
-      this.chatId,
-      this.replyToMsgId,
-      this.replyInThread,
-      this.onCardCreated,
-    );
-    this.multiCard.adoptExistingCard(adoptedCard);
-
-    // Schedule an immediate patch to sync the current state
-    this.schedulePatch();
+    // Keep a single owner until every old mutation, including settings, has
+    // been acknowledged. The adopted backend starts at that exact sequence.
+    this.backendTransition = (async () => {
+      try {
+        await this.nativePageChain;
+        if (this.terminalDeliveryError !== undefined)
+          throw this.terminalDeliveryError;
+        const backend = this.streamingBackend;
+        if (!backend) return;
+        await backend.drain();
+        await backend.disableStreamingMode();
+        if (this.state !== 'streaming' && this.state !== 'creating') return;
+        if (this.nativeCards.length > 1) {
+          this.nativeFullUpdates = true;
+          this.textFlushCtrl = new FlushController(1000, 30);
+          this.auxFlushCtrl = new FlushController(1500, 0);
+          this.patchFailCount = 0;
+          return;
+        }
+        const adopted = new CardKitBackend(this.client, backend.mutations);
+        adopted.adoptCard(
+          backend.getCardId()!,
+          this.messageId!,
+          backend.getSequence(),
+        );
+        this.multiCard = new MultiCardManager(
+          this.client,
+          this.chatId,
+          this.replyToMsgId,
+          this.replyInThread,
+          this.onCardCreated,
+        );
+        this.multiCard.adoptExistingCard(adopted);
+        this.streamingBackend = null;
+        this.backendMode = 'v1';
+        this.textFlushCtrl = null;
+        this.auxFlushCtrl = null;
+        this.patchFailCount = 0;
+        this.flushCtrl.dispose();
+        this.flushCtrl = new FlushController(1000, 50);
+        logger.warn(
+          { chatId: this.chatId },
+          'Streaming card handed over to full updates',
+        );
+      } catch (error) {
+        this.fenceVisibleCardMutation(error);
+      }
+    })().finally(() => {
+      this.backendTransition = null;
+      if (this.state === 'streaming') {
+        if (this.nativeFullUpdates) {
+          this.startHeartbeat();
+          this.scheduleTextFlush();
+        } else if (this.backendMode === 'v1') this.schedulePatch();
+      }
+    });
   }
 
   /**
    * Build a structured terminal card from the controller's accumulated state.
    * Reuses the shared v2 builder so the visual surface matches non-streaming
    * replies (metadata row, collapsible thinking/tool panels, grey footer). The
-   * builder decides the header off status: `done` has none, `aborted`→warning
-   * keeps an orange status header.
+   * builder keeps a compact status header and places execution details after
+   * the answer in both live and terminal layouts.
    */
   private buildStructuredFinalCard(
     finalState: 'completed' | 'aborted',
@@ -3304,27 +4077,19 @@ export class StreamingCardController {
       reasoningTokens?: number;
       modelUsage?: Record<string, { outputTokens?: number }>;
     },
+    text = this.accumulatedText,
   ): object {
     const status: CardStatus = finalState === 'aborted' ? 'warning' : 'done';
-    const toolCounts = new Map<string, number>();
-    for (const tc of this.toolCalls.values()) {
-      // Task sub-agents are surfaced in the dedicated tasks panel; don't also
-      // double-count them as ordinary tools (the streaming card registers each
-      // Task via startTool('Task: …') for its timeline). Counting them here
-      // would yield a confusing 'Task: xxx' entry in the tool stats.
-      if (tc.name === 'Task' || tc.name.startsWith('Task:')) continue;
-      toolCounts.set(tc.name, (toolCounts.get(tc.name) ?? 0) + 1);
-    }
     const toolCalls: ToolCallStat[] = Array.from(
-      toolCounts,
+      this.toolTotals,
       ([name, count]) => ({ name, count }),
     );
     const thinking = this.thinkingText.trim() || undefined;
-    return buildAgentReplyCard({
+    const card = buildAgentReplyCard({
       status,
-      text: this.accumulatedText || '> ⚠️ 本次运行没有生成可展示的最终内容。',
+      text: text || '> ⚠️ 本次运行没有生成可展示的最终内容。',
       thinking,
-      footer: this.traceFooterLink(),
+
       meta: {
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
         durationMs: usage?.durationMs,
@@ -3338,6 +4103,24 @@ export class StreamingCardController {
         numTurns: usage?.numTurns,
       },
     });
+    (card.body as { elements: object[] }).elements.push({
+      tag: 'markdown',
+      element_id: CARD_ELEMENT_IDS.FOOTER_NOTE,
+      text_size: 'notation',
+      content: this.traceFooterLink() ?? '',
+    });
+    const budget =
+      Math.floor(CARDKIT_JSON_MAX_BYTES * this.nativeCapacityScale) - 3000;
+    if (
+      this.nativeSuppressDetails ||
+      !fitsCardCapacity(card, { maxBytes: budget })
+    ) {
+      const body = card.body as { elements: Array<Record<string, unknown>> };
+      body.elements = body.elements.filter(
+        (element) => element.element_id !== CARD_ELEMENT_IDS.DETAILS_PANEL,
+      );
+    }
+    return card;
   }
 
   /**
@@ -3346,141 +4129,46 @@ export class StreamingCardController {
   private async finalizeStreamingCard(
     finalState: 'completed' | 'aborted',
   ): Promise<void> {
+    await this.nativePageChain;
+    if (this.terminalDeliveryError !== undefined)
+      throw this.terminalDeliveryError;
     const backend = this.streamingBackend!;
-
     try {
-      // 1. Let any provider mutation already accepted by the shared queue
-      // settle before crossing the terminal boundary.
-      await backend.drain();
-
-      // 2. Disable streaming mode (allows header/button changes)
-      await backend.disableStreamingMode();
-
-      // 3. Build structured final card (usage note comes later via patchUsageNote)
-      const cardJson = this.buildStructuredFinalCard(finalState);
-      const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
-
-      if (
-        cardSize <= CARD_SIZE_LIMIT &&
-        this.accumulatedText.length <= MAX_FINAL_SINGLE_CARD_CHARS
-      ) {
-        // 4a. Single card fits (both built JSON and RAW text length — the
-        // latter catches ASCII replies whose truncated JSON looks small)
-        await backend.updateCardFull(cardJson);
-      } else {
-        // 4b. Too large for single card — split on finalize (full content).
-        // Set the flag BEFORE awaiting: patchUsageNote may fire mid-split and
-        // must not rebuild a single card over the just-created continuations.
-        this.finalizedAsSplit = true;
-        await this.splitOnFinalize(finalState);
-      }
+      await this.syncNativePages(this.accumulatedText, finalState);
     } catch (err) {
+      if (!canSwitchFeishuCardBackend(err) || this.nativeCards.length > 1)
+        throw err;
       logger.debug(
         { err, chatId: this.chatId },
-        'Streaming finalize failed, trying truncated fallback',
+        'Streaming finalize was rejected, trying a simpler answer card',
       );
-      // Fallback: truncate to a byte budget (CJK is 3 bytes/char, so a
-      // char-count slice would still overflow) and try once more.
+      // This path owns a single page. Strip
+      // optional presentation detail on a schema rejection, retaining the
+      // complete answer instead of silently truncating it.
       try {
-        let lo = 0;
-        let hi = this.accumulatedText.length;
-        while (lo < hi) {
-          const mid = (lo + hi + 1) >> 1;
-          if (byteLen(this.accumulatedText.slice(0, mid)) <= FREEZE_SLICE_BYTES)
-            lo = mid;
-          else hi = mid - 1;
-        }
-        const truncated = this.accumulatedText.slice(0, lo);
         const fallbackCard = buildSchema2Card(
-          truncated + '\n\n> ⚠️ 输出已截断',
+          this.accumulatedText,
           finalState,
+          '',
+          statusHeadline(finalState === 'aborted' ? 'warning' : 'done'),
         );
+        (fallbackCard as { body: { elements: object[] } }).body.elements.push({
+          tag: 'markdown',
+          element_id: CARD_ELEMENT_IDS.FOOTER_NOTE,
+          text_size: 'notation',
+          content: this.traceFooterLink() ?? '',
+        });
         await backend.updateCardFull(fallbackCard);
       } catch (fallbackErr) {
         logger.warn(
           { err: fallbackErr, chatId: this.chatId },
-          'Streaming finalize truncated fallback also failed',
+          'Streaming finalize simple fallback also failed',
         );
         // Both attempts failed — the card face is still stuck on「生成中」.
         // Rethrow so complete() reverts state and the caller falls back to a
         // static IM message; swallowing here would silently lose the reply
         // AND leave a zombie card.
         throw fallbackErr;
-      }
-    }
-  }
-
-  /**
-   * Split content into multiple cards on finalize (only when streaming card content exceeds CARD_SIZE_LIMIT).
-   * The first card (existing streaming card) gets frozen, subsequent cards are new.
-   */
-  private async splitOnFinalize(
-    finalState: 'completed' | 'aborted',
-  ): Promise<void> {
-    const backend = this.streamingBackend!;
-    const { title } = extractTitleAndBody(this.accumulatedText);
-    const chunks = splitCodeBlockSafe(this.accumulatedText, CARD_MD_LIMIT);
-
-    // Group chunks into cards bounded by element count AND UTF-8 byte budget.
-    // Char-count budgeting under-counts CJK 3x — a 43-chunk or 18000-char card
-    // can be 100KB+ / 54KB of JSON, far over the ~30KB API limit.
-    const MAX_ELEMENTS_PER_CARD = 43;
-    const groups: string[][] = [];
-    let current: string[] = [];
-    let currentBytes = 0;
-    for (const chunk of chunks) {
-      const chunkBytes = byteLen(chunk);
-      if (
-        current.length > 0 &&
-        (current.length >= MAX_ELEMENTS_PER_CARD ||
-          currentBytes + chunkBytes > FREEZE_SLICE_BYTES)
-      ) {
-        groups.push(current);
-        current = [];
-        currentBytes = 0;
-      }
-      current.push(chunk);
-      currentBytes += chunkBytes;
-    }
-    if (current.length > 0) groups.push(current);
-
-    for (let i = 0; i < groups.length; i++) {
-      const text = groups[i].join('\n\n');
-      const isLast = i === groups.length - 1;
-      const state = isLast ? finalState : ('frozen' as const);
-      if (i === 0) {
-        // First card reuses the existing streaming card. It extracts its own
-        // title (strip-first-line, #488); only continuation cards get the
-        // override title so their first line stays in the body.
-        const firstCard = buildSchema2Card(text, state, '');
-        await backend.updateCardFull(firstCard);
-        if (isLast) {
-          this.lastSplitCard = {
-            render: (cardJson) => backend.updateCardFull(cardJson),
-            text,
-            state,
-            titlePrefix: '',
-          };
-        }
-      } else {
-        const contCard = new CardKitBackend(this.client);
-        const contCardJson = buildSchema2Card(text, state, '(续) ', title);
-        await contCard.createCard(contCardJson);
-        const newMsgId = await contCard.sendCard(
-          this.chatId,
-          this.replyToMsgId,
-          this.replyInThread,
-        );
-        this.onCardCreated?.(newMsgId);
-        if (isLast) {
-          this.lastSplitCard = {
-            render: (cardJson) => contCard.updateCard(cardJson),
-            text,
-            state,
-            titlePrefix: '(续) ',
-            title,
-          };
-        }
       }
     }
   }
@@ -3518,7 +4206,9 @@ export class StreamingCardController {
           },
           'CardKit card update failed',
         );
-        throw err;
+        throw canSwitchFeishuCardBackend(err)
+          ? err
+          : this.fenceVisibleCardMutation(err);
       }
     } else {
       // Legacy message.patch path (no auxiliary content)
@@ -3529,12 +4219,13 @@ export class StreamingCardController {
 
       try {
         const messageId = this.messageId;
-        const run = this.legacyPatchChain.then(() =>
-          this.client.im.v1.message.patch({
+        const run = this.legacyPatchChain.then(async () => {
+          const response = await this.client.im.v1.message.patch({
             path: { message_id: messageId },
             data: { content },
-          }),
-        );
+          });
+          assertCardKitAcknowledged(response, 'im.message.patch');
+        });
         this.legacyPatchChain = run.then(
           () => undefined,
           () => undefined,
@@ -3554,7 +4245,9 @@ export class StreamingCardController {
           },
           'Streaming card patch failed',
         );
-        throw err;
+        throw canSwitchFeishuCardBackend(err)
+          ? err
+          : this.fenceVisibleCardMutation(err);
       }
     }
   }
@@ -3569,14 +4262,11 @@ export async function reconcileInterruptedStreamingCard(
   client: lark.Client,
   input: InterruptedStreamingCardInput,
 ): Promise<{ version: number; method: 'cardkit' | 'message_patch' }> {
-  const saved = input.snapshot as
-    | { text?: unknown; thinking?: unknown }
-    | null
-    | undefined;
-  const partial = typeof saved?.text === 'string' ? saved.text.trim() : '';
-  const reason = input.reason?.trim() || '上次服务中断，本次任务未完成';
-  const text = partial ? `${partial}\n\n---\n> ⚠️ ${reason}` : `> ⚠️ ${reason}`;
-  const card = buildAgentReplyCard({ status: 'warning', text });
+  const rewrite = resolveInterruptedStreamingCardRewrite(input);
+  const card = buildAgentReplyCard({
+    status: rewrite.status,
+    text: rewrite.text,
+  });
 
   if (input.cardId) {
     let version = Math.max(0, Math.trunc(input.version));
@@ -3627,10 +4317,11 @@ export async function reconcileInterruptedStreamingCard(
   if (!input.messageId) {
     throw new Error('Interrupted streaming card has no cardId or messageId');
   }
-  await client.im.v1.message.patch({
+  const response = await client.im.v1.message.patch({
     path: { message_id: input.messageId },
     data: { content: JSON.stringify(card) },
   });
+  assertCardKitAcknowledged(response, 'im.message.patch reconcile');
   return {
     version: Math.max(0, Math.trunc(input.version)),
     method: 'message_patch',

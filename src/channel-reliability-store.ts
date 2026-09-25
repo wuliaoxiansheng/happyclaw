@@ -947,6 +947,37 @@ export function ignoreChannelInbox(
   return finishClaimedInbox(claim, { status: 'ignored', error: reason, now });
 }
 
+/**
+ * A direct companion can consume a root while that root is waiting without a
+ * lease. This closes the durable retry before the note starts its Agent turn.
+ */
+export function ignoreDeferredChannelInbox(input: {
+  provider: string;
+  accountId: string;
+  externalMessageId: string;
+  reason: string;
+  now?: Date | string;
+}): boolean {
+  const now = isoNow(input.now);
+  const changed = requireDatabase()
+    .prepare(
+      `UPDATE channel_inbox
+       SET status = 'ignored', error = ?, completed_at = ?, updated_at = ?,
+           lease_owner = NULL, lease_expires_at = NULL
+       WHERE provider = ? AND account_id = ? AND external_message_id = ?
+         AND status = 'queued' AND lease_owner IS NULL`,
+    )
+    .run(
+      input.reason,
+      now,
+      now,
+      input.provider,
+      input.accountId,
+      input.externalMessageId,
+    );
+  return changed.changes === 1;
+}
+
 export function failChannelInbox(
   claim: Pick<ClaimedChannelInboxItem, 'id' | 'leaseOwner' | 'leaseToken'>,
   input: {
@@ -1483,6 +1514,30 @@ export function interruptExpiredChannelTurnRuns(
 }
 
 /**
+ * Close a Turn whose reply was already persisted before the process died.
+ * Lease-free on purpose: crash recovery runs after the old owner is gone.
+ * Terminal rows stay immutable.
+ */
+export function completeRecoveredChannelTurnRun(
+  id: string,
+  nowInput?: Date | string,
+): boolean {
+  const now = isoNow(nowInput);
+  const changed = requireDatabase()
+    .prepare(
+      `UPDATE turn_runs
+       SET status = 'completed', completed_at = COALESCE(completed_at, ?),
+           updated_at = ?, error = NULL,
+           lease_owner = NULL, lease_expires_at = NULL,
+           lease_token = lease_token + 1, revision = revision + 1
+       WHERE id = ?
+         AND status IN ('queued','running','finalizing','waiting_user','retry_wait')`,
+    )
+    .run(now, now, id);
+  return changed.changes === 1;
+}
+
+/**
  * Explicitly fence one live conversation Turn (stop button, shutdown, or
  * unrecoverable card/run reconciliation). Terminal rows are immutable, so
  * repeating the same interrupt is a no-op.
@@ -1686,6 +1741,34 @@ export function hasUncertainChannelOutbox(turnRunId: string): boolean {
   return Boolean(getUncertainChannelOutboxForTurn(turnRunId));
 }
 
+/** A provider-authoritative rejection: no visible mutation occurred. */
+export function getFailedChannelOutboxForTurn(
+  turnRunId: string,
+): ChannelOutboxItem | undefined {
+  const row = requireDatabase()
+    .prepare(
+      `SELECT * FROM channel_outbox
+       WHERE turn_run_id = ? AND status = 'failed'
+       ORDER BY updated_at, id LIMIT 1`,
+    )
+    .get(turnRunId) as OutboxRow | undefined;
+  return row ? mapOutbox(row) : undefined;
+}
+
+/** A provider-acknowledged sibling means a later failed row is partial delivery. */
+export function getDeliveredChannelOutboxForTurn(
+  turnRunId: string,
+): ChannelOutboxItem | undefined {
+  const row = requireDatabase()
+    .prepare(
+      `SELECT * FROM channel_outbox
+       WHERE turn_run_id = ? AND status = 'delivered'
+       ORDER BY updated_at, id LIMIT 1`,
+    )
+    .get(turnRunId) as OutboxRow | undefined;
+  return row ? mapOutbox(row) : undefined;
+}
+
 /**
  * Every uncertain side effect awaiting reconciliation, oldest first.
  *
@@ -1870,6 +1953,52 @@ export function completeChannelOutbox(
       now,
     );
   return changed.changes === 1;
+}
+
+/** Retire a definitively rejected Feishu size parent only after its replacement
+ * pages have all been acknowledged. Preserve the budget and payload identity so
+ * an exact retry can traverse the same children instead of replaying the parent. */
+export function markFeishuCapacityReplacementDelivered(
+  id: string,
+  payloadHash: string,
+  replacementBudget: number,
+): boolean {
+  if (!Number.isInteger(replacementBudget) || replacementBudget < 256)
+    return false;
+  const item = getChannelOutboxItem(id);
+  if (!item || item.provider !== 'feishu' || item.payloadHash !== payloadHash)
+    return false;
+  if (item.status === 'cancelled') {
+    try {
+      const marker = JSON.parse(item.error ?? '');
+      return (
+        marker.kind === 'feishu_capacity_replaced' &&
+        marker.payloadHash === payloadHash &&
+        marker.replacementBudget === replacementBudget
+      );
+    } catch {
+      return false;
+    }
+  }
+  if (item.status !== 'failed' || !/\b230025\b/.test(item.error ?? ''))
+    return false;
+  const marker = JSON.stringify({
+    kind: 'feishu_capacity_replaced',
+    code: 230025,
+    replacementBudget,
+    payloadHash,
+    originalError: item.error,
+  });
+  return (
+    requireDatabase()
+      .prepare(
+        `UPDATE channel_outbox SET status = 'cancelled', error = ?,
+       revision = revision + 1, updated_at = ?
+     WHERE id = ? AND provider = 'feishu' AND status = 'failed'
+       AND payload_hash = ? AND error = ?`,
+      )
+      .run(marker, isoNow(), id, payloadHash, item.error).changes === 1
+  );
 }
 
 export function failChannelOutbox(

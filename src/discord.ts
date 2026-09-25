@@ -32,7 +32,11 @@ import type {
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { logger } from './logger.js';
-import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
+import {
+  saveDownloadedFile,
+  sanitizeImFilename,
+  MAX_FILE_SIZE,
+} from './im-downloader.js';
 import { detectImageMimeType } from './image-detector.js';
 import { splitTextChunks, createDedupCache } from './im-utils.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
@@ -45,6 +49,11 @@ import {
   ExactAsyncIndicatorRegistry,
   processingIndicatorKey,
 } from './processing-indicator.js';
+import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
+import {
+  ChannelInboundLifecycle,
+  type ChannelInboundLease,
+} from './channel-inbound-lifecycle.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -259,20 +268,97 @@ function splitDiscordChunks(text: string): string[] {
  * Download an attachment from a URL and return a Buffer.
  * Returns null on failure or if the file exceeds MAX_FILE_SIZE.
  */
-async function downloadAttachment(url: string): Promise<Buffer | null> {
+async function downloadAttachment(
+  url: string,
+  signal: AbortSignal,
+): Promise<Buffer | null> {
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, { signal });
     if (!response.ok) return null;
     const arrayBuffer = await response.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     if (buffer.length > MAX_FILE_SIZE) return null;
     return buffer;
-  } catch {
+  } catch (error) {
+    if (signal.aborted) throw error;
     return null;
   }
 }
 
 // ─── Factory Function ───────────────────────────────────────────
+
+function iterDiscordCollection<T>(
+  value: { values?: () => Iterable<T> } | T[] | undefined | null,
+): T[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value.values === 'function') return [...value.values()];
+  return [];
+}
+
+/** Wrapper + forwarded-snapshot attachments, fed through the same persist/download loop. */
+function collectDiscordInboundAttachments(msg: {
+  attachments?: { values?: () => Iterable<any> } | any[] | null;
+  messageSnapshots?: { values?: () => Iterable<any> } | any[] | null;
+  message_snapshots?: any[] | null;
+}): any[] {
+  const collected = [...iterDiscordCollection(msg.attachments)];
+  const snapshots = [
+    ...iterDiscordCollection(msg.messageSnapshots),
+    ...(msg.message_snapshots ?? []),
+  ];
+  for (const snap of snapshots) {
+    const inner = snap?.message ?? snap;
+    collected.push(...iterDiscordCollection(inner?.attachments));
+  }
+  return collected;
+}
+
+/** Sticker-only and forwarded-snapshot text used before the empty persist gate. */
+export function discordSupplementalInboundText(msg: {
+  stickers?:
+    | { values?: () => Iterable<{ name?: string | null }> }
+    | Array<{ name?: string | null }>;
+  stickerItems?:
+    | { values?: () => Iterable<{ name?: string | null }> }
+    | Array<{ name?: string | null }>;
+  sticker_items?: Array<{ name?: string | null }>;
+  messageSnapshots?: { values?: () => Iterable<any> } | any[];
+  message_snapshots?: any[];
+}): string {
+  const stickerNames: string[] = [];
+  for (const sticker of [
+    ...iterDiscordCollection(msg.stickers),
+    ...iterDiscordCollection(msg.stickerItems),
+    ...(msg.sticker_items ?? []),
+  ]) {
+    const name = sticker?.name?.trim();
+    if (name) stickerNames.push(name);
+  }
+  const uniqueStickers = [...new Set(stickerNames)];
+  const stickerText = uniqueStickers.length
+    ? uniqueStickers.map((name) => `[表情包: ${name}]`).join('\n')
+    : '';
+
+  const snapshots = [
+    ...iterDiscordCollection(msg.messageSnapshots),
+    ...(msg.message_snapshots ?? []),
+  ];
+  const snapshotBits: string[] = [];
+  for (const snap of snapshots) {
+    const inner = snap?.message ?? snap;
+    const text = typeof inner?.content === 'string' ? inner.content.trim() : '';
+    if (text) snapshotBits.push(text);
+    const nested = discordSupplementalInboundText({
+      stickers: inner?.stickers,
+      stickerItems: inner?.stickerItems,
+      sticker_items: inner?.sticker_items,
+    });
+    if (nested) snapshotBits.push(nested);
+  }
+
+  return [...snapshotBits, stickerText].filter(Boolean).join('\n');
+}
 
 export function createDiscordConnection(
   config: DiscordConnectionConfig,
@@ -280,6 +366,7 @@ export function createDiscordConnection(
   let discordClient: Client | null = null;
   let stopping = false;
   let readyFired = false;
+  const inboundLifecycle = new ChannelInboundLifecycle();
 
   // Message deduplication — LRU Map, 1000 entries, 30min TTL
   // LRU deduplication cache（共享 helper）
@@ -354,8 +441,11 @@ export function createDiscordConnection(
   async function handleMessage(
     msg: Message,
     opts: DiscordConnectOpts,
+    lease: ChannelInboundLease,
+    connectedClient: Client,
   ): Promise<void> {
     try {
+      inboundLifecycle.assertCurrent(lease);
       // Skip bot messages
       if (msg.author.bot) return;
 
@@ -378,16 +468,7 @@ export function createDiscordConnection(
         return;
       }
 
-      // Dedup check
-      if (dedup.isDuplicate(msgId)) {
-        logger.debug({ msgId }, 'Discord dropped: duplicate');
-        return;
-      }
-      if (!processingLock.acquire(msgId)) {
-        logger.debug({ msgId }, 'Discord message already in-flight, skipping');
-        return;
-      }
-      dedup.markSeen(msgId);
+      if (!processingLock.acquire(msgId)) return;
       try {
         // Skip stale messages from before connection (hot-reload scenario)
         if (opts.ignoreMessagesBefore && msg.createdTimestamp) {
@@ -431,6 +512,7 @@ export function createDiscordConnection(
           isChatAuthorized: opts.isChatAuthorized,
           onPairAttempt: opts.onPairAttempt,
         });
+        inboundLifecycle.assertCurrent(lease);
         if (admission.kind === 'paired') {
           await msg.reply('配对成功！此聊天已连接到你的工作区。');
           return;
@@ -454,8 +536,8 @@ export function createDiscordConnection(
 
         // Guild channel: check group filtering (must check actual @mention first)
         if (!isDM) {
-          const isBotMentioned = discordClient?.user
-            ? msg.mentions.has(discordClient.user)
+          const isBotMentioned = connectedClient.user
+            ? msg.mentions.has(connectedClient.user)
             : false;
 
           // Gate 1: require_mention mode — only process if bot was @mentioned
@@ -490,7 +572,7 @@ export function createDiscordConnection(
 
         // Extract content, stripping bot mentions
         let content = msg.content;
-        if (!isDM && discordClient?.user) {
+        if (!isDM && connectedClient.user) {
           // Remove bot mention patterns: <@123456> or <@!123456>
           content = content.replace(/<@!?\d+>/g, '').trim();
         }
@@ -531,13 +613,6 @@ export function createDiscordConnection(
         }
         const { targetJid, routing: agentRouting } = resolvedRoute;
 
-        // Only an admitted, policy-approved, routable chat may mutate metadata.
-        lastMessageIds.set(jid, msgId);
-        lastMessageIds.set(rawJid, msgId);
-        storeChatMetadata(jid, new Date().toISOString());
-        updateChatName(jid, chatName);
-        opts.onNewChat(jid, chatName);
-
         // Process attachments
         let attachmentsJson: string | undefined;
         const imageAttachments: {
@@ -546,15 +621,32 @@ export function createDiscordConnection(
           mimeType: string;
         }[] = [];
 
-        for (const attachment of msg.attachments.values()) {
+        for (const attachment of collectDiscordInboundAttachments(msg)) {
           const contentType = attachment.contentType || '';
           const isImage = contentType.startsWith('image/');
           const attachUrl = attachment.url;
           const attachName = attachment.name || `file_${Date.now()}`;
+          // Provider filenames reach the Agent prompt; strip newlines and
+          // brackets so a crafted name cannot break out of the marker.
+          const safeName = sanitizeImFilename(attachName);
+
+          // Discord reports the byte size up front: skip the download rather
+          // than buffering a body downloadAttachment would discard anyway.
+          if (
+            typeof attachment.size === 'number' &&
+            attachment.size > MAX_FILE_SIZE
+          ) {
+            const marker = isImage
+              ? '[图片过大，未下载]'
+              : `[文件过大，未下载: ${safeName}]`;
+            content = content ? `${content}\n${marker}` : marker;
+            continue;
+          }
 
           if (isImage) {
             // Download image for base64 and disk save
-            const buffer = await downloadAttachment(attachUrl);
+            const buffer = await downloadAttachment(attachUrl, lease.signal);
+            inboundLifecycle.assertCurrent(lease);
             if (buffer) {
               const mimeType = detectImageMimeType(buffer) || contentType;
 
@@ -571,6 +663,7 @@ export function createDiscordConnection(
               const groupFolder = opts.resolveGroupFolder?.(jid);
               if (groupFolder) {
                 try {
+                  inboundLifecycle.assertCurrent(lease);
                   const ext = mimeType.split('/')[1] || 'jpg';
                   const filename = `img_${Date.now()}.${ext}`;
                   const savedPath = await saveDownloadedFile(
@@ -579,43 +672,63 @@ export function createDiscordConnection(
                     filename,
                     buffer,
                   );
+                  inboundLifecycle.assertCurrent(lease);
                   if (!content) {
                     content = `[图片: ${savedPath}]`;
                   } else {
                     content += `\n[图片: ${savedPath}]`;
                   }
                 } catch (err) {
+                  inboundLifecycle.assertCurrent(lease);
                   logger.warn({ err }, 'Failed to save Discord image to disk');
                   if (!content) content = '[图片]';
                 }
               } else {
                 if (!content) content = '[图片]';
               }
+            } else {
+              // Keep the failure visible (also beside text) and never let an
+              // image-only message fall through the empty gate unacknowledged.
+              if (!content) {
+                content = '[图片下载失败]';
+              } else {
+                content += '\n[图片下载失败]';
+              }
             }
           } else {
             // Non-image file: download and save to workspace
-            const buffer = await downloadAttachment(attachUrl);
+            const buffer = await downloadAttachment(attachUrl, lease.signal);
+            inboundLifecycle.assertCurrent(lease);
             if (buffer) {
               const groupFolder = opts.resolveGroupFolder?.(jid);
               if (groupFolder) {
                 try {
+                  inboundLifecycle.assertCurrent(lease);
                   const savedPath = await saveDownloadedFile(
                     groupFolder,
                     'discord',
                     attachName,
                     buffer,
                   );
+                  inboundLifecycle.assertCurrent(lease);
                   if (!content) {
                     content = `[文件: ${savedPath}]`;
                   } else {
                     content += `\n[文件: ${savedPath}]`;
                   }
                 } catch (err) {
+                  inboundLifecycle.assertCurrent(lease);
                   logger.warn({ err }, 'Failed to save Discord file to disk');
-                  if (!content) content = `[文件: ${attachName}]`;
+                  if (!content) content = `[文件: ${safeName}]`;
                 }
               } else {
-                if (!content) content = `[文件: ${attachName}]`;
+                if (!content) content = `[文件: ${safeName}]`;
+              }
+            } else {
+              if (!content) {
+                content = `[文件下载失败: ${safeName}]`;
+              } else {
+                content += `\n[文件下载失败: ${safeName}]`;
               }
             }
           }
@@ -625,14 +738,27 @@ export function createDiscordConnection(
           attachmentsJson = JSON.stringify(imageAttachments);
         }
 
+        const supplemental = discordSupplementalInboundText(msg);
+        if (supplemental) {
+          content = content ? `${content}\n${supplemental}` : supplemental;
+        }
+
         // Skip empty messages
         if (!content && !attachmentsJson) {
           return;
         }
 
+        inboundLifecycle.assertCurrent(lease);
+        lastMessageIds.set(jid, msgId);
+        lastMessageIds.set(rawJid, msgId);
+        storeChatMetadata(jid, new Date().toISOString());
+        updateChatName(jid, chatName);
+        opts.onNewChat(jid, chatName);
+
         const id = crypto.randomUUID();
         const timestamp = new Date(msg.createdTimestamp).toISOString();
         const senderId = `discord:${msg.author.id}`;
+        inboundLifecycle.assertCurrent(lease);
         storeChatMetadata(targetJid, timestamp);
         storeMessageDirect(
           id,
@@ -672,7 +798,9 @@ export function createDiscordConnection(
             processingIndicatorKey(ackChatId, id),
             async () => {
               try {
+                inboundLifecycle.assertCurrent(lease);
                 await msg.react('\u{1F440}'); // eyes emoji
+                inboundLifecycle.assertCurrent(lease);
                 logger.debug(
                   { msgId: msg.id, inputMessageId: id, jid },
                   'Discord ack reaction attached',
@@ -711,7 +839,10 @@ export function createDiscordConnection(
         processingLock.release(msgId);
       }
     } catch (err) {
-      logger.error({ err }, 'Error handling Discord message');
+      if (!inboundLifecycle.isCancellation(err, lease)) {
+        logger.error({ err }, 'Error handling Discord message');
+      }
+      throw err;
     }
   }
 
@@ -732,6 +863,7 @@ export function createDiscordConnection(
     }
 
     const chunks = splitDiscordChunks(text);
+    const tracker = new PhysicalDeliveryTracker(chunks.length);
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
@@ -752,12 +884,14 @@ export function createDiscordConnection(
           }
         }
         if (files.length > 0) {
-          await channel.send({ content: chunk, files });
+          await tracker.send(() =>
+            channel.send({ content: chunk, files }).then(() => undefined),
+          );
         } else {
-          await channel.send(chunk);
+          await tracker.send(() => channel.send(chunk).then(() => undefined));
         }
       } else {
-        await channel.send(chunk);
+        await tracker.send(() => channel.send(chunk).then(() => undefined));
       }
     }
   }
@@ -771,10 +905,11 @@ export function createDiscordConnection(
 
       stopping = false;
       readyFired = false;
+      const lease = inboundLifecycle.begin();
       let readyTimeout: ReturnType<typeof setTimeout> | null = null;
 
       try {
-        discordClient = new Client({
+        const connectedClient = new Client({
           intents: [
             GatewayIntentBits.Guilds,
             GatewayIntentBits.GuildMessages,
@@ -784,6 +919,7 @@ export function createDiscordConnection(
           ],
           partials: [Partials.Channel, Partials.Message],
         });
+        discordClient = connectedClient;
 
         // Ready event
         discordClient.once(Events.ClientReady, async (readyClient) => {
@@ -931,14 +1067,26 @@ export function createDiscordConnection(
         // configured (line 658), DMs are also delivered without needing raw fallback.
         // This avoids the 2x REST fetch (channels.fetch + messages.fetch) per message
         // that the previous raw-event handler incurred.
-        discordClient.on(Events.MessageCreate, async (msg) => {
-          if (stopping) return;
+        connectedClient.on(Events.MessageCreate, (msg) => {
+          if (stopping || !inboundLifecycle.isCurrent(lease)) return;
           if (msg.author?.bot) return;
-          try {
-            await handleMessage(msg, opts);
-          } catch (err) {
-            logger.error({ err }, 'Error in Discord message handler');
-          }
+          const task = inboundLifecycle
+            .runMessage(
+              lease,
+              msg.id,
+              (id) => dedup.isDuplicate(id),
+              (id) => dedup.markSeen(id),
+              () => handleMessage(msg, opts, lease, connectedClient),
+            )
+            .catch((err) => {
+              if (inboundLifecycle.isCancellation(err, lease)) {
+                logger.debug(
+                  { msgId: msg.id },
+                  'Discord inbound callback cancelled',
+                );
+              }
+            });
+          return inboundLifecycle.track(task);
         });
 
         // Guild create (bot added to a new server) — log only, don't register
@@ -975,6 +1123,8 @@ export function createDiscordConnection(
       } catch (err) {
         if (readyTimeout) clearTimeout(readyTimeout);
         logger.error({ err }, 'Discord initial connection failed');
+        if (inboundLifecycle.isCurrent(lease)) inboundLifecycle.invalidate();
+        await inboundLifecycle.settle();
         const failedClient = discordClient;
         discordClient = null;
         if (failedClient) {
@@ -993,15 +1143,18 @@ export function createDiscordConnection(
 
     async disconnect(): Promise<void> {
       stopping = true;
+      inboundLifecycle.invalidate();
+      const currentClient = discordClient;
+      await inboundLifecycle.settle();
       await ackReactions.clearAll();
-      if (discordClient) {
+      if (currentClient) {
         try {
-          discordClient.destroy();
+          currentClient.destroy();
         } catch (err) {
           logger.debug({ err }, 'Error disconnecting Discord client');
         }
-        discordClient = null;
       }
+      if (discordClient === currentClient) discordClient = null;
       readyFired = false;
       dedup.clear();
       lastMessageIds.clear();

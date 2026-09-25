@@ -158,6 +158,105 @@ describe('StreamEventProcessor observability mapping', () => {
     expect(processor.getBlockingPendingSdkTaskCount()).toBe(0);
   });
 
+  test('merged background-completion placeholders settle their own debt but never complete the input', () => {
+    const { processor } = makeProcessor();
+    // Message order observed from Claude Code 2.1.280 when two background
+    // Bash commands finish while the main reply is still being generated.
+    for (const taskId of ['bash-a', 'bash-b']) {
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_started',
+        task_id: taskId,
+        description: taskId,
+        task_type: 'local_bash',
+      });
+    }
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'background_tasks_changed',
+      tasks: [{ task_id: 'bash-a' }, { task_id: 'bash-b' }],
+    });
+    for (const [taskId, remaining] of [
+      ['bash-a', [{ task_id: 'bash-b' }]],
+      ['bash-b', []],
+    ] as const) {
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'background_tasks_changed',
+        tasks: remaining,
+      });
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_updated',
+        task_id: taskId,
+        patch: { status: 'completed' },
+      });
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: taskId,
+        status: 'completed',
+        summary: `${taskId} done`,
+      });
+    }
+    expect(processor.getBlockingBackgroundCompletionDebtCount()).toBe(2);
+
+    // The CLI answers both queued notifications with one call: first an
+    // empty num_turns=0 placeholder, then the shared reply. With a later user
+    // turn already accepted, no activity is attributed to these debts, so each
+    // task-notification Result must still settle one of them.
+    processor.observeMergedCompletionPlaceholder();
+    expect(processor.getBlockingBackgroundCompletionDebtCount()).toBe(1);
+    expect(processor.canCompleteObservedBackgroundResult()).toBe(false);
+
+    expect(processor.observeBackgroundResult('task-notification')).toBe(true);
+    expect(processor.getBlockingBackgroundCompletionDebtCount()).toBe(0);
+
+    // Even with no debt left, a placeholder is never a completion boundary:
+    // the shared call that answers it has not run yet.
+    processor.observeMergedCompletionPlaceholder();
+    expect(processor.canCompleteObservedBackgroundResult()).toBe(false);
+  });
+
+  test('treats stopped and aborted task_updated as terminal SDK statuses', () => {
+    const { processor } = makeProcessor();
+
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'stopped-1',
+      description: 'user stopped this task',
+      task_type: 'local_agent',
+    });
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'aborted-1',
+      description: 'user aborted this task',
+      task_type: 'local_agent',
+    });
+    expect(processor.getPendingSdkTaskCount()).toBe(2);
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(2);
+
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_updated',
+      task_id: 'stopped-1',
+      patch: { status: 'stopped' },
+    });
+    expect(processor.getPendingSdkTaskCount()).toBe(1);
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(1);
+
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_updated',
+      task_id: 'aborted-1',
+      patch: { status: 'aborted' },
+    });
+    expect(processor.getPendingSdkTaskCount()).toBe(0);
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(0);
+  });
+
   test('maps SDK task_progress to structured task_progress event', () => {
     const { processor, outputs } = makeProcessor();
 

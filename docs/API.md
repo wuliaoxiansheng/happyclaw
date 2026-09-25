@@ -60,6 +60,11 @@ Public：
 - `DELETE /api/auth/sessions/:id`
 - `POST /api/auth/avatar`
 
+会话 Cookie 在 HTTPS 下名为 `__Host-happyclaw_session`，HTTP 下名为
+`happyclaw_session`；每次下发会话都会同时让另一个名称过期。`POST /api/auth/logout`
+让两个名称都过期，并删除该请求在两个名称下携带、且属于同一用户的全部会话；
+其他设备的会话不受影响。
+
 ## 工作区、消息和运行控制
 
 - `GET|POST /api/groups`
@@ -75,14 +80,23 @@ Public：
 - `POST /api/groups/:jid/reset-owner`，admin break-glass
 - `GET /api/groups/:jid/messages`
 - `DELETE /api/groups/:jid/messages/:messageId`
+- `GET /api/groups/:jid/messages/:messageId/attachments/:index/original`
 - `GET|PUT /api/groups/:jid/env`
 - `GET|PUT /api/groups/:jid/mcp`，仅兼容旧客户端
 - `POST /api/messages`
 - `GET /api/follow-ups`
 - `POST /api/follow-ups/:messageId/action`
 
-`POST /api/messages` 可以携带 Web 附件和 Runtime Session 标识。`/clear` 会进入与
-`reset-session` 相同的 owner 级破坏性检查。
+`POST /api/messages` 可以携带 Web 附件和 Runtime Session 标识。`/clear` 与
+`/fresh` 会进入与 `reset-session` 相同的 owner 级破坏性检查。`/fresh` 会开启
+新的 SDK 窗口并写入零摘要交接说明，不删除库中的旧历史，也不关闭 auto-compact。
+
+`GET /api/groups/:jid/messages` 返回的图片附件是降采样缩略图，并带
+`hasOriginal` 标记；原图由
+`GET /api/groups/:jid/messages/:messageId/attachments/:index/original`
+按需返回，`:index` 是附件在存储数组中的下标。存储的附件本身不变，Agent 仍然
+接收原分辨率图片。两个路由共用同一套工作区访问与 Host 执行权限检查，Runtime
+Session 消息使用 `{workspaceJid}#agent:{sessionId}` 作为 `:jid`。
 
 `POST /api/groups` 和 `PATCH /api/groups/:jid` 接受 `interaction_mode`
 （`assistant` 或 `proactive`），两者的响应体都会回显当前值。该字段存放在
@@ -157,7 +171,7 @@ HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
 - `PUT /api/groups/:jid/agents/:agentId/im-binding`
 - `DELETE /api/groups/:jid/agents/:agentId/im-binding/:imJid`
 
-群聊绑定到工作区：
+原生话题群绑定到工作区：
 
 - `POST /api/groups/:jid/im-groups/sync`
 - `GET /api/groups/:jid/im-groups`
@@ -166,10 +180,14 @@ HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
 
 约束：
 
-- 工作区绑定只接受群聊。
-- Runtime Session 绑定只接受私聊。
-- 飞书话题群和需要 @ 激活的普通群使用 `thread_map`，每个原生上下文映射独立
-  Runtime Session。
+- 工作区绑定只接受原生话题群（飞书话题群或 Telegram Forum）。
+- Runtime Session 绑定接受私聊和普通群，`sessionId=main` 表示该 Workspace 的主会话。
+- 话题群使用 `thread_map`，每个原生话题映射独立 Session；普通群的 @ 策略不改变绑定层级。
+- `DELETE` 绑定会真正解除路由，不恢复默认工作区或自动创建会话。
+- 每条输入的回复回到实际来源渠道；Web 输入不会自动镜像到已绑定 IM。
+- 绑定管理 `PUT /api/config/user-im/bindings/:imJid` 使用
+  `{target_session_id: "main", target_main_jid: "web:..."}` 选择主会话；
+  仅指定 `target_main_jid` 表示话题群的 Workspace 绑定。
 - 请求必须携带或解析出正确的 `channel_account_id`，不能跨机器人账号绑定。
 
 ## Agent Profiles
@@ -250,6 +268,9 @@ owner 明确拒绝首次设置时可提交
 
 读操作要求访问工作区，写操作要求工作区 owner。
 
+`workspace-config/skills/install` 的 `package` 规则与 `POST /api/skills/install`
+相同：URL 形式只接受 github.com 仓库或 tree 链接，其他主机返回 400。
+
 ## 渠道账号
 
 - `GET|POST /api/channel-accounts`
@@ -265,8 +286,9 @@ owner 明确拒绝首次设置时可提交
 - `POST /api/channel-accounts/:id/disconnect`
 - `POST /api/channel-accounts/:id/logout`
 
-账号严格按 `owner_user_id` 隔离。同一 Provider 可以有多个账号，每个账号可以选择
-默认工作区。
+账号严格按 `owner_user_id` 隔离。同一 Provider 可以有多个账号。兼容字段
+`default_workspace_jid` 不能替代渠道会话的显式绑定；连接、发现和配对不自动选择 Session。
+层级和渠道规则见[业务模型](BUSINESS-MODEL.md)。
 
 ## Provider 与系统配置
 
@@ -345,6 +367,14 @@ Skills：
 - `DELETE /api/skills/user-all`
 - `POST /api/skills/install`
 - `POST /api/skills/:id/reinstall`
+
+`POST /api/skills/install` 的 `package` 接受 `owner/repo`、`owner/repo@skill`
+等包名，或 `https://github.com/<owner>/<repo>`、
+`https://github.com/<owner>/<repo>/tree/<ref>/<path>` 形式的 GitHub URL。URL
+按解析出的 owner、repo、ref 和路径重建后交给 `skills add`；其他主机、非默认端口、
+凭据、查询串、片段和 blob 链接在启动安装进程前返回 400。其他 Git 主机改用
+`POST /api/skills/import/git`。`skills add` 子进程继承服务进程的
+`HTTPS_PROXY`/`NO_PROXY`。Agent 的 `install_skill` 工具与 reinstall 使用同一规则。
 
 MCP：
 

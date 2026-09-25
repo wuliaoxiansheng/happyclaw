@@ -42,6 +42,16 @@ import {
   resolveAdmittedChannelRoute,
 } from './channel-admission.js';
 import { canonicalizeWhatsAppProviderConversationJid } from './whatsapp-jid.js';
+import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
+import {
+  ChannelInboundLifecycle,
+  type ChannelInboundLease,
+} from './channel-inbound-lifecycle.js';
+import {
+  WhatsAppProviderAckTracker,
+  WHATSAPP_PROVIDER_ACK_TIMEOUT_MS,
+} from './whatsapp-provider-ack.js';
+export { WHATSAPP_PROVIDER_ACK_TIMEOUT_MS } from './whatsapp-provider-ack.js';
 export {
   getWhatsAppAuthDir,
   migrateLegacyWhatsAppAuthDir,
@@ -230,6 +240,11 @@ export function createWhatsAppConnection(
   let reconnectTimer: NodeJS.Timeout | null = null;
   let reconnectAttempt = 0;
   let socketGeneration = 0;
+  let activeInboundLease: ChannelInboundLease | null = null;
+  const inboundLifecycle = new ChannelInboundLifecycle();
+  const providerAcks = new WhatsAppProviderAckTracker(
+    WHATSAPP_PROVIDER_ACK_TIMEOUT_MS,
+  );
   // Cache real group display names (jid → name); fetched lazily per group on
   // first message arrival to avoid blowing up reconnect.
   const groupNameCache = new Map<string, string>();
@@ -305,6 +320,7 @@ export function createWhatsAppConnection(
 
   async function startSocket(): Promise<void> {
     const generation = ++socketGeneration;
+    const lease = inboundLifecycle.begin();
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
@@ -362,7 +378,11 @@ export function createWhatsAppConnection(
       // different (undici) type and intentionally remains untouched here.
       ...(ambientProxyAgent ? { agent: ambientProxyAgent } : {}),
     });
-    if (generation !== socketGeneration || intentionalDisconnect) {
+    if (
+      generation !== socketGeneration ||
+      intentionalDisconnect ||
+      !inboundLifecycle.isCurrent(lease)
+    ) {
       await closeWhatsAppSocketSafely(
         nextSock,
         'WhatsApp socket superseded during startup',
@@ -370,6 +390,8 @@ export function createWhatsAppConnection(
       return;
     }
     sock = nextSock;
+    activeInboundLease = lease;
+    providerAcks.activate(lease.generation);
 
     // OpenClaw also observes the WebSocket error surface directly. Baileys
     // normally translates these to connection.update, but keeping an explicit
@@ -377,6 +399,16 @@ export function createWhatsAppConnection(
     // socket is being replaced at exactly the same time.
     nextSock.ws?.on?.('error', (error: Error) => {
       logger.warn({ error, feature: 'whatsapp' }, 'WhatsApp WebSocket error');
+    });
+    // Baileys rc13 resolves sendMessage after socket write. The successful
+    // Meta message-class stanza ACK is exposed on this locked transport event.
+    nextSock.ws?.on?.('CB:ack,class:message', (node: any) => {
+      if (!inboundLifecycle.isCurrent(lease)) return;
+      providerAcks.recordServerAck(
+        lease.generation,
+        node?.attrs?.id,
+        node?.attrs?.error ? String(node.attrs.error) : undefined,
+      );
     });
 
     setState({ status: 'connecting' });
@@ -409,7 +441,12 @@ export function createWhatsAppConnection(
         Parameters<typeof nextSock.ev.on<'connection.update'>>[1]
       >[0],
     ): Promise<void> {
-      if (generation !== socketGeneration || sock !== nextSock) return;
+      if (
+        generation !== socketGeneration ||
+        sock !== nextSock ||
+        !inboundLifecycle.isCurrent(lease)
+      )
+        return;
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
@@ -457,6 +494,12 @@ export function createWhatsAppConnection(
           { feature: 'whatsapp', statusCode, reason, intentionalDisconnect },
           'WhatsApp connection closed',
         );
+        inboundLifecycle.invalidate();
+        if (activeInboundLease === lease) activeInboundLease = null;
+        providerAcks.deactivate(
+          lease.generation,
+          'WhatsApp connection closed before provider ACK',
+        );
 
         if (isLoggedOut) {
           setState({ status: 'logged_out', error: reason });
@@ -491,25 +534,63 @@ export function createWhatsAppConnection(
       }
     }
 
-    nextSock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (generation !== socketGeneration || sock !== nextSock) return;
+    nextSock.ev.on('messages.update', (updates) => {
+      if (!inboundLifecycle.isCurrent(lease)) return;
+      providerAcks.observeMessageUpdates(lease.generation, updates);
+    });
+
+    nextSock.ev.on('messages.upsert', ({ messages, type }) => {
+      if (
+        generation !== socketGeneration ||
+        sock !== nextSock ||
+        !inboundLifecycle.isCurrent(lease)
+      )
+        return;
       // 'notify' = real-time incoming, 'append' = history sync (skip)
       if (type !== 'notify') return;
-      for (const msg of messages) {
-        try {
-          await handleIncomingMessage(msg);
-        } catch (err) {
-          logger.error(
-            { err, msgId: msg.key?.id },
-            'WhatsApp message handler threw',
-          );
+      const task = (async (): Promise<void> => {
+        for (const msg of messages) {
+          const remoteJid = msg.key?.remoteJid;
+          const logicalJid = remoteJid
+            ? canonicalizeWhatsAppProviderConversationJid(remoteJid)
+            : '';
+          const messageKey = msg.key?.id
+            ? `${logicalJid}|${msg.key.id}`
+            : undefined;
+          try {
+            await inboundLifecycle.runMessage(
+              lease,
+              messageKey,
+              isDuplicate,
+              markSeen,
+              () => handleIncomingMessage(msg, lease, nextSock),
+            );
+          } catch (err) {
+            if (inboundLifecycle.isCancellation(err, lease)) {
+              logger.debug(
+                { msgId: msg.key?.id },
+                'WhatsApp inbound callback cancelled',
+              );
+            } else {
+              logger.error(
+                { err, msgId: msg.key?.id },
+                'WhatsApp message handler threw',
+              );
+            }
+          }
         }
-      }
+      })();
+      return inboundLifecycle.track(task);
     });
 
     // Group membership events: bot added/removed from groups
     nextSock.ev.on('group-participants.update', async (update) => {
-      if (generation !== socketGeneration || sock !== nextSock) return;
+      if (
+        generation !== socketGeneration ||
+        sock !== nextSock ||
+        !inboundLifecycle.isCurrent(lease)
+      )
+        return;
       try {
         const involvesSelf = update.participants.some((participant) =>
           isWhatsAppSelfParticipant(participant, sock?.user),
@@ -561,7 +642,7 @@ export function createWhatsAppConnection(
   }
 
   /**
-   * Detect and download a media message (image/video/audio/document).
+   * Detect and download a media message (image/video/audio/document/sticker).
    * Returns null if `content` has no supported media node.
    * Returns { content, attachmentsJson } shaped like dingtalk's normalize result.
    */
@@ -569,23 +650,37 @@ export function createWhatsAppConnection(
     msg: WAMessage,
     content: proto.IMessage,
     groupFolder: string | undefined,
+    lease: ChannelInboundLease,
+    activeSock: WASocket,
   ): Promise<{ content: string; attachmentsJson?: string } | null> {
+    inboundLifecycle.assertCurrent(lease);
     const detected = detectMedia(content);
     if (!detected) return null;
     const { kind, label, node, defaultExt } = detected;
 
+    // Baileys unwraps its known FutureProofMessage variants internally, but
+    // rc13 does not yet recognize proto-74 lottieStickerMessage. Keep the
+    // provider key/envelope metadata while giving the downloader the same
+    // normalized content used by detection. This also remains valid for the
+    // wrappers Baileys already understands and lets media re-upload use the
+    // exact inner media key.
+    const downloadEnvelope: WAMessage =
+      msg.message === content ? msg : { ...msg, message: content };
+
     let buffer: Buffer;
     try {
       buffer = await downloadMediaMessage(
-        msg,
+        downloadEnvelope,
         'buffer',
-        {},
+        { options: { signal: lease.signal } },
         {
           logger: logger.child({ feature: 'whatsapp-media' }) as never,
-          reuploadRequest: sock?.updateMediaMessage as never,
+          reuploadRequest: activeSock.updateMediaMessage as never,
         },
       );
+      inboundLifecycle.assertCurrent(lease);
     } catch (err) {
+      inboundLifecycle.assertCurrent(lease);
       logger.warn(
         { err, kind, msgId: msg.key?.id },
         'WhatsApp media download failed',
@@ -607,13 +702,16 @@ export function createWhatsAppConnection(
 
     let savedPath: string;
     try {
+      inboundLifecycle.assertCurrent(lease);
       savedPath = await saveDownloadedFile(
         groupFolder,
         'whatsapp',
         fileName,
         buffer,
       );
+      inboundLifecycle.assertCurrent(lease);
     } catch (err) {
+      inboundLifecycle.assertCurrent(lease);
       if (err instanceof FileTooLargeError) {
         return {
           content: `[${label}: 文件过大未保存 ${(buffer.length / 1024 / 1024).toFixed(1)}MB${captionLine}]`,
@@ -642,7 +740,12 @@ export function createWhatsAppConnection(
   }
 
   /** Convert one baileys WAMessage into our IM pipeline (storeMessageDirect + broadcast). */
-  async function handleIncomingMessage(msg: WAMessage): Promise<void> {
+  async function handleIncomingMessage(
+    msg: WAMessage,
+    lease: ChannelInboundLease,
+    activeSock: WASocket,
+  ): Promise<void> {
+    inboundLifecycle.assertCurrent(lease);
     if (!opts) return;
     const { key, message: content, pushName, messageTimestamp } = msg;
     if (!key || !content) return;
@@ -674,29 +777,8 @@ export function createWhatsAppConnection(
       return;
     }
 
-    // LRU dedup + in-flight lock: skip duplicates that re-arrive at reconnect
-    // / stream-switch boundaries. Keyed by (canonical remote JID, key.id) so a
-    // placeholder resend cannot bypass dedup by changing `@c.us` into
-    // `@s.whatsapp.net`; Baileys also reuses key.id across unrelated chats.
-    // Messages without key.id bypass both checks (no reliable address).
-    const dedupKey = key.id ? `${logicalRemoteJid}|${key.id}` : '';
-    if (dedupKey) {
-      if (isDuplicate(dedupKey)) {
-        logger.debug(
-          { msgId: key.id, remoteJid },
-          'WhatsApp duplicate dropped',
-        );
-        return;
-      }
-      if (!processingLock.acquire(dedupKey)) {
-        logger.debug(
-          { msgId: key.id, remoteJid },
-          'WhatsApp message already in-flight, skipping',
-        );
-        return;
-      }
-      markSeen(dedupKey);
-    }
+    const processingKey = key.id ? `${logicalRemoteJid}|${key.id}` : '';
+    if (processingKey && !processingLock.acquire(processingKey)) return;
     try {
       // Filter old messages (heat-up after reconnect, history sync stragglers)
       if (
@@ -742,14 +824,15 @@ export function createWhatsAppConnection(
         isChatAuthorized: opts.isChatAuthorized,
         onPairAttempt: opts.onPairAttempt,
       });
+      inboundLifecycle.assertCurrent(lease);
       if (admission.kind === 'paired') {
-        await sock?.sendMessage(remoteJid, {
+        await activeSock.sendMessage(remoteJid, {
           text: '配对成功！此聊天已连接到你的工作区。',
         });
         return;
       }
       if (admission.kind === 'pair_rejected') {
-        await sock?.sendMessage(remoteJid, {
+        await activeSock.sendMessage(remoteJid, {
           text: '配对码无效或已过期，请在 Web 设置页重新生成。',
         });
         return;
@@ -759,7 +842,7 @@ export function createWhatsAppConnection(
         const lastReject = rejectTimestamps.get(chatJid) ?? 0;
         if (now - lastReject >= 60_000) {
           rejectTimestamps.set(chatJid, now);
-          await sock?.sendMessage(remoteJid, {
+          await activeSock.sendMessage(remoteJid, {
             text: '此聊天尚未配对。请在 Web 设置页生成配对码，然后发送 /pair <code>。',
           });
         }
@@ -780,7 +863,7 @@ export function createWhatsAppConnection(
           return;
         }
 
-        const isBotMentioned = isMentioningBot(inner, sock?.user);
+        const isBotMentioned = isMentioningBot(inner, activeSock.user);
         if (
           opts.shouldProcessGroupMessage &&
           !isBotMentioned &&
@@ -804,7 +887,7 @@ export function createWhatsAppConnection(
           return;
         }
         if (isBotMentioned && text) {
-          text = stripLeadingWhatsAppBotMention(text, inner, sock?.user);
+          text = stripLeadingWhatsAppBotMention(text, inner, activeSock.user);
         }
       }
 
@@ -852,16 +935,6 @@ export function createWhatsAppConnection(
       }
       const { targetJid, routing } = resolvedRoute;
 
-      // Only admitted, policy-approved, routable chats may mutate metadata or
-      // start provider/network side effects.
-      storeChatMetadata(chatJid, timestampISO);
-      updateChatName(chatJid, chatName);
-      opts.onNewChat(chatJid, chatName);
-      if (isGroup && !groupNameCache.has(remoteJid)) {
-        groupNameCache.set(remoteJid, remoteJid);
-        void resolveGroupName(remoteJid);
-      }
-
       // Handle media (image/video/audio/document) whenever the message carries
       // it — NOT only when there's no text. A captioned image/video has non-empty
       // `text` (extractMessageText reads the caption), so gating on `!finalContent`
@@ -877,7 +950,10 @@ export function createWhatsAppConnection(
         msg,
         inner,
         opts.resolveGroupFolder?.(chatJid),
+        lease,
+        activeSock,
       );
+      inboundLifecycle.assertCurrent(lease);
       if (media) {
         finalContent = media.content;
         attachmentsJson = media.attachmentsJson;
@@ -888,6 +964,15 @@ export function createWhatsAppConnection(
           'WhatsApp message has neither text nor supported media',
         );
         return;
+      }
+
+      inboundLifecycle.assertCurrent(lease);
+      storeChatMetadata(chatJid, timestampISO);
+      updateChatName(chatJid, chatName);
+      opts.onNewChat(chatJid, chatName);
+      if (isGroup && !groupNameCache.has(remoteJid)) {
+        groupNameCache.set(remoteJid, remoteJid);
+        void resolveGroupName(remoteJid);
       }
 
       const id = crypto.randomUUID();
@@ -934,7 +1019,7 @@ export function createWhatsAppConnection(
         );
       }
     } finally {
-      if (dedupKey) processingLock.release(dedupKey);
+      if (processingKey) processingLock.release(processingKey);
     }
   }
 
@@ -948,13 +1033,23 @@ export function createWhatsAppConnection(
     async disconnect(): Promise<void> {
       intentionalDisconnect = true;
       socketGeneration += 1;
+      const lease = activeInboundLease;
+      activeInboundLease = null;
+      inboundLifecycle.invalidate();
+      if (lease) {
+        providerAcks.deactivate(
+          lease.generation,
+          'WhatsApp disconnected before provider ACK',
+        );
+      }
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
       const currentSock = sock;
-      sock = null;
       await closeWhatsAppSocketSafely(currentSock);
+      await inboundLifecycle.settle();
+      if (sock === currentSock) sock = null;
       await saveCredsQueue;
       ambientProxyAgent?.destroy();
       processingLock.dispose();
@@ -964,8 +1059,16 @@ export function createWhatsAppConnection(
     async logout(): Promise<void> {
       intentionalDisconnect = true;
       socketGeneration += 1;
+      const lease = activeInboundLease;
+      activeInboundLease = null;
+      inboundLifecycle.invalidate();
+      if (lease) {
+        providerAcks.deactivate(
+          lease.generation,
+          'WhatsApp logged out before provider ACK',
+        );
+      }
       const currentSock = sock;
-      sock = null;
       if (currentSock) {
         try {
           await currentSock.logout();
@@ -974,6 +1077,8 @@ export function createWhatsAppConnection(
         }
         await closeWhatsAppSocketSafely(currentSock);
       }
+      await inboundLifecycle.settle();
+      if (sock === currentSock) sock = null;
       await saveCredsQueue;
       ambientProxyAgent?.destroy();
       // Note: auth files on disk remain; caller (im-manager) wipes authDir if needed
@@ -986,6 +1091,9 @@ export function createWhatsAppConnection(
       localImagePaths?: string[],
     ): Promise<void> {
       assertWhatsAppSocketConnected(sock, currentState);
+      const activeSock = sock;
+      const lease = activeInboundLease;
+      if (!lease) throw new Error('WhatsApp socket is not connected');
       const jid = stripChannelPrefix(chatId);
 
       // Strip markdown to WhatsApp plain text (matches dingtalk/wechat/qq pattern).
@@ -994,6 +1102,9 @@ export function createWhatsAppConnection(
       // so we pick the safe option: drop formatting, send plain text.
       const plain = markdownToPlainText(text);
       const chunks = splitTextChunks(plain, TEXT_CHUNK_LIMIT);
+      const tracker = new PhysicalDeliveryTracker(
+        chunks.length + (localImagePaths?.length ?? 0),
+      );
 
       try {
         for (let i = 0; i < chunks.length; i++) {
@@ -1001,7 +1112,11 @@ export function createWhatsAppConnection(
             chunks.length > 1
               ? `${chunks[i]}\n\n(${i + 1}/${chunks.length})`
               : chunks[i];
-          await sock.sendMessage(jid, { text: chunk });
+          await tracker.send(() =>
+            providerAcks.send(activeSock, lease.generation, jid, {
+              text: chunk,
+            }),
+          );
           // Throttle between chunks to stay under WhatsApp Web's anti-spam
           // burst threshold; same reason qq/dingtalk soft-throttle bulk sends.
           if (i < chunks.length - 1) {
@@ -1014,9 +1129,14 @@ export function createWhatsAppConnection(
         if (localImagePaths && localImagePaths.length > 0) {
           for (const imgPath of localImagePaths) {
             try {
-              const buf = await readFile(imgPath);
-              const mime = guessMimeType(imgPath) || 'image/jpeg';
-              await sock.sendMessage(jid, { image: buf, mimetype: mime });
+              await tracker.send(async () => {
+                const buf = await readFile(imgPath);
+                const mime = guessMimeType(imgPath) || 'image/jpeg';
+                await providerAcks.send(activeSock, lease.generation, jid, {
+                  image: buf,
+                  mimetype: mime,
+                });
+              });
             } catch (err) {
               logger.error(
                 { err, imgPath, chatId },
@@ -1043,9 +1163,12 @@ export function createWhatsAppConnection(
       fileName?: string,
     ): Promise<void> {
       assertWhatsAppSocketConnected(sock, currentState);
+      const activeSock = sock;
+      const lease = activeInboundLease;
+      if (!lease) throw new Error('WhatsApp socket is not connected');
       const jid = stripChannelPrefix(chatId);
       try {
-        await sock.sendMessage(jid, {
+        await providerAcks.send(activeSock, lease.generation, jid, {
           image: imageBuffer,
           mimetype: mimeType,
           caption: caption ? markdownToPlainText(caption) : undefined,
@@ -1066,15 +1189,18 @@ export function createWhatsAppConnection(
       fileName: string,
     ): Promise<void> {
       assertWhatsAppSocketConnected(sock, currentState);
+      const activeSock = sock;
+      const lease = activeInboundLease;
+      if (!lease) throw new Error('WhatsApp socket is not connected');
       const jid = stripChannelPrefix(chatId);
       try {
         const buf = await readFile(filePath);
-        const mime = guessMimeType(fileName) || 'application/octet-stream';
-        await sock.sendMessage(jid, {
-          document: buf,
-          mimetype: mime,
-          fileName,
-        });
+        await providerAcks.send(
+          activeSock,
+          lease.generation,
+          jid,
+          buildWhatsAppSendFileContent(buf, fileName),
+        );
       } catch (err) {
         logger.error(
           { err, feature: 'whatsapp', chatId, filePath },
@@ -1105,7 +1231,8 @@ export function createWhatsAppConnection(
 }
 
 /**
- * Strip ephemeral / view-once envelopes so the real inner message is exposed.
+ * Strip ephemeral / view-once / future-proof envelopes so the real inner
+ * message is exposed.
  * extractMessageText recurses through these on its own, but detectMedia and
  * isMentioningBot only inspect top-level nodes — so a disappearing-message photo
  * (`ephemeralMessage.message.imageMessage`, increasingly the Meta default) would
@@ -1127,7 +1254,8 @@ export function unwrapMessageContent(content: proto.IMessage): proto.IMessage {
       inner.viewOnceMessageV2?.message ||
       inner.viewOnceMessageV2Extension?.message ||
       inner.documentWithCaptionMessage?.message ||
-      inner.editedMessage?.message;
+      inner.editedMessage?.message ||
+      inner.lottieStickerMessage?.message;
     if (!next) break;
     inner = next;
   }
@@ -1136,7 +1264,7 @@ export function unwrapMessageContent(content: proto.IMessage): proto.IMessage {
 
 /**
  * Extract human-readable text from a baileys IMessage payload.
- * Returns null for unsupported message types (image/audio/video/document — M3 scope).
+ * Returns null only when there is no supported human-readable payload.
  */
 export function extractMessageText(content: proto.IMessage): string | null {
   if (content.conversation) return content.conversation;
@@ -1156,8 +1284,175 @@ export function extractMessageText(content: proto.IMessage): string | null {
   // so the user at least sees what was sent. Media binary download is M3.
   if (content.imageMessage?.caption) return content.imageMessage.caption;
   if (content.videoMessage?.caption) return content.videoMessage.caption;
+  if (content.ptvMessage?.caption) return content.ptvMessage.caption;
   if (content.documentMessage?.caption) return content.documentMessage.caption;
+  if (content.eventMessage) {
+    const name = boundedWhatsAppText(content.eventMessage.name);
+    return name ? `[活动: ${name}]` : '[活动]';
+  }
+  if (content.groupInviteMessage) {
+    const name =
+      boundedWhatsAppText(content.groupInviteMessage.groupName) ||
+      boundedWhatsAppText(content.groupInviteMessage.caption);
+    return name ? `[群邀请: ${name}]` : '[群邀请]';
+  }
+  if (content.locationMessage) {
+    return formatWhatsAppLocation(content.locationMessage);
+  }
+  if (content.liveLocationMessage) {
+    return formatWhatsAppLocation(content.liveLocationMessage);
+  }
+  if (content.contactMessage) {
+    return formatWhatsAppContact(content.contactMessage);
+  }
+  if (content.contactsArrayMessage) {
+    const contacts = content.contactsArrayMessage.contacts ?? [];
+    return formatWhatsAppContacts(contacts);
+  }
   return null;
+}
+
+function boundedWhatsAppText(value: string | null | undefined): string {
+  return (value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 512);
+}
+
+export function formatWhatsAppLocation(loc: {
+  degreesLatitude?: number | null;
+  degreesLongitude?: number | null;
+  name?: string | null;
+  address?: string | null;
+}): string {
+  const name = boundedWhatsAppText(loc.name);
+  const address = boundedWhatsAppText(loc.address);
+  const lat = loc.degreesLatitude;
+  const lon = loc.degreesLongitude;
+  const coords =
+    Number.isFinite(lat) && Number.isFinite(lon) ? `${lat}, ${lon}` : '';
+  const details: string[] = [];
+  if (name) details.push(name);
+  if (address && address !== name) details.push(`地址: ${address}`);
+  if (coords) details.push(`坐标: ${coords}`);
+  if (details.length > 0) return `[位置: ${details.join(' | ')}]`;
+  return '[位置]';
+}
+
+interface ParsedWhatsAppVCard {
+  name?: string;
+  phones: string[];
+  emails: string[];
+  organizations: string[];
+}
+
+function decodeVCardValue(value: string): string {
+  return boundedWhatsAppText(
+    value.replace(/\\n/gi, ' ').replace(/\\([,;\\])/g, '$1'),
+  );
+}
+
+function pushUniqueBounded(values: string[], value: string): void {
+  if (value && values.length < 5 && !values.includes(value)) values.push(value);
+}
+
+/** Parse only the human-facing, non-executable vCard fields we persist. */
+export function parseWhatsAppVCard(
+  vcard: string | null | undefined,
+): ParsedWhatsAppVCard {
+  const parsed: ParsedWhatsAppVCard = {
+    phones: [],
+    emails: [],
+    organizations: [],
+  };
+  if (!vcard) return parsed;
+
+  // RFC 6350 folded lines begin with SP/HTAB. Bound input before parsing so a
+  // hostile contact card cannot grow a durable message without limit.
+  const unfolded = vcard.slice(0, 32 * 1024).replace(/\r?\n[ \t]/g, '');
+  let structuredName: string | undefined;
+  for (const line of unfolded.split(/\r?\n/)) {
+    const separator = line.indexOf(':');
+    if (separator <= 0) continue;
+    const rawKey = line.slice(0, separator).split(';', 1)[0] ?? '';
+    const key = (rawKey.split('.').pop() ?? '').toUpperCase();
+    const rawValue = line.slice(separator + 1);
+    if (key === 'FN') {
+      parsed.name ||= decodeVCardValue(rawValue);
+    } else if (key === 'N') {
+      const fields = rawValue.split(';').map(decodeVCardValue);
+      structuredName ||= [fields[3], fields[1], fields[2], fields[0], fields[4]]
+        .filter(Boolean)
+        .join(' ');
+    } else if (key === 'TEL') {
+      pushUniqueBounded(
+        parsed.phones,
+        decodeVCardValue(rawValue).replace(/^tel:/i, ''),
+      );
+    } else if (key === 'EMAIL') {
+      pushUniqueBounded(
+        parsed.emails,
+        decodeVCardValue(rawValue).replace(/^mailto:/i, ''),
+      );
+    } else if (key === 'ORG') {
+      pushUniqueBounded(
+        parsed.organizations,
+        rawValue.split(';').map(decodeVCardValue).filter(Boolean).join(' / '),
+      );
+    }
+  }
+  parsed.name ||= structuredName;
+  return parsed;
+}
+
+export function formatWhatsAppContact(contact: {
+  displayName?: string | null;
+  vcard?: string | null;
+}): string {
+  const vcard = parseWhatsAppVCard(contact.vcard);
+  const name = boundedWhatsAppText(contact.displayName) || vcard.name;
+  const lines = [name ? `[联系人: ${name}]` : '[联系人]'];
+  if (vcard.phones.length > 0) lines.push(`电话: ${vcard.phones.join(', ')}`);
+  if (vcard.emails.length > 0) lines.push(`邮箱: ${vcard.emails.join(', ')}`);
+  if (vcard.organizations.length > 0) {
+    lines.push(`组织: ${vcard.organizations.join(', ')}`);
+  }
+  return lines.join('\n').slice(0, 4096);
+}
+
+export const WHATSAPP_MAX_CONTACTS_PER_MESSAGE = 20;
+export const WHATSAPP_MAX_CONTACT_TEXT_LENGTH = 8192;
+
+export function formatWhatsAppContacts(
+  contacts: Array<{ displayName?: string | null; vcard?: string | null }>,
+): string {
+  if (contacts.length === 0) return '[联系人]';
+  const rendered: string[] = [];
+  const scanCount = Math.min(
+    contacts.length,
+    WHATSAPP_MAX_CONTACTS_PER_MESSAGE,
+  );
+  // Reserve enough room for the omission marker so the bound never truncates
+  // into a phone number or email address.
+  const markerReserve = 96;
+  let length = 0;
+  for (let index = 0; index < scanCount; index++) {
+    const entry = formatWhatsAppContact(contacts[index]!);
+    const separatorLength = rendered.length > 0 ? 1 : 0;
+    if (
+      length + separatorLength + entry.length >
+      WHATSAPP_MAX_CONTACT_TEXT_LENGTH - markerReserve
+    ) {
+      break;
+    }
+    rendered.push(entry);
+    length += separatorLength + entry.length;
+  }
+
+  const omitted = contacts.length - rendered.length;
+  if (omitted > 0) rendered.push(`[另有 ${omitted} 个联系人未显示]`);
+  return rendered.join('\n').slice(0, WHATSAPP_MAX_CONTACT_TEXT_LENGTH);
 }
 
 /**
@@ -1177,7 +1472,7 @@ export function normalizeTimestamp(
 }
 
 interface DetectedMedia {
-  kind: 'image' | 'video' | 'audio' | 'document';
+  kind: 'image' | 'video' | 'audio' | 'document' | 'sticker';
   label: string;
   defaultExt: string;
   node: {
@@ -1187,7 +1482,7 @@ interface DetectedMedia {
   };
 }
 
-function detectMedia(content: proto.IMessage): DetectedMedia | null {
+export function detectMedia(content: proto.IMessage): DetectedMedia | null {
   if (content.imageMessage) {
     return {
       kind: 'image',
@@ -1196,12 +1491,13 @@ function detectMedia(content: proto.IMessage): DetectedMedia | null {
       node: content.imageMessage as DetectedMedia['node'],
     };
   }
-  if (content.videoMessage) {
+  const video = content.videoMessage ?? content.ptvMessage;
+  if (video) {
     return {
       kind: 'video',
       label: '视频',
       defaultExt: '.mp4',
-      node: content.videoMessage as DetectedMedia['node'],
+      node: video as DetectedMedia['node'],
     };
   }
   if (content.audioMessage) {
@@ -1219,6 +1515,14 @@ function detectMedia(content: proto.IMessage): DetectedMedia | null {
       label: '文档',
       defaultExt: '',
       node: content.documentMessage as DetectedMedia['node'],
+    };
+  }
+  if (content.stickerMessage) {
+    return {
+      kind: 'sticker',
+      label: '贴纸',
+      defaultExt: '.webp',
+      node: content.stickerMessage as DetectedMedia['node'],
     };
   }
   return null;
@@ -1325,8 +1629,12 @@ export function isMentioningBot(
     content.extendedTextMessage?.contextInfo ||
     content.imageMessage?.contextInfo ||
     content.videoMessage?.contextInfo ||
+    content.ptvMessage?.contextInfo ||
     content.documentMessage?.contextInfo ||
-    content.audioMessage?.contextInfo;
+    content.audioMessage?.contextInfo ||
+    content.stickerMessage?.contextInfo ||
+    content.eventMessage?.contextInfo ||
+    content.groupInviteMessage?.contextInfo;
   const mentioned = ctx?.mentionedJid;
   if (!mentioned || mentioned.length === 0) return false;
   return mentioned.some((m) => identities.has(canonicalizeWhatsAppUserJid(m)));
@@ -1365,6 +1673,38 @@ export function stripLeadingWhatsAppBotMention(
  * Covers WhatsApp-relevant types: image/video/audio/document.
  * Returns null when unknown so caller can fall back to a sensible default.
  */
+
+export type WhatsAppSendFileContent =
+  | { video: Buffer; mimetype: string }
+  | { audio: Buffer; mimetype: string }
+  | { document: Buffer; mimetype: string; fileName: string };
+
+const WHATSAPP_NATIVE_VIDEO_MIME = new Map([['mp4', 'video/mp4']]);
+const WHATSAPP_NATIVE_AUDIO_MIME = new Map([
+  ['mp3', 'audio/mpeg'],
+  ['m4a', 'audio/mp4'],
+  ['ogg', 'audio/ogg'],
+  ['opus', 'audio/ogg'],
+]);
+
+/**
+ * Only formats verified against WhatsApp's native media envelopes are routed
+ * as video/audio. A browser-playable MOV/WebM/WAV is not necessarily accepted
+ * by WhatsApp's upload contract, so every non-allowlisted file stays a document.
+ */
+export function buildWhatsAppSendFileContent(
+  buf: Buffer,
+  fileName: string,
+): WhatsAppSendFileContent {
+  const ext = fileName.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] ?? '';
+  const videoMime = WHATSAPP_NATIVE_VIDEO_MIME.get(ext);
+  if (videoMime) return { video: buf, mimetype: videoMime };
+  const audioMime = WHATSAPP_NATIVE_AUDIO_MIME.get(ext);
+  if (audioMime) return { audio: buf, mimetype: audioMime };
+  const mime = guessMimeType(fileName) || 'application/octet-stream';
+  return { document: buf, mimetype: mime, fileName };
+}
+
 export function guessMimeType(fileName: string): string | null {
   const m = fileName.toLowerCase().match(/\.([a-z0-9]+)$/);
   if (!m) return null;
@@ -1381,7 +1721,8 @@ export function guessMimeType(fileName: string): string | null {
   // Audio
   if (ext === 'mp3') return 'audio/mpeg';
   if (ext === 'ogg' || ext === 'opus') return 'audio/ogg';
-  if (ext === 'm4a' || ext === 'aac') return 'audio/aac';
+  if (ext === 'm4a') return 'audio/mp4';
+  if (ext === 'aac') return 'audio/aac';
   if (ext === 'wav') return 'audio/wav';
   // Document
   if (ext === 'pdf') return 'application/pdf';

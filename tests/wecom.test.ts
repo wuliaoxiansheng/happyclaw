@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
 const sdkMock = vi.hoisted(() => {
@@ -8,8 +11,17 @@ const sdkMock = vi.hoisted(() => {
     readonly options: Record<string, unknown>;
     connect = vi.fn(() => this);
     disconnect = vi.fn();
-    sendMessage = vi.fn(async () => ({ errcode: 0 }));
-    replyStream = vi.fn(async () => ({ errcode: 0 }));
+    sendMessage = vi.fn(async () => ({ errcode: 0, headers: { req_id: 'm' } }));
+    replyStream = vi.fn(async () => ({ errcode: 0, headers: { req_id: 's' } }));
+    uploadMedia = vi.fn(async (_buffer: Buffer, options: { type: string }) => ({
+      type: options.type,
+      media_id: `media-${options.type}`,
+      created_at: '2026-08-27T00:00:00.000Z',
+    }));
+    sendMediaMessage = vi.fn(async () => ({
+      errcode: 0,
+      headers: { req_id: 'media' },
+    }));
 
     constructor(options: Record<string, unknown>) {
       this.options = options;
@@ -37,6 +49,7 @@ vi.mock('@wecom/aibot-node-sdk', () => ({
 
 vi.mock('../src/db.js', () => ({
   getMessage: vi.fn(() => null),
+  getMessagePayload: vi.fn(() => null),
   sequenceInboundTimestampAfterChatTail: vi.fn(
     (_chatJid: string, proposedTimestamp: string) => proposedTimestamp,
   ),
@@ -56,17 +69,24 @@ vi.mock('../src/logger.js', () => ({
 
 import {
   getMessage,
+  getMessagePayload,
   sequenceInboundTimestampAfterChatTail,
   storeMessageDirect,
 } from '../src/db.js';
 import { notifyNewImMessage } from '../src/message-notifier.js';
 import { createWeComConnection, splitWeComMarkdown } from '../src/wecom.js';
+import { classifyImSendFailure } from '../src/im-send-retry-policy.js';
 import {
   truncateWeComUtf8,
   WECOM_MARKDOWN_MAX_BYTES,
 } from '../src/wecom-streaming.js';
 
 type MockClient = InstanceType<typeof sdkMock.MockWSClient>;
+
+const PNG_1X1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64',
+);
 
 function frame(input: {
   reqId: string;
@@ -125,6 +145,19 @@ describe('WeCom connection security and delivery', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(getMessage).mockReturnValue(null);
+    vi.mocked(getMessagePayload).mockImplementation((chatJid, messageId) => {
+      const call = vi
+        .mocked(storeMessageDirect)
+        .mock.calls.find(
+          (entry) => entry[0] === messageId && entry[1] === chatJid,
+        );
+      return call
+        ? {
+            content: call[4],
+            attachments: call[7]?.attachments ?? null,
+          }
+        : null;
+    });
     vi.mocked(sequenceInboundTimestampAfterChatTail).mockImplementation(
       (_chatJid, proposedTimestamp) => proposedTimestamp,
     );
@@ -181,6 +214,167 @@ describe('WeCom connection security and delivery', () => {
     ).rejects.toThrow('authentication timed out');
     expect(sdkMock.MockWSClient.instances[0].disconnect).toHaveBeenCalled();
     expect(connection.isConnected()).toBe(false);
+  });
+
+  test('sends markdown plus every local image through uploadMedia and sendMediaMessage', async () => {
+    const connected = await connect();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wecom-outbound-'));
+    const first = path.join(dir, 'first.png');
+    const second = path.join(dir, 'second.png');
+    fs.writeFileSync(first, PNG_1X1);
+    fs.writeFileSync(second, PNG_1X1);
+    try {
+      await connected.connection.sendMessage('c2c:user-1', 'body', [
+        first,
+        second,
+      ]);
+      expect(connected.client.sendMessage).toHaveBeenCalledOnce();
+      expect(connected.client.uploadMedia).toHaveBeenCalledTimes(2);
+      expect(connected.client.sendMediaMessage).toHaveBeenNthCalledWith(
+        1,
+        'user-1',
+        'image',
+        'media-image',
+      );
+      expect(connected.client.sendMediaMessage).toHaveBeenNthCalledWith(
+        2,
+        'user-1',
+        'image',
+        'media-image',
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      await connected.connection.disconnect();
+    }
+  });
+
+  test('ACKed body/image prefix makes a later media rejection partial and uncertain', async () => {
+    const connected = await connect();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wecom-partial-'));
+    const first = path.join(dir, 'first.png');
+    const second = path.join(dir, 'second.png');
+    fs.writeFileSync(first, PNG_1X1);
+    fs.writeFileSync(second, PNG_1X1);
+    connected.client.sendMediaMessage
+      .mockResolvedValueOnce({ errcode: 0, headers: { req_id: 'ok' } })
+      .mockResolvedValueOnce({ errcode: 40013, errmsg: 'invalid media' });
+    let failure: unknown;
+    try {
+      await connected.connection.sendMessage('c2c:user-1', 'body', [
+        first,
+        second,
+      ]);
+    } catch (error) {
+      failure = error;
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      await connected.connection.disconnect();
+    }
+    expect(failure).toMatchObject({
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+      deliveredOutputs: 2,
+      totalOutputs: 3,
+    });
+    expect(classifyImSendFailure(failure)).toBe('uncertain');
+  });
+
+  test('public image caption and file APIs send every requested provider output', async () => {
+    const connected = await connect();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wecom-file-'));
+    const filePath = path.join(dir, 'report.bin');
+    fs.writeFileSync(filePath, 'report');
+    try {
+      await connected.connection.sendImage(
+        'c2c:user-1',
+        PNG_1X1,
+        'image/png',
+        'caption',
+        'photo.png',
+      );
+      await connected.connection.sendFile(
+        'c2c:user-1',
+        filePath,
+        '../unsafe/report.bin',
+      );
+      expect(connected.client.sendMessage).toHaveBeenCalledOnce();
+      expect(connected.client.uploadMedia).toHaveBeenNthCalledWith(1, PNG_1X1, {
+        type: 'image',
+        filename: 'photo.png',
+      });
+      expect(connected.client.uploadMedia.mock.calls[1]?.[1]).toEqual({
+        type: 'file',
+        filename: 'report.bin',
+      });
+      expect(connected.client.sendMediaMessage).toHaveBeenNthCalledWith(
+        1,
+        'user-1',
+        'image',
+        'media-image',
+      );
+      expect(connected.client.sendMediaMessage).toHaveBeenNthCalledWith(
+        2,
+        'user-1',
+        'file',
+        'media-file',
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      await connected.connection.disconnect();
+    }
+  });
+
+  test('missing media ACK is uncertain and never accepted as success', async () => {
+    const connected = await connect();
+    connected.client.sendMediaMessage.mockResolvedValueOnce({});
+    await expect(
+      connected.connection.sendImage('c2c:user-1', PNG_1X1, 'image/png'),
+    ).rejects.toMatchObject({ deliveryPhase: 'uncertain' });
+    await connected.connection.disconnect();
+  });
+
+  test('invalid image preflight fails before sending its caption', async () => {
+    const connected = await connect();
+    await expect(
+      connected.connection.sendImage(
+        'c2c:user-1',
+        Buffer.from('not-an-image'),
+        'image/png',
+        'must not be sent',
+      ),
+    ).rejects.toMatchObject({ deliveryPhase: 'pre_accept' });
+    expect(connected.client.sendMessage).not.toHaveBeenCalled();
+    expect(connected.client.uploadMedia).not.toHaveBeenCalled();
+    await connected.connection.disconnect();
+  });
+
+  test('disconnect during upload prevents a stale media send', async () => {
+    const connected = await connect();
+    let finishUpload!: () => void;
+    connected.client.uploadMedia.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishUpload = () =>
+            resolve({
+              type: 'image',
+              media_id: 'stale-media',
+              created_at: '2026-08-27T00:00:00.000Z',
+            });
+        }),
+    );
+    const pending = connected.connection.sendImage(
+      'c2c:user-1',
+      PNG_1X1,
+      'image/png',
+    );
+    await vi.waitFor(() =>
+      expect(connected.client.uploadMedia).toHaveBeenCalledOnce(),
+    );
+    await connected.connection.disconnect();
+    finishUpload();
+    await expect(pending).rejects.toMatchObject({
+      code: 'WECOM_MEDIA_CANCELLED',
+    });
+    expect(connected.client.sendMediaMessage).not.toHaveBeenCalled();
   });
 
   test('unauthorized and resolver-rejected messages have no business side effects', async () => {
@@ -565,7 +759,7 @@ describe('WeCom connection security and delivery', () => {
     ).rejects.toThrow('ACK failed');
   });
 
-  test('propagates failure when both streaming finalization and fallback fail', async () => {
+  test('propagates streaming finalization failure without controller fallback', async () => {
     const connected = await connect();
     connected.client.emit('message.text', frame({ reqId: 'req-fail' }));
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(1));
@@ -575,8 +769,8 @@ describe('WeCom connection security and delivery', () => {
       inputId,
     );
     connected.client.replyStream.mockRejectedValueOnce(new Error('stream ACK'));
-    connected.client.sendMessage.mockRejectedValueOnce(new Error('send ACK'));
-    await expect(session!.complete('answer')).rejects.toThrow('send ACK');
+    await expect(session!.complete('answer')).rejects.toThrow('stream ACK');
+    expect(connected.client.sendMessage).not.toHaveBeenCalled();
   });
 });
 

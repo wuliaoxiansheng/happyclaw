@@ -50,6 +50,10 @@ export interface ChannelContentLink {
   bundleId: string;
   role: 'forwarded_content' | 'forwarder_comment';
   relatedMessageId?: string;
+  /** The host resolved the complete provider material and may reuse it. */
+  materialResolved?: boolean;
+  /** Product fallback when an admitted forward receives no authored note. */
+  defaultAction?: 'summarize';
 }
 
 /**
@@ -141,6 +145,8 @@ export interface ChannelMount {
   session_id?: string | null;
   routing_mode: ChannelRoutingMode;
   reply_policy: 'source_only' | 'mirror';
+  /** Null inherits the workspace mode; applies only to inputs from this mount. */
+  interaction_mode_override?: InteractionMode | null;
   activation_mode:
     | 'auto'
     | 'always'
@@ -420,6 +426,8 @@ export interface AgentBuilderDraft {
 export interface NewMessage {
   id: string;
   chat_jid: string;
+  /** Host-assigned durable arrival order. Provider clocks never participate. */
+  ingest_sequence?: number;
   source_jid?: string;
   sender: string;
   sender_name: string;
@@ -451,12 +459,15 @@ export type FollowUpStatus =
   | 'promoting'
   | 'released'
   | 'cancelled'
+  /** Forward material is visible but intentionally held for a companion note. */
+  | 'awaiting_companion'
   /** Preserved in history, but already delivered through a linked physical input. */
   | 'subsumed';
 
 export interface QueuedFollowUp {
   id: string;
   chat_jid: string;
+  ingest_sequence?: number;
   source_jid?: string;
   sender: string;
   sender_name: string;
@@ -497,6 +508,12 @@ export type MessageSourceKind =
   | 'sdk_send_message'
   | 'proactive_sdk_fallback'
   | 'input_rejection_warning'
+  /**
+   * Standalone notice that the primary model hit a model-scope wall and the
+   * turn is being answered by the configured fallback model instead. Like
+   * 'input_rejection_warning' it is an out-of-band notice, never the answer.
+   */
+  | 'provider_fallback_notice'
   | 'interrupt_partial'
   | 'overflow_partial'
   | 'compact_partial'
@@ -525,6 +542,8 @@ export interface MessageAttachment {
 export interface MessageCursor {
   timestamp: string;
   id: string;
+  /** Durable host ingest position. Missing only on legacy persisted cursors. */
+  sequence?: number;
 }
 
 export interface ScheduledTask {
@@ -583,6 +602,7 @@ export type TaskRunNotificationStatus =
   | 'success'
   | 'partial_failed'
   | 'failed'
+  | 'uncertain'
   | 'skipped';
 
 export interface TaskRunNotificationSummary {
@@ -590,6 +610,9 @@ export interface TaskRunNotificationSummary {
   succeeded: number;
   failed: number;
   failed_channels: string[];
+  /** Subset of failed attempts whose provider acceptance is unknown. */
+  uncertain?: number;
+  uncertain_channels?: string[];
 }
 
 export interface TaskRunNotificationReceipt {

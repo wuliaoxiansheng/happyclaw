@@ -96,6 +96,59 @@ describe('automatic enabled-model pool', () => {
     expect(second!.resetSession).toBe(true);
   });
 
+  test.each(['round-robin', 'weighted-round-robin'] as const)(
+    'transient replay stays on its first provider under %s',
+    (strategy) => {
+      runtimeConfig.saveBalancingConfig({ strategy });
+      const first = trySelectPoolProvider(
+        `transient-${strategy}-first`,
+        null,
+        null,
+      )!;
+      const replay = trySelectPoolProvider(
+        `transient-${strategy}-replay`,
+        null,
+        null,
+        first.profileId,
+      )!;
+      expect(replay.profileId).toBe(first.profileId);
+      expect(providerPool.getHealthStatus(first.profileId).healthy).toBe(true);
+    },
+  );
+
+  test('transient replay pin is ignored after health or model-tier eligibility changes', () => {
+    runtimeConfig.saveBalancingConfig({ strategy: 'round-robin' });
+    const unhealthy = trySelectPoolProvider(
+      'transient-ineligible-health-first',
+      null,
+      null,
+    )!;
+    providerPool.reportFailure(unhealthy.profileId, true);
+    const healthFallback = trySelectPoolProvider(
+      'transient-ineligible-health-replay',
+      null,
+      null,
+      unhealthy.profileId,
+    )!;
+    expect(healthFallback.profileId).not.toBe(unhealthy.profileId);
+    providerPool.resetHealth(unhealthy.profileId);
+
+    const modelWall = trySelectPoolProvider(
+      'transient-ineligible-tier-first',
+      null,
+      null,
+    )!;
+    providerPool.reportModelFailure(modelWall.profileId, 'claude-fable-5');
+    const tierFallback = trySelectPoolProvider(
+      'transient-ineligible-tier-replay',
+      null,
+      null,
+      modelWall.profileId,
+    )!;
+    expect(tierFallback.profileId).not.toBe(modelWall.profileId);
+    providerPool.resetModelQuarantine(modelWall.profileId);
+  });
+
   test('an explicit Agent model configuration still pins selection', () => {
     for (let i = 0; i < 5; i += 1) {
       const result = trySelectPoolProvider(

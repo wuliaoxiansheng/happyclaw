@@ -9,6 +9,7 @@ import { getTaskById } from './db.js';
 import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
 import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
+import { isIpcInputPayloadFilename } from './ipc-delivery-recovery.js';
 import type {
   RunnerRuntime,
   StuckRecoveryCandidate,
@@ -18,6 +19,8 @@ export type SendMessageResult = 'sent' | 'no_active';
 export interface IpcMessageCursor {
   timestamp: string;
   id: string;
+  /** Host-assigned durable arrival order. */
+  sequence?: number;
   /** Immutable provider route that owns this exact original input's side
    * effects. Omitted for Web/legacy inputs. */
   sourceJid?: string;
@@ -91,6 +94,9 @@ function compareIpcMessageCursors(
   a: IpcMessageCursor,
   b: IpcMessageCursor,
 ): number {
+  if (a.sequence !== undefined && b.sequence !== undefined) {
+    return a.sequence - b.sequence;
+  }
   if (a.timestamp !== b.timestamp) return a.timestamp < b.timestamp ? -1 : 1;
   if (a.id === b.id) return 0;
   return a.id < b.id ? -1 : 1;
@@ -1144,8 +1150,14 @@ export class GroupQueue {
         // Fail closed when the host has not installed its DB-backed checker.
         if (!this.isIpcDeliveryCommitEligibleFn?.(first)) break;
 
-        // Commit first. If persistence throws, keep the delivery pending so
-        // exit/startup recovery replays it rather than silently losing it.
+        // Remove every Runner-visible copy before committing the DB cursor.
+        // A failed Runner unlink can otherwise leave a claim that is replayed
+        // after this healthy receipt has already advanced durable state.
+        if (!this.discardDeliveryIpcFiles(state, new Set([first.deliveryId]))) {
+          throw new Error(
+            `Failed to remove acknowledged IPC claim ${first.deliveryId}`,
+          );
+        }
         commit([first]);
         state.pendingIpcDeliveries.delete(first.deliveryId);
         state.acknowledgedIpcDeliveryIds.delete(first.deliveryId);
@@ -1155,9 +1167,27 @@ export class GroupQueue {
     return committed;
   }
 
-  markRunnerQueryIdle(groupJid: string): void {
+  markRunnerQueryIdle(
+    groupJid: string,
+    options?: { preserveIpcDebt?: boolean },
+  ): void {
     const state = this.resolveActiveState(groupJid);
     if (!state?.active || !state.queryInFlight) return;
+    // Truncation/compaction continues report queryIdle even though they
+    // refused later user IPC (acceptIpc=false). Wiping the #618/#622 debt
+    // clock here hides a leftover IPC file from stuck recovery.
+    if (options?.preserveIpcDebt) {
+      const hasPendingReceipts = state.pendingIpcDeliveries?.size > 0;
+      const hasPendingFiles = Boolean(
+        state.groupFolder &&
+        this.hasRemainingIpcMessages(
+          state.groupFolder,
+          state.agentId,
+          state.taskRunId,
+        ),
+      );
+      if (hasPendingReceipts || hasPendingFiles) return;
+    }
     const completedQueryId = state.queryId;
     state.queryInFlight = false;
     state.ipcOwedSinceAt = null;
@@ -1795,10 +1825,23 @@ export class GroupQueue {
         const maximum = [...deliveryTarget.coveredCursors].sort(
           compareIpcMessageCursors,
         )[deliveryTarget.coveredCursors.length - 1];
+        const coveredHaveAnySequence = deliveryTarget.coveredCursors.some(
+          (cursor) => cursor.sequence !== undefined,
+        );
+        const coveredAllHaveSequence = deliveryTarget.coveredCursors.every(
+          (cursor) => cursor.sequence !== undefined,
+        );
+        const sequenceShapeInvalid =
+          coveredHaveAnySequence || deliveryTarget.cursor.sequence !== undefined
+            ? !coveredAllHaveSequence ||
+              deliveryTarget.cursor.sequence === undefined ||
+              maximum?.sequence !== deliveryTarget.cursor.sequence
+            : false;
         if (
           !maximum ||
           maximum.timestamp !== deliveryTarget.cursor.timestamp ||
-          maximum.id !== deliveryTarget.cursor.id
+          maximum.id !== deliveryTarget.cursor.id ||
+          sequenceShapeInvalid
         ) {
           throw new Error(
             'IPC delivery target must end at its maximum covered cursor',
@@ -2034,10 +2077,14 @@ export class GroupQueue {
       // Once the host rewinds to the durable DB cursor, DB is the sole replay
       // source. Remove any still-on-disk copies first so the next runner cannot
       // receive both a stale IPC file and the DB replay.
-      this.discardDeliveryIpcFiles(
-        state,
-        new Set(receipts.map((r) => r.deliveryId)),
-      );
+      if (
+        !this.discardDeliveryIpcFiles(
+          state,
+          new Set(receipts.map((r) => r.deliveryId)),
+        )
+      ) {
+        throw new Error('Failed to remove unacknowledged IPC delivery files');
+      }
       if (!this.onUnacknowledgedIpcDeliveriesFn) {
         throw new Error(
           'unacknowledged IPC delivery recovery callback is not configured',
@@ -2057,17 +2104,21 @@ export class GroupQueue {
   private discardDeliveryIpcFiles(
     state: GroupState,
     deliveryIds: Set<string>,
-  ): void {
-    if (!state.groupFolder || deliveryIds.size === 0) return;
+  ): boolean {
+    if (!state.groupFolder || deliveryIds.size === 0) return true;
     const inputDir = this.resolveIpcInputDir(state as ActiveGroupState);
     let filenames: string[];
     try {
-      filenames = fs
-        .readdirSync(inputDir)
-        .filter((name) => name.endsWith('.json'));
-    } catch {
-      return;
+      filenames = fs.readdirSync(inputDir).filter(isIpcInputPayloadFilename);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      logger.warn(
+        { inputDir, err },
+        'Failed to list IPC input directory while discarding delivery files',
+      );
+      return false;
     }
+    let complete = true;
     for (const filename of filenames) {
       const filepath = path.join(inputDir, filename);
       try {
@@ -2079,12 +2130,14 @@ export class GroupQueue {
           fs.unlinkSync(filepath);
         }
       } catch (err) {
+        complete = false;
         logger.warn(
           { filepath, err },
           'Failed to inspect/discard unacknowledged IPC delivery file',
         );
       }
     }
+    return complete;
   }
 
   private abandonUnacknowledgedIpcDeliveries(
@@ -2095,10 +2148,14 @@ export class GroupQueue {
       return;
     state.acknowledgedIpcDeliveryIds ??= new Set();
     const receipts = [...state.pendingIpcDeliveries.values()];
-    this.discardDeliveryIpcFiles(
-      state,
-      new Set(receipts.map((r) => r.deliveryId)),
-    );
+    if (
+      !this.discardDeliveryIpcFiles(
+        state,
+        new Set(receipts.map((r) => r.deliveryId)),
+      )
+    ) {
+      throw new Error('Failed to remove abandoned IPC delivery files');
+    }
     if (!this.onAbandonedIpcDeliveriesFn) {
       logger.error(
         { groupJid, receipts },
@@ -2125,7 +2182,7 @@ export class GroupQueue {
         : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
     try {
       const files = fs.readdirSync(inputDir);
-      return files.some((f) => f.endsWith('.json'));
+      return files.some(isIpcInputPayloadFilename);
     } catch {
       return false;
     }
@@ -2198,6 +2255,33 @@ export class GroupQueue {
       );
     }
     return closed;
+  }
+
+  /**
+   * Gracefully retire only runners using the refreshed Provider. The drain
+   * sentinel is consumed after the current query, so a read-only usage poll
+   * can rotate credentials without interrupting unrelated or in-flight work.
+   */
+  drainProviderRunnersForCredentialRefresh(providerId: string): number {
+    let drained = 0;
+    for (const [jid, state] of this.groups) {
+      if (
+        !state.active ||
+        !state.groupFolder ||
+        state.selectedProviderId !== providerId ||
+        state.drainSentinelWritten
+      ) {
+        continue;
+      }
+      if (!this.writeDrainSentinel(state as ActiveGroupState)) continue;
+      state.drainSentinelWritten = true;
+      drained++;
+      logger.info(
+        { groupJid: jid, groupFolder: state.groupFolder, providerId },
+        'Sent drain signal after provider credential refresh',
+      );
+    }
+    return drained;
   }
 
   /**

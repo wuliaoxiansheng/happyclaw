@@ -7,6 +7,7 @@ import {
   extractMessageText,
   extFromMime,
   guessMimeType,
+  buildWhatsAppSendFileContent,
   isMentioningBot,
   isWhatsAppSelfParticipant,
   normalizeTimestamp,
@@ -514,5 +515,59 @@ describe('stripLeadingWhatsAppBotMention', () => {
     expect(
       stripLeadingWhatsAppBotMention('@15551234567', trustedMention, SELF),
     ).toBe('@15551234567');
+  });
+});
+
+describe('buildWhatsAppSendFileContent', () => {
+  const buf = Buffer.from('x');
+
+  test('only MP4 uses native video', () => {
+    expect(buildWhatsAppSendFileContent(buf, 'clip.mp4')).toEqual({
+      video: buf,
+      mimetype: 'video/mp4',
+    });
+    expect(buildWhatsAppSendFileContent(buf, 'clip.MOV')).toEqual({
+      document: buf,
+      mimetype: 'video/quicktime',
+      fileName: 'clip.MOV',
+    });
+    expect(buildWhatsAppSendFileContent(buf, 'clip.webm')).toEqual({
+      document: buf,
+      mimetype: 'video/webm',
+      fileName: 'clip.webm',
+    });
+  });
+
+  test('allowlisted OGG/MP3/M4A use native audio with correct M4A MIME', () => {
+    expect(buildWhatsAppSendFileContent(buf, 'voice.ogg')).toEqual({
+      audio: buf,
+      mimetype: 'audio/ogg',
+    });
+    expect(buildWhatsAppSendFileContent(buf, 'track.mp3')).toEqual({
+      audio: buf,
+      mimetype: 'audio/mpeg',
+    });
+    expect(buildWhatsAppSendFileContent(buf, 'track.m4a')).toEqual({
+      audio: buf,
+      mimetype: 'audio/mp4',
+    });
+    expect(buildWhatsAppSendFileContent(buf, 'wave.wav')).toEqual({
+      document: buf,
+      mimetype: 'audio/wav',
+      fileName: 'wave.wav',
+    });
+  });
+
+  test('pdf and unknown stay document', () => {
+    expect(buildWhatsAppSendFileContent(buf, 'notes.pdf')).toEqual({
+      document: buf,
+      mimetype: 'application/pdf',
+      fileName: 'notes.pdf',
+    });
+    expect(buildWhatsAppSendFileContent(buf, 'blob.bin')).toEqual({
+      document: buf,
+      mimetype: 'application/octet-stream',
+      fileName: 'blob.bin',
+    });
   });
 });

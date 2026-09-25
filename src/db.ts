@@ -1,3 +1,4 @@
+import { selectChannelReplyBatch } from './channel-reply-source.js';
 import crypto from 'crypto';
 import Database from './sqlite-compat.js';
 import fs from 'fs';
@@ -199,12 +200,15 @@ function stmts() {
          )`,
       ),
       getMessagesSince: db.prepare(
-        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, channel_context, source_kind, task_id,
-                delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-         FROM messages
-         WHERE chat_jid = ? AND (timestamp > ? OR (timestamp = ? AND id > ?)) AND is_from_me = 0
-           AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'subsumed')
-         ORDER BY timestamp ASC, id ASC`,
+        `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+                m.attachments, m.channel_context, m.source_kind, m.task_id,
+                m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+                m.delivery_updated_at, seq.sequence AS ingest_sequence
+         FROM message_ingest_sequences seq
+         JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+         WHERE m.chat_jid = ? AND seq.sequence > ? AND m.is_from_me = 0
+           AND COALESCE(m.delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'awaiting_companion', 'subsumed')
+         ORDER BY seq.sequence ASC`,
       ),
       getExpiredSessionIds: db.prepare(
         'SELECT id FROM user_sessions WHERE expires_at < ?',
@@ -219,15 +223,18 @@ function getNewMessagesStmt(jidCount: number): any {
   if (!s) {
     const placeholders = Array(jidCount).fill('?').join(',');
     s = db.prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, channel_context, source_kind, task_id,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE (timestamp > ? OR (timestamp = ? AND id > ?))
-         AND chat_jid IN (${placeholders})
-         AND is_from_me = 0
-         AND COALESCE(source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt')
-         AND COALESCE(delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'subsumed')
-       ORDER BY timestamp ASC, id ASC`,
+      `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.attachments, m.channel_context, m.source_kind, m.task_id,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE seq.sequence > ?
+         AND m.chat_jid IN (${placeholders})
+         AND m.is_from_me = 0
+         AND COALESCE(m.source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt')
+         AND COALESCE(m.delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'awaiting_companion', 'subsumed')
+       ORDER BY seq.sequence ASC`,
     );
     // Cap cache size to avoid unbounded growth in deployments where the
     // distinct jidCount values shift over time. better-sqlite3 does not
@@ -321,6 +328,50 @@ function tableExists(tableName: string): boolean {
   return !!row;
 }
 
+/**
+ * Give every persisted message an immutable host-side arrival position.
+ *
+ * The sequence lives in a separate table so upgrading an existing installation
+ * never rebuilds the large messages table. The mapping intentionally survives
+ * message deletion and INSERT OR REPLACE: re-observing the same provider
+ * message remains idempotent and cannot jump past a committed cursor.
+ */
+function ensureMessageIngestSequenceSchema(backfill: boolean): void {
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS message_ingest_sequences (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_jid TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        UNIQUE (chat_jid, message_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_message_ingest_sequences_chat_sequence
+        ON message_ingest_sequences(chat_jid, sequence);
+    `);
+
+    if (backfill) {
+      // rowid reflects the host's historical insertion order. ORDER BY makes
+      // the AUTOINCREMENT backfill deterministic for an upgraded database.
+      db.exec(`
+        INSERT OR IGNORE INTO message_ingest_sequences (chat_jid, message_id)
+        SELECT chat_jid, id
+        FROM messages
+        ORDER BY rowid ASC;
+      `);
+    }
+    db.exec(`
+      DROP TRIGGER IF EXISTS messages_assign_ingest_sequence;
+      CREATE TRIGGER messages_assign_ingest_sequence
+      AFTER INSERT ON messages
+      BEGIN
+        INSERT INTO message_ingest_sequences (chat_jid, message_id)
+        VALUES (NEW.chat_jid, NEW.id)
+        ON CONFLICT(chat_jid, message_id) DO NOTHING;
+      END;
+    `);
+  })();
+}
+
 function reportKnownForeignKeyOrphans(): void {
   if (!tableExists('users')) return;
   const specs: Array<{
@@ -393,6 +444,20 @@ function sqliteStringLiteral(value: string): string {
  * or data-reconciliation write; a backup failure aborts startup.
  */
 function createPreMigrationBackup(dbPath: string, schemaVersion: number): void {
+  const skipBackup = ['1', 'true'].includes(
+    (process.env.HAPPYCLAW_SKIP_MIGRATION_BACKUP ?? '').trim().toLowerCase(),
+  );
+  if (skipBackup) {
+    logger.warn(
+      {
+        fromVersion: schemaVersion,
+        toVersion: CURRENT_SCHEMA_VERSION,
+        environmentOverride: 'HAPPYCLAW_SKIP_MIGRATION_BACKUP',
+      },
+      'Skipping pre-migration SQLite backup by explicit operator policy',
+    );
+    return;
+  }
   const configuredDir = process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR;
   const backupDir = configuredDir
     ? path.resolve(configuredDir)
@@ -1305,6 +1370,12 @@ export function initDatabase(
   ensureColumn('registered_groups', 'init_git_url', 'TEXT');
   ensureColumn('messages', 'attachments', 'TEXT');
   ensureColumn('messages', 'source_jid', 'TEXT');
+  // v73 -> v74: provider timestamps and random provider IDs are display and
+  // idempotency fields, not a safe durable consumption order.
+  ensureMessageIngestSequenceSchema(
+    rawSchemaVersionBeforeInit === null ||
+      Number(rawSchemaVersionBeforeInit) < 74,
+  );
   ensureColumn('registered_groups', 'created_by', 'TEXT');
   ensureColumn('registered_groups', 'is_home', 'INTEGER DEFAULT 0');
   // v56 -> v57: cache provider chat avatars so binding lists do not need an
@@ -2164,6 +2235,20 @@ export function initDatabase(
   ensureColumn('registered_groups', 'channel_account_id', 'TEXT');
   ensureColumn('channel_mounts', 'channel_account_id', 'TEXT');
   ensureColumn('agent_channel_mounts', 'channel_account_id', 'TEXT');
+  // v74 → v75: one channel can override the workspace interaction contract.
+  for (const table of ['channel_mounts', 'agent_channel_mounts']) {
+    ensureColumn(
+      table,
+      'interaction_mode_override',
+      "TEXT CHECK (interaction_mode_override IS NULL OR interaction_mode_override IN ('assistant', 'proactive'))",
+    );
+  }
+  ensureColumn(
+    'sessions',
+    'interaction_mode',
+    "TEXT CHECK (interaction_mode IS NULL OR interaction_mode IN ('assistant', 'proactive'))",
+  );
+
   ensureColumn(
     'channel_accounts',
     'is_legacy_default',
@@ -3082,6 +3167,123 @@ export function getMessageChannelTurnContext(
   return parseChannelTurnContext(row?.channel_context) ?? null;
 }
 
+export interface ForwardBundleRootMaterial {
+  id: string;
+  content: string;
+  senderName: string;
+  attachments: string | null;
+  channelContext: ChannelTurnContext;
+}
+
+/** Reuse an already-normalized forward root instead of calling Feishu again. */
+export function getForwardBundleRootMaterial(
+  chatJid: string,
+  bundleId: string,
+  sender: string,
+): ForwardBundleRootMaterial | null {
+  const row = db
+    .prepare(
+      `SELECT id, content, sender_name, attachments, channel_context
+       FROM messages
+       WHERE id = ? AND chat_jid = ? AND sender = ? AND is_from_me = 0
+         AND channel_context IS NOT NULL AND json_valid(channel_context)
+         AND json_extract(channel_context, '$.message.contentLink.kind') = 'forward_bundle'
+         AND json_extract(channel_context, '$.message.contentLink.bundleId') = ?
+         AND json_extract(channel_context, '$.message.contentLink.role') = 'forwarded_content'
+         AND json_extract(channel_context, '$.message.contentLink.materialResolved') = 1
+         AND COALESCE(delivery_status, '') <> 'cancelled'
+       LIMIT 1`,
+    )
+    .get(bundleId, chatJid, sender, bundleId) as
+    | {
+        id: string;
+        content: string;
+        sender_name: string;
+        attachments: string | null;
+        channel_context: unknown;
+      }
+    | undefined;
+  if (!row) return null;
+  const channelContext = parseChannelTurnContext(row.channel_context);
+  if (!channelContext) return null;
+  return {
+    id: row.id,
+    content: toUtf8String(row.content),
+    senderName: toUtf8String(row.sender_name),
+    attachments: row.attachments,
+    channelContext,
+  };
+}
+
+/**
+ * Release a held forward root into the companion's exact execution family.
+ * No active query means the root becomes an ordinary pending input; an
+ * unrelated active query keeps root and note together in the durable queue.
+ */
+export function releaseAwaitingForwardBundleRoot(input: {
+  chatJid: string;
+  bundleId: string;
+  sender: string;
+  queuedRunId?: string | null;
+  subsumedByMessageId?: string | null;
+  updatedAt?: string;
+}): boolean {
+  const subsumed = Boolean(input.subsumedByMessageId);
+  const queued = Boolean(input.queuedRunId);
+  const changed = db
+    .prepare(
+      `UPDATE messages
+       SET delivery_mode = ?, delivery_status = ?, delivery_run_id = ?,
+           delivery_updated_at = ?
+       WHERE id = ? AND chat_jid = ? AND sender = ? AND is_from_me = 0
+         AND delivery_status = 'awaiting_companion'
+         AND channel_context IS NOT NULL AND json_valid(channel_context)
+         AND json_extract(channel_context, '$.message.contentLink.kind') = 'forward_bundle'
+         AND json_extract(channel_context, '$.message.contentLink.bundleId') = ?
+         AND json_extract(channel_context, '$.message.contentLink.role') = 'forwarded_content'`,
+    )
+    .run(
+      queued ? 'queue' : null,
+      subsumed ? 'subsumed' : queued ? 'queued' : null,
+      subsumed ? input.subsumedByMessageId : queued ? input.queuedRunId : null,
+      input.updatedAt ?? new Date().toISOString(),
+      input.bundleId,
+      input.chatJid,
+      input.sender,
+      input.bundleId,
+    );
+  return changed.changes === 1;
+}
+
+/** Stop exposing a held root as runnable after bounded material lookup fails. */
+export function cancelAwaitingForwardBundleRoot(input: {
+  chatJid: string;
+  bundleId: string;
+  sender: string;
+  updatedAt?: string;
+}): boolean {
+  const changed = db
+    .prepare(
+      `UPDATE messages
+       SET delivery_mode = NULL, delivery_status = 'cancelled',
+           delivery_run_id = NULL, delivery_updated_at = ?
+       WHERE id = ? AND chat_jid = ? AND sender = ? AND is_from_me = 0
+         AND delivery_status = 'awaiting_companion'
+         AND channel_context IS NOT NULL AND json_valid(channel_context)
+         AND json_extract(channel_context, '$.message.contentLink.kind') = 'forward_bundle'
+         AND json_extract(channel_context, '$.message.contentLink.bundleId') = ?
+         AND json_extract(channel_context, '$.message.contentLink.role') = 'forwarded_content'`,
+    )
+    .run(
+      input.updatedAt ?? new Date().toISOString(),
+      input.bundleId,
+      input.chatJid,
+      input.sender,
+      input.bundleId,
+    );
+  return changed.changes === 1;
+}
+
 /**
  * Find a previously admitted note that already carries the complete material
  * for this physical merged-forward root. This durable lookup lets a root event
@@ -3214,6 +3416,8 @@ function normalizeQueuedFollowUpRow(
   return {
     id: String(row.id),
     chat_jid: String(row.chat_jid),
+    ingest_sequence:
+      typeof row.ingest_sequence === 'number' ? row.ingest_sequence : undefined,
     source_jid: row.source_jid ? String(row.source_jid) : undefined,
     sender: String(row.sender ?? ''),
     sender_name: String(row.sender_name ?? ''),
@@ -3234,7 +3438,10 @@ function normalizeQueuedFollowUpRow(
 const FOLLOW_UP_SELECT = `
   SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp,
          attachments, channel_context, delivery_mode, delivery_status, delivery_run_id,
-         delivery_priority
+         delivery_priority,
+         (SELECT sequence FROM message_ingest_sequences seq
+          WHERE seq.chat_jid = messages.chat_jid AND seq.message_id = messages.id)
+           AS ingest_sequence
   FROM messages
 `;
 
@@ -3272,7 +3479,7 @@ export function listQueuedFollowUps(chatJid: string): QueuedFollowUp[] {
     .prepare(
       `${FOLLOW_UP_SELECT}
        WHERE chat_jid = ? AND delivery_status IN ('queued', 'promoting')
-       ORDER BY delivery_priority ASC, timestamp ASC, id ASC`,
+       ORDER BY delivery_priority ASC, ingest_sequence ASC`,
     )
     .all(chatJid) as Array<Record<string, unknown>>;
   return rows.map(normalizeQueuedFollowUpRow);
@@ -3388,7 +3595,7 @@ export function moveQueuedFollowUp(
     `${FOLLOW_UP_SELECT}
      WHERE chat_jid = ? AND delivery_status = 'queued'
        AND delivery_mode = 'queue'
-     ORDER BY delivery_priority ASC, timestamp ASC, id ASC`,
+     ORDER BY delivery_priority ASC, ingest_sequence ASC`,
   );
   const update = db.prepare(
     `UPDATE messages
@@ -3471,7 +3678,7 @@ export function claimNextQueuedFollowUp(
   const select = db.prepare(
     `${FOLLOW_UP_SELECT}
      WHERE chat_jid = ? AND delivery_status = 'queued'
-     ORDER BY delivery_priority ASC, timestamp ASC, id ASC
+     ORDER BY delivery_priority ASC, ingest_sequence ASC
      LIMIT 1`,
   );
   const update = db.prepare(
@@ -3510,7 +3717,7 @@ export function claimNextQueuedFollowUpBatch(
   const select = db.prepare(
     `${FOLLOW_UP_SELECT}
      WHERE chat_jid = ? AND delivery_status = 'queued'
-     ORDER BY delivery_priority ASC, timestamp ASC, id ASC`,
+     ORDER BY delivery_priority ASC, ingest_sequence ASC`,
   );
   const update = db.prepare(
     `UPDATE messages
@@ -3521,7 +3728,9 @@ export function claimNextQueuedFollowUpBatch(
   return db.transaction(() => {
     const rows = select.all(chatJid) as Array<Record<string, unknown>>;
     if (rows.length === 0) return [];
-    const claimed = rows.map(normalizeQueuedFollowUpRow);
+    const claimed = selectChannelReplyBatch(
+      rows.map(normalizeQueuedFollowUpRow),
+    );
     const updatedAt = new Date().toISOString();
     for (const item of claimed) {
       const result = update.run(runId, updatedAt, chatJid, item.id);
@@ -4403,17 +4612,22 @@ export function getNewMessages(
 ): { messages: NewMessage[]; newCursor: MessageCursor } {
   if (jids.length === 0) return { messages: [], newCursor: cursor };
 
+  const resolvedCursor = resolveMessageCursorSequence(cursor);
   const rawRows = getNewMessagesStmt(jids.length).all(
-    cursor.timestamp,
-    cursor.timestamp,
-    cursor.id,
+    resolvedCursor.sequence,
     ...jids,
   ) as NewMessage[];
   const rows = rawRows.map((r) => normalizeMessageRow(r));
   const last = rows[rows.length - 1];
   return {
     messages: rows,
-    newCursor: last ? { timestamp: last.timestamp, id: last.id } : cursor,
+    newCursor: last
+      ? {
+          timestamp: last.timestamp,
+          id: last.id,
+          sequence: last.ingest_sequence,
+        }
+      : resolvedCursor,
   };
 }
 
@@ -4421,13 +4635,76 @@ export function getMessagesSince(
   chatJid: string,
   cursor: MessageCursor,
 ): NewMessage[] {
+  const resolvedCursor = resolveMessageCursorSequence(cursor, chatJid);
   const rows = stmts().getMessagesSince.all(
     chatJid,
-    cursor.timestamp,
-    cursor.timestamp,
-    cursor.id,
+    resolvedCursor.sequence,
   ) as NewMessage[];
   return rows.map((row) => normalizeMessageRow(row));
+}
+
+/**
+ * Upgrade a legacy `(timestamp,id)` cursor to the immutable host sequence.
+ * Exact message identity is authoritative. If the old anchor was deleted or
+ * malformed, replay from zero rather than guessing from a provider clock and
+ * silently losing work.
+ */
+export function resolveMessageCursorSequence(
+  cursor: MessageCursor,
+  chatJid?: string,
+): MessageCursor & { sequence: number } {
+  if (
+    typeof cursor.sequence === 'number' &&
+    Number.isSafeInteger(cursor.sequence) &&
+    cursor.sequence >= 0
+  ) {
+    return { ...cursor, sequence: cursor.sequence };
+  }
+
+  let row: { sequence: number } | undefined;
+  if (cursor.id) {
+    if (chatJid) {
+      row = db
+        .prepare(
+          `SELECT sequence FROM message_ingest_sequences
+           WHERE chat_jid = ? AND message_id = ?`,
+        )
+        .get(chatJid, cursor.id) as { sequence: number } | undefined;
+    } else {
+      row = db
+        .prepare(
+          `SELECT seq.sequence
+           FROM message_ingest_sequences seq
+           JOIN messages m
+             ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+           WHERE m.id = ? AND m.timestamp = ?
+           ORDER BY seq.sequence DESC
+           LIMIT 1`,
+        )
+        .get(cursor.id, cursor.timestamp) as { sequence: number } | undefined;
+    }
+  }
+  return { ...cursor, sequence: row?.sequence ?? 0 };
+}
+
+/** Exact stable cursor for a persisted message, used by immediate Web paths. */
+export function getMessageCursor(
+  chatJid: string,
+  messageId: string,
+): MessageCursor | null {
+  const row = db
+    .prepare(
+      `SELECT m.timestamp, seq.sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid = ? AND m.id = ?`,
+    )
+    .get(chatJid, messageId) as
+    | { timestamp: string; sequence: number }
+    | undefined;
+  return row
+    ? { timestamp: row.timestamp, id: messageId, sequence: row.sequence }
+    : null;
 }
 
 type CreateTaskInput = Omit<
@@ -5821,7 +6098,8 @@ export function completeIsolatedTaskRunWithWorkspaceResultIntent(input: {
     if (!mergedPayload) return false;
     const notificationStatus: TaskRunNotificationStatus =
       current.notification_status === 'failed' ||
-      current.notification_status === 'partial_failed'
+      current.notification_status === 'partial_failed' ||
+      current.notification_status === 'uncertain'
         ? current.notification_status
         : 'pending';
     const startedAt = current.started_at
@@ -6674,6 +6952,10 @@ function subtractNotificationSummary(
     (current?.succeeded ?? 0) - (baseline?.succeeded ?? 0),
   );
   const failed = Math.max(0, (current?.failed ?? 0) - (baseline?.failed ?? 0));
+  const uncertain = Math.max(
+    0,
+    (current?.uncertain ?? 0) - (baseline?.uncertain ?? 0),
+  );
   let failedChannels: string[] = [];
   if (failed > 0) {
     const baselineChannels = new Set(baseline?.failed_channels ?? []);
@@ -6687,7 +6969,25 @@ function subtractNotificationSummary(
       failedChannels = [...(current?.failed_channels ?? [])];
     }
   }
-  return { attempted, succeeded, failed, failed_channels: failedChannels };
+  const baselineUncertainChannels = new Set(baseline?.uncertain_channels ?? []);
+  const uncertainChannels = (current?.uncertain_channels ?? []).filter(
+    (channel) => !baselineUncertainChannels.has(channel),
+  );
+  return {
+    attempted,
+    succeeded,
+    failed,
+    failed_channels: failedChannels,
+    ...(uncertain > 0
+      ? {
+          uncertain,
+          uncertain_channels:
+            uncertainChannels.length > 0
+              ? uncertainChannels
+              : [...(current?.uncertain_channels ?? [])],
+        }
+      : {}),
+  };
 }
 
 function subtractNotificationError(
@@ -6724,13 +7024,15 @@ function removeNotificationError(
 function notificationStatusForSummary(
   summary: TaskRunNotificationSummary,
 ): TaskRunNotificationReceipt['status'] {
-  return summary.failed === 0
-    ? summary.attempted === 0
-      ? 'skipped'
-      : 'success'
-    : summary.succeeded > 0
-      ? 'partial_failed'
-      : 'failed';
+  return (summary.uncertain ?? 0) > 0
+    ? 'uncertain'
+    : summary.failed === 0
+      ? summary.attempted === 0
+        ? 'skipped'
+        : 'success'
+      : summary.succeeded > 0
+        ? 'partial_failed'
+        : 'failed';
 }
 
 function mergeTaskRunNotificationReceipts(
@@ -6750,16 +7052,21 @@ function mergeTaskRunNotificationReceipts(
         ...next.summary.failed_channels,
       ]),
     ],
+    ...((currentSummary.uncertain ?? 0) + (next.summary.uncertain ?? 0) > 0
+      ? {
+          uncertain:
+            (currentSummary.uncertain ?? 0) + (next.summary.uncertain ?? 0),
+          uncertain_channels: [
+            ...new Set([
+              ...(currentSummary.uncertain_channels ?? []),
+              ...(next.summary.uncertain_channels ?? []),
+            ]),
+          ],
+        }
+      : {}),
   };
   return {
-    status:
-      summary.failed === 0
-        ? summary.attempted === 0
-          ? 'skipped'
-          : 'success'
-        : summary.succeeded > 0
-          ? 'partial_failed'
-          : 'failed',
+    status: notificationStatusForSummary(summary),
     summary,
     error: [currentError, next.error].filter(Boolean).join('; ') || null,
   };
@@ -6850,7 +7157,9 @@ function recordTaskRunNotificationReceiptInTransaction(
     receipt,
   );
   const shouldRetry =
-    (receipt.status === 'failed' || receipt.status === 'partial_failed') &&
+    (receipt.status === 'failed' ||
+      receipt.status === 'partial_failed' ||
+      receipt.status === 'uncertain') &&
     !!retryPayload;
   const mergedPayload = mergeTaskRunNotificationPayloads(
     currentPayload,
@@ -7038,6 +7347,12 @@ export function replaceTaskRunNotificationReceipt(
         currentSummary.failed - previousReceipt.summary.failed,
       ),
       failed_channels: [],
+      uncertain: Math.max(
+        0,
+        (currentSummary.uncertain ?? 0) -
+          (previousReceipt.summary.uncertain ?? 0),
+      ),
+      uncertain_channels: [],
     };
     if (baseSummary.failed > 0) {
       const removedChannels = new Set(previousReceipt.summary.failed_channels);
@@ -7053,6 +7368,17 @@ export function replaceTaskRunNotificationReceipt(
       if (baseSummary.failed_channels.length === 0) {
         baseSummary.failed_channels = [...currentSummary.failed_channels];
       }
+    }
+    if ((baseSummary.uncertain ?? 0) > 0) {
+      const removedUncertainChannels = new Set(
+        previousReceipt.summary.uncertain_channels ?? [],
+      );
+      baseSummary.uncertain_channels = (
+        currentSummary.uncertain_channels ?? []
+      ).filter((channel) => !removedUncertainChannels.has(channel));
+    } else {
+      delete baseSummary.uncertain;
+      delete baseSummary.uncertain_channels;
     }
     const baseError = removeNotificationError(
       row.notification_error,
@@ -7074,7 +7400,8 @@ export function replaceTaskRunNotificationReceipt(
           );
     const shouldRetryNext =
       (nextReceipt.status === 'failed' ||
-        nextReceipt.status === 'partial_failed') &&
+        nextReceipt.status === 'partial_failed' ||
+        nextReceipt.status === 'uncertain') &&
       !!nextRetryPayload;
     const mergedPayload = mergeTaskRunNotificationPayloads(
       remainingPayload,
@@ -7210,7 +7537,7 @@ function claimTaskRunNotification(
            )
            AND notification_attempt < ?
            AND (
-             (notification_status IN ('failed','partial_failed','pending')
+             (notification_status IN ('failed','partial_failed','uncertain','pending')
                AND notification_available_at IS NOT NULL
                AND notification_available_at <= ?
                AND notification_lease_owner IS NULL)
@@ -7489,7 +7816,9 @@ export function completeTaskRunNotificationAttempt(
   const now = new Date();
   const nowIso = now.toISOString();
   const workerRetryable =
-    (receipt.status === 'failed' || receipt.status === 'partial_failed') &&
+    (receipt.status === 'failed' ||
+      receipt.status === 'partial_failed' ||
+      receipt.status === 'uncertain') &&
     claim.attempt < MAX_TASK_NOTIFICATION_ATTEMPTS &&
     !!retryPayload;
   const delayMs = Math.min(60_000, 1_000 * 2 ** Math.max(0, claim.attempt - 1));
@@ -7575,6 +7904,10 @@ export function completeTaskRunNotificationAttempt(
       claim.notificationSummary.failed === 0 &&
       (claim.notificationStatus === 'pending' ||
         claim.notificationError === PENDING_NOTIFICATION_RETRY_ERROR);
+    const claimedSummaryHasUncertainty =
+      claim.notificationStatus === 'uncertain' &&
+      !!claim.notificationSummary &&
+      (claim.notificationSummary.uncertain ?? 0) > 0;
     let nextReceipt =
       currentSummary &&
       row.notification_error?.includes(FINAL_NOTIFICATION_UNKNOWN_ERROR)
@@ -7584,14 +7917,21 @@ export function completeTaskRunNotificationAttempt(
             row.notification_error,
             receipt,
           )
-        : claimedSummaryIsHistoricalSuccess && claim.notificationSummary
+        : claimedSummaryHasUncertainty && claim.notificationSummary
           ? mergeTaskRunNotificationReceipts(
-              notificationStatusForSummary(claim.notificationSummary),
+              'uncertain',
               claim.notificationSummary,
-              null,
+              claim.notificationError,
               receipt,
             )
-          : receipt;
+          : claimedSummaryIsHistoricalSuccess && claim.notificationSummary
+            ? mergeTaskRunNotificationReceipts(
+                notificationStatusForSummary(claim.notificationSummary),
+                claim.notificationSummary,
+                null,
+                receipt,
+              )
+            : receipt;
     if (concurrentWrite) {
       const lateSummary = subtractNotificationSummary(
         currentSummary,
@@ -7608,14 +7948,7 @@ export function completeTaskRunNotificationAttempt(
           nextReceipt.summary,
           nextReceipt.error ?? null,
           {
-            status:
-              lateSummary.failed === 0
-                ? lateSummary.attempted === 0
-                  ? 'skipped'
-                  : 'success'
-                : lateSummary.succeeded > 0
-                  ? 'partial_failed'
-                  : 'failed',
+            status: notificationStatusForSummary(lateSummary),
             summary: lateSummary,
             error: subtractNotificationError(
               row.notification_error,
@@ -7677,7 +8010,9 @@ export function completeTaskRunNotificationAttempt(
       );
     const discardedPayload =
       !workerRetryable &&
-      (receipt.status === 'failed' || receipt.status === 'partial_failed')
+      (receipt.status === 'failed' ||
+        receipt.status === 'partial_failed' ||
+        receipt.status === 'uncertain')
         ? (retryPayload ?? claim.payload)
         : null;
     if (result.changes === 1 && discardedPayload) {
@@ -7705,7 +8040,7 @@ export function getNextTaskRunWakeAt(): string | null {
              AND notification_available_at IS NOT NULL
              AND notification_lease_owner IS NULL
              AND status IN ('success','failed','delivered')
-             AND notification_status IN ('failed','partial_failed','pending')
+             AND notification_status IN ('failed','partial_failed','uncertain','pending')
          UNION ALL
          SELECT notification_lease_expires_at AS wake_at FROM task_runs
            WHERE notification_lease_owner IS NOT NULL
@@ -7723,7 +8058,7 @@ export function getNextTaskRunWakeAt(): string | null {
          AND notification_attempt < ?
          AND notification_available_at IS NOT NULL
          AND notification_lease_owner IS NULL
-         AND notification_status IN ('failed','partial_failed','pending')`,
+         AND notification_status IN ('failed','partial_failed','uncertain','pending')`,
     )
     .all(MAX_TASK_NOTIFICATION_ATTEMPTS) as Array<{
     id: string;
@@ -7917,6 +8252,34 @@ export function getRouterStateByPrefix(
 }
 
 // --- Session accessors ---
+
+export function getSessionInteractionMode(
+  groupFolder: string,
+  agentId?: string | null,
+): InteractionMode | null {
+  const row = db
+    .prepare(
+      'SELECT interaction_mode FROM sessions WHERE group_folder = ? AND agent_id = ?',
+    )
+    .get(groupFolder, agentId || '') as
+    | { interaction_mode: string | null }
+    | undefined;
+  return row?.interaction_mode === 'assistant' ||
+    row?.interaction_mode === 'proactive'
+    ? row.interaction_mode
+    : null;
+}
+
+/** Annotate an existing SDK resume record; never create a placeholder session. */
+export function setSessionInteractionMode(
+  groupFolder: string,
+  agentId: string | null | undefined,
+  mode: InteractionMode,
+): void {
+  db.prepare(
+    'UPDATE sessions SET interaction_mode = ? WHERE group_folder = ? AND agent_id = ?',
+  ).run(mode, groupFolder, agentId || '');
+}
 
 export function getSession(
   groupFolder: string,
@@ -8187,6 +8550,28 @@ export function setSessionProviderId(
     ).run(groupFolder, effectiveAgentId, providerId);
     syncWorkspaceRuntimeSessionProjection(groupFolder, effectiveAgentId);
   })();
+}
+
+/** Persisted session namespaces currently bound to one Provider account. */
+export function listSessionNamespacesForProviderId(providerId: string): Array<{
+  groupFolder: string;
+  agentId: string | null;
+}> {
+  if (!isDatabaseInitialized()) return [];
+  const rows = db
+    .prepare(
+      `SELECT group_folder, agent_id
+       FROM sessions
+       WHERE provider_id = ?`,
+    )
+    .all(providerId) as Array<{
+    group_folder: string;
+    agent_id: string | null;
+  }>;
+  return rows.map((row) => ({
+    groupFolder: row.group_folder,
+    agentId: row.agent_id || null,
+  }));
 }
 
 export function deleteAllSessionsForFolder(groupFolder: string): void {
@@ -10095,8 +10480,8 @@ function syncAgentChannelMountFromMount(mount: ChannelMount): void {
     `INSERT INTO agent_channel_mounts (
       channel_jid, channel_account_id, agent_profile_id, owner_user_id, channel_type,
       workspace_jid, workspace_folder, session_id, routing_mode, reply_policy,
-      activation_mode, audience_mode, owner_im_id, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      activation_mode, audience_mode, owner_im_id, interaction_mode_override, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(channel_jid) DO UPDATE SET
       channel_account_id = excluded.channel_account_id,
       agent_profile_id = excluded.agent_profile_id,
@@ -10110,6 +10495,7 @@ function syncAgentChannelMountFromMount(mount: ChannelMount): void {
       activation_mode = excluded.activation_mode,
       audience_mode = excluded.audience_mode,
       owner_im_id = excluded.owner_im_id,
+      interaction_mode_override = excluded.interaction_mode_override,
       updated_at = excluded.updated_at`,
   ).run(
     mount.channel_jid,
@@ -10125,6 +10511,7 @@ function syncAgentChannelMountFromMount(mount: ChannelMount): void {
     mount.activation_mode,
     mount.audience_mode,
     mount.owner_im_id ?? null,
+    mount.interaction_mode_override ?? null,
     mount.created_at,
     mount.updated_at,
   );
@@ -10493,6 +10880,10 @@ export type WeChatContextTokenClaimResult =
   | { status: 'claimed'; record: StoredWeChatContextToken }
   | { status: 'missing' | 'changed' | 'expired' | 'quota_exhausted' };
 
+export type WeChatContextTokenReleaseResult =
+  | { status: 'released'; record: StoredWeChatContextToken }
+  | { status: 'missing' | 'changed' };
+
 /** List only one channel account's reply credentials; tokens never cross accounts. */
 export function listWeChatContextTokens(
   channelAccountId: string,
@@ -10650,6 +11041,70 @@ export function claimWeChatContextToken(input: {
           ...record,
           send_count: sendCount,
           last_sent_at_ms: input.nowMs,
+        },
+      };
+    })
+    .immediate();
+}
+
+/**
+ * Low-level rollback for a reservation proven not to have reached the provider.
+ * HTTP/transport/ACK uncertainty must never call this: those attempts remain
+ * charged. Compare-and-swap prevents a stale rollback from rewriting a refresh.
+ */
+export function releaseWeChatContextToken(input: {
+  channelAccountId: string;
+  userId: string;
+  expectedToken: string;
+  expectedRefreshedAtMs: number;
+  expectedSourceMessageId?: string | null;
+  releaseCount: number;
+}): WeChatContextTokenReleaseResult {
+  if (!Number.isInteger(input.releaseCount) || input.releaseCount <= 0) {
+    throw new Error('WeChat context_token releaseCount must be positive');
+  }
+  return db
+    .transaction((): WeChatContextTokenReleaseResult => {
+      const record = db
+        .prepare(
+          `SELECT channel_account_id, user_id, context_token, refreshed_at_ms,
+                  source_message_id, source_sequence, send_count, last_sent_at_ms
+           FROM wechat_context_tokens
+           WHERE channel_account_id = ? AND user_id = ?`,
+        )
+        .get(input.channelAccountId, input.userId) as
+        | StoredWeChatContextToken
+        | undefined;
+      if (!record) return { status: 'missing' };
+      if (
+        record.context_token !== input.expectedToken ||
+        record.refreshed_at_ms !== input.expectedRefreshedAtMs ||
+        (input.expectedSourceMessageId !== undefined &&
+          record.source_message_id !== input.expectedSourceMessageId)
+      ) {
+        return { status: 'changed' };
+      }
+      if (record.send_count < input.releaseCount) {
+        return { status: 'changed' };
+      }
+      const sendCount = record.send_count - input.releaseCount;
+      db.prepare(
+        `UPDATE wechat_context_tokens
+         SET send_count = ?
+         WHERE channel_account_id = ? AND user_id = ?
+           AND context_token = ? AND refreshed_at_ms = ?`,
+      ).run(
+        sendCount,
+        input.channelAccountId,
+        input.userId,
+        input.expectedToken,
+        input.expectedRefreshedAtMs,
+      );
+      return {
+        status: 'released',
+        record: {
+          ...record,
+          send_count: sendCount,
         },
       };
     })
@@ -11257,6 +11712,7 @@ type ChannelMountRow = {
   activation_mode: string | null;
   audience_mode: string | null;
   owner_im_id: string | null;
+  interaction_mode_override: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -11274,6 +11730,11 @@ function parseChannelMountRow(row: ChannelMountRow): ChannelMount {
     activation_mode: parseActivationMode(row.activation_mode),
     audience_mode: parseAudienceMode(row.audience_mode),
     owner_im_id: row.owner_im_id,
+    interaction_mode_override:
+      row.interaction_mode_override === 'assistant' ||
+      row.interaction_mode_override === 'proactive'
+        ? row.interaction_mode_override
+        : null,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -11347,13 +11808,22 @@ export function upsertChannelMount(
   return db.transaction(() => {
     const now = new Date().toISOString();
     const existing = getChannelMount(mount.channel_jid);
+    // Legacy group projections do not own this setting. Preserve it across
+    // renames/activation changes; a new binding starts by inheriting its target.
+    const interactionModeOverride =
+      mount.interaction_mode_override !== undefined
+        ? mount.interaction_mode_override
+        : existing?.workspace_jid === mount.workspace_jid &&
+            (existing.session_id ?? null) === (mount.session_id ?? null)
+          ? (existing.interaction_mode_override ?? null)
+          : null;
     const createdAt = mount.created_at ?? existing?.created_at ?? now;
     const updatedAt = mount.updated_at ?? now;
     db.prepare(
       `INSERT INTO channel_mounts (
         channel_jid, channel_account_id, channel_type, workspace_jid, session_id, routing_mode,
-        reply_policy, activation_mode, audience_mode, owner_im_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        reply_policy, activation_mode, audience_mode, owner_im_id, interaction_mode_override, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(channel_jid) DO UPDATE SET
         channel_account_id = excluded.channel_account_id,
         channel_type = excluded.channel_type,
@@ -11364,6 +11834,7 @@ export function upsertChannelMount(
         activation_mode = excluded.activation_mode,
         audience_mode = excluded.audience_mode,
         owner_im_id = excluded.owner_im_id,
+        interaction_mode_override = excluded.interaction_mode_override,
         updated_at = excluded.updated_at`,
     ).run(
       mount.channel_jid,
@@ -11376,6 +11847,7 @@ export function upsertChannelMount(
       mount.activation_mode,
       mount.audience_mode ?? 'everyone',
       mount.owner_im_id ?? null,
+      interactionModeOverride,
       createdAt,
       updatedAt,
     );
@@ -11446,14 +11918,66 @@ export function syncChannelMountFromRegisteredGroup(
 }
 
 export function syncAllChannelMountsFromRegisteredGroups(): void {
-  db.prepare('DELETE FROM channel_mounts').run();
-  db.prepare('DELETE FROM agent_channel_mounts').run();
-  const rows = db
-    .prepare('SELECT * FROM registered_groups')
-    .all() as RegisteredGroupRow[];
-  for (const row of rows) {
-    syncChannelMountFromRegisteredGroup(row.jid, parseGroupRow(row));
-  }
+  db.transaction(() => {
+    const previous = new Map(
+      (
+        db.prepare('SELECT * FROM channel_mounts').all() as ChannelMountRow[]
+      ).map((row) => [row.channel_jid, parseChannelMountRow(row)]),
+    );
+    db.prepare('DELETE FROM channel_mounts').run();
+    db.prepare('DELETE FROM agent_channel_mounts').run();
+    const rows = db
+      .prepare('SELECT * FROM registered_groups')
+      .all() as RegisteredGroupRow[];
+    for (const row of rows) {
+      const mount = channelMountFromRegisteredGroup(
+        row.jid,
+        parseGroupRow(row),
+      );
+      if (!mount) continue;
+      const old = previous.get(row.jid);
+      const sameBinding =
+        old?.workspace_jid === mount.workspace_jid &&
+        (old.session_id ?? null) === (mount.session_id ?? null);
+      upsertChannelMount({
+        ...mount,
+        ...(sameBinding
+          ? {
+              interaction_mode_override: old.interaction_mode_override ?? null,
+              created_at: old.created_at,
+            }
+          : {}),
+      });
+    }
+  })();
+}
+
+/** Read only a persisted mount setting; callers must validate route ownership. */
+export function getChannelMountInteractionModeOverride(
+  channelJid: string,
+): InteractionMode | null {
+  return getChannelMount(channelJid)?.interaction_mode_override ?? null;
+}
+
+/** The runtime must be quiesced by the API before changing the contract. */
+export function setChannelMountInteractionModeOverride(
+  channelJid: string,
+  workspaceJid: string,
+  mode: InteractionMode | null,
+): ChannelMount | undefined {
+  return db.transaction(() => {
+    const result = db
+      .prepare(
+        `UPDATE channel_mounts
+      SET interaction_mode_override = ?, updated_at = ?
+      WHERE channel_jid = ? AND workspace_jid = ?`,
+      )
+      .run(mode, new Date().toISOString(), channelJid, workspaceJid);
+    if (!result.changes) return undefined;
+    const saved = getChannelMount(channelJid)!;
+    syncAgentChannelMountFromMount(saved);
+    return saved;
+  })();
 }
 
 function mapImContextBindingRow(
@@ -12075,32 +12599,89 @@ export function getMessagesPage(
   chatJid: string,
   before?: string,
   limit = 50,
+  beforeSequence?: number,
 ): Array<NewMessage & { is_from_me: boolean }> {
-  const sql = before
-    ? `
-      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-             delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-      FROM messages
-      WHERE chat_jid = ? AND timestamp < ?
-      ORDER BY timestamp DESC
+  const stableSequence =
+    typeof beforeSequence === 'number' &&
+    Number.isSafeInteger(beforeSequence) &&
+    beforeSequence >= 0
+      ? beforeSequence
+      : undefined;
+  const sql =
+    stableSequence !== undefined
+      ? `
+      SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+             m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+             m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+             m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+             m.delivery_updated_at, seq.sequence AS ingest_sequence
+      FROM message_ingest_sequences seq
+      JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+      WHERE m.chat_jid = ? AND seq.sequence < ?
+      ORDER BY seq.sequence DESC
       LIMIT ?
     `
-    : `
-      SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-             delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-      FROM messages
-      WHERE chat_jid = ?
-      ORDER BY timestamp DESC
+      : before
+        ? `
+      SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+             m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+             m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+             m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+             m.delivery_updated_at, seq.sequence AS ingest_sequence
+      FROM message_ingest_sequences seq
+      JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+      WHERE m.chat_jid = ? AND m.timestamp < ?
+      ORDER BY m.timestamp DESC, seq.sequence DESC
+      LIMIT ?
+    `
+        : `
+      SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+             m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+             m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+             m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+             m.delivery_updated_at, seq.sequence AS ingest_sequence
+      FROM message_ingest_sequences seq
+      JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+      WHERE m.chat_jid = ?
+      ORDER BY seq.sequence DESC
       LIMIT ?
     `;
 
-  const params = before ? [chatJid, before, limit] : [chatJid, limit];
+  const params =
+    stableSequence !== undefined
+      ? [chatJid, stableSequence, limit]
+      : before
+        ? [chatJid, before, limit]
+        : [chatJid, limit];
   const rows = db.prepare(sql).all(...params) as Array<
     NewMessage & { is_from_me: number }
   >;
 
+  return rows.map((row) => normalizeMessageRow(row));
+}
+
+/** Exact persisted rows for one logical input turn, newest first. */
+export function getMessagesForTurn(
+  chatJid: string,
+  turnId: string,
+): Array<NewMessage & { is_from_me: boolean }> {
+  const normalizedTurnId = turnId.trim();
+  if (!normalizedTurnId) return [];
+  const rows = db
+    .prepare(
+      `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid = ? AND m.turn_id = ?
+       ORDER BY seq.sequence DESC`,
+    )
+    .all(chatJid, normalizedTurnId) as Array<
+    NewMessage & { is_from_me: number }
+  >;
   return rows.map((row) => normalizeMessageRow(row));
 }
 
@@ -12119,13 +12700,16 @@ export function getConversationHistoryMessagesPage(
   const safeLimit = Math.min(200, Math.max(1, Math.floor(limit)));
   const rows = db
     .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE chat_jid = ? AND history_recovery_allowed = 1
-         AND id NOT IN (SELECT value FROM json_each(?))
-       ORDER BY timestamp DESC, id DESC
+      `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid = ? AND m.history_recovery_allowed = 1
+         AND m.id NOT IN (SELECT value FROM json_each(?))
+       ORDER BY seq.sequence DESC
        LIMIT ?`,
     )
     .all(chatJid, JSON.stringify(excluded), safeLimit) as Array<
@@ -12140,20 +12724,43 @@ export function getConversationHistoryMessagesPage(
  */
 export function getMessagesAfter(
   chatJid: string,
-  after: string,
+  after = '',
   limit = 50,
+  afterSequence?: number,
 ): Array<NewMessage & { is_from_me: boolean }> {
+  const stableSequence =
+    typeof afterSequence === 'number' &&
+    Number.isSafeInteger(afterSequence) &&
+    afterSequence >= 0
+      ? afterSequence
+      : undefined;
+  const sql =
+    stableSequence !== undefined
+      ? `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid = ? AND seq.sequence > ?
+       ORDER BY seq.sequence ASC
+       LIMIT ?`
+      : `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid = ? AND m.timestamp > ?
+       ORDER BY m.timestamp ASC, seq.sequence ASC
+       LIMIT ?`;
   const rows = db
-    .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE chat_jid = ? AND timestamp > ?
-       ORDER BY timestamp ASC
-       LIMIT ?`,
-    )
-    .all(chatJid, after, limit) as Array<NewMessage & { is_from_me: number }>;
+    .prepare(sql)
+    .all(chatJid, stableSequence ?? after, limit) as Array<
+    NewMessage & { is_from_me: number }
+  >;
 
   return rows.map((row) => normalizeMessageRow(row));
 }
@@ -12204,28 +12811,59 @@ export function getMessagesPageMulti(
   chatJids: string[],
   before?: string,
   limit = 50,
+  beforeSequence?: number,
 ): Array<NewMessage & { is_from_me: boolean }> {
   if (chatJids.length === 0) return [];
-  if (chatJids.length === 1) return getMessagesPage(chatJids[0], before, limit);
+  if (chatJids.length === 1)
+    return getMessagesPage(chatJids[0], before, limit, beforeSequence);
 
   const placeholders = chatJids.map(() => '?').join(',');
-  const sql = before
-    ? `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE chat_jid IN (${placeholders}) AND timestamp < ?
-       ORDER BY timestamp DESC
+  const stableSequence =
+    typeof beforeSequence === 'number' &&
+    Number.isSafeInteger(beforeSequence) &&
+    beforeSequence >= 0
+      ? beforeSequence
+      : undefined;
+  const sql =
+    stableSequence !== undefined
+      ? `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid IN (${placeholders}) AND seq.sequence < ?
+       ORDER BY seq.sequence DESC
        LIMIT ?`
-    : `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE chat_jid IN (${placeholders})
-       ORDER BY timestamp DESC
+      : before
+        ? `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+                m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+                m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+                m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+                m.delivery_updated_at, seq.sequence AS ingest_sequence
+         FROM message_ingest_sequences seq
+         JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+         WHERE m.chat_jid IN (${placeholders}) AND m.timestamp < ?
+         ORDER BY m.timestamp DESC, seq.sequence DESC
+         LIMIT ?`
+        : `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid IN (${placeholders})
+       ORDER BY seq.sequence DESC
        LIMIT ?`;
 
-  const params = before ? [...chatJids, before, limit] : [...chatJids, limit];
+  const params =
+    stableSequence !== undefined
+      ? [...chatJids, stableSequence, limit]
+      : before
+        ? [...chatJids, before, limit]
+        : [...chatJids, limit];
   const rows = db.prepare(sql).all(...params) as Array<
     NewMessage & { is_from_me: number }
   >;
@@ -12238,24 +12876,46 @@ export function getMessagesPageMulti(
  */
 export function getMessagesAfterMulti(
   chatJids: string[],
-  after: string,
+  after = '',
   limit = 50,
+  afterSequence?: number,
 ): Array<NewMessage & { is_from_me: boolean }> {
   if (chatJids.length === 0) return [];
-  if (chatJids.length === 1) return getMessagesAfter(chatJids[0], after, limit);
+  if (chatJids.length === 1)
+    return getMessagesAfter(chatJids[0], after, limit, afterSequence);
 
   const placeholders = chatJids.map(() => '?').join(',');
+  const stableSequence =
+    typeof afterSequence === 'number' &&
+    Number.isSafeInteger(afterSequence) &&
+    afterSequence >= 0
+      ? afterSequence
+      : undefined;
+  const sql =
+    stableSequence !== undefined
+      ? `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid IN (${placeholders}) AND seq.sequence > ?
+       ORDER BY seq.sequence ASC
+       LIMIT ?`
+      : `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
+              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
+              m.delivery_updated_at, seq.sequence AS ingest_sequence
+       FROM message_ingest_sequences seq
+       JOIN messages m ON m.chat_jid = seq.chat_jid AND m.id = seq.message_id
+       WHERE m.chat_jid IN (${placeholders}) AND m.timestamp > ?
+       ORDER BY m.timestamp ASC, seq.sequence ASC
+       LIMIT ?`;
   const rows = db
-    .prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage, channel_context,
-              turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
-              delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at
-       FROM messages
-       WHERE chat_jid IN (${placeholders}) AND timestamp > ?
-       ORDER BY timestamp ASC
-       LIMIT ?`,
-    )
-    .all(...chatJids, after, limit) as Array<
+    .prepare(sql)
+    .all(...chatJids, stableSequence ?? after, limit) as Array<
     NewMessage & { is_from_me: number }
   >;
 
@@ -13524,6 +14184,21 @@ export function getMessage(
         sender: string | null;
         is_from_me: number;
       }
+    | undefined;
+  return row ?? null;
+}
+
+/** Read only the durable payload needed to resume post-persist channel effects. */
+export function getMessagePayload(
+  chatJid: string,
+  messageId: string,
+): { content: string; attachments: string | null } | null {
+  const row = db
+    .prepare(
+      'SELECT content, attachments FROM messages WHERE id = ? AND chat_jid = ?',
+    )
+    .get(messageId, chatJid) as
+    | { content: string; attachments: string | null }
     | undefined;
   return row ?? null;
 }

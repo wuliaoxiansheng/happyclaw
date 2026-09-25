@@ -32,6 +32,18 @@ const tsxCli = path.join(
   'dist',
   'cli.mjs',
 );
+const defaultTestWebPort = (() => {
+  for (let offset = 0; offset < 200; offset++) {
+    const candidate = 40_000 + ((process.pid + offset) % 20_000);
+    const probe = spawnSync('lsof', [
+      '-nP',
+      `-iTCP:${candidate}`,
+      '-sTCP:LISTEN',
+    ]);
+    if (probe.status !== 0) return candidate;
+  }
+  throw new Error('Unable to find an unused test WEB_PORT');
+})();
 
 afterAll(() => {
   delete process.env[DATABASE_MAINTENANCE_TOKEN_ENV];
@@ -41,6 +53,10 @@ afterAll(() => {
 function instanceRoot(name: string): string {
   const target = path.join(root, name);
   fs.mkdirSync(target, { recursive: true });
+  fs.writeFileSync(
+    path.join(target, '.env'),
+    `WEB_PORT=${defaultTestWebPort}\n`,
+  );
   return target;
 }
 

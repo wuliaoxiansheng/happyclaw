@@ -76,6 +76,7 @@ import {
   getRegisteredGroup,
   getChannelMount,
   getJidsByFolder,
+  getMessageCursor,
   storeMessageDirect,
   deleteUserSession,
   updateSessionLastActive,
@@ -127,9 +128,16 @@ import { recordRunContextSnapshot } from './run-context-snapshot.js';
 import { RunStreamFence } from './run-stream-fence.js';
 import {
   executeSessionReset,
+  executeFreshWindowReset,
   isClearCommand,
+  parseFreshCommand,
   SESSION_RESET_FAILURE_MESSAGE,
+  SESSION_FRESH_WINDOW_FAILURE_MESSAGE,
 } from './commands.js';
+import {
+  captureWorkspaceSnapshot,
+  formatFreshWindowHandoff,
+} from './fresh-window.js';
 import {
   normalizeImageAttachments,
   toAgentImages,
@@ -372,6 +380,65 @@ app.post('/api/messages', authMiddleware, async (c) => {
     }
   }
 
+  // /fresh [notes]: zero-summary window switch. Same owner gate as /clear.
+  const freshCommand = parseFreshCommand(content);
+  if (freshCommand) {
+    if (
+      !canModifyGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...group, jid: chatJid },
+      )
+    ) {
+      return c.json({ error: 'Only the workspace owner can run /fresh' }, 403);
+    }
+    if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+    try {
+      const snapshot = await captureWorkspaceSnapshot(
+        group.customCwd || path.join(GROUPS_DIR, group.folder),
+      );
+      const handoff = formatFreshWindowHandoff({
+        notes: freshCommand.notes,
+        snapshot,
+      });
+      await executeFreshWindowReset(
+        chatJid,
+        group.folder,
+        {
+          queue: deps.queue,
+          sessions: deps.getSessions(),
+          broadcast: broadcastNewMessage,
+          setLastAgentTimestamp: deps.setLastAgentTimestamp,
+        },
+        { agentId, handoff },
+      );
+      return c.json({ success: true, cleared: true, fresh: true });
+    } catch (err) {
+      logger.error({ chatJid, err }, '/fresh command failed');
+      const errId = crypto.randomUUID();
+      const errTs = new Date().toISOString();
+      ensureChatExists(chatJid);
+      storeMessageDirect(
+        errId,
+        chatJid,
+        '__system__',
+        'system',
+        SESSION_FRESH_WINDOW_FAILURE_MESSAGE,
+        errTs,
+        true,
+      );
+      broadcastNewMessage(chatJid, {
+        id: errId,
+        chat_jid: chatJid,
+        sender: '__system__',
+        sender_name: 'system',
+        content: SESSION_FRESH_WINDOW_FAILURE_MESSAGE,
+        timestamp: errTs,
+        is_from_me: true,
+      });
+      return c.json({ error: '零摘要换窗失败' }, 500);
+    }
+  }
+
   if (agentId) {
     const result = await handleAgentConversationMessage(
       chatJid,
@@ -399,6 +466,7 @@ app.post('/api/messages', authMiddleware, async (c) => {
     success: true,
     messageId: result.messageId,
     timestamp: result.timestamp,
+    ingestSequence: result.ingestSequence,
     disposition: result.disposition,
     runId: result.runId,
   });
@@ -514,6 +582,7 @@ async function handleWebUserMessage(
       ok: true;
       messageId: string;
       timestamp: string;
+      ingestSequence?: number;
       disposition: 'started' | 'queued' | 'steered';
       runId?: string;
     }
@@ -585,6 +654,10 @@ async function handleWebUserMessage(
         : undefined,
     },
   );
+  const messageCursor = getMessageCursor(chatJid, messageId) ?? {
+    timestamp,
+    id: messageId,
+  };
 
   broadcastNewMessage(chatJid, {
     id: messageId,
@@ -649,7 +722,13 @@ async function handleWebUserMessage(
           id: messageId,
         });
         deps.advanceGlobalCursor({ timestamp, id: messageId });
-        return { ok: true, messageId, timestamp, disposition: 'started' };
+        return {
+          ok: true,
+          messageId,
+          timestamp,
+          ingestSequence: messageCursor.sequence,
+          disposition: 'started',
+        };
       }
     }
   }
@@ -667,6 +746,7 @@ async function handleWebUserMessage(
         ok: true,
         messageId,
         timestamp,
+        ingestSequence: messageCursor.sequence,
         disposition: steerResult?.ok ? 'steered' : 'queued',
         runId: activeRunId!,
       };
@@ -675,6 +755,7 @@ async function handleWebUserMessage(
       ok: true,
       messageId,
       timestamp,
+      ingestSequence: messageCursor.sequence,
       disposition: 'queued',
       runId: activeRunId,
     };
@@ -755,6 +836,7 @@ async function handleWebUserMessage(
           ok: true,
           messageId,
           timestamp,
+          ingestSequence: messageCursor.sequence,
           disposition: activeRunId ? 'steered' : 'started',
           runId: activeRunId ?? undefined,
         };
@@ -831,8 +913,8 @@ async function handleWebUserMessage(
     undefined,
     {
       chatJid,
-      coveredCursors: [{ timestamp, id: messageId }],
-      cursor: { timestamp, id: messageId },
+      coveredCursors: [messageCursor],
+      cursor: messageCursor,
     },
     undefined,
     (receipt) => preAdmitRoute?.(group.folder, null, receipt) ?? false,
@@ -873,6 +955,7 @@ async function handleWebUserMessage(
     ok: true,
     messageId,
     timestamp,
+    ingestSequence: messageCursor.sequence,
     disposition: activeRunId ? 'steered' : 'started',
     runId: activeRunId ?? startedRunId ?? undefined,
   };
@@ -911,6 +994,7 @@ async function handleAgentConversationMessage(
       ok: true;
       messageId: string;
       timestamp: string;
+      ingestSequence?: number;
       disposition: 'started' | 'queued' | 'steered';
       runId?: string;
     }
@@ -987,6 +1071,10 @@ async function handleAgentConversationMessage(
         : undefined,
     },
   );
+  const agentMessageCursor = getMessageCursor(virtualChatJid, messageId) ?? {
+    timestamp,
+    id: messageId,
+  };
   updateAgentContextInfo(agentId, { last_active_at: timestamp });
 
   // Auto-title: show a quick placeholder derived from the first user message.
@@ -1039,6 +1127,7 @@ async function handleAgentConversationMessage(
         ok: true,
         messageId,
         timestamp,
+        ingestSequence: agentMessageCursor.sequence,
         disposition: steerResult?.ok ? 'steered' : 'queued',
         runId: activeRunId!,
       };
@@ -1047,6 +1136,7 @@ async function handleAgentConversationMessage(
       ok: true,
       messageId,
       timestamp,
+      ingestSequence: agentMessageCursor.sequence,
       disposition: 'queued',
       runId: activeRunId,
     };
@@ -1121,6 +1211,7 @@ async function handleAgentConversationMessage(
             ok: true,
             messageId,
             timestamp,
+            ingestSequence: agentMessageCursor.sequence,
             disposition: activeRunId ? 'steered' : 'started',
             runId: activeRunId ?? undefined,
           };
@@ -1198,8 +1289,8 @@ async function handleAgentConversationMessage(
     undefined,
     {
       chatJid: virtualChatJid,
-      coveredCursors: [{ timestamp, id: messageId }],
-      cursor: { timestamp, id: messageId },
+      coveredCursors: [agentMessageCursor],
+      cursor: agentMessageCursor,
     },
     undefined,
     (receipt) =>
@@ -1207,10 +1298,7 @@ async function handleAgentConversationMessage(
     { feishuCliAccountId: requiredFeishuCliAccountId },
   );
   if (agentSendResult === 'sent') {
-    deps.advanceNextPullCursorOnly(virtualChatJid, {
-      timestamp,
-      id: messageId,
-    });
+    deps.advanceNextPullCursorOnly(virtualChatJid, agentMessageCursor);
   }
   if (agentSendResult === 'no_active') {
     if (eagerExpandAgentActive && agentSendContent !== content) {
@@ -1246,6 +1334,7 @@ async function handleAgentConversationMessage(
     ok: true,
     messageId,
     timestamp,
+    ingestSequence: agentMessageCursor.sequence,
     disposition: activeRunId ? 'steered' : 'started',
     runId: activeRunId ?? startedRunId ?? undefined,
   };
@@ -1851,6 +1940,75 @@ function setupWebSocket(server: any): WebSocketServer {
             return;
           }
 
+          // ── /fresh [notes]: zero-summary window switch ──
+          const wsFreshCommand = parseFreshCommand(content);
+          if (wsFreshCommand && deps && targetGroup) {
+            if (
+              !canModifyGroup(
+                { id: session.user_id, role: session.role },
+                { ...targetGroup, jid: chatJid },
+              )
+            ) {
+              sendWsError('Only the workspace owner can run /fresh', chatJid);
+              return;
+            }
+            if (agentId) {
+              const agent = getAgent(agentId);
+              if (!agent || agent.chat_jid !== chatJid) {
+                sendWsError('Agent not found', chatJid);
+                return;
+              }
+            }
+            const errorTargetJid = agentId
+              ? `${chatJid}#agent:${agentId}`
+              : chatJid;
+            try {
+              const snapshot = await captureWorkspaceSnapshot(
+                targetGroup.customCwd ||
+                  path.join(GROUPS_DIR, targetGroup.folder),
+              );
+              const handoff = formatFreshWindowHandoff({
+                notes: wsFreshCommand.notes,
+                snapshot,
+              });
+              await executeFreshWindowReset(
+                chatJid,
+                targetGroup.folder,
+                {
+                  queue: deps.queue,
+                  sessions: deps.getSessions(),
+                  broadcast: broadcastNewMessage,
+                  setLastAgentTimestamp: deps.setLastAgentTimestamp,
+                },
+                { agentId, handoff },
+              );
+            } catch (err) {
+              logger.error({ chatJid, agentId, err }, '/fresh command failed');
+              const errId = crypto.randomUUID();
+              const errTs = new Date().toISOString();
+              ensureChatExists(errorTargetJid);
+              storeMessageDirect(
+                errId,
+                errorTargetJid,
+                '__system__',
+                'system',
+                SESSION_FRESH_WINDOW_FAILURE_MESSAGE,
+                errTs,
+                true,
+              );
+              broadcastNewMessage(errorTargetJid, {
+                id: errId,
+                chat_jid: errorTargetJid,
+                sender: '__system__',
+                sender_name: 'system',
+                content: SESSION_FRESH_WINDOW_FAILURE_MESSAGE,
+                timestamp: errTs,
+                is_from_me: true,
+              });
+            }
+            return;
+          }
+
           // Route to agent conversation handler if agentId is present
           if (agentId && deps) {
             await handleAgentConversationMessage(
@@ -2310,6 +2468,18 @@ export function broadcastNewMessage(
   agentId?: string,
   source?: string,
 ): void {
+  // WS delivery must use the same durable host-assigned position as REST
+  // pagination. Hydrate persisted rows centrally so billing, plugin and
+  // system producers cannot accidentally omit the sequence. Ephemeral
+  // messages have no matching row and retain the legacy optional field.
+  const persistedCursor =
+    msg.ingest_sequence === undefined
+      ? getMessageCursor(msg.chat_jid, msg.id)
+      : null;
+  const sequencedMessage =
+    persistedCursor?.sequence !== undefined
+      ? { ...msg, ingest_sequence: persistedCursor.sequence }
+      : msg;
   // For virtual JIDs like "web:xxx#agent:yyy", extract base JID and agentId
   let baseChatJid = chatJid;
   let effectiveAgentId = agentId;
@@ -2323,7 +2493,10 @@ export function broadcastNewMessage(
   const wsMsg: WsMessageOut = {
     type: 'new_message',
     chatJid: jid,
-    message: { ...msg, is_from_me: msg.is_from_me ?? false },
+    message: {
+      ...sequencedMessage,
+      is_from_me: sequencedMessage.is_from_me ?? false,
+    },
     ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
     ...(source ? { source } : {}),
   };
@@ -2670,7 +2843,12 @@ function updateSnapshotTask(
   } else if (event.eventType === 'task_updated') {
     const patch = event.taskPatch;
     if (patch?.status === 'completed') task.status = 'completed';
-    else if (patch?.status === 'failed' || patch?.status === 'killed')
+    else if (
+      patch?.status === 'failed' ||
+      patch?.status === 'killed' ||
+      patch?.status === 'stopped' ||
+      patch?.status === 'aborted'
+    )
       task.status = 'error';
     else if (patch?.is_backgrounded) task.status = 'backgrounded';
     task.latestSummary =
