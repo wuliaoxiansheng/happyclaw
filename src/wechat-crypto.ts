@@ -91,7 +91,10 @@ export async function downloadAndDecryptMedia(
     'Downloading encrypted media from CDN',
   );
 
-  const resp = await fetchWeChatDirect(url, { signal: AbortSignal.timeout(60_000) });
+  const resp = await fetchWeChatDirect(url, {
+    signal: AbortSignal.timeout(60_000),
+    dispatcher,
+  });
   if (!resp.ok) {
     throw new Error(`CDN download failed: ${resp.status} ${resp.statusText}`);
   }

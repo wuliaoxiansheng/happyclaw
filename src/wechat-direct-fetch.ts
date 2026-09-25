@@ -1,27 +1,22 @@
 import {
   Agent,
   fetch as undiciFetch,
-  type Dispatcher,
   type RequestInit as UndiciRequestInit,
 } from 'undici';
 
 const directDispatcher = new Agent();
 
-type FetchInitWithDispatcher = RequestInit & {
-  dispatcher?: Dispatcher;
-};
-
 /**
- * WeChat iLink/CDN endpoints must be reached directly. The host process may run
- * with NODE_USE_ENV_PROXY=1, so relying on NO_PROXY being read at runtime is not
- * sufficient; an explicit dispatcher bypasses the global proxy dispatcher.
+ * Default to direct transport rather than the process-wide proxy, but honor
+ * an account-local dispatcher. Overriding it here silently disables the
+ * account's proxy setting and bypasses its connection lifecycle.
  */
 export function fetchWeChatDirect(
   input: string | URL | Request,
-  init?: RequestInit,
+  init?: UndiciRequestInit,
 ): Promise<Response> {
   return undiciFetch(input as string | URL, {
     ...init,
-    dispatcher: directDispatcher,
-  } as UndiciRequestInit & FetchInitWithDispatcher) as unknown as Promise<Response>;
+    dispatcher: init?.dispatcher ?? directDispatcher,
+  }) as unknown as Promise<Response>;
 }
