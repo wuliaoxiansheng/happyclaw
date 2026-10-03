@@ -157,8 +157,8 @@ export function classifyImSendFailure(error: unknown): ImSendFailureOutcome {
 }
 
 /**
- * Decide whether repeating a failed IM send can make progress and whether the
- * failure is evidence that the concrete chat binding is unhealthy.
+ * Decide whether repeating a failed IM send can make progress. Delivery-stage
+ * evidence alone must never revoke a persisted chat authorization or binding.
  */
 export function imSendFailurePolicy(error: unknown): ImSendFailurePolicy {
   const outcome = classifyImSendFailure(error);
@@ -171,7 +171,9 @@ export function imSendFailurePolicy(error: unknown): ImSendFailurePolicy {
   }
   return {
     retryable: true,
-    countsTowardChannelRemoval: true,
+    // No request reached the provider, so offline/DNS/proxy/local failures
+    // cannot establish that the remote chat or its pairing is invalid.
+    countsTowardChannelRemoval: false,
     outcome,
   };
 }

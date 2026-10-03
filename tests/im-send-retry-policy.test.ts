@@ -6,6 +6,8 @@ import {
   physicalDeliveryProgressError,
   imSendFailurePolicy,
   isUncertainAfterAcceptImError,
+  preAcceptImDeliveryError,
+  retryUnscopedImSend,
 } from '../src/im-send-retry-policy.js';
 import { DefinitiveChannelDeliveryError } from '../src/channel-outbox-delivery.js';
 import { WeChatContextTokenError } from '../src/wechat-context-token.js';
@@ -44,12 +46,50 @@ describe('imSendFailurePolicy', () => {
       ),
     ).toEqual({
       retryable: true,
-      countsTowardChannelRemoval: true,
+      countsTowardChannelRemoval: false,
       outcome: 'pre_accept',
     });
     expect(classifyImSendFailure(new Error('connection reset'))).toBe(
       'uncertain',
     );
+  });
+
+  test.each([
+    'ENOTFOUND',
+    'EAI_AGAIN',
+    'ECONNREFUSED',
+    'UND_ERR_CONNECT_TIMEOUT',
+  ])('preserves chat pairing across a wrapped %s failure', (code) => {
+    const cause = Object.assign(new Error('network unavailable'), { code });
+    expect(imSendFailurePolicy(new Error('adapter failed', { cause }))).toEqual(
+      {
+        retryable: true,
+        countsTowardChannelRemoval: false,
+        outcome: 'pre_accept',
+      },
+    );
+  });
+
+  test('repeated offline WeChat notification retries never count toward unpairing', async () => {
+    let attempts = 0;
+    let removalFailures = 0;
+    for (let notification = 0; notification < 5; notification++) {
+      const result = await retryUnscopedImSend(
+        async () => {
+          attempts++;
+          throw preAcceptImDeliveryError(
+            'No IM channel available for wechat:paired-peer (wechat)',
+          );
+        },
+        { maxAttempts: 3, sleep: async () => {} },
+      );
+      expect(result).toMatchObject({ ok: false, outcome: 'pre_accept' });
+      if (imSendFailurePolicy(result.error).countsTowardChannelRemoval) {
+        removalFailures++;
+      }
+    }
+    expect(attempts).toBe(15);
+    expect(removalFailures).toBe(0);
   });
 
   test('does not automatically replay an accepted-but-unacknowledged delivery', () => {
