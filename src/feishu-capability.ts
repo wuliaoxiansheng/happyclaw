@@ -462,7 +462,10 @@ async function assertMessageInCurrentChat(
 ): Promise<Record<string, unknown>> {
   const response = await client.im.v1.message.get({
     path: { message_id: messageId },
-    params: { user_id_type: 'open_id' as const, with_sender_name: true } as never,
+    params: {
+      user_id_type: 'open_id' as const,
+      with_sender_name: true,
+    } as never,
   });
   assertApiSuccess('get_message', response);
   const items = Array.isArray(response.data?.items) ? response.data.items : [];
