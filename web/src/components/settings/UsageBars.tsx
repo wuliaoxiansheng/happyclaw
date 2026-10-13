@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '@/api/client';
+import { cn } from '@/lib/utils';
 import type {
   CachedOAuthUsage,
+  CodexRateLimitsUsage,
+  CodexRateLimitWindow,
   OAuthExtraUsage,
   OAuthUsageBucket,
   ProviderQuotaObservation,
@@ -16,9 +19,9 @@ export function clampUsagePercentage(value: number | null): number | null {
 }
 
 function barColor(utilization: number): string {
-  if (utilization >= 80) return 'bg-red-500';
-  if (utilization >= 50) return 'bg-amber-500';
-  return 'bg-emerald-500';
+  if (utilization >= 80) return 'bg-error';
+  if (utilization >= 50) return 'bg-warning';
+  return 'bg-success';
 }
 
 export function formatResetTime(resetsAt: string | null): string | null {
@@ -113,19 +116,19 @@ function UsageColumn({
   const pct = clampUsagePercentage(bucket.utilization);
   const reset = formatResetTime(bucket.resets_at);
   return (
-    <div className="min-w-0 rounded-md bg-muted/35 px-2.5 py-2">
+    <div className="min-w-0 rounded-lg bg-muted/50 px-2.5 py-2">
       <div className="flex min-w-0 items-center justify-between gap-2">
         <span
-          className="truncate text-[11px] font-medium text-muted-foreground"
+          className="truncate text-micro font-medium text-muted-foreground"
           title={label}
         >
           {label}
         </span>
-        <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+        <span className="shrink-0 font-mono text-micro text-muted-foreground tabular-nums">
           {pct === null ? '—' : `${Math.round(pct)}%`}
         </span>
       </div>
-      <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
+      <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-foreground/10">
         {pct !== null && (
           <div
             className={`h-full rounded-full transition-all ${barColor(pct)}`}
@@ -134,7 +137,7 @@ function UsageColumn({
         )}
       </div>
       {(reset || detail) && (
-        <div className="mt-1 truncate text-[10px] text-muted-foreground/60">
+        <div className="mt-1 truncate text-micro text-faint-foreground">
           {detail ?? (reset ? `${reset} 后重置` : null)}
         </div>
       )}
@@ -187,6 +190,96 @@ function ExtraUsageColumn({ extra }: { extra: OAuthExtraUsage }) {
   );
 }
 
+/** 300 → "5h", 10080 → "7d": the window lengths ChatGPT reports. */
+export function codexWindowLabel(minutes: number | null): string {
+  if (minutes === null || !Number.isFinite(minutes) || minutes <= 0)
+    return '额度';
+  if (minutes % 1440 === 0) return `${minutes / 1440}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+}
+
+function codexWindowBucket(window: CodexRateLimitWindow): OAuthUsageBucket {
+  return {
+    utilization: window.usedPercent,
+    resets_at:
+      window.resetsAt && Number.isFinite(window.resetsAt)
+        ? new Date(window.resetsAt * 1000).toISOString()
+        : null,
+  };
+}
+
+/** ChatGPT subscription windows as seen on the latest gateway response. */
+function CodexUsage({
+  usage,
+  className,
+}: {
+  usage: CodexRateLimitsUsage;
+  className?: string;
+}) {
+  if (usage.limits.length === 0) {
+    return (
+      <div className={cn('text-micro text-muted-foreground', className)}>
+        发出一次请求后显示 ChatGPT 订阅额度
+      </div>
+    );
+  }
+  const columns: Array<{
+    key: string;
+    label: string;
+    bucket: OAuthUsageBucket;
+    detail?: string;
+  }> = [];
+  for (const limit of usage.limits) {
+    // The account-wide limit is "codex"; others are model-specific.
+    const prefix =
+      limit.limitId === 'codex' ? '' : `${limit.limitName ?? limit.limitId} `;
+    for (const window of [limit.primary, limit.secondary]) {
+      if (!window) continue;
+      columns.push({
+        key: `${limit.limitId}-${window.windowMinutes}`,
+        label: `${prefix}${codexWindowLabel(window.windowMinutes)}`,
+        bucket: codexWindowBucket(window),
+      });
+    }
+    if (limit.credits?.hasCredits) {
+      columns.push({
+        key: `${limit.limitId}-credits`,
+        label: `${prefix}Credits`,
+        bucket: { utilization: null, resets_at: null },
+        detail: limit.credits.unlimited
+          ? '不限量'
+          : `余额 ${limit.credits.balance ?? '—'}`,
+      });
+    }
+  }
+  return (
+    <div className={cn('min-w-0 space-y-2', className)}>
+      {usage.rateLimitReachedType && (
+        <div className="text-micro text-error">
+          已触达 ChatGPT 订阅限额（{usage.rateLimitReachedType}
+          ），重置前请求会被拒绝
+        </div>
+      )}
+      <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+        {columns.map((column) => (
+          <UsageColumn
+            key={column.key}
+            label={column.label}
+            bucket={column.bucket}
+            detail={column.detail}
+          />
+        ))}
+      </div>
+      {usage.observedAt && (
+        <div className="text-micro text-faint-foreground">
+          更新于 {new Date(usage.observedAt).toLocaleTimeString()}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function displayRateLimitType(type: string | undefined): string {
   switch (type) {
     case 'five_hour':
@@ -223,24 +316,26 @@ function LiveStatus({
         : '可用';
   const status = current ? currentStatus : `上次观测：${currentStatus}`;
   const color = !current
-    ? 'bg-muted-foreground/50'
+    ? 'bg-faint-foreground'
     : usingOverage
-      ? 'bg-blue-500'
+      ? 'bg-primary'
       : observation.status === 'rejected'
-        ? 'bg-red-500'
+        ? 'bg-error'
         : observation.status === 'allowed_warning'
-          ? 'bg-amber-500'
-          : 'bg-emerald-500';
+          ? 'bg-warning'
+          : 'bg-success';
   const pct = sdkUtilizationPercentage(observation);
   const reset = formatEpochReset(observation.resetsAt);
 
   return (
     <div
-      className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border/60 px-2.5 py-1.5 text-[11px] text-muted-foreground"
+      className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-surface-border px-2.5 py-1.5 text-micro text-muted-foreground"
       title={new Date(observation.observedAt).toLocaleString()}
     >
       <span className={`size-1.5 shrink-0 rounded-full ${color}`} />
-      <span className="shrink-0 font-medium">{current ? 'Live' : 'Last'}</span>
+      <span className="shrink-0 font-medium text-foreground">
+        {current ? 'Live' : 'Last'}
+      </span>
       <span className="min-w-0 truncate">{status}</span>
       <span className="shrink-0">
         {displayRateLimitType(observation.rateLimitType)}
@@ -261,11 +356,15 @@ function LiveStatus({
 export function UsageBars({
   providerId,
   providerVersion,
+  className,
 }: {
   providerId: string;
   providerVersion?: string;
+  className?: string;
 }) {
-  const [usage, setUsage] = useState<CachedOAuthUsage | null>(null);
+  const [usage, setUsage] = useState<
+    CachedOAuthUsage | CodexRateLimitsUsage | null
+  >(null);
   const [loading, setLoading] = useState(true);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -277,7 +376,7 @@ export function UsageBars({
     const fetchUsage = async () => {
       if (document.visibilityState !== 'visible') return;
       try {
-        const data = await api.get<CachedOAuthUsage>(
+        const data = await api.get<CachedOAuthUsage | CodexRateLimitsUsage>(
           `/api/config/claude/providers/${providerId}/usage`,
         );
         if (!cancelled) setUsage(data);
@@ -304,7 +403,36 @@ export function UsageBars({
     };
   }, [providerId, providerVersion]);
 
-  if (loading || !usage?.data) return null;
+  if (loading || !usage) return null;
+  if ('kind' in usage && usage.kind === 'codex_rate_limits') {
+    return <CodexUsage usage={usage} className={className} />;
+  }
+  if (!('data' in usage) || !usage.data) return null;
+
+  // An unsupported grant can still carry live SDK rate-limit observations;
+  // only the usage buckets are unavailable.
+  const statusNote =
+    usage.status === 'needs_relogin'
+      ? { tone: 'text-error', text: '授权已失效，重新登录后才能查看用量' }
+      : usage.status === 'unsupported' && usage.unsupportedReason !== 'no_oauth'
+        ? {
+            tone: 'text-muted-foreground',
+            text: 'Setup Token / 仅推理权限的授权不支持用量查询',
+          }
+        : null;
+  if (usage.status) {
+    if (!statusNote && !usage.observation) return null;
+    return (
+      <div className={cn('min-w-0 space-y-2', className)}>
+        {statusNote && (
+          <div className={cn('text-micro', statusNote.tone)}>
+            {statusNote.text}
+          </div>
+        )}
+        {usage.observation && <LiveStatus observation={usage.observation} />}
+      </div>
+    );
+  }
 
   const buckets: { label: string; bucket: OAuthUsageBucket }[] = [];
   if (usage.data.five_hour)
@@ -329,12 +457,9 @@ export function UsageBars({
   }
 
   return (
-    <div className="mt-2 ml-4 min-w-0 space-y-2">
+    <div className={cn('min-w-0 space-y-2', className)}>
       {usage.error && (
-        <div
-          className="text-[10px] text-amber-600 dark:text-amber-400"
-          title={usage.error}
-        >
+        <div className="text-micro text-warning" title={usage.error}>
           暂时无法刷新，显示上次数据
           {Number.isFinite(usage.fetchedAt)
             ? `（${new Date(usage.fetchedAt).toLocaleString()}）`

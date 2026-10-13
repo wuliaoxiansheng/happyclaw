@@ -150,7 +150,7 @@ afterAll(() => {
 });
 
 describe('provider runtime apply is a lossless configuration mutation', () => {
-  test('lists independent model switches without a default-model API', async () => {
+  test('lists independent model switches with no default until one is chosen', async () => {
     bindDeps(
       {},
       {
@@ -177,16 +177,297 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     const response = await app.request('/api/config/claude/providers');
     expect(response.status).toBe(200);
     const body = await response.json();
-    expect(body).not.toHaveProperty('defaultProviderId');
+    expect(body.defaultModelConfigId).toBeNull();
     expect(body.providers).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ id: initial.id, enabled: true }),
         expect.objectContaining({ id: replacement.id, enabled: false }),
       ]),
     );
-    expect(
-      await app.request('/api/config/claude/default', { method: 'PUT' }),
-    ).toHaveProperty('status', 404);
+  });
+
+  describe('default model', () => {
+    const stopGroup = vi.fn(async () => {});
+    // A registered workspace makes every applied change stop its runner, so
+    // "stops nothing" assertions can actually fail.
+    const workspaces = () => ({
+      'web:default-model': registerWorkspace(
+        'web:default-model',
+        'default-model',
+      ),
+    });
+
+    beforeEach(() => {
+      stopGroup.mockClear();
+      bindDeps(workspaces(), {
+        listDescendantJids: () => [],
+        pauseGroupsForMutation: () => ({ id: 12 }),
+        resumeGroupsAfterMutation: vi.fn(),
+        stopGroup,
+      });
+    });
+
+    async function putDefault(modelConfigId: unknown): Promise<Response> {
+      return app.request('/api/config/claude/default', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ modelConfigId }),
+      });
+    }
+
+    async function listedDefault(): Promise<string | null> {
+      const response = await app.request('/api/config/claude/providers');
+      return (await response.json()).defaultModelConfigId;
+    }
+
+    test('sets, reports and clears the default', async () => {
+      const first = runtimeConfig.createProvider({
+        name: unique('default-a'),
+        type: 'official',
+        anthropicApiKey: 'a-key',
+        enabled: true,
+      });
+      runtimeConfig.createProvider({
+        name: unique('default-b'),
+        type: 'official',
+        anthropicApiKey: 'b-key',
+        enabled: true,
+      });
+
+      const set = await putDefault(first.id);
+      expect(set.status).toBe(200);
+      // A real change stops the workspace's runner so the next turn restarts
+      // on the new default.
+      expect(stopGroup).toHaveBeenCalled();
+      expect(await set.json()).toMatchObject({
+        defaultModelConfigId: first.id,
+        provider: { id: first.id },
+        applied: { success: true },
+      });
+      expect(await listedDefault()).toBe(first.id);
+
+      const cleared = await putDefault(null);
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({
+        defaultModelConfigId: null,
+        provider: null,
+      });
+      expect(await listedDefault()).toBeNull();
+    });
+
+    test('choosing a disabled configuration switches it on', async () => {
+      runtimeConfig.createProvider({
+        name: unique('pool-member'),
+        type: 'official',
+        anthropicApiKey: 'member-key',
+        enabled: true,
+      });
+      const spare = runtimeConfig.createProvider({
+        name: unique('spare'),
+        type: 'official',
+        anthropicApiKey: 'spare-key',
+        enabled: false,
+      });
+
+      const response = await putDefault(spare.id);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        provider: { id: spare.id, enabled: true },
+      });
+      expect(
+        runtimeConfig.getProviders().find((item) => item.id === spare.id),
+      ).toMatchObject({ enabled: true });
+    });
+
+    test('rejects an unknown or credential-less target before stopping a runner', async () => {
+      const bare = runtimeConfig.createProvider({
+        name: unique('no-credential'),
+        type: 'official',
+        enabled: false,
+      });
+
+      const missing = await putDefault('does-not-exist');
+      expect(missing.status).toBe(400);
+      expect(await missing.json()).toMatchObject({
+        error: expect.stringContaining('未找到'),
+      });
+      const noCredential = await putDefault(bare.id);
+      expect(noCredential.status).toBe(400);
+      expect(await noCredential.json()).toMatchObject({
+        error: expect.stringContaining('凭据'),
+      });
+      for (const bad of [undefined, '', '   ', 7]) {
+        expect((await putDefault(bad)).status).toBe(400);
+      }
+      expect(stopGroup).not.toHaveBeenCalled();
+      expect(await listedDefault()).toBeNull();
+    });
+
+    test('choosing the current default again changes nothing and stops nothing', async () => {
+      const only = runtimeConfig.createProvider({
+        name: unique('default-repeat'),
+        type: 'official',
+        anthropicApiKey: 'repeat-key',
+        enabled: true,
+      });
+      expect((await putDefault(only.id)).status).toBe(200);
+      stopGroup.mockClear();
+
+      const again = await putDefault(only.id);
+      expect(again.status).toBe(200);
+      expect(await again.json()).toMatchObject({
+        defaultModelConfigId: only.id,
+        applied: { stoppedCount: 0 },
+      });
+      expect(stopGroup).not.toHaveBeenCalled();
+    });
+
+    test('the default cannot be switched off, and says how to', async () => {
+      const chosen = runtimeConfig.createProvider({
+        name: unique('default-locked'),
+        type: 'official',
+        anthropicApiKey: 'locked-key',
+        enabled: true,
+      });
+      runtimeConfig.createProvider({
+        name: unique('default-other'),
+        type: 'official',
+        anthropicApiKey: 'other-key',
+        enabled: true,
+      });
+      expect((await putDefault(chosen.id)).status).toBe(200);
+      stopGroup.mockClear();
+
+      const refused = await setProviderEnabled(chosen.id, false);
+      expect(refused.status).toBe(400);
+      expect(await refused.json()).toMatchObject({
+        error: expect.stringContaining('取消默认'),
+      });
+      expect(stopGroup).not.toHaveBeenCalled();
+      expect(
+        runtimeConfig.getProviders().find((item) => item.id === chosen.id),
+      ).toMatchObject({ enabled: true });
+
+      expect((await putDefault(null)).status).toBe(200);
+      expect((await setProviderEnabled(chosen.id, false)).status).toBe(200);
+    });
+
+    test('deleting the default returns to the automatic pool', async () => {
+      const chosen = runtimeConfig.createProvider({
+        name: unique('default-doomed'),
+        type: 'official',
+        anthropicApiKey: 'doomed-key',
+        enabled: true,
+      });
+      runtimeConfig.createProvider({
+        name: unique('default-survivor'),
+        type: 'official',
+        anthropicApiKey: 'survivor-key',
+        enabled: true,
+      });
+      expect((await putDefault(chosen.id)).status).toBe(200);
+
+      expect((await deleteProvider(chosen.id)).status).toBe(200);
+      expect(await listedDefault()).toBeNull();
+      expect(runtimeConfig.getDefaultModelConfigId()).toBeNull();
+    });
+
+    test('the list does not present a default that lost its credential', async () => {
+      const chosen = runtimeConfig.createProvider({
+        name: unique('default-uncredentialed'),
+        type: 'official',
+        anthropicApiKey: 'soon-gone',
+        enabled: true,
+      });
+      runtimeConfig.createProvider({
+        name: unique('default-credentialed'),
+        type: 'official',
+        anthropicApiKey: 'stays',
+        enabled: true,
+      });
+      expect((await putDefault(chosen.id)).status).toBe(200);
+      expect(await listedDefault()).toBe(chosen.id);
+
+      runtimeConfig.updateProviderSecrets(chosen.id, {
+        clearAnthropicApiKey: true,
+      });
+
+      // Runtime already treats it as no default; the page must agree, and
+      // nothing may still guard it as if it were one.
+      expect(runtimeConfig.getUsableDefaultProvider()).toBeNull();
+      expect(runtimeConfig.getDefaultModelConfigId()).toBeNull();
+      expect(await listedDefault()).toBeNull();
+      expect((await setProviderEnabled(chosen.id, false)).status).toBe(200);
+      const deleted = await deleteProvider(chosen.id);
+      expect(deleted.status).toBe(200);
+      expect(await deleted.json()).toMatchObject({ defaultCleared: false });
+    });
+
+    test('deleting the default says so; deleting another configuration does not', async () => {
+      const chosen = runtimeConfig.createProvider({
+        name: unique('default-told'),
+        type: 'official',
+        anthropicApiKey: 'told-key',
+        enabled: true,
+      });
+      const other = runtimeConfig.createProvider({
+        name: unique('default-untold'),
+        type: 'official',
+        anthropicApiKey: 'untold-key',
+        enabled: true,
+      });
+      expect((await putDefault(chosen.id)).status).toBe(200);
+
+      const deletedOther = await deleteProvider(other.id);
+      expect(deletedOther.status).toBe(200);
+      expect(await deletedOther.json()).toMatchObject({
+        ok: true,
+        defaultCleared: false,
+      });
+      expect(await listedDefault()).toBe(chosen.id);
+
+      const deletedDefault = await deleteProvider(chosen.id);
+      expect(deletedDefault.status).toBe(200);
+      expect(await deletedDefault.json()).toMatchObject({
+        ok: true,
+        defaultCleared: true,
+      });
+      expect(await listedDefault()).toBeNull();
+    });
+
+    test('other edits keep the default', async () => {
+      const chosen = runtimeConfig.createProvider({
+        name: unique('default-edited'),
+        type: 'third_party',
+        anthropicBaseUrl: 'https://edited.example.test',
+        anthropicAuthToken: 'edited-token',
+        anthropicModel: 'edited-model',
+        enabled: true,
+      });
+      runtimeConfig.createProvider({
+        name: unique('default-neighbour'),
+        type: 'official',
+        anthropicApiKey: 'neighbour-key',
+        enabled: true,
+      });
+      expect((await putDefault(chosen.id)).status).toBe(200);
+
+      expect(
+        (await patchProvider(chosen.id, { anthropicModel: 'edited-model-2' }))
+          .status,
+      ).toBe(200);
+      const created = await app.request('/api/config/claude/providers', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: unique('default-newcomer'),
+          type: 'official',
+          anthropicApiKey: 'newcomer-key',
+        }),
+      });
+      expect(created.status).toBeLessThan(300);
+      expect(await listedDefault()).toBe(chosen.id);
+    });
   });
 
   test('allows disabling an Agent model but still blocks deleting it', async () => {

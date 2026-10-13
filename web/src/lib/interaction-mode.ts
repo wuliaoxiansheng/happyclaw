@@ -1,4 +1,5 @@
 import type { GroupInfo, InteractionMode } from '../types';
+import { normalizeProcessVisibility } from './process-visibility';
 
 export const DEFAULT_INTERACTION_MODE: InteractionMode = 'assistant';
 
@@ -12,6 +13,7 @@ export function normalizeGroupInteractionMode(group: GroupInfo): GroupInfo {
   return {
     ...group,
     interaction_mode: normalizeInteractionMode(group.interaction_mode),
+    process_visibility: normalizeProcessVisibility(group.process_visibility),
   };
 }
 

@@ -604,6 +604,80 @@ describe('scheduled task workspace/session contract', () => {
     );
   });
 
+  test('treats a deliberate <internal>-only final as a silent isolated success', async () => {
+    const taskId = createTask({ id: 'task-internal-only-isolated-result' });
+    const groups = {
+      [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+    };
+    runContainerAgentMock.mockImplementationOnce(
+      async (_group, input, onProcess) => {
+        onProcess?.({} as never, `container-${input.taskRunId}`, null);
+        return {
+          status: 'success',
+          result: '<internal>Stage 3 done：已启动，见 launch.json</internal>',
+          inputTurnCompleted: true,
+        };
+      },
+    );
+    const { deps, waitForRun } = makeDeps(groups);
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await waitForRun();
+
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'success',
+      error: null,
+    });
+    expect(deps.storeResultAndNotify).toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringContaining('以内部确认静默完成'),
+      expect.objectContaining({ sourceKind: 'scheduled_task_result' }),
+    );
+    expect(deps.storeResultAndNotify).not.toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringContaining('Stage 3 done'),
+      expect.anything(),
+    );
+  });
+
+  test('labels an <internal>-only final as silent on the non-durable isolated path too', async () => {
+    // The legacy path only claims a task that is already due.
+    const taskId = createTask({
+      id: 'task-internal-only-legacy-isolated',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+    });
+    const groups = {
+      [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+    };
+    runContainerAgentMock.mockImplementationOnce(
+      async (_group, input, onProcess) => {
+        onProcess?.({} as never, `container-${input.taskRunId}`, null);
+        return {
+          status: 'success',
+          result: '<internal>Stage 3 done</internal>',
+          inputTurnCompleted: true,
+        };
+      },
+    );
+    const { deps, waitForRun } = makeDeps(groups);
+
+    expect(enqueueIsolatedScheduledTask(db.getTaskById(taskId)!, deps)).toBe(
+      true,
+    );
+    await waitForRun();
+
+    expect(deps.storeResultAndNotify).toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringContaining('以内部确认静默完成'),
+      expect.objectContaining({ sourceKind: 'scheduled_task_result' }),
+    );
+    expect(deps.storeResultAndNotify).not.toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringContaining('没有返回可展示的业务结果'),
+      expect.anything(),
+    );
+  });
+
   test('resume accepts only future one-shot schedules', () => {
     const future = new Date(Date.now() + 60_000).toISOString();
     const past = new Date(Date.now() - 60_000).toISOString();
@@ -2761,8 +2835,13 @@ describe('scheduled task workspace/session contract', () => {
       },
     });
 
+    // The competing claim happens after one full lease has elapsed, so only
+    // the heartbeat (every leaseMs / 3) keeps it owned. The margins tolerate
+    // a loaded CI event loop: a 60ms lease lapsed whenever a timer slipped
+    // by ~40ms, and the leftover claim then leaked into the next test.
+    const leaseMs = 900;
     deps.storeResultAndNotify.mockImplementationOnce(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 180));
+      await new Promise((resolve) => setTimeout(resolve, 2_400));
       return {
         status: 'success',
         summary: {
@@ -2773,10 +2852,14 @@ describe('scheduled task workspace/session contract', () => {
         },
       };
     });
-    const retrying = processClaimedTaskRunNotification(retryClaim, deps, 60);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    const retrying = processClaimedTaskRunNotification(
+      retryClaim,
+      deps,
+      leaseMs,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
     expect(
-      db.claimNextTaskRunNotification('competing-retry-worker', 60),
+      db.claimNextTaskRunNotification('competing-retry-worker', leaseMs),
     ).toBeUndefined();
     expect(await retrying).toBe(true);
     expect(deps.storeResultAndNotify).toHaveBeenLastCalledWith(

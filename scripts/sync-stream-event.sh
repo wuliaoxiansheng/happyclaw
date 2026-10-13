@@ -43,3 +43,11 @@ for target in \
 ; do
   sync_file "$SRC_CP" "$target"
 done
+
+# --- Reply step list + reasoning text helpers (2 targets each: backend + web) ---
+# The backend records a settled turn's ordered steps with the very reducer the
+# Web renders live, so the two cannot drift. Not needed by the agent-runner.
+for name in thinking-text stream-steps; do
+  sync_file "$ROOT/shared/$name.ts" "$ROOT/src/$name.ts"
+  sync_file "$ROOT/shared/$name.ts" "$ROOT/web/src/lib/$name.ts"
+done

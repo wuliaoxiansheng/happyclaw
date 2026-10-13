@@ -476,7 +476,11 @@ describe('notification-only retry state', () => {
   test('failure receipt survives a crash before execution completion', async () => {
     const task = createDefinition('notification-crash-durability');
     const created = db.createTaskRun({ task, triggerType: 'manual' });
-    const execution = db.claimNextTaskRun('crashing-worker', 20)!;
+    // The lease has to be short enough to expire during the 1.05s wait below,
+    // yet long enough that a loaded machine cannot let it lapse between the
+    // claim and the immediate start mark: 20ms made this whole group flaky
+    // under a parallel full run.
+    const execution = db.claimNextTaskRun('crashing-worker', 300)!;
     expect(
       db.markTaskRunExecutionStarted(
         execution.id,

@@ -6,6 +6,17 @@ import os from 'os';
 import { ASSISTANT_NAME, DATA_DIR } from './config.js';
 import { logger } from './logger.js';
 import { clearProviderQuotaObservation } from './provider-quota-observation.js';
+import {
+  CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+  CODEX_GATEWAY_ROUTE,
+  type CodexOAuthCredentials,
+  type CodexOAuthRefreshErrorState,
+} from './codex-gateway/types.js';
+import { isCodexGatewayBaseUrl } from './codex-gateway/resolve-gateway-url.js';
+import { resolveCodexDefaultEffort } from './codex-gateway/model-catalog.js';
+import { getResolvedCodexCatalog } from './codex-gateway/model-catalog-sync.js';
+import { normalizeLegacyCodexModel } from './codex-gateway/convert-request.js';
+import { retiredCodexReauthReason } from './codex-gateway/oauth.js';
 
 const MAX_FIELD_LENGTH = 2000;
 const DEFAULT_THIRD_PARTY_PROFILE_ID = 'default';
@@ -102,6 +113,10 @@ const INHERITED_CLAUDE_PROVIDER_ENV_KEYS = [
   'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_NO_FLICKER',
+  'CLAUDE_CODE_SUBAGENT_MODEL',
+  'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+  'ANTHROPIC_SMALL_FAST_MODEL',
+  'ANTHROPIC_BETAS',
   'API_TIMEOUT_MS',
 ] as const;
 
@@ -126,12 +141,104 @@ const THIRD_PARTY_CONFIGURABLE_ENV_KEYS = new Set([
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'CLAUDE_CODE_SUBAGENT_MODEL',
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
   'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_NO_FLICKER',
   'API_TIMEOUT_MS',
 ]);
+
+/** Model-tier mappings that default to the provider model. */
+const THIRD_PARTY_MODEL_ENV_KEYS = [
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'CLAUDE_CODE_SUBAGENT_MODEL',
+] as const;
+
+/**
+ * Haiku tier behind the ChatGPT subscription gateway: Claude Code's own
+ * small-fast model id (2.1.x first-party default). The gateway maps every
+ * claude-* model to the provider's Codex model and recognizes haiku-tier
+ * calls as background requests that run at low effort.
+ */
+const CODEX_GATEWAY_HAIKU_MODEL = 'claude-haiku-5-5';
+
+/** The gateway placeholder, or the local gateway URL it resolves to at launch. */
+function isCodexGatewayEndpoint(baseUrl: string): boolean {
+  if (isCodexGatewayBaseUrl(baseUrl)) return true;
+  try {
+    const url = new URL(baseUrl);
+    return (
+      ['127.0.0.1', 'localhost', 'host.docker.internal'].includes(
+        url.hostname,
+      ) && url.pathname.replace(/\/+$/, '') === CODEX_GATEWAY_ROUTE
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Provider env values that Claude Code parses as positive integers. */
+const POSITIVE_INTEGER_PROVIDER_ENV_KEYS = new Set([
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+  'API_TIMEOUT_MS',
+]);
+
+const PROVIDER_EFFORT_LEVELS = new Set([
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+]);
+
+/**
+ * How a third-party token is sent. `bearer` matches the usual
+ * `ANTHROPIC_AUTH_TOKEN=...` shell setup (`Authorization: Bearer`);
+ * `x-api-key` matches `ANTHROPIC_API_KEY`. Providers saved before the choice
+ * existed have no mode and keep the legacy inference in buildClaudeEnvLines.
+ */
+export type ProviderAuthMode = 'bearer' | 'x-api-key';
+
+/**
+ * Reject provider env the runtime would otherwise drop or misread, so the
+ * admin sees why instead of a silent "saved". Returns a user-facing message,
+ * or null when the map is acceptable. Write paths only: stored maps are still
+ * read leniently so an old file never fails to load.
+ */
+export function validateProviderCustomEnv(
+  customEnv: Record<string, string>,
+): string | null {
+  const dangerous = Object.keys(customEnv).filter(isDangerousEnvKey);
+  if (dangerous.length > 0) {
+    return `以下环境变量出于安全原因不允许配置：${dangerous.join(', ')}`;
+  }
+  const reserved = Object.keys(customEnv).filter(
+    (key) => RESERVED_CLAUDE_ENV_KEYS.has(key) || key === 'ANTHROPIC_API_KEY',
+  );
+  if (reserved.length > 0) {
+    return `${reserved.join(', ')} 由端点、密钥或模型字段管理，请在对应字段中填写`;
+  }
+  for (const [key, value] of Object.entries(customEnv)) {
+    const trimmed = value.trim();
+    if (POSITIVE_INTEGER_PROVIDER_ENV_KEYS.has(key) && trimmed) {
+      if (!/^[1-9]\d*$/.test(trimmed)) {
+        return `${key} 必须是正整数`;
+      }
+    }
+    if (
+      key === 'CLAUDE_CODE_EFFORT_LEVEL' &&
+      trimmed &&
+      !PROVIDER_EFFORT_LEVELS.has(trimmed)
+    ) {
+      return `CLAUDE_CODE_EFFORT_LEVEL 只能是 ${[...PROVIDER_EFFORT_LEVELS].join(' / ')}`;
+    }
+  }
+  return null;
+}
 
 const THIRD_PARTY_RUNTIME_DEFAULTS = {
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
@@ -140,7 +247,16 @@ const THIRD_PARTY_RUNTIME_DEFAULTS = {
   API_TIMEOUT_MS: '3000000',
 } as const;
 
-function isOneMillionContextModel(model: string): boolean {
+/**
+ * Whether a third-party provider defaults to a 1M auto-compact window.
+ *
+ * Only an explicit `[1m]` model ID does. Claude Code 2.1.285+ gives 1M-native
+ * Claude models (Sonnet 5+, Opus 4.7+, Fable) a 1M window behind a gateway
+ * too, but it cannot see a gateway capped at 200K, which then fails with
+ * "Prompt is too long" instead of compacting; a provider that serves 1M sets
+ * the `[1m]` suffix or its own CLAUDE_CODE_AUTO_COMPACT_WINDOW.
+ */
+export function isOneMillionContextModel(model: string): boolean {
   return /\[1m\]$/i.test(model.trim());
 }
 const DANGEROUS_ENV_VARS = new Set([
@@ -209,8 +325,8 @@ const MAX_CUSTOM_ENV_ENTRIES = 50;
 const MAX_THIRD_PARTY_PROFILES = 20;
 
 // Fallback scopes for .credentials.json when stored credentials lack scopes.
-// Differs from OAUTH_SCOPES in routes/config.ts (the authorize-flow request):
-// authorize requests org:create_api_key; credential files need user:sessions:claude_code.
+// Differs from CLAUDE_OAUTH_LOGIN_SCOPES in claude-oauth.ts (the authorize
+// request): only the browser consent carries org:create_api_key.
 const DEFAULT_CREDENTIAL_SCOPES = [
   'user:inference',
   'user:profile',
@@ -223,6 +339,27 @@ export interface ClaudeOAuthCredentials {
   expiresAt: number; // Unix timestamp (ms)
   scopes: string[];
   subscriptionType?: string; // e.g. 'max', 'pro' — written to .credentials.json if present
+}
+
+/** Account facts Anthropic returns with a Claude token or its profile. */
+export interface ClaudeOAuthAccountInfo {
+  accountUuid?: string;
+  emailAddress?: string;
+  organizationUuid?: string;
+  organizationName?: string;
+  /** Known even for a setup-token grant, which has no credential file. */
+  subscriptionType?: string;
+}
+
+/**
+ * A refresh rejection that replaying the same refresh token cannot fix. It
+ * stays on the provider (stopping automatic refresh) until its Claude
+ * credentials change.
+ */
+export interface ClaudeOAuthRefreshError {
+  kind: 'invalid_grant' | 'rejected' | 'account_mismatch';
+  message: string;
+  at: number;
 }
 
 export interface OAuthUsageBucket {
@@ -259,6 +396,12 @@ export interface CachedOAuthUsage {
   data: OAuthUsageResponse;
   fetchedAt: number; // Unix timestamp ms
   error?: string;
+  /**
+   * Set when no usage can be read: the credential cannot reach the usage
+   * endpoint (`unsupported`), or the grant was rejected and needs a new login.
+   */
+  status?: 'unsupported' | 'needs_relogin';
+  unsupportedReason?: 'inference_only' | 'setup_token' | 'no_oauth';
   /** Latest bounded SDK rate_limit_event snapshot for this provider. */
   observation?:
     | import('./provider-quota-observation.js').ProviderQuotaSnapshot
@@ -268,6 +411,8 @@ export interface CachedOAuthUsage {
 export interface ClaudeProviderConfig {
   anthropicBaseUrl: string;
   anthropicAuthToken: string;
+  /** Unset for legacy providers: buildClaudeEnvLines infers the header. */
+  anthropicAuthMode?: ProviderAuthMode;
   anthropicApiKey: string;
   claudeCodeOauthToken: string;
   claudeOAuthCredentials: ClaudeOAuthCredentials | null;
@@ -341,6 +486,10 @@ interface SecretPayload {
   anthropicApiKey: string;
   claudeCodeOauthToken: string;
   claudeOAuthCredentials?: ClaudeOAuthCredentials | null;
+  codexOAuthCredentials?: CodexOAuthCredentials | null;
+  claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
+  claudeOAuthLastRefreshAt?: number | null;
+  claudeOAuthLastRefreshError?: ClaudeOAuthRefreshError | null;
 }
 
 interface EncryptedSecrets {
@@ -442,8 +591,11 @@ interface StoredProviderV4 {
   weight: number;
   anthropicBaseUrl: string;
   anthropicModel: string;
+  anthropicAuthMode?: ProviderAuthMode;
   secrets: EncryptedSecrets;
   customEnv?: Record<string, string>;
+  /** ChatGPT/Codex 订阅：最近一次 token 刷新失败（非机密运行态，凭据写入时清除）。 */
+  codexOAuthLastRefreshError?: CodexOAuthRefreshErrorState;
   updatedAt: string;
 }
 
@@ -459,6 +611,13 @@ interface StoredClaudeProviderConfigV5 {
   providers: StoredProviderV4[];
   /** Legacy V5 field. Read only so older files can be normalized in place. */
   defaultProviderId?: string | null;
+  /**
+   * The configuration conversations run on when nothing more specific chose
+   * one. Absent means the automatic pool of enabled configurations. A
+   * separate key from the legacy pointer, which every installation once had
+   * and which therefore must never be read as a deliberate choice.
+   */
+  defaultModelConfigId?: string | null;
   balancing: BalancingConfig;
   updatedAt: string;
 }
@@ -472,10 +631,18 @@ export interface UnifiedProvider {
   weight: number;
   anthropicBaseUrl: string;
   anthropicAuthToken: string;
+  anthropicAuthMode?: ProviderAuthMode;
   anthropicModel: string;
   anthropicApiKey: string;
   claudeCodeOauthToken: string;
   claudeOAuthCredentials: ClaudeOAuthCredentials | null;
+  codexOAuthCredentials: CodexOAuthCredentials | null;
+  /** Reset whenever the Claude credentials change; kept across refreshes. */
+  claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
+  claudeOAuthLastRefreshAt?: number | null;
+  claudeOAuthLastRefreshError?: ClaudeOAuthRefreshError | null;
+  /** 缺省视为无刷新失败；存量配置没有这个字段。 */
+  codexOAuthLastRefreshError?: CodexOAuthRefreshErrorState | null;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
@@ -489,6 +656,8 @@ export interface UnifiedProviderPublic {
   weight: number;
   anthropicBaseUrl: string;
   anthropicModel: string;
+  /** null for providers saved before the explicit choice existed. */
+  anthropicAuthMode: ProviderAuthMode | null;
   hasAnthropicAuthToken: boolean;
   anthropicAuthTokenMasked: string | null;
   hasAnthropicApiKey: boolean;
@@ -498,6 +667,34 @@ export interface UnifiedProviderPublic {
   hasClaudeOAuthCredentials: boolean;
   claudeOAuthCredentialsExpiresAt: number | null;
   claudeOAuthCredentialsAccessTokenMasked: string | null;
+  hasCodexOAuthCredentials: boolean;
+  codexOAuthCredentialsExpiresAt: number | null;
+  codexOAuthCredentialsEmail: string | null;
+  codexOAuthCredentialsPlanType: string | null;
+  /** Official providers only; null for third-party or no credential. */
+  claudeAuthKind: 'oauth' | 'setup_token' | 'api_key' | null;
+  claudeOAuthAccountEmail: string | null;
+  claudeOAuthOrganizationName: string | null;
+  claudeOAuthOrganizationUuid: string | null;
+  claudeOAuthSubscriptionType: string | null;
+  claudeOAuthScopes: string[];
+  claudeOAuthLastRefreshAt: number | null;
+  claudeOAuthNeedsReLogin: boolean;
+  claudeOAuthLastRefreshError: ClaudeOAuthRefreshError | null;
+  /** ChatGPT 订阅登录已失效，需要在模型配置里重新登录。 */
+  codexOAuthNeedsReauth: boolean;
+  /** 最近一次上游 token 刷新失败；成功刷新或重新登录后为 null。 */
+  codexOAuthLastRefreshError: {
+    kind: CodexOAuthRefreshErrorState['kind'];
+    message: string;
+    at: string;
+  } | null;
+  /**
+   * Codex provider 在 Agent 未显式指定推理力度时实际使用的默认档：
+   * CODEX_REASONING_EFFORT 按模型目录钳制后的值，未配置时取该模型的目录默认档。
+   * 非 Codex provider 为 null。网关请求侧使用同一个解析函数。
+   */
+  codexDefaultEffort: string | null;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
@@ -553,6 +750,12 @@ function normalizeBaseUrl(input: unknown): string {
     throw new Error('Invalid field: anthropicBaseUrl');
   }
   return value;
+}
+
+function normalizeProviderAuthMode(
+  input: unknown,
+): ProviderAuthMode | undefined {
+  return input === 'bearer' || input === 'x-api-key' ? input : undefined;
 }
 
 function normalizeModel(input: unknown): string {
@@ -685,13 +888,93 @@ function buildConfig(
   };
 }
 
+/**
+ * What stat can tell about a file's contents. Atomic rewrites (tmp + rename)
+ * change `ino`; in-place rewrites change mtime/ctime and usually size.
+ */
+interface FileSignature {
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+}
+
+function statFileSignature(filePath: string): FileSignature | null {
+  try {
+    const st = fs.statSync(filePath);
+    return {
+      ino: st.ino,
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      ctimeMs: st.ctimeMs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sameFileSignature(
+  a: FileSignature | null,
+  b: FileSignature | null,
+): boolean {
+  if (a === null || b === null) return a === b;
+  return (
+    a.ino === b.ino &&
+    a.size === b.size &&
+    a.mtimeMs === b.mtimeMs &&
+    a.ctimeMs === b.ctimeMs
+  );
+}
+
+/**
+ * File timestamps are coarse (a kernel tick, or a whole second on some
+ * filesystems), so a same-size in-place rewrite right after the observed one
+ * can keep its signature. As with git's "racily clean" index entries, a
+ * signature only proves the contents unchanged once it was observed at least
+ * this long after the file's mtime; until then readers re-read the file.
+ */
+const RACY_SIGNATURE_WINDOW_MS = 2_000;
+
+function fileSignatureSettled(
+  sig: FileSignature | null,
+  observedAt: number,
+): boolean {
+  return sig === null || observedAt - sig.mtimeMs >= RACY_SIGNATURE_WINDOW_MS;
+}
+
+// The key never rotates in-process, but channel-account-secrets or another
+// process may create it and an operator may restore it, so a cached key is
+// revalidated by one stat instead of mkdir + exists + read on every crypto op.
+let encryptionKeyCache: {
+  sig: FileSignature;
+  observedAt: number;
+  key: Buffer;
+} | null = null;
+
 function getOrCreateEncryptionKey(): Buffer {
+  const observedAt = Date.now();
+  const sig = statFileSignature(CLAUDE_CONFIG_KEY_FILE);
+  const cached = encryptionKeyCache;
+  if (
+    cached &&
+    sig &&
+    sameFileSignature(cached.sig, sig) &&
+    fileSignatureSettled(sig, cached.observedAt)
+  ) {
+    return cached.key;
+  }
+  encryptionKeyCache = null;
+
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
 
   if (fs.existsSync(CLAUDE_CONFIG_KEY_FILE)) {
     const raw = fs.readFileSync(CLAUDE_CONFIG_KEY_FILE, 'utf-8').trim();
     const key = Buffer.from(raw, 'hex');
-    if (key.length === 32) return key;
+    if (key.length === 32) {
+      // `sig` predates the read, so a concurrent rewrite only forces a re-read.
+      if (sig) encryptionKeyCache = { sig, observedAt, key };
+      return key;
+    }
     throw new Error('Invalid encryption key file');
   }
 
@@ -769,7 +1052,91 @@ function decryptSecrets(secrets: EncryptedSecrets): SecretPayload {
       };
     }
   }
+  // Restore Codex (ChatGPT 订阅) OAuth credentials if present
+  if (
+    parsed.codexOAuthCredentials &&
+    typeof parsed.codexOAuthCredentials === 'object'
+  ) {
+    const creds = parsed.codexOAuthCredentials as Record<string, unknown>;
+    if (
+      typeof creds.accessToken === 'string' &&
+      typeof creds.refreshToken === 'string'
+    ) {
+      result.codexOAuthCredentials = {
+        accessToken: creds.accessToken,
+        refreshToken: creds.refreshToken,
+        expiresAt: typeof creds.expiresAt === 'number' ? creds.expiresAt : 0,
+        accountId: typeof creds.accountId === 'string' ? creds.accountId : null,
+        planType: typeof creds.planType === 'string' ? creds.planType : null,
+        email: typeof creds.email === 'string' ? creds.email : null,
+        ...(creds.isFedramp === true ? { isFedramp: true } : {}),
+        updatedAt:
+          typeof creds.updatedAt === 'string'
+            ? creds.updatedAt
+            : new Date(0).toISOString(),
+      };
+    }
+  }
+  const account = decodeClaudeOAuthAccount(parsed.claudeOAuthAccount);
+  if (account) result.claudeOAuthAccount = account;
+  if (
+    typeof parsed.claudeOAuthLastRefreshAt === 'number' &&
+    Number.isFinite(parsed.claudeOAuthLastRefreshAt)
+  ) {
+    result.claudeOAuthLastRefreshAt = parsed.claudeOAuthLastRefreshAt;
+  }
+  const refreshError = decodeClaudeOAuthRefreshError(
+    parsed.claudeOAuthLastRefreshError,
+  );
+  if (refreshError) result.claudeOAuthLastRefreshError = refreshError;
   return result;
+}
+
+const CLAUDE_OAUTH_ACCOUNT_FIELDS = [
+  'accountUuid',
+  'emailAddress',
+  'organizationUuid',
+  'organizationName',
+  'subscriptionType',
+] as const;
+
+function decodeClaudeOAuthAccount(
+  value: unknown,
+): ClaudeOAuthAccountInfo | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const account: ClaudeOAuthAccountInfo = {};
+  for (const field of CLAUDE_OAUTH_ACCOUNT_FIELDS) {
+    if (typeof raw[field] === 'string' && raw[field]) {
+      account[field] = raw[field] as string;
+    }
+  }
+  return Object.keys(account).length > 0 ? account : null;
+}
+
+const CLAUDE_OAUTH_REFRESH_ERROR_KINDS = new Set<
+  ClaudeOAuthRefreshError['kind']
+>(['invalid_grant', 'rejected', 'account_mismatch']);
+
+function decodeClaudeOAuthRefreshError(
+  value: unknown,
+): ClaudeOAuthRefreshError | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (
+    !CLAUDE_OAUTH_REFRESH_ERROR_KINDS.has(
+      raw.kind as ClaudeOAuthRefreshError['kind'],
+    ) ||
+    typeof raw.message !== 'string' ||
+    typeof raw.at !== 'number'
+  ) {
+    return null;
+  }
+  return {
+    kind: raw.kind as ClaudeOAuthRefreshError['kind'],
+    message: raw.message,
+    at: raw.at,
+  };
 }
 
 function encryptChannelSecret<T>(payload: T): EncryptedSecrets {
@@ -1091,6 +1458,10 @@ function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
     anthropicApiKey: provider.anthropicApiKey || '',
     claudeCodeOauthToken: provider.claudeCodeOauthToken || '',
     claudeOAuthCredentials: provider.claudeOAuthCredentials ?? null,
+    codexOAuthCredentials: provider.codexOAuthCredentials ?? null,
+    claudeOAuthAccount: provider.claudeOAuthAccount ?? null,
+    claudeOAuthLastRefreshAt: provider.claudeOAuthLastRefreshAt ?? null,
+    claudeOAuthLastRefreshError: provider.claudeOAuthLastRefreshError ?? null,
   };
   const sanitizedEnv = sanitizeCustomEnvMap(provider.customEnv || {}, {
     skipReservedClaudeKeys: true,
@@ -1103,11 +1474,48 @@ function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
     weight: Math.max(1, Math.min(100, provider.weight || 1)),
     anthropicBaseUrl: provider.anthropicBaseUrl || '',
     anthropicModel: provider.anthropicModel || '',
+    ...(provider.anthropicAuthMode
+      ? { anthropicAuthMode: provider.anthropicAuthMode }
+      : {}),
     secrets: encryptSecrets(secrets),
     ...(Object.keys(sanitizedEnv).length > 0
       ? { customEnv: sanitizedEnv }
       : {}),
+    ...(provider.codexOAuthLastRefreshError
+      ? { codexOAuthLastRefreshError: provider.codexOAuthLastRefreshError }
+      : {}),
     updatedAt: provider.updatedAt || new Date().toISOString(),
+  };
+}
+
+const MAX_REFRESH_ERROR_MESSAGE_LENGTH = 300;
+
+/** 只接受结构完整的刷新失败记录；手改或损坏的字段视为没有失败。 */
+function normalizeCodexRefreshErrorState(
+  raw: unknown,
+): CodexOAuthRefreshErrorState | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  if (record.kind !== 'reauth_required' && record.kind !== 'transient') {
+    return null;
+  }
+  if (typeof record.message !== 'string' || typeof record.at !== 'string') {
+    return null;
+  }
+  // Earlier releases also saved other 4xx answers (e.g. a Cloudflare 403) as
+  // needing re-login; the official classification retries those.
+  const retired =
+    record.kind === 'reauth_required'
+      ? retiredCodexReauthReason(record.message)
+      : null;
+  if (retired) return { kind: 'transient', message: retired, at: record.at };
+  return {
+    kind: record.kind,
+    message: record.message.slice(0, MAX_REFRESH_ERROR_MESSAGE_LENGTH),
+    at: record.at,
+    ...(record.accessTokenRejected === true
+      ? { accessTokenRejected: true }
+      : {}),
   };
 }
 
@@ -1121,10 +1529,24 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
     weight: Math.max(1, Math.min(100, stored.weight || 1)),
     anthropicBaseUrl: stored.anthropicBaseUrl || '',
     anthropicAuthToken: secrets.anthropicAuthToken || '',
+    ...(normalizeProviderAuthMode(stored.anthropicAuthMode)
+      ? {
+          anthropicAuthMode: normalizeProviderAuthMode(
+            stored.anthropicAuthMode,
+          ),
+        }
+      : {}),
     anthropicModel: stored.anthropicModel || '',
     anthropicApiKey: secrets.anthropicApiKey || '',
     claudeCodeOauthToken: secrets.claudeCodeOauthToken || '',
     claudeOAuthCredentials: secrets.claudeOAuthCredentials ?? null,
+    codexOAuthCredentials: secrets.codexOAuthCredentials ?? null,
+    claudeOAuthAccount: secrets.claudeOAuthAccount ?? null,
+    claudeOAuthLastRefreshAt: secrets.claudeOAuthLastRefreshAt ?? null,
+    claudeOAuthLastRefreshError: secrets.claudeOAuthLastRefreshError ?? null,
+    codexOAuthLastRefreshError: normalizeCodexRefreshErrorState(
+      stored.codexOAuthLastRefreshError,
+    ),
     customEnv: sanitizeCustomEnvMap(stored.customEnv || {}, {
       skipReservedClaudeKeys: true,
     }),
@@ -1158,6 +1580,7 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
       anthropicApiKey: v3.officialSecrets.anthropicApiKey,
       claudeCodeOauthToken: v3.officialSecrets.claudeCodeOauthToken,
       claudeOAuthCredentials: v3.officialSecrets.claudeOAuthCredentials ?? null,
+      codexOAuthCredentials: null,
       customEnv: v3.officialCustomEnv || {},
       updatedAt: v3.officialUpdatedAt || now,
     });
@@ -1178,6 +1601,7 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
       anthropicApiKey: '',
       claudeCodeOauthToken: '',
       claudeOAuthCredentials: null,
+      codexOAuthCredentials: null,
       customEnv: profile.customEnv || {},
       updatedAt: profile.updatedAt || now,
     });
@@ -1233,11 +1657,102 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
   return { providers, balancing };
 }
 
-/** Read V5 config, with automatic V3/V4 migration. */
-function readStoredStateV4(): {
+interface StoredStateV5 {
   providers: UnifiedProvider[];
   balancing: BalancingConfig;
-} | null {
+  /** Always the id of an existing provider, or null for the automatic pool. */
+  defaultModelConfigId: string | null;
+}
+
+/**
+ * A pointer is only kept while it names a configuration that exists and holds
+ * a credential: a default that was deleted or lost its key stops being one,
+ * everywhere at once (the settings page, the guards and the runtime), and is
+ * not resurrected by restoring the key.
+ */
+function normalizeDefaultModelConfigId(
+  providers: ReadonlyArray<UnifiedProvider>,
+  candidate: unknown,
+): string | null {
+  if (typeof candidate !== 'string') return null;
+  const named = providers.find((provider) => provider.id === candidate);
+  return named && providerHasCredentials(named) ? candidate : null;
+}
+
+/** Legacy subscriptions can predate the internal identifier used to mint grants. */
+function ensureCodexGatewayIdentifiers(providers: UnifiedProvider[]): boolean {
+  let changed = false;
+  for (const provider of providers) {
+    if (
+      provider.codexOAuthCredentials &&
+      isCodexGatewayBaseUrl(provider.anthropicBaseUrl) &&
+      !provider.anthropicAuthToken
+    ) {
+      // This stays encrypted with the provider. Only per-runner grants, never
+      // this identifier, authenticate requests to the embedded gateway.
+      provider.anthropicAuthToken = crypto.randomBytes(32).toString('hex');
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
+ * Decrypted V5 state, valid while the config and key files keep the
+ * signatures observed before they were read. The Codex gateway, container
+ * launches, status polling and settings routes read the model configuration
+ * many times per request; each uncached read re-parsed the file and decrypted
+ * every provider.
+ */
+let storedStateCache: {
+  configSig: FileSignature;
+  keySig: FileSignature | null;
+  observedAt: number;
+  state: StoredStateV5;
+} | null = null;
+/** Bumped by every save, so a read that migrated the file caches nothing. */
+let storedStateWriteGeneration = 0;
+
+/**
+ * Read V5 config, with automatic V3/V4 migration. Returns a private copy:
+ * callers modify the result in place before saving it.
+ */
+function readStoredStateV4(): StoredStateV5 | null {
+  const observedAt = Date.now();
+  const configSig = statFileSignature(CLAUDE_CONFIG_FILE);
+  if (!configSig) {
+    storedStateCache = null;
+    return null;
+  }
+  const keySig = statFileSignature(CLAUDE_CONFIG_KEY_FILE);
+  const cached = storedStateCache;
+  if (
+    cached &&
+    sameFileSignature(cached.configSig, configSig) &&
+    sameFileSignature(cached.keySig, keySig) &&
+    fileSignatureSettled(configSig, cached.observedAt) &&
+    fileSignatureSettled(keySig, cached.observedAt)
+  ) {
+    return structuredClone(cached.state);
+  }
+  storedStateCache = null;
+
+  const generation = storedStateWriteGeneration;
+  const state = readStoredStateV4FromDisk();
+  // Migration paths rewrite the file (new signature) and return null on
+  // failure; only a plain V5 read is cached, keyed by the pre-read stats.
+  if (state && storedStateWriteGeneration === generation) {
+    storedStateCache = {
+      configSig,
+      keySig,
+      observedAt,
+      state: structuredClone(state),
+    };
+  }
+  return state;
+}
+
+function readStoredStateV4FromDisk(): StoredStateV5 | null {
   if (!fs.existsSync(CLAUDE_CONFIG_FILE)) return null;
   try {
     const content = fs.readFileSync(CLAUDE_CONFIG_FILE, 'utf-8');
@@ -1246,8 +1761,12 @@ function readStoredStateV4(): {
     if (parsed.version === 5) {
       const v5 = parsed as unknown as StoredClaudeProviderConfigV5;
       const providers = v5.providers.map(fromStoredProviderV4);
-      const state = {
+      const state: StoredStateV5 = {
         providers,
+        defaultModelConfigId: normalizeDefaultModelConfigId(
+          providers,
+          v5.defaultModelConfigId,
+        ),
         balancing: {
           strategy: v5.balancing?.strategy || DEFAULT_BALANCING_CONFIG.strategy,
           unhealthyThreshold:
@@ -1258,8 +1777,19 @@ function readStoredStateV4(): {
             DEFAULT_BALANCING_CONFIG.recoveryIntervalMs,
         },
       };
+      const repairedGatewayIdentifiers =
+        ensureCodexGatewayIdentifiers(providers);
+      if (
+        repairedGatewayIdentifiers ||
+        Object.hasOwn(v5, 'defaultProviderId')
+      ) {
+        writeStoredStateV4(
+          state.providers,
+          state.balancing,
+          state.defaultModelConfigId,
+        );
+      }
       if (Object.hasOwn(v5, 'defaultProviderId')) {
-        writeStoredStateV4(state.providers, state.balancing);
         logger.info(
           'Removed legacy default model pointer from Claude model configuration',
         );
@@ -1270,8 +1800,9 @@ function readStoredStateV4(): {
     if (parsed.version === 4) {
       const v4 = parsed as unknown as StoredClaudeProviderConfigV4;
       const providers = v4.providers.map(fromStoredProviderV4);
-      const migrated = {
+      const migrated: StoredStateV5 = {
         providers,
+        defaultModelConfigId: null,
         balancing: {
           strategy: v4.balancing?.strategy || DEFAULT_BALANCING_CONFIG.strategy,
           unhealthyThreshold:
@@ -1282,7 +1813,7 @@ function readStoredStateV4(): {
             DEFAULT_BALANCING_CONFIG.recoveryIntervalMs,
         },
       };
-      writeStoredStateV4(migrated.providers, migrated.balancing);
+      writeStoredStateV4(migrated.providers, migrated.balancing, null);
       logger.info('Migrated Claude model configuration from V4 to V5');
       return migrated;
     }
@@ -1291,10 +1822,13 @@ function readStoredStateV4(): {
     const v3 = readStoredState();
     if (!v3) return null;
 
-    const migrated = migrateV3toV4(v3);
+    const migrated: StoredStateV5 = {
+      ...migrateV3toV4(v3),
+      defaultModelConfigId: null,
+    };
 
     // Auto-save as V5 on first read (lazy migration)
-    writeStoredStateV4(migrated.providers, migrated.balancing);
+    writeStoredStateV4(migrated.providers, migrated.balancing, null);
     logger.info(
       { providerCount: migrated.providers.length },
       'Migrated Claude provider config from V3 to V5',
@@ -1313,10 +1847,22 @@ function readStoredStateV4(): {
 function writeStoredStateV4(
   providers: UnifiedProvider[],
   balancing: BalancingConfig,
+  defaultModelConfigId: string | null,
 ): void {
+  // Cover V3/V4 migration and newly imported subscriptions as well as V5 reads.
+  ensureCodexGatewayIdentifiers(providers);
+  // Every save goes through here: drop the decrypted cache first, so the next
+  // read decrypts what was actually persisted.
+  storedStateCache = null;
+  storedStateWriteGeneration++;
+  const defaultId = normalizeDefaultModelConfigId(
+    providers,
+    defaultModelConfigId,
+  );
   const payload: StoredClaudeProviderConfigV5 = {
     version: 5,
     providers: providers.map(toStoredProviderV4),
+    ...(defaultId ? { defaultModelConfigId: defaultId } : {}),
     balancing,
     updatedAt: new Date().toISOString(),
   };
@@ -1336,6 +1882,73 @@ export function getEnabledProviders(): UnifiedProvider[] {
   return getProviders().filter((p) => p.enabled);
 }
 
+/**
+ * The configuration conversations run on when nothing more specific (a
+ * conversation pick, an Agent binding, a Workspace environment) chose one;
+ * null when the automatic pool decides.
+ */
+export function getDefaultModelConfigId(): string | null {
+  return readStoredStateV4()?.defaultModelConfigId ?? null;
+}
+
+/**
+ * The default configuration when it can serve a launch right now. One that
+ * lost its credential or was switched off behind the pointer's back does not
+ * pin anything: the conversation falls through to the automatic pool rather
+ * than failing every turn on it.
+ */
+export function getUsableDefaultProvider(): UnifiedProvider | null {
+  const state = readStoredStateV4();
+  if (!state?.defaultModelConfigId) return null;
+  const provider = state.providers.find(
+    (item) => item.id === state.defaultModelConfigId,
+  );
+  return provider?.enabled && providerHasCredentials(provider)
+    ? provider
+    : null;
+}
+
+export const DEFAULT_MODEL_DISABLE_ERROR =
+  '默认模型配置不能禁用，请先取消默认或改选其他默认模型';
+
+/**
+ * Make a configuration the default, or clear the choice with null so the
+ * automatic pool decides again. The pool is what a default replaces, so the
+ * default has to be a member of it: a disabled configuration is switched on
+ * together with being chosen, and the default cannot be switched off while it
+ * is the default.
+ */
+export function setDefaultModelConfig(
+  id: string | null,
+): UnifiedProvider | null {
+  const state = readStoredStateV4();
+  if (!state) throw new Error('Claude 配置不存在');
+  if (id === null) {
+    if (state.defaultModelConfigId !== null) {
+      writeStoredStateV4(state.providers, state.balancing, null);
+    }
+    return null;
+  }
+
+  const idx = state.providers.findIndex((p) => p.id === id);
+  if (idx < 0) throw new Error('未找到指定供应商');
+  const provider = state.providers[idx];
+  if (!providerHasCredentials(provider)) {
+    throw new Error('该模型配置还没有可用的凭据，请先填写密钥或完成授权');
+  }
+  if (state.defaultModelConfigId === id && provider.enabled) return provider;
+
+  if (!provider.enabled) {
+    state.providers[idx] = {
+      ...provider,
+      enabled: true,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  writeStoredStateV4(state.providers, state.balancing, id);
+  return state.providers[idx];
+}
+
 export function getBalancingConfig(): BalancingConfig {
   const state = readStoredStateV4();
   return state?.balancing ?? { ...DEFAULT_BALANCING_CONFIG };
@@ -1344,16 +1957,79 @@ export function getBalancingConfig(): BalancingConfig {
 export function saveBalancingConfig(
   config: Partial<BalancingConfig>,
 ): BalancingConfig {
-  const state = readStoredStateV4() || {
+  const state: StoredStateV5 = readStoredStateV4() || {
     providers: [],
+    defaultModelConfigId: null,
     balancing: { ...DEFAULT_BALANCING_CONFIG },
   };
   const merged: BalancingConfig = {
     ...state.balancing,
     ...config,
   };
-  writeStoredStateV4(state.providers, merged);
+  writeStoredStateV4(state.providers, merged, state.defaultModelConfigId);
   return merged;
+}
+
+type ClaudeAuthKind = 'oauth' | 'setup_token' | 'api_key';
+
+function hasSecretValue(value: string | undefined, fieldName: string): boolean {
+  return typeof value === 'string' && normalizeSecret(value, fieldName) !== '';
+}
+
+/**
+ * The official authentication kind a write selects. Claude Code silently
+ * prefers one credential when several are present, so a provider holds at
+ * most one kind and supplying two in one write is rejected.
+ */
+function selectedClaudeAuthKind(
+  type: UnifiedProvider['type'],
+  input: {
+    claudeOAuthCredentials?: ClaudeOAuthCredentials | null;
+    claudeCodeOauthToken?: string;
+    anthropicApiKey?: string;
+    anthropicAuthToken?: string;
+  },
+): ClaudeAuthKind | null {
+  const kinds: ClaudeAuthKind[] = [];
+  if (input.claudeOAuthCredentials) kinds.push('oauth');
+  if (hasSecretValue(input.claudeCodeOauthToken, 'claudeCodeOauthToken')) {
+    kinds.push('setup_token');
+  }
+  if (
+    type === 'official' &&
+    (hasSecretValue(input.anthropicApiKey, 'anthropicApiKey') ||
+      hasSecretValue(input.anthropicAuthToken, 'anthropicAuthToken'))
+  ) {
+    kinds.push('api_key');
+  }
+  if (kinds.length > 1) {
+    throw new Error(
+      '一次只能设置一种官方认证方式（OAuth 登录凭据、setup-token 或 API Key）',
+    );
+  }
+  return kinds[0] ?? null;
+}
+
+/** Validate a credential write before any runtime is touched. */
+export function assertSingleClaudeAuthKind(
+  type: UnifiedProvider['type'],
+  input: Parameters<typeof selectedClaudeAuthKind>[1],
+): void {
+  selectedClaudeAuthKind(type, input);
+}
+
+/** Drop every credential of the kinds the write did not select. */
+function applyClaudeAuthKind(
+  provider: UnifiedProvider,
+  kind: ClaudeAuthKind | null,
+): void {
+  if (!kind) return;
+  if (kind !== 'oauth') provider.claudeOAuthCredentials = null;
+  if (kind !== 'setup_token') provider.claudeCodeOauthToken = '';
+  if (provider.type === 'official' && kind !== 'api_key') {
+    provider.anthropicApiKey = '';
+    provider.anthropicAuthToken = '';
+  }
 }
 
 export function createProvider(input: {
@@ -1361,16 +2037,21 @@ export function createProvider(input: {
   type: 'official' | 'third_party';
   anthropicBaseUrl?: string;
   anthropicAuthToken?: string;
+  anthropicAuthMode?: ProviderAuthMode;
   anthropicModel?: string;
   anthropicApiKey?: string;
   claudeCodeOauthToken?: string;
   claudeOAuthCredentials?: ClaudeOAuthCredentials | null;
+  claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
+  codexOAuthCredentials?: CodexOAuthCredentials | null;
   customEnv?: Record<string, string>;
   weight?: number;
   enabled?: boolean;
 }): UnifiedProvider {
-  const state = readStoredStateV4() || {
+  const authKind = selectedClaudeAuthKind(input.type, input);
+  const state: StoredStateV5 = readStoredStateV4() || {
     providers: [],
+    defaultModelConfigId: null,
     balancing: { ...DEFAULT_BALANCING_CONFIG },
   };
 
@@ -1391,6 +2072,9 @@ export function createProvider(input: {
     anthropicAuthToken: input.anthropicAuthToken
       ? normalizeSecret(input.anthropicAuthToken, 'anthropicAuthToken')
       : '',
+    ...(input.anthropicAuthMode
+      ? { anthropicAuthMode: input.anthropicAuthMode }
+      : {}),
     anthropicModel: input.anthropicModel
       ? normalizeModel(input.anthropicModel)
       : '',
@@ -1401,14 +2085,23 @@ export function createProvider(input: {
       ? normalizeSecret(input.claudeCodeOauthToken, 'claudeCodeOauthToken')
       : '',
     claudeOAuthCredentials: input.claudeOAuthCredentials ?? null,
+    codexOAuthCredentials: input.codexOAuthCredentials ?? null,
+    claudeOAuthAccount: input.claudeOAuthAccount ?? null,
+    claudeOAuthLastRefreshAt: null,
+    claudeOAuthLastRefreshError: null,
     customEnv: sanitizeCustomEnvMap(input.customEnv || {}, {
       skipReservedClaudeKeys: true,
     }),
     updatedAt: now,
   };
+  applyClaudeAuthKind(provider, authKind);
 
   state.providers.push(provider);
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV4(
+    state.providers,
+    state.balancing,
+    state.defaultModelConfigId,
+  );
   return provider;
 }
 
@@ -1417,6 +2110,7 @@ export function updateProvider(
   patch: {
     name?: string;
     anthropicBaseUrl?: string;
+    anthropicAuthMode?: ProviderAuthMode;
     anthropicModel?: string;
     customEnv?: Record<string, string>;
     weight?: number;
@@ -1437,6 +2131,9 @@ export function updateProvider(
     ...(patch.anthropicBaseUrl !== undefined
       ? { anthropicBaseUrl: normalizeBaseUrl(patch.anthropicBaseUrl) }
       : {}),
+    ...(patch.anthropicAuthMode !== undefined
+      ? { anthropicAuthMode: patch.anthropicAuthMode }
+      : {}),
     ...(patch.anthropicModel !== undefined
       ? { anthropicModel: normalizeModel(patch.anthropicModel) }
       : {}),
@@ -1454,7 +2151,11 @@ export function updateProvider(
   };
 
   state.providers[idx] = updated;
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV4(
+    state.providers,
+    state.balancing,
+    state.defaultModelConfigId,
+  );
   return updated;
 }
 
@@ -1469,6 +2170,10 @@ export function updateProviderSecrets(
     clearClaudeCodeOauthToken?: boolean;
     claudeOAuthCredentials?: ClaudeOAuthCredentials;
     clearClaudeOAuthCredentials?: boolean;
+    /** Account facts for the credentials set by this write. */
+    claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
+    codexOAuthCredentials?: CodexOAuthCredentials;
+    clearCodexOAuthCredentials?: boolean;
   },
 ): UnifiedProvider {
   const state = readStoredStateV4();
@@ -1478,6 +2183,7 @@ export function updateProviderSecrets(
   if (idx < 0) throw new Error('未找到指定供应商');
 
   const current = state.providers[idx];
+  const authKind = selectedClaudeAuthKind(current.type, secrets);
   const updated = { ...current, updatedAt: new Date().toISOString() };
 
   if (typeof secrets.anthropicAuthToken === 'string') {
@@ -1509,14 +2215,40 @@ export function updateProviderSecrets(
 
   if (secrets.claudeOAuthCredentials) {
     updated.claudeOAuthCredentials = secrets.claudeOAuthCredentials;
-    // When full OAuth creds set, clear legacy single token
-    updated.claudeCodeOauthToken = '';
   } else if (secrets.clearClaudeOAuthCredentials) {
     updated.claudeOAuthCredentials = null;
   }
+  applyClaudeAuthKind(updated, authKind);
+
+  if (secrets.codexOAuthCredentials) {
+    updated.codexOAuthCredentials = secrets.codexOAuthCredentials;
+    // New credentials end any refresh backoff or re-login requirement.
+    updated.codexOAuthLastRefreshError = null;
+  } else if (secrets.clearCodexOAuthCredentials) {
+    updated.codexOAuthCredentials = null;
+    updated.codexOAuthLastRefreshError = null;
+  }
+
+  // Account facts and refresh state describe one Claude grant. A new or
+  // removed credential starts over, which also lifts a needs-re-login state.
+  const claudeGrantChanged =
+    current.claudeCodeOauthToken !== updated.claudeCodeOauthToken ||
+    !sameOAuthCredentials(
+      current.claudeOAuthCredentials,
+      updated.claudeOAuthCredentials,
+    );
+  if (claudeGrantChanged || secrets.claudeOAuthAccount !== undefined) {
+    updated.claudeOAuthAccount = secrets.claudeOAuthAccount ?? null;
+    updated.claudeOAuthLastRefreshAt = null;
+    updated.claudeOAuthLastRefreshError = null;
+  }
 
   state.providers[idx] = updated;
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV4(
+    state.providers,
+    state.balancing,
+    state.defaultModelConfigId,
+  );
   clearProviderQuotaObservation(id);
   return updated;
 }
@@ -1533,16 +2265,123 @@ function oauthCredentialsSnapshot(credentials: ClaudeOAuthCredentials): string {
   });
 }
 
+function sameOAuthCredentials(
+  left: ClaudeOAuthCredentials | null,
+  right: ClaudeOAuthCredentials | null,
+): boolean {
+  if (!left || !right) return left === right;
+  return oauthCredentialsSnapshot(left) === oauthCredentialsSnapshot(right);
+}
+
+/** Index of the provider still holding exactly `expected`, or -1. */
+function findProviderHoldingOAuth(
+  providers: UnifiedProvider[],
+  id: string,
+  expected: ClaudeOAuthCredentials,
+): number {
+  const idx = providers.findIndex((provider) => provider.id === id);
+  if (idx < 0) throw new Error('未找到指定供应商');
+  const currentOauth = buildClaudeAiOauthPayload(
+    providerToConfig(providers[idx]),
+  );
+  if (
+    !currentOauth ||
+    oauthCredentialsSnapshot(currentOauth) !==
+      oauthCredentialsSnapshot(expected)
+  ) {
+    return -1;
+  }
+  return idx;
+}
+
 /**
  * Persist an SDK-refreshed OAuth credential only if the provider still holds
  * the exact credential snapshot used to start reconciliation. The synchronous
  * read/modify/write is a compare-and-swap boundary inside the Node process, so
  * an admin update or another session refresh cannot be silently overwritten.
+ * A successful rotation proves the grant is alive, so it also clears a
+ * recorded refresh rejection.
  */
 export function updateProviderOAuthCredentialsIfCurrent(
   id: string,
   expected: ClaudeOAuthCredentials,
   refreshed: ClaudeOAuthCredentials,
+  options?: { account?: ClaudeOAuthAccountInfo | null },
+): boolean {
+  const state = readStoredStateV4();
+  if (!state) throw new Error('Claude 配置不存在');
+  const idx = findProviderHoldingOAuth(state.providers, id, expected);
+  if (idx < 0) return false;
+
+  const current = state.providers[idx];
+  state.providers[idx] = {
+    ...current,
+    claudeOAuthCredentials: {
+      ...refreshed,
+      scopes: [...new Set(refreshed.scopes)].sort(),
+    },
+    claudeOAuthAccount: options?.account
+      ? { ...(current.claudeOAuthAccount ?? {}), ...options.account }
+      : (current.claudeOAuthAccount ?? null),
+    claudeOAuthLastRefreshAt: Date.now(),
+    claudeOAuthLastRefreshError: null,
+    updatedAt: new Date().toISOString(),
+  };
+  writeStoredStateV4(
+    state.providers,
+    state.balancing,
+    state.defaultModelConfigId,
+  );
+  return true;
+}
+
+/**
+ * Record a terminal refresh rejection, but only while the provider still
+ * holds the credential that was rejected: after a concurrent rotation or an
+ * administrator update the old token is expected to fail.
+ */
+export function markProviderOAuthRefreshFailureIfCurrent(
+  id: string,
+  expected: ClaudeOAuthCredentials,
+  error: ClaudeOAuthRefreshError,
+): boolean {
+  const state = readStoredStateV4();
+  if (!state) throw new Error('Claude 配置不存在');
+  const idx = findProviderHoldingOAuth(state.providers, id, expected);
+  if (idx < 0) return false;
+  state.providers[idx] = {
+    ...state.providers[idx],
+    claudeOAuthLastRefreshError: error,
+  };
+  writeStoredStateV4(
+    state.providers,
+    state.balancing,
+    state.defaultModelConfigId,
+  );
+  return true;
+}
+
+function codexOAuthCredentialsSnapshot(
+  credentials: CodexOAuthCredentials,
+): string {
+  return JSON.stringify({
+    accessToken: credentials.accessToken,
+    refreshToken: credentials.refreshToken,
+    expiresAt: credentials.expiresAt,
+    accountId: credentials.accountId,
+  });
+}
+
+/**
+ * Persist a gateway-refreshed Codex (ChatGPT 订阅) OAuth credential only if the
+ * provider still holds the exact credential snapshot used to start the
+ * refresh. Same compare-and-swap boundary as
+ * updateProviderOAuthCredentialsIfCurrent above.
+ */
+export function updateProviderCodexOAuthCredentialsIfCurrent(
+  id: string,
+  expected: CodexOAuthCredentials,
+  refreshed: CodexOAuthCredentials,
 ): boolean {
   const state = readStoredStateV4();
   if (!state) throw new Error('Claude 配置不存在');
@@ -1550,25 +2389,109 @@ export function updateProviderOAuthCredentialsIfCurrent(
   if (idx < 0) throw new Error('未找到指定供应商');
 
   const current = state.providers[idx];
-  const currentOauth = buildClaudeAiOauthPayload(providerToConfig(current));
+  const currentCodexOauth = current.codexOAuthCredentials;
   if (
-    !currentOauth ||
-    oauthCredentialsSnapshot(currentOauth) !==
-      oauthCredentialsSnapshot(expected)
+    !currentCodexOauth ||
+    codexOAuthCredentialsSnapshot(currentCodexOauth) !==
+      codexOAuthCredentialsSnapshot(expected)
   ) {
     return false;
   }
 
   state.providers[idx] = {
     ...current,
-    claudeOAuthCredentials: {
-      ...refreshed,
-      scopes: [...new Set(refreshed.scopes)].sort(),
-    },
+    codexOAuthCredentials: refreshed,
+    codexOAuthLastRefreshError: null,
     updatedAt: new Date().toISOString(),
   };
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV4(
+    state.providers,
+    state.balancing,
+    state.defaultModelConfigId,
+  );
   return true;
+}
+
+/**
+ * Record (or clear, with null) the gateway's last Codex token refresh failure,
+ * guarded by the same credential snapshot as the refresh itself: a failure
+ * observed for credentials an admin has since replaced must not mark the new
+ * login as needing re-authorization. This is runtime state, so updatedAt and
+ * the provider's configuration fields are left untouched.
+ */
+export function setProviderCodexOAuthRefreshErrorIfCurrent(
+  id: string,
+  expected: CodexOAuthCredentials,
+  error: CodexOAuthRefreshErrorState | null,
+): boolean {
+  const state = readStoredStateV4();
+  if (!state) return false;
+  const idx = state.providers.findIndex((provider) => provider.id === id);
+  if (idx < 0) return false;
+  const current = state.providers[idx];
+  if (
+    !current.codexOAuthCredentials ||
+    codexOAuthCredentialsSnapshot(current.codexOAuthCredentials) !==
+      codexOAuthCredentialsSnapshot(expected)
+  ) {
+    return false;
+  }
+  const normalized = error ? normalizeCodexRefreshErrorState(error) : null;
+  if (
+    JSON.stringify(current.codexOAuthLastRefreshError ?? null) ===
+    JSON.stringify(normalized)
+  ) {
+    return true;
+  }
+  state.providers[idx] = {
+    ...current,
+    codexOAuthLastRefreshError: normalized,
+  };
+  writeStoredStateV4(
+    state.providers,
+    state.balancing,
+    state.defaultModelConfigId,
+  );
+  return true;
+}
+
+/** Whether a stored provider routes through the embedded ChatGPT/Codex gateway. */
+export function isCodexGatewayProvider(
+  provider: Pick<UnifiedProvider, 'anthropicBaseUrl'>,
+): boolean {
+  return provider.anthropicBaseUrl === CODEX_GATEWAY_BASE_URL_PLACEHOLDER;
+}
+
+/**
+ * The reasoning effort a Codex provider uses when the Agent does not set one.
+ * Shared by the settings payload and the gateway so both always agree.
+ */
+export function resolveCodexProviderDefaultEffort(
+  provider: Pick<UnifiedProvider, 'anthropicModel' | 'customEnv'>,
+): string {
+  return resolveCodexDefaultEffort(
+    getResolvedCodexCatalog().models,
+    normalizeLegacyCodexModel(provider.anthropicModel || ''),
+    provider.customEnv?.CODEX_REASONING_EFFORT,
+  );
+}
+
+export function getProviderById(id: string): UnifiedProvider | null {
+  return getProviders().find((provider) => provider.id === id) ?? null;
+}
+
+/** Whether a provider holds a credential its runtime can authenticate with. */
+export function providerHasCredentials(provider: UnifiedProvider): boolean {
+  if (provider.codexOAuthCredentials) return true;
+  if (provider.type === 'third_party') {
+    return !!(provider.anthropicAuthToken || provider.anthropicApiKey);
+  }
+  return !!(
+    provider.anthropicApiKey ||
+    provider.anthropicAuthToken ||
+    provider.claudeCodeOauthToken ||
+    provider.claudeOAuthCredentials
+  );
 }
 
 export function setProviderEnabled(
@@ -1583,14 +2506,64 @@ export function setProviderEnabled(
 
   const provider = state.providers[idx];
   if (provider.enabled === enabled) return provider;
+  if (!enabled && state.defaultModelConfigId === id) {
+    throw new Error(DEFAULT_MODEL_DISABLE_ERROR);
+  }
+  // An enabled provider joins the automatic pool at once; without a
+  // credential every turn routed to it would fail authentication.
+  if (enabled && !providerHasCredentials(provider)) {
+    throw new Error('该模型配置还没有可用的凭据，请先填写密钥或完成授权');
+  }
 
   state.providers[idx] = {
     ...provider,
     enabled,
     updatedAt: new Date().toISOString(),
   };
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV4(
+    state.providers,
+    state.balancing,
+    state.defaultModelConfigId,
+  );
   return state.providers[idx];
+}
+
+/**
+ * Copy a provider together with its encrypted secrets, disabled, right after
+ * the original. OAuth providers are refused: two configurations rotating one
+ * refresh token would invalidate each other on the first refresh.
+ */
+export function duplicateProvider(id: string): UnifiedProvider {
+  const state = readStoredStateV4();
+  if (!state) throw new Error('Claude 配置不存在');
+
+  const idx = state.providers.findIndex((p) => p.id === id);
+  if (idx < 0) throw new Error('未找到指定供应商');
+  if (state.providers.length >= MAX_PROVIDERS) {
+    throw new Error(`最多只能创建 ${MAX_PROVIDERS} 个供应商`);
+  }
+
+  const source = state.providers[idx];
+  if (source.codexOAuthCredentials || source.claudeOAuthCredentials) {
+    throw new Error(
+      'OAuth 授权的模型配置不能复制：两份配置轮换同一个刷新令牌会互相失效，请新建后重新授权',
+    );
+  }
+  const suffix = ' (副本)';
+  const copy: UnifiedProvider = {
+    ...structuredClone(source),
+    id: crypto.randomBytes(8).toString('hex'),
+    name: `${source.name.slice(0, 64 - suffix.length)}${suffix}`,
+    enabled: false,
+    updatedAt: new Date().toISOString(),
+  };
+  state.providers.splice(idx + 1, 0, copy);
+  writeStoredStateV4(
+    state.providers,
+    state.balancing,
+    state.defaultModelConfigId,
+  );
+  return copy;
 }
 
 export function deleteProvider(id: string): void {
@@ -1601,7 +2574,11 @@ export function deleteProvider(id: string): void {
   if (idx < 0) throw new Error('未找到指定供应商');
 
   state.providers.splice(idx, 1);
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV4(
+    state.providers,
+    state.balancing,
+    state.defaultModelConfigId,
+  );
   clearProviderQuotaObservation(id);
 }
 
@@ -1612,6 +2589,9 @@ export function providerToConfig(
   return {
     anthropicBaseUrl: provider.anthropicBaseUrl,
     anthropicAuthToken: provider.anthropicAuthToken,
+    ...(provider.anthropicAuthMode
+      ? { anthropicAuthMode: provider.anthropicAuthMode }
+      : {}),
     anthropicApiKey: provider.anthropicApiKey,
     claudeCodeOauthToken: provider.claudeCodeOauthToken,
     claudeOAuthCredentials: provider.claudeOAuthCredentials,
@@ -1632,6 +2612,7 @@ export function toPublicProvider(
     weight: provider.weight,
     anthropicBaseUrl: provider.anthropicBaseUrl,
     anthropicModel: provider.anthropicModel,
+    anthropicAuthMode: provider.anthropicAuthMode ?? null,
     hasAnthropicAuthToken: !!provider.anthropicAuthToken,
     anthropicAuthTokenMasked: maskSecret(provider.anthropicAuthToken),
     hasAnthropicApiKey: !!provider.anthropicApiKey,
@@ -1644,9 +2625,53 @@ export function toPublicProvider(
     claudeOAuthCredentialsAccessTokenMasked: provider.claudeOAuthCredentials
       ? maskSecret(provider.claudeOAuthCredentials.accessToken)
       : null,
+    hasCodexOAuthCredentials: !!provider.codexOAuthCredentials,
+    codexOAuthCredentialsExpiresAt:
+      provider.codexOAuthCredentials?.expiresAt ?? null,
+    codexOAuthCredentialsEmail: provider.codexOAuthCredentials?.email ?? null,
+    codexOAuthCredentialsPlanType:
+      provider.codexOAuthCredentials?.planType ?? null,
+    claudeAuthKind: claudeAuthKindOf(provider),
+    claudeOAuthAccountEmail: provider.claudeOAuthAccount?.emailAddress ?? null,
+    claudeOAuthOrganizationName:
+      provider.claudeOAuthAccount?.organizationName ?? null,
+    claudeOAuthOrganizationUuid:
+      provider.claudeOAuthAccount?.organizationUuid ?? null,
+    claudeOAuthSubscriptionType:
+      provider.claudeOAuthCredentials?.subscriptionType ??
+      provider.claudeOAuthAccount?.subscriptionType ??
+      null,
+    claudeOAuthScopes: provider.claudeOAuthCredentials
+      ? [...provider.claudeOAuthCredentials.scopes]
+      : [],
+    claudeOAuthLastRefreshAt: provider.claudeOAuthLastRefreshAt ?? null,
+    claudeOAuthNeedsReLogin: !!provider.claudeOAuthLastRefreshError,
+    claudeOAuthLastRefreshError: provider.claudeOAuthLastRefreshError ?? null,
+    codexOAuthNeedsReauth:
+      provider.codexOAuthLastRefreshError?.kind === 'reauth_required',
+    codexOAuthLastRefreshError: provider.codexOAuthLastRefreshError
+      ? {
+          kind: provider.codexOAuthLastRefreshError.kind,
+          message: provider.codexOAuthLastRefreshError.message,
+          at: provider.codexOAuthLastRefreshError.at,
+        }
+      : null,
+    codexDefaultEffort: isCodexGatewayProvider(provider)
+      ? resolveCodexProviderDefaultEffort(provider)
+      : null,
     customEnv: provider.customEnv || {},
     updatedAt: provider.updatedAt,
   };
+}
+
+function claudeAuthKindOf(
+  provider: UnifiedProvider,
+): UnifiedProviderPublic['claudeAuthKind'] {
+  if (provider.type !== 'official') return null;
+  if (provider.claudeOAuthCredentials) return 'oauth';
+  if (provider.claudeCodeOauthToken) return 'setup_token';
+  if (provider.anthropicApiKey || provider.anthropicAuthToken) return 'api_key';
+  return null;
 }
 
 /**
@@ -1664,10 +2689,9 @@ export function resolveProviderById(providerId: string): {
   if (!provider) {
     logger.warn(
       { providerId },
-      'resolveProviderById: provider not found, falling back to first enabled',
+      'resolveProviderById: provider not found, falling back to the default or first enabled',
     );
-    const fallback =
-      state.providers.find((p) => p.enabled) || state.providers[0];
+    const fallback = selectGlobalProvider(state) || state.providers[0];
     if (!fallback) return { config: defaultsFromEnv(), customEnv: {} };
     return {
       config: providerToConfig(fallback),
@@ -1926,11 +2950,29 @@ export function toPublicClaudeProviderConfig(
   };
 }
 
+/**
+ * The configuration the host's own, non-conversation Claude calls use: the
+ * default while it can serve (the same test as getUsableDefaultProvider),
+ * else the first enabled one.
+ */
+function selectGlobalProvider(
+  state: StoredStateV5,
+): UnifiedProvider | undefined {
+  return (
+    state.providers.find(
+      (p) =>
+        p.enabled &&
+        p.id === state.defaultModelConfigId &&
+        providerHasCredentials(p),
+    ) ?? state.providers.find((p) => p.enabled)
+  );
+}
+
 export function getClaudeProviderConfig(): ClaudeProviderConfig {
   try {
     const state = readStoredStateV4();
     if (state) {
-      const selected = state.providers.find((p) => p.enabled);
+      const selected = selectGlobalProvider(state);
       if (selected) return providerToConfig(selected);
       throw new Error('没有启用的模型配置，请先在模型配置页面打开一个模型');
     }
@@ -1995,21 +3037,20 @@ export function buildClaudeEnvLines(
   }
   if (config.anthropicAuthToken) {
     const bearerMatch = /^Bearer\s+(.+)$/i.exec(config.anthropicAuthToken);
-    if (config.anthropicBaseUrl && !bearerMatch) {
-      // Most third-party Anthropic-compatible endpoints expect API-key style
-      // auth (the SDK sends a bare token as `X-Api-Key`). A plain token maps to
-      // ANTHROPIC_API_KEY so non-Anthropic endpoints don't 404 on the OAuth path.
-      lines.push(
-        `ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicAuthToken)}`,
-      );
-    } else {
-      // An explicit `Bearer <token>` (or first-party usage) goes to
-      // ANTHROPIC_AUTH_TOKEN so the SDK emits `Authorization: Bearer <token>`.
-      // The SDK adds the `Bearer ` prefix itself, so strip the user-supplied
-      // one to avoid a doubled `Authorization: Bearer Bearer <token>`.
-      const token = bearerMatch ? bearerMatch[1] : config.anthropicAuthToken;
-      lines.push(`ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(token)}`);
-    }
+    // The SDK adds the `Bearer ` prefix itself, so strip a user-supplied one
+    // to avoid a doubled `Authorization: Bearer Bearer <token>`.
+    const token = bearerMatch ? bearerMatch[1] : config.anthropicAuthToken;
+    // An explicit mode wins. Legacy providers keep the old inference: a bare
+    // token behind a custom endpoint is sent as `X-Api-Key`, an explicit
+    // `Bearer <token>` (or first-party usage) as `Authorization: Bearer`.
+    const sendAsApiKey = config.anthropicAuthMode
+      ? config.anthropicAuthMode === 'x-api-key'
+      : !!config.anthropicBaseUrl && !bearerMatch;
+    lines.push(
+      sendAsApiKey
+        ? `ANTHROPIC_API_KEY=${sanitizeEnvValue(token)}`
+        : `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(token)}`,
+    );
   }
   if (config.anthropicModel) {
     lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
@@ -2023,22 +3064,27 @@ export function buildClaudeEnvLines(
   // [1m] suffix, while allowing provider-level advanced settings to replace
   // any default explicitly.
   if (config.anthropicBaseUrl) {
+    // A blank override means "use the default": an empty model mapping would
+    // send Claude Code back to first-party model IDs the gateway lacks.
     const configuredValue = (key: string, fallback: string): string =>
-      Object.hasOwn(customEnv, key)
+      Object.hasOwn(customEnv, key) && customEnv[key].trim()
         ? sanitizeCustomEnvValue(key, customEnv[key])
         : fallback;
 
-    if (config.anthropicModel) {
-      const model = sanitizeEnvValue(config.anthropicModel);
-      lines.push(
-        `ANTHROPIC_DEFAULT_OPUS_MODEL=${configuredValue('ANTHROPIC_DEFAULT_OPUS_MODEL', model)}`,
+    // Every model tier follows the provider model by default. A pass-through
+    // relay leaves the model empty, so only explicit per-tier mappings apply.
+    // The Codex gateway keeps a Claude haiku id so it can tell Claude Code's
+    // background calls apart from agent turns.
+    const model = sanitizeEnvValue(config.anthropicModel);
+    const codexGateway = isCodexGatewayEndpoint(config.anthropicBaseUrl);
+    for (const key of THIRD_PARTY_MODEL_ENV_KEYS) {
+      const value = configuredValue(
+        key,
+        codexGateway && key === 'ANTHROPIC_DEFAULT_HAIKU_MODEL'
+          ? CODEX_GATEWAY_HAIKU_MODEL
+          : model,
       );
-      lines.push(
-        `ANTHROPIC_DEFAULT_SONNET_MODEL=${configuredValue('ANTHROPIC_DEFAULT_SONNET_MODEL', model)}`,
-      );
-      lines.push(
-        `ANTHROPIC_DEFAULT_HAIKU_MODEL=${configuredValue('ANTHROPIC_DEFAULT_HAIKU_MODEL', model)}`,
-      );
+      if (value) lines.push(`${key}=${value}`);
     }
 
     lines.push(
@@ -2067,7 +3113,7 @@ export function getActiveProfileCustomEnv(): Record<string, string> {
   const state = readStoredStateV4();
   if (!state) return {};
 
-  const selected = state.providers.find((p) => p.enabled);
+  const selected = selectGlobalProvider(state);
   if (!selected) return {};
 
   return sanitizeCustomEnvMap(selected.customEnv || {}, {
@@ -2285,6 +3331,13 @@ export function mergeClaudeEnvConfig(
     anthropicAuthToken: hasExplicitAuth
       ? override.anthropicAuthToken || ''
       : override.anthropicAuthToken || global.anthropicAuthToken,
+    // The header style belongs to the provider's own token; a workspace token
+    // brings no mode and keeps the legacy inference.
+    ...(!hasExplicitAuth &&
+    !override.anthropicAuthToken &&
+    global.anthropicAuthMode
+      ? { anthropicAuthMode: global.anthropicAuthMode }
+      : {}),
     anthropicApiKey: hasExplicitAuth
       ? override.anthropicApiKey || ''
       : override.anthropicApiKey || global.anthropicApiKey,

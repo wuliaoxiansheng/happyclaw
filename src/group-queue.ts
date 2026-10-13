@@ -122,6 +122,15 @@ export type QueryFinishReason =
 
 const MAX_RETRIES = 5;
 const BASE_RETRY_MS = 5000;
+const RETRY_JITTER_RATIO = 0.2;
+let retryJitterSource: () => number = Math.random;
+
+/** Test hook: make retry delays deterministic (0 = exact base backoff). */
+export function setRetryJitterSourceForTesting(
+  source: (() => number) | null,
+): void {
+  retryJitterSource = source ?? Math.random;
+}
 const RUNNER_TEARDOWN_TIMEOUT_MS = 15_000;
 
 interface GroupState {
@@ -203,6 +212,8 @@ interface GroupState {
   /** IPC deliveries written to this runner but not yet acknowledged by a
    * healthy agent query result. Keyed by deliveryId for out-of-order acks. */
   pendingIpcDeliveries: Map<string, IpcDeliveryReceipt>;
+  /** Immutable query identity stamped when each durable input was published. */
+  pendingIpcQueryIds?: Map<string, string>;
   /** Receipts observed from stdout but blocked behind an earlier unacknowledged
    * delivery for the same chat. They remain replayable until the contiguous
    * prefix is durably committed. */
@@ -977,7 +988,7 @@ export class GroupQueue {
   }
 
   /**
-   * Write a single _drain sentinel to the actual active main-agent runner that
+   * Write _drain to the exact conversation runner, or the main runner that
    * owns this serialization key. This must target the runner state rather than
    * the caller's group state because sibling JIDs can share one process.
    */
@@ -985,14 +996,21 @@ export class GroupQueue {
     groupJid: string,
     reason: string,
   ): boolean {
-    const activeRunner = this.findActiveRunnerFor(groupJid);
+    const directState = this.groups.get(groupJid);
+    const exactConversationRunner =
+      directState?.active &&
+      directState.agentId !== null &&
+      groupJid.endsWith(`#agent:${directState.agentId}`);
+    const activeRunner = exactConversationRunner
+      ? groupJid
+      : this.findActiveRunnerFor(groupJid);
     if (!activeRunner) return false;
 
     const runnerState = this.getGroup(activeRunner);
     if (
       !runnerState.active ||
       !runnerState.groupFolder ||
-      runnerState.agentId !== null
+      (runnerState.agentId !== null && !exactConversationRunner)
     ) {
       return false;
     }
@@ -1160,6 +1178,7 @@ export class GroupQueue {
         }
         commit([first]);
         state.pendingIpcDeliveries.delete(first.deliveryId);
+        state.pendingIpcQueryIds?.delete(first.deliveryId);
         state.acknowledgedIpcDeliveryIds.delete(first.deliveryId);
         committed.push(first);
       }
@@ -1217,6 +1236,24 @@ export class GroupQueue {
     return state?.active && state.queryInFlight ? state.queryId : null;
   }
 
+  /** Terminal DB message id covered by a still-pending IPC input delivery. */
+  getPendingIpcDeliveryMessageId(
+    groupJid: string,
+    deliveryId: string,
+  ): string | null {
+    return (
+      this.groups.get(groupJid)?.pendingIpcDeliveries?.get(deliveryId)?.cursor
+        .id ?? null
+    );
+  }
+
+  getPublishedIpcQueryId(groupJid: string, deliveryId: string): string | null {
+    const state = this.groups.get(groupJid);
+    if (!state?.active || !state.pendingIpcDeliveries.has(deliveryId))
+      return null;
+    return state.pendingIpcQueryIds?.get(deliveryId) ?? null;
+  }
+
   /** True only when the immutable DB batch owned by the active query includes
    * this physical input. Used by provider-level semantic coalescing so an
    * unrelated query can never be interrupted merely because it shares a lane. */
@@ -1262,6 +1299,10 @@ export class GroupQueue {
     ) {
       return false;
     }
+    // A reservation released before announceReservedQuery was never shown
+    // to clients: publishing its terminal only sends a run_finished for a
+    // runId no client knows.
+    const wasAnnounced = state.announcedQueryId === expectedQueryId;
     state.queryInFlight = false;
     state.ipcOwedSinceAt = null;
     state.queryId = null;
@@ -1269,11 +1310,13 @@ export class GroupQueue {
     state.announcedQueryId = null;
     state.pendingInterruptQueryId = null;
     state.currentQueryCoveredMessageIds = new Set();
-    this.announceQueryFinish(
-      groupJid,
-      expectedQueryId,
-      notifyIdle ? 'completed' : 'released',
-    );
+    if (wasAnnounced) {
+      this.announceQueryFinish(
+        groupJid,
+        expectedQueryId,
+        notifyIdle ? 'completed' : 'released',
+      );
+    }
     if (notifyIdle) {
       try {
         this.onQueryIdleFn?.(groupJid, expectedQueryId);
@@ -1901,6 +1944,8 @@ export class GroupQueue {
       if (receipt) {
         state.pendingIpcDeliveries ??= new Map();
         state.pendingIpcDeliveries.set(receipt.deliveryId, receipt);
+        state.pendingIpcQueryIds ??= new Map();
+        state.pendingIpcQueryIds.set(receipt.deliveryId, queryRunId);
         // Claim eligibility is observed synchronously in the same stack as
         // rename+registration. A blocked claim remains in both the file/ledger
         // until a later durable cursor advance makes it provably contiguous.
@@ -2092,6 +2137,7 @@ export class GroupQueue {
       }
       this.onUnacknowledgedIpcDeliveriesFn(groupJid, receipts);
       state.pendingIpcDeliveries.clear();
+      state.pendingIpcQueryIds?.clear();
       state.acknowledgedIpcDeliveryIds.clear();
     } catch (err) {
       logger.error(
@@ -2167,6 +2213,7 @@ export class GroupQueue {
     // the exit path falls back to replay rather than silently dropping work.
     this.onAbandonedIpcDeliveriesFn(groupJid, receipts);
     state.pendingIpcDeliveries.clear();
+    state.pendingIpcQueryIds?.clear();
     state.acknowledgedIpcDeliveryIds.clear();
   }
 
@@ -2261,12 +2308,16 @@ export class GroupQueue {
    * Gracefully retire only runners using the refreshed Provider. The drain
    * sentinel is consumed after the current query, so a read-only usage poll
    * can rotate credentials without interrupting unrelated or in-flight work.
+   * A lane that is active but has not registered its process yet is still
+   * launching: it reads the rotated credentials when it spawns, and its
+   * selectedProviderId may be left over from the previous run.
    */
   drainProviderRunnersForCredentialRefresh(providerId: string): number {
     let drained = 0;
     for (const [jid, state] of this.groups) {
       if (
         !state.active ||
+        !state.process ||
         !state.groupFolder ||
         state.selectedProviderId !== providerId ||
         state.drainSentinelWritten
@@ -2279,6 +2330,41 @@ export class GroupQueue {
       logger.info(
         { groupJid: jid, groupFolder: state.groupFolder, providerId },
         'Sent drain signal after provider credential refresh',
+      );
+    }
+    return drained;
+  }
+
+  /**
+   * Retire the runners of one conversation after its model selection changed.
+   * A warm runner keeps the provider environment it was spawned with, so the
+   * next message must reach a fresh one. The drain sentinel lets an in-flight
+   * query finish first. With a concrete target, runners already on it are
+   * left alone; a null target (back to the default) cannot be predicted
+   * before pool selection, so every active runner is drained.
+   */
+  drainRunnersForModelSelection(
+    groupJids: readonly string[],
+    targetProviderId: string | null,
+  ): number {
+    let drained = 0;
+    for (const jid of new Set(groupJids)) {
+      const state = this.groups.get(jid);
+      if (
+        !state?.active ||
+        !state.groupFolder ||
+        state.drainSentinelWritten ||
+        (targetProviderId !== null &&
+          state.selectedProviderId === targetProviderId)
+      ) {
+        continue;
+      }
+      if (!this.writeDrainSentinel(state as ActiveGroupState)) continue;
+      state.drainSentinelWritten = true;
+      drained++;
+      logger.info(
+        { groupJid: jid, groupFolder: state.groupFolder, targetProviderId },
+        'Sent drain signal after conversation model selection changed',
       );
     }
     return drained;
@@ -3029,7 +3115,13 @@ export class GroupQueue {
       return;
     }
 
-    const delayMs = BASE_RETRY_MS * Math.pow(2, state.retryCount - 1);
+    // Up to +20% jitter: a provider outage fails many workspaces at once, and
+    // identical delays would replay them all in the same instant.
+    const delayMs = Math.round(
+      BASE_RETRY_MS *
+        Math.pow(2, state.retryCount - 1) *
+        (1 + RETRY_JITTER_RATIO * retryJitterSource()),
+    );
     logger.info(
       {
         groupJid,

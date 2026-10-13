@@ -43,7 +43,9 @@ import {
   getChannelAccount,
   getGroupsByTargetAgent,
   updateAgentLastImJid,
+  clearSessionModelSelectionsForModelConfig,
   countAgentProfilesByModelConfigId,
+  countSessionModelSelectionsForModelConfig,
 } from '../db.js';
 import {
   channelConversationJid,
@@ -77,6 +79,7 @@ import {
   UnifiedProviderCreateSchema,
   UnifiedProviderPatchSchema,
   UnifiedProviderSecretsSchema,
+  ProviderConnectivityTestSchema,
   BalancingConfigSchema,
 } from '../schemas.js';
 import {
@@ -85,12 +88,19 @@ import {
   appendClaudeConfigAudit,
   getProviders,
   getEnabledProviders,
+  getDefaultModelConfigId,
+  getUsableDefaultProvider,
+  setDefaultModelConfig,
+  DEFAULT_MODEL_DISABLE_ERROR,
   getBalancingConfig,
   saveBalancingConfig,
   createProvider,
   updateProvider,
   updateProviderSecrets,
   setProviderEnabled,
+  duplicateProvider,
+  providerHasCredentials,
+  validateProviderCustomEnv,
   deleteProvider,
   providerToConfig,
   toPublicProvider,
@@ -111,7 +121,7 @@ import {
   getContainerEnvConfig,
   saveSystemSettings,
   buildClaudeAiOauthPayload,
-  updateProviderOAuthCredentialsIfCurrent,
+  assertSingleClaudeAuthKind,
   getUserFeishuConfig,
   saveUserFeishuConfig,
   getUserTelegramConfig,
@@ -129,9 +139,71 @@ import {
   appendImConfigAudit,
 } from '../runtime-config.js';
 import type {
+  ClaudeOAuthAccountInfo,
   ClaudeOAuthCredentials,
   CachedOAuthUsage,
+  UnifiedProvider,
 } from '../runtime-config.js';
+import {
+  buildClaudeAuthorizeUrl,
+  buildClaudeCodeExchangeBody,
+  ClaudeCredentialInputError,
+  CLAUDE_CODE_USER_AGENT,
+  CLAUDE_OAUTH_PROFILE_URL,
+  CLAUDE_OAUTH_TOKEN_URL,
+  CLAUDE_OAUTH_USAGE_URL,
+  claudeOAuthErrorCode,
+  claudeOAuthScopesForProfile,
+  claudeOAuthStateMatches,
+  claudeOAuthTokenHeaders,
+  extractClaudeOAuthAccount,
+  mergeClaudeOAuthAccount,
+  parseClaudeCallbackInput,
+  parseClaudeCredentialInput,
+  parseClaudeExpiresIn,
+  parseClaudeOAuthProfile,
+  parseClaudeTokenScopes,
+  type ClaudeOAuthLoginProfile,
+} from '../claude-oauth.js';
+import {
+  isClaudeOAuthRefreshDue,
+  onClaudeOAuthCredentialsRefreshed,
+  refreshClaudeProviderOAuth,
+  type ClaudeOAuthRefreshOutcome,
+} from '../claude-oauth-refresh.js';
+import {
+  generateCodexPkcePair,
+  buildCodexAuthorizeUrl,
+  exchangeCodexCode,
+  buildCodexCredentials,
+  CodexOAuthTokenError,
+  revokeCodexTokenInBackground,
+} from '../codex-gateway/oauth.js';
+import { forgetCodexTransportState } from '../codex-gateway/transport-state.js';
+import {
+  codexProviderCreationDefaults,
+  extractCodexCallbackParams,
+  planCodexReauthorization,
+} from '../codex-gateway/provider-authorization.js';
+import {
+  CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+  CODEX_OAUTH_FLOW_TTL_MS,
+} from '../codex-gateway/types.js';
+import {
+  clearCodexProviderRateLimits,
+  getCodexProviderRateLimits,
+} from '../codex-gateway/rate-limit-snapshot.js';
+import {
+  CODEX_DEFAULT_MODEL,
+  filterCodexCatalogByPlan,
+  resolveCodexDefaultEffort,
+} from '../codex-gateway/model-catalog.js';
+import {
+  ensureCodexProviderCatalog,
+  getResolvedCodexCatalog,
+  maybeRefreshCodexCatalog,
+  type ProviderCodexCatalog,
+} from '../codex-gateway/model-catalog-sync.js';
 import {
   hasOAuthUsageSignals,
   parseOAuthUsageResponse,
@@ -140,6 +212,7 @@ import type { AudienceMode, AuthUser, RegisteredGroup } from '../types.js';
 import { logger } from '../logger.js';
 import brandAssetRoutes from './brand-assets.js';
 import { testFeishuCredentials } from '../feishu-connectivity.js';
+import { testProviderConnectivity } from '../provider-connectivity.js';
 import {
   buildSessionMountUpdate,
   buildDetachedWorkspaceUpdate,
@@ -536,6 +609,19 @@ function syncProviderSessionCaches(affectedFolders: string[]): void {
   }
 }
 
+/**
+ * Whether runners may be using this provider. The automatic pool only picks
+ * enabled ones, but an Agent binding or a conversation's model pick can run
+ * any saved configuration — those need the same runtime cleanup on a change.
+ */
+function providerMayHaveRunners(provider: UnifiedProvider): boolean {
+  return (
+    provider.enabled ||
+    countAgentProfilesByModelConfigId(provider.id) > 0 ||
+    countSessionModelSelectionsForModelConfig(provider.id) > 0
+  );
+}
+
 function commitProviderConfigWithSessionInvalidation<T>(
   providerId: string,
   invalidation: ApplyOptions['sessionInvalidation'],
@@ -748,17 +834,16 @@ async function applyClaudeConfigToAllGroups(
 
 // --- OAuth 常量 ---
 
-const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-const OAUTH_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/callback';
-const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference';
-const OAUTH_AUTHORIZE_URL = 'https://claude.ai/oauth/authorize';
-const OAUTH_TOKEN_URL = 'https://api.anthropic.com/v1/oauth/token';
 const OAUTH_FLOW_TTL = 10 * 60 * 1000; // 10 minutes
+const OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS = 30_000;
+const OAUTH_PROFILE_TIMEOUT_MS = 5_000;
 
 interface OAuthFlow {
   codeVerifier: string;
   expiresAt: number;
   targetProviderId?: string; // 空 = 创建新供应商
+  userId: string; // 发起者绑定：防止同权限的其他管理员消费他人挂起的流程
+  profile: ClaudeOAuthLoginProfile;
 }
 const oauthFlows = new Map<string, OAuthFlow>();
 
@@ -770,12 +855,25 @@ setInterval(() => {
   }
 }, 60_000);
 
+interface CodexOAuthFlow {
+  codeVerifier: string;
+  expiresAt: number;
+  targetProviderId?: string; // 空 = 创建新供应商
+  userId: string; // 发起者绑定：防止同权限的其他管理员消费他人挂起的流程
+}
+const codexOauthFlows = new Map<string, CodexOAuthFlow>();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, flow] of codexOauthFlows) {
+    if (flow.expiresAt < now) codexOauthFlows.delete(key);
+  }
+}, 60_000);
+
 // --- OAuth Usage Cache ---
 
-const OAUTH_USAGE_API = 'https://api.anthropic.com/api/oauth/usage';
 const USAGE_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
 const OAUTH_USAGE_TIMEOUT_MS = 5_000;
-const OAUTH_TOKEN_REFRESH_TIMEOUT_MS = 30_000;
 const usageCache = new Map<string, CachedOAuthUsage>();
 const inFlightUsageRequests = new Map<string, Promise<CachedOAuthUsage>>();
 const usageCacheEpochs = new Map<string, number>();
@@ -858,108 +956,63 @@ function usageFailureFallback(
   };
 }
 
-class ProviderOAuthCredentialsChangedError extends Error {
-  constructor() {
-    super('Provider OAuth credentials changed during refresh');
-    this.name = 'ProviderOAuthCredentialsChangedError';
+// Host-side rotations (usage polls, runner launches) make the cached usage
+// body stale and leave this Provider's warm runners holding the previous token
+// in memory. Drain only those runners after their current query; a
+// settings-page GET must never interrupt active work.
+onClaudeOAuthCredentialsRefreshed((providerId) => {
+  invalidateProviderUsageCache(providerId);
+  try {
+    deps?.queue?.drainProviderRunnersForCredentialRefresh?.(providerId);
+  } catch (err) {
+    logger.warn(
+      { err, providerId },
+      'Failed to drain runners after OAuth credential refresh',
+    );
   }
+});
+
+/** The usage endpoint needs user:profile; a grant without it gets 403. */
+function isInferenceOnlyGrant(scopes: string[]): boolean {
+  return scopes.length > 0 && !scopes.includes('user:profile');
 }
 
-async function refreshProviderOAuthCredentials(
+function unsupportedUsage(
   providerId: string,
-  expected: ClaudeOAuthCredentials,
-): Promise<void> {
-  const endpoint = await fetchOAuthEndpoint(
-    OAUTH_TOKEN_URL,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        grant_type: 'refresh_token',
-        refresh_token: expected.refreshToken,
-        client_id: OAUTH_CLIENT_ID,
-        scope: expected.scopes.join(' '),
-      }),
-    },
-    OAUTH_TOKEN_REFRESH_TIMEOUT_MS,
-  );
-  let raw: Record<string, unknown>;
-  try {
-    if (!endpoint.response.ok) {
-      throw new Error(
-        `OAuth token refresh returned ${endpoint.response.status}`,
-      );
-    }
-    raw = (await endpoint.response.json()) as Record<string, unknown>;
-  } finally {
-    endpoint.release();
-  }
-  const accessToken =
-    typeof raw.access_token === 'string' ? raw.access_token.trim() : '';
-  if (!accessToken) {
-    throw new Error('OAuth token refresh returned no access_token');
-  }
-  const refreshToken =
-    typeof raw.refresh_token === 'string' && raw.refresh_token.trim()
-      ? raw.refresh_token.trim()
-      : expected.refreshToken;
-  const expiresIn =
-    typeof raw.expires_in === 'number' &&
-    Number.isFinite(raw.expires_in) &&
-    raw.expires_in > 0
-      ? raw.expires_in
-      : 8 * 60 * 60;
-  const responseScopes =
-    typeof raw.scope === 'string'
-      ? raw.scope.split(/\s+/).filter(Boolean)
-      : expected.scopes;
-  const refreshed: ClaudeOAuthCredentials = {
-    ...expected,
-    accessToken,
-    refreshToken,
-    expiresAt: Date.now() + expiresIn * 1000,
-    scopes: responseScopes,
+  reason: NonNullable<CachedOAuthUsage['unsupportedReason']>,
+  fetchedAt?: number,
+): CachedOAuthUsage {
+  const observation = getProviderQuotaObservation(providerId);
+  return {
+    data: parseOAuthUsageResponse({}),
+    fetchedAt: fetchedAt ?? observation?.observedAt ?? Date.now(),
+    status: 'unsupported',
+    unsupportedReason: reason,
+    observation,
   };
+}
 
-  let persisted = false;
-  try {
-    persisted = updateProviderOAuthCredentialsIfCurrent(
-      providerId,
-      expected,
-      refreshed,
-    );
-  } catch {
-    throw new ProviderOAuthCredentialsChangedError();
-  }
-  if (!persisted) {
-    throw new ProviderOAuthCredentialsChangedError();
-  }
-  invalidateProviderUsageCache(providerId);
-  const updated = getProviders().find((provider) => provider.id === providerId);
-  if (updated) {
-    try {
-      updateProviderSessionCredentials(providerId, providerToConfig(updated));
-    } catch (err) {
-      logger.warn(
-        { err, providerId },
-        'Failed to project refreshed OAuth credentials into sessions',
-      );
-    }
-    // A rotated refresh token may invalidate a credential cached inside a
-    // running SDK process. Drain only this Provider's runners after their
-    // current query; a settings-page GET must never interrupt active work.
-    try {
-      deps?.queue?.drainProviderRunnersForCredentialRefresh?.(providerId);
-    } catch (err) {
-      logger.warn(
-        { err, providerId },
-        'Failed to drain runners after OAuth credential refresh',
-      );
-    }
-  }
+function needsReloginUsage(
+  providerId: string,
+  cached: CachedOAuthUsage | undefined,
+  message: string,
+): CachedOAuthUsage {
+  const observation = getProviderQuotaObservation(providerId);
+  return {
+    data: cached?.data ?? parseOAuthUsageResponse({}),
+    fetchedAt: cached?.fetchedAt ?? observation?.observedAt ?? Date.now(),
+    error: message,
+    status: 'needs_relogin',
+    observation,
+  };
+}
+
+function providerReloginMessage(providerId: string): string {
+  return (
+    getProviders().find((provider) => provider.id === providerId)
+      ?.claudeOAuthLastRefreshError?.message ??
+    'Claude OAuth credentials were rejected; log in again'
+  );
 }
 
 async function fetchOAuthUsage(
@@ -992,30 +1045,88 @@ async function fetchOAuthUsage(
     providerToConfig(provider),
   );
   if (!oauthCredentials) {
-    const observation = getProviderQuotaObservation(providerId);
-    return {
-      data: parseOAuthUsageResponse({}),
-      fetchedAt: observation?.observedAt ?? Date.now(),
-      observation,
-    };
+    return unsupportedUsage(
+      providerId,
+      provider.claudeCodeOauthToken ? 'setup_token' : 'no_oauth',
+    );
+  }
+  if (provider.claudeOAuthLastRefreshError) {
+    return needsReloginUsage(
+      providerId,
+      cached,
+      provider.claudeOAuthLastRefreshError.message,
+    );
+  }
+  if (isInferenceOnlyGrant(oauthCredentials.scopes)) {
+    return unsupportedUsage(providerId, 'inference_only');
   }
 
   const requestEpoch = getProviderUsageEpoch(providerId);
 
   let requestPromise!: Promise<CachedOAuthUsage>;
+  // Leave the in-flight slot before re-reading credentials, so the retry
+  // cannot join this very promise.
+  const detachAndRetry = (attempted: boolean): Promise<CachedOAuthUsage> => {
+    if (inFlightUsageRequests.get(providerId) === requestPromise) {
+      inFlightUsageRequests.delete(providerId);
+      advanceProviderUsageEpoch(providerId);
+    }
+    return fetchOAuthUsage(providerId, attempted, cached);
+  };
+  // Shared by the proactive and the 401 refresh: retry with whatever the
+  // Provider holds now, report a rejected grant, or fail this request.
+  const settleRefresh = async (
+    outcome: ClaudeOAuthRefreshOutcome,
+  ): Promise<CachedOAuthUsage> => {
+    switch (outcome.status) {
+      case 'refreshed':
+      case 'not_due':
+        return detachAndRetry(true);
+      case 'superseded':
+        // Credentials changed outside this request; keep the full snapshot
+        // because a token refresh stays within one account.
+        return detachAndRetry(false);
+      case 'needs_relogin':
+        return needsReloginUsage(providerId, cached, outcome.error.message);
+      case 'failed':
+        if (outcome.terminal) {
+          return needsReloginUsage(
+            providerId,
+            cached,
+            providerReloginMessage(providerId),
+          );
+        }
+        throw new Error(outcome.message);
+      case 'backoff':
+        throw new Error(outcome.message);
+      case 'no_credentials':
+        return detachAndRetry(false);
+    }
+  };
   requestPromise = (async () => {
     try {
-      if (!refreshAttempted && oauthCredentials.expiresAt <= Date.now()) {
-        await refreshProviderOAuthCredentials(providerId, oauthCredentials);
-        return fetchOAuthUsage(providerId, true, cached);
+      if (
+        !refreshAttempted &&
+        isClaudeOAuthRefreshDue(providerId, oauthCredentials)
+      ) {
+        const outcome = await refreshClaudeProviderOAuth(providerId);
+        // A token inside the renewal window but not yet expired stays usable
+        // when the refresh fails transiently.
+        const unexpired = oauthCredentials.expiresAt > Date.now();
+        const transient =
+          outcome.status === 'backoff' ||
+          (outcome.status === 'failed' && !outcome.terminal);
+        // Awaited so a failure reaches the snapshot fallback below.
+        if (!(transient && unexpired)) return await settleRefresh(outcome);
       }
 
       const endpoint = await fetchOAuthEndpoint(
-        OAUTH_USAGE_API,
+        CLAUDE_OAUTH_USAGE_URL,
         {
           headers: {
             Authorization: `Bearer ${oauthCredentials.accessToken}`,
             'anthropic-beta': 'oauth-2025-04-20',
+            'Content-Type': 'application/json',
           },
         },
         OAUTH_USAGE_TIMEOUT_MS,
@@ -1031,8 +1142,26 @@ async function fetchOAuthUsage(
 
         if (endpoint.response.status === 401 && !refreshAttempted) {
           endpoint.release();
-          await refreshProviderOAuthCredentials(providerId, oauthCredentials);
-          return fetchOAuthUsage(providerId, true, cached);
+          return await settleRefresh(
+            await refreshClaudeProviderOAuth(providerId, { force: true }),
+          );
+        }
+        if (endpoint.response.status === 403) {
+          const body = await endpoint.response.text().catch(() => '');
+          // An inference-only grant (setup-token scope) is answered with a
+          // scope/permission 403: report it as unsupported, not as a failure.
+          if (/scope|permission/i.test(body)) {
+            const result = unsupportedUsage(
+              providerId,
+              'inference_only',
+              Date.now(),
+            );
+            if (getProviderUsageEpoch(providerId) === requestEpoch) {
+              usageCache.set(providerId, result);
+            }
+            return result;
+          }
+          throw new Error('Usage API returned 403');
         }
         if (!endpoint.response.ok) {
           throw new Error(`Usage API returned ${endpoint.response.status}`);
@@ -1062,17 +1191,6 @@ async function fetchOAuthUsage(
       if (getProviderUsageEpoch(providerId) !== requestEpoch) {
         return fetchOAuthUsage(providerId);
       }
-      if (err instanceof ProviderOAuthCredentialsChangedError) {
-        // A refresh performed outside this route can change the Provider
-        // without advancing our request epoch. Detach this exact promise
-        // before retrying so fetchOAuthUsage cannot join itself. Preserve the
-        // full snapshot because a token refresh stays within one account.
-        if (inFlightUsageRequests.get(providerId) === requestPromise) {
-          inFlightUsageRequests.delete(providerId);
-          advanceProviderUsageEpoch(providerId);
-        }
-        return fetchOAuthUsage(providerId, false, cached);
-      }
       const message = err instanceof Error ? err.message : 'Usage API failed';
       const fallback = usageFailureFallback(providerId, cached, message);
       if (fallback) {
@@ -1089,6 +1207,184 @@ async function fetchOAuthUsage(
 
   inFlightUsageRequests.set(providerId, requestPromise);
   return requestPromise;
+}
+
+// --- Claude credential writes ---
+
+type ProviderSecretsUpdate = Parameters<typeof updateProviderSecrets>[1];
+
+/**
+ * Map a raw `claudeCredentialInput` paste (`.credentials.json` or a
+ * setup-token) onto the structured credential fields. Combining it with
+ * another credential field would make the selected auth kind ambiguous.
+ */
+function claudeCredentialInputFields(
+  input: string | undefined,
+  type: UnifiedProvider['type'],
+  others: {
+    claudeOAuthCredentials?: unknown;
+    claudeCodeOauthToken?: string;
+    anthropicApiKey?: string;
+    anthropicAuthToken?: string;
+  },
+): Pick<
+  ProviderSecretsUpdate,
+  'claudeOAuthCredentials' | 'claudeCodeOauthToken'
+> {
+  if (input === undefined) return {};
+  if (type !== 'official') {
+    throw new ClaudeCredentialInputError(
+      'claudeCredentialInput 仅适用于官方供应商',
+    );
+  }
+  if (
+    others.claudeOAuthCredentials ||
+    others.claudeCodeOauthToken?.trim() ||
+    others.anthropicApiKey?.trim() ||
+    others.anthropicAuthToken?.trim()
+  ) {
+    throw new ClaudeCredentialInputError(
+      'claudeCredentialInput 不能与其他凭据字段同时提交',
+    );
+  }
+  const parsed = parseClaudeCredentialInput(input);
+  return parsed.kind === 'oauth'
+    ? { claudeOAuthCredentials: parsed.credentials }
+    : { claudeCodeOauthToken: parsed.token };
+}
+
+/**
+ * Persist one provider's credential change. Callers hold the config mutation
+ * lock.
+ *
+ * A change that may switch Claude accounts drops the sessions bound to the
+ * provider, because thinking-block signatures do not survive an account
+ * switch; for an enabled provider that runs inside the workspace quiesce,
+ * which is what keeps a finishing runner from re-binding a dropped session. A
+ * re-login of the same account keeps its sessions and quiesces nothing. In
+ * every case only this provider's runners are retired, after their current
+ * query.
+ */
+async function commitProviderCredentialUpdate(
+  actor: string,
+  previous: UnifiedProvider,
+  secrets: ProviderSecretsUpdate,
+  audit: { action: string; changedFields: string[]; trigger: string },
+): Promise<ClaudeMutationResult<UnifiedProvider>> {
+  const id = previous.id;
+  const previousAccount = previous.claudeOAuthAccount?.accountUuid;
+  const sameAccount =
+    !!previousAccount &&
+    previousAccount === secrets.claudeOAuthAccount?.accountUuid;
+  const commit = () => {
+    const updated = updateProviderSecrets(id, secrets);
+    invalidateProviderUsageCache(id);
+    appendClaudeConfigAuditBestEffort(actor, audit.action, audit.changedFields);
+    return runAfterProviderPersistence(updated, () => {
+      if (updated.claudeOAuthCredentials) {
+        updateProviderSessionCredentials(id, providerToConfig(updated));
+      }
+      try {
+        deps?.queue?.drainProviderRunnersForCredentialRefresh?.(id);
+      } catch (err) {
+        logger.warn(
+          { err, providerId: id },
+          'Failed to drain runners after provider credential update',
+        );
+      }
+    });
+  };
+  if (providerMayHaveRunners(previous) && !sameAccount) {
+    return mutateClaudeConfigForAllGroups(
+      actor,
+      { trigger: audit.trigger, providerId: id },
+      commit,
+      {
+        clearSessionsForProviderId: id,
+        sessionInvalidation: { modelChanged: true, baseUrlChanged: true },
+      },
+    );
+  }
+  return {
+    value: commit(),
+    applied: {
+      success: true,
+      stoppedCount: 0,
+      failedCount: 0,
+      persisted: true,
+    },
+  };
+}
+
+type ClaudeCodeExchange =
+  | { ok: true; data: Record<string, unknown> }
+  /** status is null for a network failure, timeout or unreadable body. */
+  | { ok: false; status: number | null; body: string };
+
+async function exchangeClaudeAuthorizationCode(
+  options: Parameters<typeof buildClaudeCodeExchangeBody>[0],
+): Promise<ClaudeCodeExchange> {
+  try {
+    const endpoint = await fetchOAuthEndpoint(
+      CLAUDE_OAUTH_TOKEN_URL,
+      {
+        method: 'POST',
+        headers: claudeOAuthTokenHeaders(),
+        body: JSON.stringify(buildClaudeCodeExchangeBody(options)),
+      },
+      OAUTH_TOKEN_EXCHANGE_TIMEOUT_MS,
+    );
+    try {
+      const body = await endpoint.response.text();
+      if (!endpoint.response.ok) {
+        return { ok: false, status: endpoint.response.status, body };
+      }
+      const data: unknown = JSON.parse(body);
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return { ok: false, status: null, body: 'non-object token response' };
+      }
+      return { ok: true, data: data as Record<string, unknown> };
+    } finally {
+      endpoint.release();
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      status: null,
+      body: err instanceof Error ? err.message : 'network error',
+    };
+  }
+}
+
+/** Best effort: login still succeeds when the profile cannot be read. */
+async function fetchClaudeOAuthProfile(
+  accessToken: string,
+): Promise<ClaudeOAuthAccountInfo | null> {
+  try {
+    const endpoint = await fetchOAuthEndpoint(
+      CLAUDE_OAUTH_PROFILE_URL,
+      {
+        headers: {
+          'User-Agent': CLAUDE_CODE_USER_AGENT,
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-cache',
+        },
+      },
+      OAUTH_PROFILE_TIMEOUT_MS,
+    );
+    try {
+      if (!endpoint.response.ok) return null;
+      const raw: unknown = await endpoint.response.json();
+      return raw && typeof raw === 'object' && !Array.isArray(raw)
+        ? parseClaudeOAuthProfile(raw as Record<string, unknown>)
+        : null;
+    } finally {
+      endpoint.release();
+    }
+  } catch {
+    return null;
+  }
 }
 
 // --- Routes ---
@@ -1125,10 +1421,94 @@ configRoutes.get(
         })),
         balancing,
         enabledCount: enabledProviders.length,
+        // The default that actually applies: one that lost its credential
+        // pins nothing, so the page must not present it as the default.
+        defaultModelConfigId: getUsableDefaultProvider()?.id ?? null,
       });
     } catch (err) {
       logger.error({ err }, 'Failed to list providers');
       return c.json({ error: 'Failed to list providers' }, 500);
+    }
+  },
+);
+
+// ─── PUT /claude/default — 设置或取消默认模型配置 ─────
+// providerId=null 取消默认，回到已启用配置的自动轮换。
+configRoutes.put(
+  '/claude/default',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const raw = (body as { modelConfigId?: unknown }).modelConfigId;
+    if (raw !== null && (typeof raw !== 'string' || !raw.trim())) {
+      return c.json(
+        { error: 'modelConfigId must be a non-empty string or null' },
+        400,
+      );
+    }
+    const modelConfigId = raw === null ? null : (raw as string).trim();
+    const actor = (c.get('user') as AuthUser).username;
+
+    try {
+      return await withClaudeConfigMutationLock(async () => {
+        const previousId = getDefaultModelConfigId();
+        const target = modelConfigId
+          ? getProviders().find((provider) => provider.id === modelConfigId)
+          : null;
+        // Refuse before any runner is stopped.
+        if (modelConfigId) {
+          if (!target) throw new Error('未找到指定模型配置');
+          if (!providerHasCredentials(target)) {
+            throw new Error(
+              '该模型配置还没有可用的凭据，请先填写密钥或完成授权',
+            );
+          }
+        }
+        if (previousId === modelConfigId && (!target || target.enabled)) {
+          return c.json({
+            defaultModelConfigId: previousId,
+            provider: target ? toPublicProvider(target) : null,
+            applied: {
+              success: true,
+              stoppedCount: 0,
+              failedCount: 0,
+              persisted: true,
+            },
+          });
+        }
+        const mutation = await mutateClaudeConfigForAllGroups(
+          actor,
+          {
+            trigger: 'default_model_update',
+            previousModelConfigId: previousId,
+            modelConfigId,
+          },
+          () => {
+            const provider = setDefaultModelConfig(modelConfigId);
+            appendClaudeConfigAuditBestEffort(
+              actor,
+              modelConfigId ? 'set_default_model' : 'clear_default_model',
+              modelConfigId ? [`id:${modelConfigId}`] : [],
+            );
+            return provider;
+          },
+        );
+        const provider = mutation.value ?? null;
+        const payload = {
+          defaultModelConfigId: getUsableDefaultProvider()?.id ?? null,
+          provider: provider ? toPublicProvider(provider) : null,
+          applied: mutation.applied,
+        };
+        return mutation.applied.success
+          ? c.json(payload)
+          : c.json({ error: mutation.applied.error, ...payload }, 503);
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to set default model';
+      logger.warn({ err, modelConfigId }, 'Failed to set default model');
+      return c.json({ error: message }, 400);
     }
   },
 );
@@ -1148,10 +1528,41 @@ configRoutes.post(
       );
     }
 
+    const envError = validateProviderCustomEnv(validation.data.customEnv ?? {});
+    if (envError) return c.json({ error: envError }, 400);
+    if (validation.data.enabled) {
+      const draft = validation.data;
+      const hasCredential = !!(
+        draft.anthropicAuthToken?.trim() ||
+        draft.anthropicApiKey?.trim() ||
+        (draft.type === 'official' &&
+          (draft.claudeCodeOauthToken?.trim() ||
+            draft.claudeOAuthCredentials ||
+            draft.claudeCredentialInput?.trim()))
+      );
+      if (!hasCredential) {
+        return c.json({ error: '启用的模型配置必须带有可用的凭据' }, 400);
+      }
+    }
+
     const actor = (c.get('user') as AuthUser).username;
+    const { claudeCredentialInput, ...createInput } = validation.data;
+    let pasted: ReturnType<typeof claudeCredentialInputFields>;
+    try {
+      pasted = claudeCredentialInputFields(
+        claudeCredentialInput,
+        createInput.type,
+        createInput,
+      );
+    } catch (err) {
+      if (err instanceof ClaudeCredentialInputError) {
+        return c.json({ error: err.message }, 400);
+      }
+      throw err;
+    }
 
     try {
-      const provider = createProvider(validation.data);
+      const provider = createProvider({ ...createInput, ...pasted });
       appendClaudeConfigAudit(actor, 'create_provider', [
         `id:${provider.id}`,
         `type:${provider.type}`,
@@ -1182,13 +1593,38 @@ configRoutes.patch(
         400,
       );
     }
+    if (validation.data.customEnv) {
+      const envError = validateProviderCustomEnv(validation.data.customEnv);
+      if (envError) return c.json({ error: envError }, 400);
+    }
 
     const actor = (c.get('user') as AuthUser).username;
+    const { anthropicAuthToken, clearAnthropicAuthToken, ...providerPatch } =
+      validation.data;
+    const tokenChange =
+      anthropicAuthToken !== undefined
+        ? { anthropicAuthToken }
+        : clearAnthropicAuthToken
+          ? { clearAnthropicAuthToken: true }
+          : null;
 
     try {
       return await withClaudeConfigMutationLock(async () => {
         const previous = getProviders().find((p) => p.id === id);
         if (!previous) throw new Error('未找到指定供应商');
+        if (tokenChange && previous.type !== 'third_party') {
+          throw new Error('只有第三方模型配置可以在这里修改 API 密钥');
+        }
+        if (tokenChange && previous.codexOAuthCredentials) {
+          throw new Error('ChatGPT 订阅配置的网关凭据由系统管理');
+        }
+        if (
+          clearAnthropicAuthToken &&
+          previous.enabled &&
+          !previous.anthropicApiKey
+        ) {
+          throw new Error('该配置正在启用，请先停用再清空密钥');
+        }
         const changedFields = Object.keys(validation.data).map(
           (k) => `${k}:updated`,
         );
@@ -1205,14 +1641,33 @@ configRoutes.patch(
           JSON.stringify(validation.data.customEnv) !==
             JSON.stringify(previous.customEnv)
         );
+        // A different key can mean a different upstream account, whose
+        // thinking signatures the old session would replay; the auth header
+        // style changes the protocol the endpoint sees.
+        const tokenChanged = !!(
+          tokenChange &&
+          (anthropicAuthToken !== undefined
+            ? anthropicAuthToken.trim() !== previous.anthropicAuthToken
+            : !!previous.anthropicAuthToken)
+        );
+        const authModeChanged = !!(
+          providerPatch.anthropicAuthMode !== undefined &&
+          providerPatch.anthropicAuthMode !== previous.anthropicAuthMode
+        );
         const protocolFieldChanged =
-          baseUrlChanged || modelChanged || customEnvChanged;
+          baseUrlChanged ||
+          modelChanged ||
+          customEnvChanged ||
+          tokenChanged ||
+          authModeChanged;
         const pendingInvalidation = getPendingProviderSessionInvalidation(id);
         const sessionInvalidation = {
           modelChanged:
             modelChanged || pendingInvalidation?.modelChanged === true,
           baseUrlChanged:
-            baseUrlChanged || pendingInvalidation?.baseUrlChanged === true,
+            baseUrlChanged ||
+            tokenChanged ||
+            pendingInvalidation?.baseUrlChanged === true,
         };
         const shouldClearSessions =
           !!pendingInvalidation || protocolFieldChanged;
@@ -1223,9 +1678,15 @@ configRoutes.patch(
           baseUrlChanged,
           modelChanged,
           customEnvChanged,
+          tokenChanged,
+          authModeChanged,
         };
         const commit = () => {
-          const updated = updateProvider(id, validation.data);
+          let updated = updateProvider(id, providerPatch);
+          if (tokenChange) {
+            updated = updateProviderSecrets(id, tokenChange);
+            invalidateProviderUsageCache(id);
+          }
           appendClaudeConfigAuditBestEffort(actor, 'update_provider', [
             `id:${id}`,
             ...changedFields,
@@ -1235,7 +1696,7 @@ configRoutes.patch(
         };
 
         let mutation: ClaudeMutationResult<ReturnType<typeof updateProvider>>;
-        if (previous.enabled) {
+        if (providerMayHaveRunners(previous)) {
           mutation = await mutateClaudeConfigForAllGroups(
             actor,
             metadata,
@@ -1328,64 +1789,55 @@ configRoutes.put(
       return await withClaudeConfigMutationLock(async () => {
         const previous = getProviders().find((provider) => provider.id === id);
         if (!previous) throw new Error('未找到指定供应商');
+        const { claudeCredentialInput, ...structured } = validation.data;
+        let secrets: ProviderSecretsUpdate;
+        try {
+          secrets = {
+            ...structured,
+            ...claudeCredentialInputFields(
+              claudeCredentialInput,
+              previous.type,
+              structured,
+            ),
+          };
+        } catch (err) {
+          if (err instanceof ClaudeCredentialInputError) {
+            return c.json({ error: err.message }, 400);
+          }
+          throw err;
+        }
+        // Reject an ambiguous write before any runtime is quiesced.
+        assertSingleClaudeAuthKind(previous.type, secrets);
         const changedFields: string[] = [];
-        if (validation.data.anthropicAuthToken !== undefined)
+        if (secrets.anthropicAuthToken !== undefined)
           changedFields.push('anthropicAuthToken:set');
-        if (validation.data.clearAnthropicAuthToken)
+        if (secrets.clearAnthropicAuthToken)
           changedFields.push('anthropicAuthToken:clear');
-        if (validation.data.anthropicApiKey !== undefined)
+        if (secrets.anthropicApiKey !== undefined)
           changedFields.push('anthropicApiKey:set');
-        if (validation.data.clearAnthropicApiKey)
+        if (secrets.clearAnthropicApiKey)
           changedFields.push('anthropicApiKey:clear');
-        if (validation.data.claudeCodeOauthToken !== undefined)
+        if (secrets.claudeCodeOauthToken !== undefined)
           changedFields.push('claudeCodeOauthToken:set');
-        if (validation.data.clearClaudeCodeOauthToken)
+        if (secrets.clearClaudeCodeOauthToken)
           changedFields.push('claudeCodeOauthToken:clear');
-        if (validation.data.claudeOAuthCredentials)
+        if (secrets.claudeOAuthCredentials)
           changedFields.push('claudeOAuthCredentials:set');
-        if (validation.data.clearClaudeOAuthCredentials)
+        if (secrets.clearClaudeOAuthCredentials)
           changedFields.push('claudeOAuthCredentials:clear');
+        if (claudeCredentialInput !== undefined)
+          changedFields.push('claudeCredentialInput:parsed');
 
-        const commit = () => {
-          const updated = updateProviderSecrets(id, validation.data);
-          invalidateProviderUsageCache(id);
-          appendClaudeConfigAuditBestEffort(actor, 'update_provider_secrets', [
-            `id:${id}`,
-            ...changedFields,
-          ]);
-          return runAfterProviderPersistence(updated, () => {
-            if (validation.data.claudeOAuthCredentials && updated.enabled) {
-              updateProviderSessionCredentials(id, providerToConfig(updated));
-              deps?.queue?.closeAllActiveForCredentialRefresh();
-            }
-          });
-        };
-
-        const mutation = previous.enabled
-          ? await mutateClaudeConfigForAllGroups(
-              actor,
-              {
-                trigger: 'provider_secrets_update',
-                providerId: id,
-              },
-              commit,
-              {
-                clearSessionsForProviderId: id,
-                sessionInvalidation: {
-                  modelChanged: true,
-                  baseUrlChanged: true,
-                },
-              },
-            )
-          : {
-              value: commit(),
-              applied: {
-                success: true,
-                stoppedCount: 0,
-                failedCount: 0,
-                persisted: true,
-              } satisfies ClaudeApplyResultPayload,
-            };
+        const mutation = await commitProviderCredentialUpdate(
+          actor,
+          previous,
+          secrets,
+          {
+            action: 'update_provider_secrets',
+            changedFields: [`id:${id}`, ...changedFields],
+            trigger: 'provider_secrets_update',
+          },
+        );
 
         if (!mutation.applied.success) {
           return c.json(
@@ -1439,15 +1891,20 @@ configRoutes.delete(
           modelChanged: true,
           baseUrlChanged: true,
         };
+        // Deleting the default returns unselected conversations to the
+        // automatic pool; the operator is told, and the audit says so.
+        const wasDefault = !!previous && getDefaultModelConfigId() === id;
         const mutation = await mutateClaudeConfigForAllGroups(
           actor,
-          { trigger: 'provider_delete', providerId: id },
+          { trigger: 'provider_delete', providerId: id, wasDefault },
           () => {
             if (previous) {
               deleteProvider(id);
+              clearSessionModelSelectionsForModelConfig(id);
               invalidateProviderUsageCache(id);
               appendClaudeConfigAuditBestEffort(actor, 'delete_provider', [
                 `id:${id}`,
+                ...(wasDefault ? ['default_cleared'] : []),
               ]);
             }
             return { id };
@@ -1457,6 +1914,19 @@ configRoutes.delete(
             sessionInvalidation,
           },
         );
+        if (
+          previous?.codexOAuthCredentials &&
+          !getProviders().some((provider) => provider.id === id)
+        ) {
+          // Like the official logout, end the ChatGPT grant HappyClaw no
+          // longer holds; deletion never waits for or fails on this.
+          forgetCodexTransportState(id);
+          clearCodexProviderRateLimits(id);
+          revokeCodexTokenInBackground(previous.codexOAuthCredentials, {
+            providerId: id,
+            reason: 'provider_deleted',
+          });
+        }
         if (!mutation.applied.success) {
           return c.json(
             {
@@ -1466,7 +1936,11 @@ configRoutes.delete(
             503,
           );
         }
-        return c.json({ ok: true, applied: mutation.applied });
+        return c.json({
+          ok: true,
+          applied: mutation.applied,
+          defaultCleared: wasDefault,
+        });
       });
     } catch (err) {
       const message =
@@ -1492,6 +1966,16 @@ configRoutes.post(
 
     try {
       return await withClaudeConfigMutationLock(async () => {
+        // Refuse before any runner is stopped: enabling a credential-less
+        // provider would only route turns into authentication failures.
+        const target = getProviders().find((provider) => provider.id === id);
+        if (!target) throw new Error('未找到指定供应商');
+        if (body.enabled && !providerHasCredentials(target)) {
+          throw new Error('该模型配置还没有可用的凭据，请先填写密钥或完成授权');
+        }
+        if (!body.enabled && getDefaultModelConfigId() === id) {
+          throw new Error(DEFAULT_MODEL_DISABLE_ERROR);
+        }
         const mutation = await mutateClaudeConfigForAllGroups(
           actor,
           { trigger: 'provider_toggle', providerId: id },
@@ -1530,6 +2014,106 @@ configRoutes.post(
   },
 );
 
+// ─── POST /claude/providers/:id/duplicate — 复制供应商（含密钥，默认停用）─────
+configRoutes.post(
+  '/claude/providers/:id/duplicate',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const { id } = c.req.param();
+    const actor = (c.get('user') as AuthUser).username;
+    try {
+      return await withClaudeConfigMutationLock(async () => {
+        const provider = duplicateProvider(id);
+        appendClaudeConfigAuditBestEffort(actor, 'duplicate_provider', [
+          `source:${id}`,
+          `id:${provider.id}`,
+        ]);
+        return c.json(toPublicProvider(provider), 201);
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to duplicate provider';
+      logger.warn({ err }, 'Failed to duplicate provider');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+// ─── POST /claude/providers/test — 测试第三方端点连通性 ─────
+const CONNECTIVITY_TEST_WINDOW_MS = 60_000;
+const CONNECTIVITY_TEST_LIMIT = 10;
+const connectivityTestHits = new Map<string, number[]>();
+
+configRoutes.post(
+  '/claude/providers/test',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const user = c.get('user') as AuthUser;
+    const now = Date.now();
+    const recent = (connectivityTestHits.get(user.id) ?? []).filter(
+      (at) => now - at < CONNECTIVITY_TEST_WINDOW_MS,
+    );
+    if (recent.length >= CONNECTIVITY_TEST_LIMIT) {
+      return c.json({ error: '测试过于频繁，请稍后再试' }, 429);
+    }
+    recent.push(now);
+    connectivityTestHits.set(user.id, recent);
+
+    const body = await c.req.json().catch(() => ({}));
+    const validation = ProviderConnectivityTestSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json({ error: 'Invalid request body' }, 400);
+    }
+    const draft = validation.data;
+    const stored = draft.providerId
+      ? getProviders().find((provider) => provider.id === draft.providerId)
+      : undefined;
+    if (draft.providerId && !stored) {
+      return c.json({ error: '未找到指定供应商' }, 404);
+    }
+    if (
+      stored &&
+      (stored.type !== 'third_party' || stored.codexOAuthCredentials)
+    ) {
+      return c.json({ error: '只有第三方兼容接口支持测试连接' }, 400);
+    }
+
+    const baseUrl =
+      draft.anthropicBaseUrl?.trim() || stored?.anthropicBaseUrl || '';
+    const token =
+      draft.anthropicAuthToken?.trim() || stored?.anthropicAuthToken || '';
+    if (!baseUrl) return c.json({ error: '请填写 API 端点' }, 400);
+    if (!token) return c.json({ error: '请填写 API 密钥' }, 400);
+    const customEnv = draft.customEnv ?? stored?.customEnv ?? {};
+    const model = draft.anthropicModel ?? stored?.anthropicModel ?? '';
+
+    const result = await testProviderConnectivity({
+      baseUrl,
+      token,
+      // A legacy provider has no mode; probe with the header its runtime
+      // infers (bare token → x-api-key, `Bearer …` → Authorization).
+      authMode:
+        draft.anthropicAuthMode ??
+        stored?.anthropicAuthMode ??
+        (stored && !/^Bearer\s/i.test(token) ? 'x-api-key' : 'bearer'),
+      model,
+      haikuModel: customEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL,
+      customHeaders: customEnv.ANTHROPIC_CUSTOM_HEADERS,
+    });
+    logger.info(
+      {
+        providerId: draft.providerId ?? null,
+        ok: result.ok,
+        statuses: result.probes.map((probe) => probe.status),
+      },
+      'Provider connectivity test finished',
+    );
+    return c.json(result);
+  },
+);
+
 // ─── POST /claude/providers/:id/reset-health — 重置健康状态 ─────
 configRoutes.post(
   '/claude/providers/:id/reset-health',
@@ -1557,12 +2141,23 @@ configRoutes.get(
 );
 
 // ─── GET /claude/providers/:id/usage — OAuth 用量数据 ─────
+// ChatGPT 订阅 provider 没有用量接口：返回网关从上游 x-codex-* 响应头记下的
+// 最近一次用量窗口快照（kind: 'codex_rate_limits'，见 rate-limit-snapshot.ts）。
 configRoutes.get(
   '/claude/providers/:id/usage',
   authMiddleware,
   systemConfigMiddleware,
   async (c) => {
     const { id } = c.req.param();
+    if (
+      getProviders().some(
+        (provider) =>
+          provider.id === id &&
+          provider.anthropicBaseUrl === CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+      )
+    ) {
+      return c.json(getCodexProviderRateLimits(id));
+    }
     try {
       const usage = await fetchOAuthUsage(id);
       return c.json(usage);
@@ -1635,11 +2230,35 @@ configRoutes.post(
   authMiddleware,
   systemConfigMiddleware,
   async (c) => {
-    const body = await c.req.json().catch(() => ({}));
+    const body = (await c.req.json().catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
     const targetProviderId =
-      typeof (body as Record<string, unknown>).targetProviderId === 'string'
-        ? ((body as Record<string, unknown>).targetProviderId as string)
+      typeof body.targetProviderId === 'string' && body.targetProviderId
+        ? body.targetProviderId
         : undefined;
+    if (targetProviderId) {
+      const target = getProviders().find(
+        (provider) => provider.id === targetProviderId,
+      );
+      if (!target) return c.json({ error: 'Provider not found' }, 404);
+      if (target.type !== 'official') {
+        return c.json(
+          { error: 'Claude OAuth login requires an official provider' },
+          400,
+        );
+      }
+    }
+    if (
+      body.profile !== undefined &&
+      body.profile !== 'full' &&
+      body.profile !== 'setup_token'
+    ) {
+      return c.json({ error: 'profile must be full or setup_token' }, 400);
+    }
+    const profile: ClaudeOAuthLoginProfile =
+      body.profile === 'setup_token' ? 'setup_token' : 'full';
 
     const state = randomBytes(32).toString('hex');
     const codeVerifier = randomBytes(32).toString('base64url');
@@ -1651,20 +2270,12 @@ configRoutes.post(
       codeVerifier,
       expiresAt: Date.now() + OAUTH_FLOW_TTL,
       targetProviderId,
-    });
-
-    const params = new URLSearchParams({
-      response_type: 'code',
-      client_id: OAUTH_CLIENT_ID,
-      redirect_uri: OAUTH_REDIRECT_URI,
-      scope: OAUTH_SCOPES,
-      state,
-      code_challenge: codeChallenge,
-      code_challenge_method: 'S256',
+      userId: (c.get('user') as AuthUser).id,
+      profile,
     });
 
     return c.json({
-      authorizeUrl: `${OAUTH_AUTHORIZE_URL}?${params.toString()}`,
+      authorizeUrl: buildClaudeAuthorizeUrl({ codeChallenge, state, profile }),
       state,
     });
   },
@@ -1676,129 +2287,484 @@ configRoutes.post(
   authMiddleware,
   systemConfigMiddleware,
   async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const { state, code } = body as { state?: string; code?: string };
-
-    if (!state || !code) {
+    const body = (await c.req.json().catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
+    // `code` may be the bare code, the `code#state` pair the callback page
+    // shows, or the callback page URL.
+    const parsed =
+      typeof body.code === 'string'
+        ? parseClaudeCallbackInput(body.code)
+        : null;
+    const bodyState =
+      typeof body.state === 'string' && body.state ? body.state : null;
+    const state = bodyState ?? parsed?.state ?? null;
+    if (typeof body.code !== 'string' || !body.code.trim() || !state) {
       return c.json({ error: 'Missing state or code' }, 400);
     }
-
-    const cleanedCode = code.trim().split('#')[0]?.split('&')[0] ?? code.trim();
+    if (!parsed) {
+      return c.json({ error: 'Invalid code/callback URL' }, 400);
+    }
 
     const flow = oauthFlows.get(state);
     if (!flow) {
       return c.json({ error: 'Invalid or expired OAuth state' }, 400);
     }
+    const user = c.get('user') as AuthUser;
+    if (flow.userId !== user.id) {
+      oauthFlows.delete(state);
+      return c.json({ error: 'OAuth flow was started by another user' }, 403);
+    }
     if (flow.expiresAt < Date.now()) {
       oauthFlows.delete(state);
       return c.json({ error: 'OAuth flow expired' }, 400);
     }
+    // A pasted state belongs to whichever login produced the code; it must be
+    // this flow's. The flow stays so the right code can still be pasted.
+    if (parsed.state && !claudeOAuthStateMatches(state, parsed.state)) {
+      return c.json({ error: 'State mismatch' }, 400);
+    }
+    if (
+      flow.targetProviderId &&
+      !getProviders().some(
+        (provider) =>
+          provider.id === flow.targetProviderId && provider.type === 'official',
+      )
+    ) {
+      oauthFlows.delete(state);
+      return c.json({ error: 'Provider not found' }, 404);
+    }
+
+    const exchange = await exchangeClaudeAuthorizationCode({
+      code: parsed.code,
+      codeVerifier: flow.codeVerifier,
+      state,
+      profile: flow.profile,
+    });
+    if (!exchange.ok) {
+      // A 4xx rejection is definitive for this code; a network failure, 429
+      // or 5xx keeps the flow so the operator can retry the same code.
+      const definitive =
+        exchange.status !== null &&
+        exchange.status >= 400 &&
+        exchange.status < 500 &&
+        exchange.status !== 429;
+      if (definitive) oauthFlows.delete(state);
+      logger.warn(
+        {
+          status: exchange.status,
+          oauthError:
+            exchange.status !== null
+              ? claudeOAuthErrorCode(exchange.body)
+              : null,
+        },
+        'OAuth token exchange failed',
+      );
+      return c.json(
+        {
+          error: `Token exchange failed: ${exchange.status ?? 'network error'}`,
+          retryable: !definitive,
+        },
+        definitive ? 400 : 502,
+      );
+    }
     oauthFlows.delete(state);
 
-    try {
-      const tokenResp = await fetch(OAUTH_TOKEN_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent':
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          Accept: 'application/json, text/plain, */*',
-          Referer: 'https://claude.ai/',
-          Origin: 'https://claude.ai',
-        },
-        body: JSON.stringify({
-          grant_type: 'authorization_code',
-          client_id: OAUTH_CLIENT_ID,
-          code: cleanedCode,
-          redirect_uri: OAUTH_REDIRECT_URI,
-          code_verifier: flow.codeVerifier,
-          state,
-          expires_in: 31536000, // 1 year
-        }),
-      });
+    const tokenData = exchange.data;
+    const accessToken =
+      typeof tokenData.access_token === 'string'
+        ? tokenData.access_token.trim()
+        : '';
+    if (!accessToken) {
+      return c.json({ error: 'No access_token in response' }, 400);
+    }
+    const refreshToken =
+      typeof tokenData.refresh_token === 'string'
+        ? tokenData.refresh_token.trim()
+        : '';
+    const scopes = parseClaudeTokenScopes(tokenData.scope) ?? [
+      ...claudeOAuthScopesForProfile(flow.profile),
+    ];
+    let account = extractClaudeOAuthAccount(tokenData);
+    if (scopes.includes('user:profile')) {
+      account = mergeClaudeOAuthAccount(
+        account,
+        await fetchClaudeOAuthProfile(accessToken),
+      );
+    }
 
-      if (!tokenResp.ok) {
-        const errText = await tokenResp.text().catch(() => '');
-        logger.warn(
-          { status: tokenResp.status, body: errText },
-          'OAuth token exchange failed',
-        );
-        return c.json(
-          { error: `Token exchange failed: ${tokenResp.status}` },
-          400,
-        );
-      }
-
-      const tokenData = (await tokenResp.json()) as {
-        access_token?: string;
-        refresh_token?: string;
-        expires_in?: number;
-        scope?: string;
-        [key: string]: unknown;
-      };
-
-      if (!tokenData.access_token) {
-        return c.json({ error: 'No access_token in response' }, 400);
-      }
-
-      const actor = (c.get('user') as AuthUser).username;
-
-      let oauthCredentials: ClaudeOAuthCredentials | null = null;
-      if (tokenData.refresh_token) {
-        const expiresAt = tokenData.expires_in
-          ? Date.now() + tokenData.expires_in * 1000
-          : Date.now() + 8 * 60 * 60 * 1000;
-        oauthCredentials = {
-          accessToken: tokenData.access_token,
-          refreshToken: tokenData.refresh_token,
-          expiresAt,
-          scopes: tokenData.scope ? tokenData.scope.split(' ') : [],
-        };
-      }
-
-      let provider;
-      if (flow.targetProviderId) {
-        // Update existing provider's OAuth credentials
-        provider = updateProviderSecrets(flow.targetProviderId, {
-          claudeOAuthCredentials: oauthCredentials ?? undefined,
-          claudeCodeOauthToken: oauthCredentials
-            ? undefined
-            : tokenData.access_token,
-          clearAnthropicApiKey: true,
-        });
-        invalidateProviderUsageCache(flow.targetProviderId);
-      } else {
-        // Create new official provider
-        provider = createProvider({
-          name: '官方 Claude (OAuth)',
-          type: 'official',
+    // A setup-token login (or a full login answered without a refresh token)
+    // yields a long-lived inference token rather than a rotating grant.
+    const oauthCredentials: ClaudeOAuthCredentials | null =
+      flow.profile === 'full' && refreshToken
+        ? {
+            accessToken,
+            refreshToken,
+            expiresAt:
+              Date.now() + parseClaudeExpiresIn(tokenData.expires_in) * 1000,
+            scopes,
+            ...(account?.subscriptionType
+              ? { subscriptionType: account.subscriptionType }
+              : {}),
+          }
+        : null;
+    const secrets: ProviderSecretsUpdate = oauthCredentials
+      ? {
           claudeOAuthCredentials: oauthCredentials,
-          claudeCodeOauthToken: oauthCredentials ? '' : tokenData.access_token,
+          claudeOAuthAccount: account,
+        }
+      : { claudeCodeOauthToken: accessToken, claudeOAuthAccount: account };
+    const credentialField = oauthCredentials
+      ? 'claudeOAuthCredentials:set'
+      : 'claudeCodeOauthToken:set';
+
+    try {
+      return await withClaudeConfigMutationLock(async () => {
+        if (flow.targetProviderId) {
+          const previous = getProviders().find(
+            (provider) => provider.id === flow.targetProviderId,
+          );
+          if (!previous) return c.json({ error: 'Provider not found' }, 404);
+          const mutation = await commitProviderCredentialUpdate(
+            user.username,
+            previous,
+            secrets,
+            {
+              action: 'oauth_login',
+              changedFields: [`providerId:${previous.id}`, credentialField],
+              trigger: 'provider_oauth_login',
+            },
+          );
+          if (!mutation.applied.success) {
+            return c.json(
+              {
+                error: mutation.applied.error,
+                applied: mutation.applied,
+                ...(mutation.value
+                  ? { provider: toPublicProvider(mutation.value) }
+                  : {}),
+              },
+              503,
+            );
+          }
+          return c.json(toPublicProvider(mutation.value!));
+        }
+
+        const provider = createProvider({
+          name: account?.emailAddress
+            ? `官方 Claude (${account.emailAddress})`
+            : '官方 Claude (OAuth)',
+          type: 'official',
+          ...secrets,
           enabled: true,
         });
-      }
-
-      // Write .credentials.json to all sessions
-      if (oauthCredentials) {
-        updateProviderSessionCredentials(
-          provider.id,
-          providerToConfig(provider),
-        );
-        deps?.queue?.closeAllActiveForCredentialRefresh();
-      }
-
-      appendClaudeConfigAudit(actor, 'oauth_login', [
-        `providerId:${provider.id}`,
-        oauthCredentials
-          ? 'claudeOAuthCredentials:set'
-          : 'claudeCodeOauthToken:set',
-      ]);
-
-      return c.json(toPublicProvider(provider));
+        appendClaudeConfigAuditBestEffort(user.username, 'oauth_login', [
+          `providerId:${provider.id}`,
+          credentialField,
+        ]);
+        return c.json(toPublicProvider(provider));
+      });
     } catch (err) {
-      logger.error({ err }, 'OAuth token exchange error');
+      logger.error({ err }, 'Failed to persist Claude OAuth login');
       const message =
-        err instanceof Error ? err.message : 'OAuth token exchange failed';
+        err instanceof Error ? err.message : 'Failed to persist OAuth login';
+      return c.json({ error: message }, 500);
+    }
+  },
+);
+
+// ─── GET /codex/model-catalog — Codex 模型目录（UI 下拉数据源）──────────
+// 目录真相源是上游 openai/codex 的 models.json，由 model-catalog-sync
+// 定期同步（baked-in 目录兜底）；前端不再硬编码。带 ?providerId= 时改用该
+// 账号的实时目录（/backend-api/codex/models，首次等待一次拉取），并按其
+// ChatGPT 套餐过滤 available_in_plans。
+configRoutes.get(
+  '/codex/model-catalog',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    // TTL 过期时触发后台刷新：响应不等待网络，目录在流量中自愈。
+    maybeRefreshCodexCatalog();
+    const providerId = c.req.query('providerId')?.trim();
+    let resolved: ProviderCodexCatalog = getResolvedCodexCatalog();
+    let planType: string | null = null;
+    if (providerId) {
+      const provider = getProviders().find(
+        (candidate) =>
+          candidate.id === providerId && !!candidate.codexOAuthCredentials,
+      );
+      if (!provider) return c.json({ error: 'Codex provider not found' }, 404);
+      planType = provider.codexOAuthCredentials?.planType ?? null;
+      resolved = await ensureCodexProviderCatalog(provider.id);
+    }
+    const models = filterCodexCatalogByPlan(resolved.models, planType);
+    const defaultModel = models.some(
+      (entry) => entry.value === CODEX_DEFAULT_MODEL,
+    )
+      ? CODEX_DEFAULT_MODEL
+      : (models[0]?.value ?? CODEX_DEFAULT_MODEL);
+    return c.json({
+      models,
+      defaultModel,
+      // The default model's own default level, as new providers are created.
+      defaultEffort: resolveCodexDefaultEffort(models, defaultModel),
+      source: resolved.source,
+      fetchedAt: resolved.fetchedAt,
+      ...(providerId ? { providerId, planType } : {}),
+    });
+  },
+);
+
+// ─── POST /codex/oauth/start — 启动 ChatGPT/Codex 订阅 OAuth PKCE 流程 ─────
+configRoutes.post(
+  '/codex/oauth/start',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const targetProviderId =
+      typeof (body as Record<string, unknown>).targetProviderId === 'string'
+        ? ((body as Record<string, unknown>).targetProviderId as string)
+        : undefined;
+
+    const state = randomBytes(32).toString('hex');
+    const { codeVerifier, codeChallenge } = generateCodexPkcePair();
+
+    codexOauthFlows.set(state, {
+      codeVerifier,
+      expiresAt: Date.now() + CODEX_OAUTH_FLOW_TTL_MS,
+      targetProviderId,
+      userId: (c.get('user') as AuthUser).id,
+    });
+
+    return c.json({
+      authorizeUrl: buildCodexAuthorizeUrl(state, codeChallenge),
+      state,
+      // 登录成功后浏览器会跳去 http://localhost:1455/auth/callback（本机通常没有
+      // 进程监听，页面会加载失败）——把失败页地址栏的完整 URL 粘贴回来即可。
+      redirectHint: 'http://localhost:1455/auth/callback',
+    });
+  },
+);
+
+// ─── POST /codex/oauth/callback — ChatGPT/Codex 订阅 OAuth 回调 ─────
+configRoutes.post(
+  '/codex/oauth/callback',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { state, code: rawCode } = body as { state?: string; code?: string };
+    if (!state || !rawCode) {
+      return c.json({ error: 'Missing state or code' }, 400);
+    }
+
+    const flow = codexOauthFlows.get(state);
+    if (!flow) {
+      return c.json({ error: 'Invalid or expired OAuth state' }, 400);
+    }
+    if (flow.userId !== (c.get('user') as AuthUser).id) {
+      codexOauthFlows.delete(state);
+      return c.json({ error: 'OAuth flow was started by another user' }, 403);
+    }
+    if (flow.expiresAt < Date.now()) {
+      codexOauthFlows.delete(state);
+      return c.json({ error: 'OAuth flow expired' }, 400);
+    }
+
+    // Input problems keep the flow: the user can paste the right URL again.
+    const parsed = extractCodexCallbackParams(rawCode);
+    if (!parsed) {
+      return c.json({ error: 'Invalid code/callback URL' }, 400);
+    }
+    // 粘贴的是完整回调 URL 时优先用其中的 state 做一次一致性校验；裸 code 没有可比对项。
+    if (parsed.state && parsed.state !== state) {
+      return c.json({ error: 'State mismatch' }, 400);
+    }
+    if (parsed.kind === 'error') {
+      return c.json(
+        {
+          error: `ChatGPT 授权未完成：${parsed.error}${
+            parsed.description ? `（${parsed.description}）` : ''
+          }。请重新打开授权链接完成登录。`,
+          retryable: true,
+        },
+        400,
+      );
+    }
+
+    // Claim the flow so one code is exchanged at a time. Like the official
+    // login server, a code is never sent twice once a request may have reached
+    // the token endpoint (a response timeout may hide a consumed code); only a
+    // connection that never opened restores the flow for the same code.
+    codexOauthFlows.delete(state);
+    let codexCredentials;
+    try {
+      codexCredentials = buildCodexCredentials(
+        await exchangeCodexCode(parsed.code, flow.codeVerifier),
+      );
+    } catch (err) {
+      const tokenError = err instanceof CodexOAuthTokenError ? err : null;
+      const reusable = !!tokenError && !tokenError.requestDelivered;
+      const transient = !tokenError || tokenError.transient;
+      if (reusable && flow.expiresAt > Date.now()) {
+        codexOauthFlows.set(state, flow);
+      }
+      logger.warn(
+        { err, transient, reusable },
+        'Codex OAuth token exchange error',
+      );
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Codex OAuth token exchange failed';
+      return c.json(
+        {
+          error: reusable
+            ? `${message}；可以直接重试，无需重新授权`
+            : transient
+              ? `${message}；授权码可能已被使用，请重新登录 ChatGPT`
+              : `${message}；授权码已失效，请重新登录 ChatGPT`,
+          retryable: reusable,
+        },
+        transient ? 502 : 400,
+      );
+    }
+
+    const actor = (c.get('user') as AuthUser).username;
+    const catalog = getResolvedCodexCatalog().models;
+    try {
+      return await withClaudeConfigMutationLock(async () => {
+        if (!flow.targetProviderId) {
+          const defaults = codexProviderCreationDefaults(catalog);
+          const provider = createProvider({
+            name: `ChatGPT 订阅${codexCredentials.email ? ` (${codexCredentials.email})` : ''}`,
+            type: 'third_party',
+            anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+            // Internal identifier only; runners receive per-launch tokens.
+            anthropicAuthToken: randomBytes(32).toString('hex'),
+            anthropicModel: defaults.anthropicModel,
+            customEnv: defaults.customEnv,
+            codexOAuthCredentials: codexCredentials,
+            enabled: true,
+          });
+          appendClaudeConfigAuditBestEffort(actor, 'codex_oauth_login', [
+            `providerId:${provider.id}`,
+            'codexOAuthCredentials:set',
+          ]);
+          return c.json(toPublicProvider(provider));
+        }
+
+        const id = flow.targetProviderId;
+        const previous = getProviders().find((provider) => provider.id === id);
+        if (!previous) {
+          return c.json({ error: '未找到指定供应商' }, 404);
+        }
+        const plan = planCodexReauthorization(
+          previous,
+          codexCredentials,
+          catalog,
+        );
+        const commit = () => {
+          updateProvider(id, {
+            anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+            ...(plan.anthropicModel !== previous.anthropicModel
+              ? { anthropicModel: plan.anthropicModel }
+              : {}),
+            ...(plan.customEnv ? { customEnv: plan.customEnv } : {}),
+          });
+          const updated = updateProviderSecrets(id, {
+            codexOAuthCredentials: codexCredentials,
+            ...(plan.rotateGatewayIdentifier
+              ? { anthropicAuthToken: randomBytes(32).toString('hex') }
+              : {}),
+            clearAnthropicApiKey: true,
+            clearClaudeOAuthCredentials: true,
+            clearClaudeCodeOauthToken: true,
+          });
+          appendClaudeConfigAuditBestEffort(actor, 'codex_oauth_login', [
+            `providerId:${id}`,
+            'codexOAuthCredentials:set',
+            ...(plan.converted ? ['converted'] : []),
+            ...(plan.accountChanged ? ['accountChanged'] : []),
+          ]);
+          return updated;
+        };
+
+        // Encrypted reasoning from another account (or another protocol) must
+        // never be replayed: quiesce runners and drop this provider's sessions.
+        // The same account keeps its sessions; its runners only need to drain.
+        const mutation: ClaudeMutationResult<ReturnType<typeof commit>> =
+          plan.accountChanged
+            ? await mutateClaudeConfigForAllGroups(
+                actor,
+                {
+                  trigger: 'codex_oauth_reauthorize',
+                  providerId: id,
+                  converted: plan.converted,
+                },
+                commit,
+                {
+                  clearSessionsForProviderId: id,
+                  sessionInvalidation: {
+                    modelChanged: true,
+                    baseUrlChanged: true,
+                  },
+                },
+              )
+            : {
+                value: commit(),
+                applied: {
+                  success: true,
+                  stoppedCount: 0,
+                  failedCount: 0,
+                  persisted: true,
+                },
+              };
+        if (mutation.value) {
+          if (plan.accountChanged && previous.codexOAuthCredentials) {
+            // The replaced account's grant is no longer reachable from
+            // HappyClaw; revoke it best-effort without delaying the login.
+            forgetCodexTransportState(id);
+            // The old account's windows and credits say nothing about the new one.
+            clearCodexProviderRateLimits(id);
+            revokeCodexTokenInBackground(previous.codexOAuthCredentials, {
+              providerId: id,
+              reason: 'account_replaced',
+            });
+          }
+          // A new login settles any account verdict held against the old one.
+          providerPool.resetHealth(id);
+          try {
+            deps?.queue?.drainProviderRunnersForCredentialRefresh?.(id);
+          } catch (err) {
+            logger.warn(
+              { err, providerId: id },
+              'Failed to drain runners after ChatGPT re-authorization',
+            );
+          }
+        }
+        if (!mutation.applied.success) {
+          return c.json(
+            {
+              error: mutation.applied.error,
+              applied: mutation.applied,
+              ...(mutation.value
+                ? { provider: toPublicProvider(mutation.value) }
+                : {}),
+            },
+            503,
+          );
+        }
+        return c.json(toPublicProvider(mutation.value!));
+      });
+    } catch (err) {
+      logger.error({ err }, 'Codex OAuth provider update error');
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Codex OAuth provider update failed';
       return c.json({ error: message }, 500);
     }
   },

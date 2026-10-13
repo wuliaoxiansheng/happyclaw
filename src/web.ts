@@ -59,9 +59,13 @@ import pluginsRoutes from './routes/plugins.js';
 import workspaceConfigRoutes from './routes/workspace-config.js';
 import agentProfileRoutes from './routes/agent-profiles.js';
 import workspaceRoutes from './routes/workspaces.js';
+import turnTraceRoutes from './routes/turn-traces.js';
 import { usage as usageRoutes } from './routes/usage.js';
 import billingRoutes from './routes/billing.js';
 import bugReportRoutes from './routes/bug-report.js';
+import { codexGatewayApp } from './codex-gateway/gateway.js';
+import { initCodexCatalogSync } from './codex-gateway/model-catalog-sync.js';
+import { CODEX_GATEWAY_ROUTE } from './codex-gateway/types.js';
 import channelAccountRoutes, {
   injectChannelAccountDeps,
 } from './routes/channel-accounts.js';
@@ -93,6 +97,7 @@ import {
   resolveBoundWorkspaceJid,
 } from './workspace-attribution.js';
 import { markdownToPlainText } from './im-utils.js';
+import { stripVirtualJidSuffix } from './utils.js';
 import { isSessionExpired } from './auth.js';
 import type {
   AgentStatus,
@@ -120,12 +125,28 @@ import type { ExpandContext } from './plugin-expander-context.js';
 import { PLUGIN_EXPANSION_ATTACHMENT_TYPE } from './plugin-expander-sentinel.js';
 import { persistPluginExpansion } from './plugin-expander-store.js';
 import { logger } from './logger.js';
+import { buildPresentedAttachments } from './attachment-thumbnails.js';
+import { createOrderedDispatcher } from './ordered-dispatch.js';
 import {
   createWebSocketHeartbeat,
   startWebSocketHeartbeat,
 } from './ws-heartbeat.js';
 import { recordRunContextSnapshot } from './run-context-snapshot.js';
+import {
+  appendTraceEvent,
+  capTailAtParagraph,
+  isInternalLifecycleStatus,
+  ThinkingClock,
+  ThinkingTextBuffer,
+  type TraceEventRecord,
+} from './stream-trace.js';
 import { RunStreamFence } from './run-stream-fence.js';
+import { sweepStaleStreamingEntries } from './streaming-state-sweep.js';
+import {
+  createBackpressureTracker,
+  createStreamFlowControl,
+  type StreamFlowControl,
+} from './ws-flow-control.js';
 import {
   executeSessionReset,
   executeFreshWindowReset,
@@ -194,7 +215,14 @@ function buildWebExpandContext(
   });
 }
 
+/** Output flow control of each running terminal, keyed by group JID. */
+const terminalFlows = new Map<string, StreamFlowControl>();
+
 function releaseTerminalOwnership(ws: WebSocket, groupJid: string): void {
+  if (terminalOwners.get(groupJid) === ws) {
+    terminalFlows.get(groupJid)?.dispose();
+    terminalFlows.delete(groupJid);
+  }
   if (wsTerminals.get(ws) === groupJid) {
     wsTerminals.delete(ws);
   }
@@ -285,11 +313,15 @@ app.route('/api/agent-profiles', agentProfileRoutes);
 app.route('/api/workspaces', workspaceRoutes);
 app.route('/api/groups', agentRoutes); // Workspace session routes; /agents paths remain compatibility aliases
 app.route('/api/groups', workspaceConfigRoutes); // Workspace config under /api/groups/:jid/workspace-config
+app.route('/api/groups', turnTraceRoutes); // Stored thinking/trace of a finished turn
 app.route('/api', monitorRoutes);
 app.route('/api/usage', usageRoutes);
 app.route('/api/billing', billingRoutes);
 app.route('/api/bug-report', bugReportRoutes);
 app.route('/api/channel-accounts', channelAccountRoutes);
+// 不挂在 /api/* 下：网关用 provider gateway token 鉴权（x-api-key），
+// 不是浏览器 Cookie 会话，不需要也不应该套用 /api/* 的 CORS/Cookie 中间件。
+app.route(CODEX_GATEWAY_ROUTE, codexGatewayApp);
 
 // --- POST /api/messages ---
 
@@ -1318,8 +1350,8 @@ async function handleAgentConversationMessage(
         'Race: eager-expanded agent conv but runner exited before sendMessage; cold-start will re-expand',
       );
     }
-    // No running process — force close any stale state and start fresh.
-    // Mirrors the reliable IM path in buildOnAgentMessage() (#240).
+    // No running process — force close any stale state and start fresh
+    // (#240). Only reached on 'no_active'; a warm runner is never closed.
     deps.queue.closeStdin(virtualChatJid);
     if (deps.processAgentConversation) {
       const taskId = `agent-conv:${agentId}:${Date.now()}`;
@@ -1398,19 +1430,7 @@ app.use(
   serveStatic({ root: './web/dist' }),
 );
 
-// 字体（16.2MB 中文字体族）与图标：内容事实上不可变（变更时改文件名），
-// 缺缓存头曾导致每次打开全量重下。
-app.use(
-  '/fonts/*',
-  async (c, next) => {
-    await next();
-    if (c.res.status === 200 || c.res.status === 304) {
-      c.res.headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-    }
-  },
-  conditionalStatic(),
-  serveStatic({ root: './web/dist' }),
-);
+// 图标：内容事实上不可变（变更时改文件名），缺缓存头曾导致每次打开全量重下。
 app.use(
   '/icons/*',
   async (c, next) => {
@@ -1462,6 +1482,19 @@ app.use(
 // 反向代理 + 公网域名场景下，管理员只能通过日志定位"为什么 WS 连不上"
 // （前端只看到 onclose、后端默认静默 destroy socket），没有这行日志运维成本极高。
 const warnedRejectedOrigins = new Set<string>();
+const MAX_WARNED_REJECTED_ORIGINS = 1_000;
+
+export function evaluateWsSpawnCommandAccess(
+  user: { id: string; role: UserRole },
+  chatJid: string,
+): { dispatched: true } | { dispatched: false; reason: 'access' } {
+  const baseJid = stripVirtualJidSuffix(chatJid);
+  const row = getRegisteredGroup(baseJid);
+  if (!row || !canModifyGroup(user, { ...row, jid: baseJid })) {
+    return { dispatched: false, reason: 'access' };
+  }
+  return { dispatched: true };
+}
 
 function setupWebSocket(server: any): WebSocketServer {
   // 8 MiB 上限：覆盖单条消息含 10 张 5MB base64 image 的合法上限（~70MB 是
@@ -1498,7 +1531,14 @@ function setupWebSocket(server: any): WebSocketServer {
   });
 
   server.on('upgrade', (request: any, socket: any, head: any) => {
-    const { pathname } = new URL(request.url, `http://${request.headers.host}`);
+    let pathname: string;
+    try {
+      ({ pathname } = new URL(request.url, `http://${request.headers.host}`));
+    } catch {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
 
     if (pathname !== '/ws') {
       socket.destroy();
@@ -1527,6 +1567,10 @@ function setupWebSocket(server: any): WebSocketServer {
         const allowed = isAllowedOrigin(origin);
         if (!allowed) {
           if (!warnedRejectedOrigins.has(origin)) {
+            // Origin is client-controlled; keep the dedupe set bounded.
+            if (warnedRejectedOrigins.size >= MAX_WARNED_REJECTED_ORIGINS) {
+              warnedRejectedOrigins.clear();
+            }
             warnedRejectedOrigins.add(origin);
             logger.warn(
               {
@@ -1678,21 +1722,13 @@ function setupWebSocket(server: any): WebSocketServer {
         // See GitHub issue #241.
         if (Date.now() - snap.updatedAt > 30 * 60 * 1000) {
           streamingSnapshots.delete(jid);
+          if (!activeLogicalRuns.has(jid)) streamingFullTexts.delete(jid);
           continue;
         }
         // Skip empty or unowned snapshots. Every live query projection must
         // have a terminal-capable run identity before it can restore waiting.
-        if (
-          !snap.runId ||
-          (!snap.partialText &&
-            !snap.thinkingText &&
-            snap.activeTools.length === 0 &&
-            snap.recentEvents.length === 0 &&
-            snap.traceEvents.length === 0 &&
-            Object.keys(snap.taskStates).length === 0)
-        ) {
-          continue;
-        }
+        const restorable = buildStreamSnapshot(jid);
+        if (!restorable) continue;
         // Strip #agent: suffix for ACL lookup (virtual JIDs not in registered_groups)
         const baseJid = jid.includes('#agent:') ? jid.split('#agent:')[0] : jid;
         const allowed = getGroupAllowedUserIds(baseJid);
@@ -1702,20 +1738,8 @@ function setupWebSocket(server: any): WebSocketServer {
             JSON.stringify({
               type: 'stream_snapshot',
               chatJid: jid,
-              runId: snap.runId,
-              snapshot: {
-                partialText: snap.partialText,
-                thinkingText: snap.thinkingText,
-                activeTools: snap.activeTools,
-                recentEvents: snap.recentEvents,
-                traceEvents: snap.traceEvents,
-                taskStates: snap.taskStates,
-                todos: snap.todos,
-                systemStatus: snap.systemStatus,
-                isThinking: snap.isThinking,
-                activeHook: snap.activeHook,
-                turnId: snap.turnId,
-              },
+              runId: restorable.runId,
+              snapshot: restorable.snapshot,
             } satisfies WsMessageOut),
           );
         } catch {
@@ -1831,6 +1855,15 @@ function setupWebSocket(server: any): WebSocketServer {
           // ── /sw or /spawn command: spawn parallel task (checked before agent routing) ──
           const swMatch = content.trim().match(/^\/(sw|spawn)\s+([\s\S]+)$/i);
           if (swMatch && deps?.handleSpawnCommand) {
+            const spawnAccess = evaluateWsSpawnCommandAccess(
+              { id: session.user_id, role: session.role },
+              chatJid,
+            );
+            if (!spawnAccess.dispatched) {
+              sendWsError('Only the workspace owner can run /sw', chatJid);
+              return;
+            }
+
             const spawnMessage = swMatch[2].trim();
             if (spawnMessage) {
               try {
@@ -2149,6 +2182,13 @@ function setupWebSocket(server: any): WebSocketServer {
               }
             }
 
+            terminalFlows.get(chatJid)?.dispose();
+            const flow = createStreamFlowControl({
+              getBufferedAmount: () => ws.bufferedAmount,
+              pause: () => terminalManager.pause(chatJid),
+              resume: () => terminalManager.resume(chatJid),
+            });
+            terminalFlows.set(chatJid, flow);
             terminalManager.start(
               chatJid,
               groupStatus.containerName,
@@ -2159,6 +2199,9 @@ function setupWebSocket(server: any): WebSocketServer {
                   ws.send(
                     JSON.stringify({ type: 'terminal_output', chatJid, data }),
                   );
+                  // Pause the pty/exec output while this socket is behind
+                  // instead of buffering it (or tripping the valve below).
+                  flow.afterSend();
                 }
               },
               (_exitCode, _signal) => {
@@ -2311,6 +2354,23 @@ function setupWebSocket(server: any): WebSocketServer {
 // --- Broadcast Functions ---
 
 /**
+ * A client this far behind on reads is stalled (or on a dead link the
+ * heartbeat has not caught yet); buffering every further stream frame for it
+ * only grows server memory. It is dropped and resyncs from snapshots on
+ * reconnect.
+ */
+export const MAX_WS_BUFFERED_BYTES = 16 * 1024 * 1024;
+
+export function isWsClientBackedUp(client: {
+  bufferedAmount: number;
+}): boolean {
+  return client.bufferedAmount > MAX_WS_BUFFERED_BYTES;
+}
+
+/** Drops a client only after it stays over the limit for 10s / 3 checks. */
+const wsBackpressure = createBackpressureTracker();
+
+/**
  * Broadcast to all connected WebSocket clients.
  * If adminOnly is true, only send to clients whose session belongs to an admin user.
  * If ownerUserId is provided, only send to that user and admins (for group isolation).
@@ -2378,6 +2438,16 @@ function safeBroadcast(
       if (allowedUserIds === null || !allowedUserIds.has(session.user_id)) {
         continue;
       }
+    }
+
+    if (wsBackpressure.observe(client, isWsClientBackedUp(client))) {
+      wsClients.delete(client);
+      try {
+        client.terminate();
+      } catch {
+        /* ignore */
+      }
+      continue;
     }
 
     try {
@@ -2462,7 +2532,51 @@ export function broadcastToWebClients(chatJid: string, text: string): void {
   );
 }
 
+/**
+ * Image attachments above this many base64 chars (~64KB decoded, the
+ * thumbnail threshold) are replaced by thumbnails before broadcast.
+ */
+const BROADCAST_THUMBNAIL_MIN_ATTACHMENT_CHARS = 87_000;
+const dispatchMessageBroadcast = createOrderedDispatcher((err, chatJid) => {
+  logger.warn({ err, chatJid }, 'Failed to broadcast new message');
+});
+
+/**
+ * Push a stored message to every client allowed to see the chat.
+ *
+ * Large images go out as the same 480px thumbnails REST history serves
+ * (originals stay fetchable via `hasOriginal`): echoing a 3 MB photo as a
+ * 4 MB frame to every open tab used to stall their stream events. Messages
+ * of one chat stay in order even when a thumbnail has to be rendered first.
+ */
 export function broadcastNewMessage(
+  chatJid: string,
+  msg: NewMessage & { is_from_me?: boolean },
+  agentId?: string,
+  source?: string,
+): void {
+  const needsThumbnail =
+    typeof msg.attachments === 'string' &&
+    msg.attachments.length > BROADCAST_THUMBNAIL_MIN_ATTACHMENT_CHARS;
+  dispatchMessageBroadcast(
+    chatJid,
+    msg,
+    (ready) => deliverNewMessage(chatJid, ready, agentId, source),
+    needsThumbnail
+      ? async (original) => {
+          const attachments = await buildPresentedAttachments(
+            original.id,
+            original.attachments,
+          ).catch(() => original.attachments);
+          return attachments === original.attachments
+            ? original
+            : { ...original, attachments: attachments ?? undefined };
+        }
+      : undefined,
+  );
+}
+
+function deliverNewMessage(
   chatJid: string,
   msg: NewMessage & { is_from_me?: boolean },
   agentId?: string,
@@ -2527,6 +2641,35 @@ export function broadcastMessageDeleted(
   safeBroadcast(wsMsg, isHostGroupJid(jid), allowedUserIds);
 }
 
+/**
+ * Announce that the trace of `turnId` is stored and hangs on `messageId`. The
+ * message itself was broadcast earlier without `has_trace`.
+ */
+export function broadcastMessageTrace(
+  messageChatJid: string,
+  messageId: string,
+  turnId: string,
+): void {
+  const markerIndex = messageChatJid.indexOf('#agent:');
+  const baseChatJid =
+    markerIndex >= 0 ? messageChatJid.slice(0, markerIndex) : messageChatJid;
+  const agentId =
+    markerIndex >= 0
+      ? messageChatJid.slice(markerIndex + '#agent:'.length)
+      : undefined;
+  const jid = normalizeHomeJid(baseChatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseChatJid);
+  const wsMsg: WsMessageOut = {
+    type: 'message_trace',
+    chatJid: jid,
+    messageChatJid,
+    messageId,
+    turnId,
+    ...(agentId ? { agentId } : {}),
+  };
+  safeBroadcast(wsMsg, isHostGroupJid(jid), allowedUserIds);
+}
+
 export function broadcastFollowUpUpdate(
   chatJid: string,
   transition?: FollowUpTransition,
@@ -2564,51 +2707,44 @@ export function broadcastTyping(chatJid: string, isTyping: boolean): void {
 // ─── Streaming Snapshot Accumulation ─────────────────────────────────
 // Tracks current streaming state per group so WS reconnects can recover.
 
+/** A running tool as the Web shows it (the Web's StreamingState.activeTools). */
+interface SnapshotTool {
+  toolName: string;
+  toolUseId: string;
+  startTime: number;
+  elapsedSeconds?: number;
+  parentToolUseId?: string | null;
+  isNested?: boolean;
+  skillName?: string;
+  toolInputSummary?: string;
+  /** Structured input some tools stream (AskUserQuestion's questions). */
+  toolInput?: Record<string, unknown>;
+}
+
+interface SnapshotTimelineEvent {
+  id: string;
+  timestamp: number;
+  text: string;
+  kind:
+    | 'tool'
+    | 'skill'
+    | 'hook'
+    | 'status'
+    | 'task'
+    | 'memory'
+    | 'debug'
+    | 'permission';
+}
+
 interface StreamingSnapshotEntry {
   partialText: string;
-  thinkingText: string;
-  activeTools: Array<{
-    toolName: string;
-    toolUseId: string;
-    startTime: number;
-    toolInputSummary?: string;
-    parentToolUseId?: string | null;
-  }>;
-  recentEvents: Array<{
-    id: string;
-    timestamp: number;
-    text: string;
-    kind:
-      | 'tool'
-      | 'skill'
-      | 'hook'
-      | 'status'
-      | 'task'
-      | 'memory'
-      | 'debug'
-      | 'permission';
-  }>;
-  traceEvents: Array<{
-    id: string;
-    timestamp: number;
-    kind:
-      | 'tool'
-      | 'skill'
-      | 'hook'
-      | 'status'
-      | 'task'
-      | 'memory'
-      | 'debug'
-      | 'permission';
-    scope?: StreamEvent['agentScope'];
-    title: string;
-    summary?: string;
-    detail?: string;
-    taskId?: string;
-    toolUseId?: string;
-    parentToolUseId?: string | null;
-    displayLevel?: StreamEvent['displayLevel'];
-  }>;
+  /** The main Agent's reasoning text, bounded to MAX_SNAPSHOT_THINKING. */
+  thinking: ThinkingTextBuffer;
+  /** Reasoning timing, kept the way the Web keeps it ("已思考 Xs"). */
+  clock: ThinkingClock;
+  activeTools: SnapshotTool[];
+  recentEvents: SnapshotTimelineEvent[];
+  traceEvents: TraceEventRecord[];
   taskStates: Record<
     string,
     {
@@ -2624,8 +2760,8 @@ interface StreamingSnapshotEntry {
       lastToolName?: string;
       thinkingTail: string;
       textTail: string;
-      activeTools: StreamingSnapshotEntry['activeTools'];
-      recentTools: StreamingSnapshotEntry['recentEvents'];
+      activeTools: SnapshotTool[];
+      recentTools: SnapshotTimelineEvent[];
       updatedAt: number;
     }
   >;
@@ -2661,28 +2797,126 @@ const MAX_SNAPSHOT_TOMBSTONES = 500;
 /** Accumulates full (non-truncated) text per group for shutdown persistence & disk buffer. */
 const streamingFullTexts = new Map<string, string>();
 const MAX_SNAPSHOT_TEXT = 4000;
-const MAX_SNAPSHOT_THINKING = 8000;
+/** A reconnect resync carries the whole reply up to the client's own cap. */
+const MAX_SNAPSHOT_RESYNC_TEXT = 200_000;
+
+const SNAPSHOT_FENCE_PATTERN = /^ {0,3}(`{3,}|~{3,})/;
+const SNAPSHOT_LIST_ITEM_PATTERN = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)/;
+
+/**
+ * Where `text`'s top-level Markdown blocks start (blank lines outside code
+ * fences and `$$` math, unless the next line continues the block). Mirrors
+ * splitMarkdownBlocks in web/src/lib/markdown-blocks.ts.
+ */
+function markdownBlockStarts(text: string): number[] {
+  const starts = [0];
+  let offset = 0;
+  let fence: { char: string; length: number } | null = null;
+  let inMath = false;
+  let lastContentLine = '';
+  let pendingBlank = false;
+  let hasContent = false;
+  for (const line of text.split('\n')) {
+    const lineStart = offset;
+    offset += line.length + 1;
+    if (fence) {
+      const close = SNAPSHOT_FENCE_PATTERN.exec(line);
+      if (
+        close &&
+        close[1][0] === fence.char &&
+        close[1].length >= fence.length &&
+        line.trim() === close[1]
+      ) {
+        fence = null;
+      }
+      continue;
+    }
+    if (inMath) {
+      if (line.trim() === '$$') inMath = false;
+      continue;
+    }
+    if (line.trim() === '') {
+      if (hasContent) pendingBlank = true;
+      continue;
+    }
+    if (pendingBlank) {
+      const continues =
+        /^[ \t]/.test(line) ||
+        (SNAPSHOT_LIST_ITEM_PATTERN.test(line) &&
+          SNAPSHOT_LIST_ITEM_PATTERN.test(lastContentLine));
+      if (!continues) starts.push(lineStart);
+      pendingBlank = false;
+    }
+    hasContent = true;
+    const open = SNAPSHOT_FENCE_PATTERN.exec(line);
+    if (open) fence = { char: open[1][0], length: open[1].length };
+    else if (line.trim() === '$$') inMath = true;
+    if (!/^[ \t]/.test(line)) lastContentLine = line;
+  }
+  return starts;
+}
+
+/**
+ * The text a reconnecting client restores. It used to be the last 4000 raw
+ * characters, cut mid-word or mid-fence, and it replaced the longer text the
+ * client already had. Send the whole streamed reply; past the client's cap,
+ * cut at a block boundary with the client's `markdownTail` marker.
+ */
+function snapshotResyncText(jid: string, tail: string): string {
+  const full = streamingFullTexts.get(jid);
+  return capSnapshotText(full && full.endsWith(tail) ? full : tail);
+}
+
+/** `text` up to `max` characters, cut at a block boundary (markdownTail). */
+export function capSnapshotText(
+  text: string,
+  max: number = MAX_SNAPSHOT_RESYNC_TEXT,
+): string {
+  if (text.length <= max) return text;
+  const minStart = text.length - max;
+  const start = markdownBlockStarts(text).find((index) => index >= minStart);
+  if (start !== undefined) return `…\n\n${text.slice(start)}`;
+  // One block longer than the budget: keep its last lines, re-opening the
+  // code fence the cut landed in so the tail doesn't render as prose.
+  const cut = text.indexOf('\n', minStart);
+  const tailStart = cut >= 0 ? cut + 1 : minStart;
+  const opener = openFenceLineAt(text, tailStart);
+  return `…\n\n${opener ? `${opener}\n` : ''}${text.slice(tailStart)}`;
+}
+
+/** The opening line of the code fence `index` lies inside, if any. */
+function openFenceLineAt(text: string, index: number): string | null {
+  let fence: { char: string; length: number; line: string } | null = null;
+  let offset = 0;
+  for (const line of text.split('\n')) {
+    if (offset >= index) break;
+    offset += line.length + 1;
+    const marker = SNAPSHOT_FENCE_PATTERN.exec(line)?.[1];
+    if (!marker) continue;
+    if (!fence) {
+      fence = { char: marker[0], length: marker.length, line };
+    } else if (
+      marker[0] === fence.char &&
+      marker.length >= fence.length &&
+      line.trim() === marker
+    ) {
+      fence = null;
+    }
+  }
+  return fence?.line ?? null;
+}
+/** A reconnect restores this much of the run's reasoning (cut at a paragraph). */
+const MAX_SNAPSHOT_THINKING = 32_000;
 const MAX_SNAPSHOT_EVENTS = 20;
 const MAX_SNAPSHOT_TRACE_EVENTS = 200;
 const MAX_SNAPSHOT_TASK_TAIL = 4000;
+/** Recent-tool rows kept per sub-agent task (the Web keeps the same). */
+const MAX_SNAPSHOT_TASK_RECENT_TOOLS = 30;
 
 /** Push a recent event entry and truncate to MAX_SNAPSHOT_EVENTS. */
 function pushRecentEvent(
   snap: StreamingSnapshotEntry,
-  event: {
-    id: string;
-    timestamp: number;
-    text: string;
-    kind:
-      | 'tool'
-      | 'skill'
-      | 'hook'
-      | 'status'
-      | 'task'
-      | 'memory'
-      | 'debug'
-      | 'permission';
-  },
+  event: SnapshotTimelineEvent,
 ): void {
   snap.recentEvents.push(event);
   if (snap.recentEvents.length > MAX_SNAPSHOT_EVENTS) {
@@ -2690,73 +2924,8 @@ function pushRecentEvent(
   }
 }
 
-function pushTraceEvent(
-  snap: StreamingSnapshotEntry,
-  event: StreamEvent,
-): void {
-  if (
-    event.eventType === 'text_delta' ||
-    event.eventType === 'thinking_delta' ||
-    event.eventType === 'usage' ||
-    event.eventType === 'init' ||
-    event.eventType === 'context_audit' ||
-    (event.eventType === 'status' &&
-      isInternalLifecycleStatus(event.statusText))
-  )
-    return;
-  const kind = event.eventType.startsWith('tool_')
-    ? event.skillName
-      ? 'skill'
-      : 'tool'
-    : event.eventType.startsWith('hook_')
-      ? 'hook'
-      : event.eventType.startsWith('task_')
-        ? 'task'
-        : event.eventType === 'memory_recall' ||
-            event.eventType === 'compact_boundary'
-          ? 'memory'
-          : event.eventType === 'permission_denied'
-            ? 'permission'
-            : event.eventType === 'raw_sdk_event'
-              ? 'debug'
-              : 'status';
-  const title =
-    event.title ||
-    event.summary ||
-    event.taskSummary ||
-    event.statusText ||
-    event.toolName ||
-    event.rawType ||
-    event.eventType;
-  snap.traceEvents.push({
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-    timestamp: Date.now(),
-    kind,
-    scope: event.agentScope,
-    title,
-    summary: event.summary || event.taskSummary || event.toolInputSummary,
-    detail: event.detail,
-    taskId: event.taskId,
-    toolUseId: event.toolUseId,
-    parentToolUseId: event.parentToolUseId,
-    displayLevel: event.displayLevel,
-  });
-  if (snap.traceEvents.length > MAX_SNAPSHOT_TRACE_EVENTS) {
-    snap.traceEvents = snap.traceEvents.slice(-MAX_SNAPSHOT_TRACE_EVENTS);
-  }
-}
-
 function tailText(text: string, max: number): string {
   return text.length > max ? text.slice(-max) : text;
-}
-
-function isInternalLifecycleStatus(statusText?: string | null): boolean {
-  return (
-    statusText === 'requesting' ||
-    statusText === 'compacting' ||
-    statusText === 'idle' ||
-    statusText === 'interrupted'
-  );
 }
 
 function snapshotTaskId(event: StreamEvent): string | null {
@@ -2765,6 +2934,22 @@ function snapshotTaskId(event: StreamEvent): string | null {
     event.taskId ||
     (event.eventType.startsWith('task_') ? event.toolUseId || null : null)
   );
+}
+
+function pushTaskRecentTool(
+  task: StreamingSnapshotEntry['taskStates'][string],
+  kind: SnapshotTimelineEvent['kind'],
+  text: string,
+): void {
+  task.recentTools = [
+    ...task.recentTools,
+    {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: Date.now(),
+      kind,
+      text,
+    },
+  ].slice(-MAX_SNAPSHOT_TASK_RECENT_TOOLS);
 }
 
 function updateSnapshotTask(
@@ -2865,12 +3050,15 @@ function updateSnapshotTask(
       };
     }
   } else if (event.eventType === 'tool_use_start' && event.parentToolUseId) {
-    const tool = {
+    const tool: SnapshotTool = {
       toolName: event.toolName || 'unknown',
       toolUseId: event.toolUseId || '',
       startTime: Date.now(),
-      toolInputSummary: event.toolInputSummary,
       parentToolUseId: event.parentToolUseId,
+      isNested: event.isNested,
+      skillName: event.skillName,
+      toolInputSummary: event.toolInputSummary,
+      toolInput: event.toolInput,
     };
     task.activeTools = task.activeTools.some(
       (t) => t.toolUseId === tool.toolUseId && tool.toolUseId,
@@ -2879,12 +3067,79 @@ function updateSnapshotTask(
           t.toolUseId === tool.toolUseId ? { ...t, ...tool } : t,
         )
       : [...task.activeTools, tool];
+    pushTaskRecentTool(
+      task,
+      event.skillName ? 'skill' : 'tool',
+      `${event.skillName ? `技能 ${event.skillName}` : `工具 ${event.toolName || 'unknown'}`}${event.toolInputSummary ? ` (${event.toolInputSummary})` : ''}`,
+    );
   } else if (event.eventType === 'tool_use_end' && event.parentToolUseId) {
     task.activeTools = task.activeTools.filter(
       (t) => t.toolUseId !== event.toolUseId,
     );
+    pushTaskRecentTool(
+      task,
+      'tool',
+      `✓ ${event.toolName || event.toolUseId || '工具'}`,
+    );
+  } else if (event.eventType === 'tool_progress' && event.parentToolUseId) {
+    task.activeTools = task.activeTools.map((t) =>
+      t.toolUseId === event.toolUseId
+        ? {
+            ...t,
+            elapsedSeconds: event.elapsedSeconds,
+            toolInputSummary: event.toolInputSummary || t.toolInputSummary,
+          }
+        : t,
+    );
   }
   snap.taskStates[taskId] = task;
+}
+
+type StreamSnapshotMessage = Extract<WsMessageOut, { type: 'stream_snapshot' }>;
+
+/**
+ * What a client that (re)connects mid-run needs to rebuild the run's card: the
+ * stream_snapshot body of one runtime JID, or null when there is nothing to
+ * restore (no exact run owns it, or nothing visible happened yet). The
+ * reasoning text, timings, running tools, sub-agent states and trace come from
+ * the same reducers that feed the live events.
+ */
+export function buildStreamSnapshot(
+  jid: string,
+): { runId: string; snapshot: StreamSnapshotMessage['snapshot'] } | null {
+  const snap = streamingSnapshots.get(jid);
+  if (
+    !snap?.runId ||
+    (!snap.partialText &&
+      !snap.thinking.text &&
+      !snap.clock.sawThinking &&
+      snap.activeTools.length === 0 &&
+      snap.recentEvents.length === 0 &&
+      snap.traceEvents.length === 0 &&
+      Object.keys(snap.taskStates).length === 0)
+  ) {
+    return null;
+  }
+  return {
+    runId: snap.runId,
+    snapshot: {
+      partialText: snapshotResyncText(jid, snap.partialText),
+      thinkingText: snap.thinking.text,
+      activeTools: snap.activeTools,
+      recentEvents: snap.recentEvents,
+      traceEvents: snap.traceEvents,
+      taskStates: snap.taskStates,
+      todos: snap.todos,
+      systemStatus: snap.systemStatus,
+      isThinking: snap.isThinking,
+      thinkingStartedAt: snap.clock.startedAt,
+      thinkingDurationMs: snap.clock.durationMs || undefined,
+      phaseStartedAt: snap.clock.phaseStartedAt,
+      awaitingModel: snap.clock.awaitingModel || undefined,
+      activeHook: snap.activeHook,
+      turnId: snap.turnId,
+    },
+  };
 }
 
 function updateStreamingSnapshot(
@@ -2931,7 +3186,12 @@ function updateStreamingSnapshot(
   if (!snap) {
     snap = {
       partialText: '',
-      thinkingText: '',
+      thinking: new ThinkingTextBuffer((text) =>
+        capTailAtParagraph(text, MAX_SNAPSHOT_THINKING),
+      ),
+      // A burst that arrives whole after silent reasoning started at the
+      // model request, or at the run's start for the first one.
+      clock: new ThinkingClock(activeLogicalRuns.get(normalizedJid)?.startedAt),
       activeTools: [],
       recentEvents: [],
       traceEvents: [],
@@ -2946,14 +3206,21 @@ function updateStreamingSnapshot(
   snap.updatedAt = Date.now();
   if (event.turnId) snap.turnId = event.turnId;
   if (runId) snap.runId = runId;
-  pushTraceEvent(snap, event);
+  snap.traceEvents = appendTraceEvent(
+    snap.traceEvents,
+    event,
+    MAX_SNAPSHOT_TRACE_EVENTS,
+  );
   updateSnapshotTask(snap, event);
+  // Reasoning text and timing follow the main Agent's stream; real answer
+  // text or a tool call ends the current thinking burst.
+  snap.thinking.observe(event);
+  snap.clock.observe(event);
+  snap.isThinking = snap.clock.isThinking;
 
   switch (event.eventType) {
     case 'text_delta':
       if (event.text && !event.parentToolUseId) {
-        // Real assistant text means the current thinking burst is over.
-        snap.isThinking = false;
         snap.partialText += event.text;
         if (snap.partialText.length > MAX_SNAPSHOT_TEXT) {
           snap.partialText = snap.partialText.slice(-MAX_SNAPSHOT_TEXT);
@@ -2966,27 +3233,24 @@ function updateStreamingSnapshot(
       }
       break;
 
-    case 'thinking_delta':
-      if (event.text && !event.parentToolUseId) {
-        snap.isThinking = true;
-        snap.thinkingText += event.text;
-        if (snap.thinkingText.length > MAX_SNAPSHOT_THINKING) {
-          snap.thinkingText = snap.thinkingText.slice(-MAX_SNAPSHOT_THINKING);
-        }
-      }
-      break;
-
     case 'tool_use_start':
       if (event.toolUseId && event.toolName) {
-        // A tool call ends the current thinking burst.
-        snap.isThinking = false;
-        snap.activeTools.push({
+        const tool: SnapshotTool = {
           toolName: event.toolName,
           toolUseId: event.toolUseId,
           startTime: Date.now(),
-          toolInputSummary: event.toolInputSummary,
           parentToolUseId: event.parentToolUseId,
-        });
+          isNested: event.isNested,
+          skillName: event.skillName,
+          toolInputSummary: event.toolInputSummary,
+        };
+        snap.activeTools = snap.activeTools.some(
+          (t) => t.toolUseId === tool.toolUseId,
+        )
+          ? snap.activeTools.map((t) =>
+              t.toolUseId === tool.toolUseId ? { ...t, ...tool } : t,
+            )
+          : [...snap.activeTools, tool];
         pushRecentEvent(snap, {
           id: event.toolUseId,
           timestamp: Date.now(),
@@ -3010,8 +3274,24 @@ function updateStreamingSnapshot(
           (t) => t.toolUseId === event.toolUseId,
         );
         if (tool) {
+          tool.elapsedSeconds = event.elapsedSeconds ?? tool.elapsedSeconds;
+          if (event.skillName) tool.skillName = event.skillName;
+          if (event.toolInput) tool.toolInput = event.toolInput;
           if (event.toolInputSummary)
             tool.toolInputSummary = event.toolInputSummary;
+        } else {
+          // Progress for a tool whose start predates this snapshot.
+          snap.activeTools.push({
+            toolName: event.toolName || 'unknown',
+            toolUseId: event.toolUseId,
+            startTime: Date.now(),
+            elapsedSeconds: event.elapsedSeconds,
+            parentToolUseId: event.parentToolUseId,
+            isNested: event.isNested,
+            skillName: event.skillName,
+            toolInputSummary: event.toolInputSummary,
+            toolInput: event.toolInput,
+          });
         }
       }
       break;
@@ -3105,6 +3385,24 @@ function updateStreamingSnapshot(
   streamingSnapshots.set(normalizedJid, snap);
 }
 
+const STREAMING_STATE_SWEEP_MS = 10 * 60 * 1000;
+let streamingStateSweepTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * The reconnect-time staleness check only removed the snapshot and only ran
+ * when a client connected, so the full-text accumulator of a run that ended
+ * without a terminal event stayed resident (rewritten to the disk buffer
+ * every 5s and replayed as an interrupt partial after a restart).
+ */
+export function sweepStaleStreamingState(now: number = Date.now()): number {
+  return sweepStaleStreamingEntries(
+    streamingSnapshots,
+    streamingFullTexts,
+    activeLogicalRuns,
+    now,
+  );
+}
+
 export function clearStreamingSnapshot(chatJid: string): void {
   const jid = normalizeHomeJid(chatJid);
   streamingSnapshots.delete(jid);
@@ -3150,6 +3448,12 @@ export function broadcastStreamEvent(
       );
     }
     return;
+  }
+  // A finished sub-agent's answer (up to 16k characters) only feeds the
+  // host's replay checkpoint; the Web never reads it.
+  if (event.taskResult !== undefined) {
+    event = { ...event };
+    delete event.taskResult;
   }
 
   const jid = normalizeHomeJid(chatJid);
@@ -3449,27 +3753,8 @@ export function broadcastDockerPullComplete(
   safeBroadcast({ type: 'docker_pull_complete', success, error }, true);
 }
 
-function broadcastStatus(): void {
-  if (!deps) return;
-
-  const queueStatus = deps.queue.getStatus();
-  // Broadcast aggregate system metrics only to admin users.
-  // Non-admin users get per-user filtered metrics via REST /api/status.
-  safeBroadcast(
-    {
-      type: 'status_update',
-      activeContainers: queueStatus.activeContainerCount,
-      activeHostProcesses: queueStatus.activeHostProcessCount,
-      activeTotal: queueStatus.activeCount,
-      queueLength: queueStatus.waitingCount,
-    },
-    /* adminOnly */ true,
-  );
-}
-
 // --- Server Startup ---
 
-let statusInterval: ReturnType<typeof setInterval> | null = null;
 let httpServer: ReturnType<typeof serve> | null = null;
 let wss: WebSocketServer | null = null;
 
@@ -3479,7 +3764,7 @@ let wss: WebSocketServer | null = null;
  * module load) so integration tests can exercise HTTP routes via
  * `app.request(...)` — most notably `POST /api/messages` and its `/clear`
  * interception — without starting the HTTP server, WebSocket server, container
- * exit callbacks, or the status-broadcast interval.
+ * exit callbacks or other runtime timers.
  *
  * Mirrors the dependency wiring in {@link startWebServer} minus all the
  * runtime side effects. NOT for production use.
@@ -3519,6 +3804,8 @@ export function startWebServer(webDeps: WebDeps): void {
     broadcastDockerPullLog,
     broadcastDockerPullComplete,
   });
+  // Codex 模型目录：读磁盘缓存后后台同步上游（永不阻塞启动）。
+  initCodexCatalogSync();
 
   httpServer = serve(
     {
@@ -3568,9 +3855,12 @@ export function startWebServer(webDeps: WebDeps): void {
   webDeps.queue.setOnQueryStart(broadcastRunStarted);
   webDeps.queue.setOnQueryFinish(broadcastRunFinished);
 
-  // Broadcast status every 5 seconds
-  if (statusInterval) clearInterval(statusInterval);
-  statusInterval = setInterval(broadcastStatus, 5000);
+  if (streamingStateSweepTimer) clearInterval(streamingStateSweepTimer);
+  streamingStateSweepTimer = setInterval(
+    () => sweepStaleStreamingState(),
+    STREAMING_STATE_SWEEP_MS,
+  );
+  streamingStateSweepTimer.unref();
 }
 
 // --- Exports ---
@@ -3580,9 +3870,9 @@ export function shutdownTerminals(): void {
 }
 
 export async function shutdownWebServer(): Promise<void> {
-  if (statusInterval) {
-    clearInterval(statusInterval);
-    statusInterval = null;
+  if (streamingStateSweepTimer) {
+    clearInterval(streamingStateSweepTimer);
+    streamingStateSweepTimer = null;
   }
   // Close all WebSocket connections
   for (const client of wsClients.keys()) {

@@ -26,6 +26,12 @@ import {
   type ContainerProxyConfig,
 } from './config.js';
 import { logger } from './logger.js';
+import { isCodexGatewayBaseUrl } from './codex-gateway/resolve-gateway-url.js';
+import {
+  CodexGatewayRunnerLease,
+  applyCodexGatewayNoProxy,
+  resolveCodexGatewayLaunchConfig,
+} from './codex-gateway/runner-tokens.js';
 import {
   buildEffectiveMcpManifest,
   loadPluginMcpDefinitions,
@@ -44,8 +50,10 @@ import {
   getClaudeProviderConfig,
   getContainerEnvConfig,
   getEnabledProviders,
+  getUsableDefaultProvider,
   getBalancingConfig,
   getProviders,
+  providerHasCredentials,
   getSystemSettings,
   getEffectiveExternalDir,
   hasExplicitWorkspaceClaudeAuth,
@@ -75,11 +83,20 @@ import {
   getUserById,
   getTaskRunById,
   isDatabaseInitialized,
+  getSessionModelSelection,
   getSessionProviderId,
+  setSessionModel,
   setSessionProviderId,
 } from './db.js';
+import {
+  chatGptDefaultModel,
+  chatGptLaunchModel,
+  resolveSessionLaunchOverrides,
+  sessionModelHasChanged,
+} from './session-model-overrides.js';
 import { isApiError } from './agent-output-parser.js';
 import {
+  CODEX_REAUTH_REQUIRED_USER_NOTICE,
   DEFAULT_MAX_TRANSIENT_RETRIES,
   TransientRetryLedger,
   resolveProviderFailureClass,
@@ -138,6 +155,11 @@ import {
   type DockerOAuthReconcileOutcome,
 } from './docker-oauth-credentials.js';
 import {
+  isClaudeOAuthRefreshDue,
+  refreshClaudeProviderOAuth,
+  type ClaudeOAuthRefreshOutcome,
+} from './claude-oauth-refresh.js';
+import {
   resolveHostSkillPolicy,
   type HostSkillPolicy,
 } from './agent-profile-policy.js';
@@ -187,6 +209,142 @@ function ensureHostClaudeJson(): string {
   return p;
 }
 
+const CONTAINER_CLAUDE_JSON_FALLBACK =
+  '{"hasCompletedOnboarding":true,"autoUpdates":false}\n';
+
+function deriveContainerClaudeJson(hostJsonPath: string): string {
+  try {
+    const hostJson = JSON.parse(fs.readFileSync(hostJsonPath, 'utf-8'));
+    const stripped = { ...hostJson };
+    delete stripped.cachedGrowthBookFeatures;
+    delete stripped.oauthAccount;
+    stripped.hasCompletedOnboarding = true;
+    stripped.autoUpdates = false;
+    return JSON.stringify(stripped, null, 2) + '\n';
+  } catch {
+    return CONTAINER_CLAUDE_JSON_FALLBACK;
+  }
+}
+
+/** What stat can tell about a file's contents. */
+interface FileSignature {
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+}
+
+function statFileSignature(filePath: string): FileSignature | null {
+  try {
+    const st = fs.statSync(filePath);
+    return {
+      ino: st.ino,
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      ctimeMs: st.ctimeMs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sameFileSignature(
+  a: FileSignature | null,
+  b: FileSignature | null,
+): boolean {
+  if (a === null || b === null) return a === b;
+  return (
+    a.ino === b.ino &&
+    a.size === b.size &&
+    a.mtimeMs === b.mtimeMs &&
+    a.ctimeMs === b.ctimeMs
+  );
+}
+
+/**
+ * File timestamps are coarse, so a same-size in-place rewrite in the same
+ * tick keeps the signature. Like git's "racily clean" rule, a signature only
+ * vouches for the contents once observed this long after the file's mtime.
+ */
+const RACY_SIGNATURE_WINDOW_MS = 2_000;
+
+function fileSignatureSettled(
+  sig: FileSignature | null,
+  observedAt: number,
+): boolean {
+  return sig === null || observedAt - sig.mtimeMs >= RACY_SIGNATURE_WINDOW_MS;
+}
+
+let containerClaudeJsonSource: {
+  path: string;
+  sig: FileSignature | null;
+  observedAt: number;
+  content: string;
+} | null = null;
+let containerClaudeJsonTarget: {
+  path: string;
+  sig: FileSignature;
+  observedAt: number;
+  content: string;
+} | null = null;
+
+function writeContainerClaudeJsonIfChanged(
+  targetPath: string,
+  content: string,
+): void {
+  const observedAt = Date.now();
+  const sig = statFileSignature(targetPath);
+  const known = containerClaudeJsonTarget;
+  if (
+    known &&
+    known.path === targetPath &&
+    known.content === content &&
+    sameFileSignature(known.sig, sig) &&
+    fileSignatureSettled(known.sig, known.observedAt)
+  ) {
+    return;
+  }
+  containerClaudeJsonTarget = null;
+
+  let onDisk: string | null = null;
+  try {
+    onDisk = fs.readFileSync(targetPath, 'utf-8');
+  } catch {
+    /* missing: write it */
+  }
+  if (onDisk === content) {
+    if (sig) {
+      containerClaudeJsonTarget = {
+        path: targetPath,
+        sig,
+        observedAt,
+        content,
+      };
+    }
+    return;
+  }
+
+  // Running containers bind-mount this file read-only. Replacing it by rename
+  // leaves them a whole snapshot instead of a truncated, half-written file.
+  const tmp = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmp, content, { mode: 0o644, flag: 'wx' });
+    fs.renameSync(tmp, targetPath);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    throw err;
+  }
+  const writtenSig = statFileSignature(targetPath);
+  if (writtenSig) {
+    containerClaudeJsonTarget = {
+      path: targetPath,
+      sig: writtenSig,
+      observedAt: Date.now(),
+      content,
+    };
+  }
+}
+
 /**
  * 为 Docker 容器生成精简版 .claude.json。
  * 宿主机 ~/.claude.json 中的 cachedGrowthBookFeatures 含 tengu_bridge_repl_v2 等
@@ -195,8 +353,13 @@ function ensureHostClaudeJson(): string {
  * 同时剥离 oauthAccount：容器内不走宿主机的 OAuth 登录态，认证完全由
  * ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY 环境变量控制，避免 SDK 误检
  * OAuth 凭据后跳过标准 Bearer header（第三方 provider 返回 404）。
+ * 容器认证由 HappyClaw 配置，因此始终完成交互式初始化；宿主机未登录或
+ * 尚未完成引导时，也不能把该状态复制进已配置认证的容器。
+ *
+ * ~/.claude.json can be megabytes, so the copy is re-derived only when the
+ * host file's stats change and rewritten only when its bytes would change.
  */
-function getContainerClaudeJsonPath(): string {
+export function getContainerClaudeJsonPath(): string {
   const containerJsonDir = path.join(DATA_DIR, 'config');
   fs.mkdirSync(containerJsonDir, { recursive: true });
   const containerJsonPath = path.join(
@@ -204,24 +367,35 @@ function getContainerClaudeJsonPath(): string {
     'container-claude-json.json',
   );
 
+  const hostJsonPath = getHostClaudeJsonPath();
+  const observedAt = Date.now();
+  const sourceSig = statFileSignature(hostJsonPath);
+  const cached = containerClaudeJsonSource;
+  let content: string;
+  if (
+    cached &&
+    cached.path === hostJsonPath &&
+    sameFileSignature(cached.sig, sourceSig) &&
+    fileSignatureSettled(cached.sig, cached.observedAt)
+  ) {
+    content = cached.content;
+  } else {
+    content = deriveContainerClaudeJson(hostJsonPath);
+    containerClaudeJsonSource = {
+      path: hostJsonPath,
+      sig: sourceSig,
+      observedAt,
+      content,
+    };
+  }
+
   try {
-    const hostJson = JSON.parse(
-      fs.readFileSync(getHostClaudeJsonPath(), 'utf-8'),
-    );
-    const stripped = { ...hostJson };
-    delete stripped.cachedGrowthBookFeatures;
-    delete stripped.oauthAccount;
-    stripped.autoUpdates = false;
-    fs.writeFileSync(
-      containerJsonPath,
-      JSON.stringify(stripped, null, 2) + '\n',
-      { mode: 0o644 },
-    );
+    writeContainerClaudeJsonIfChanged(containerJsonPath, content);
   } catch {
-    fs.writeFileSync(
+    // As before, a copy that cannot be written falls back to the stub.
+    writeContainerClaudeJsonIfChanged(
       containerJsonPath,
-      '{"hasCompletedOnboarding":true,"autoUpdates":false}\n',
-      { mode: 0o644 },
+      CONTAINER_CLAUDE_JSON_FALLBACK,
     );
   }
 
@@ -263,6 +437,7 @@ export function clearSessionClaudeOAuthFiles(
 ): void {
   const sessionClaudeJson = path.join(sessionDir, '.claude.json');
   let sourceExists = false;
+  let hasSyntaxError = false;
   let claudeJson: Record<string, unknown> = {};
   try {
     const sourcePath = claudeJsonTemplatePath ?? sessionClaudeJson;
@@ -274,26 +449,44 @@ export function clearSessionClaudeOAuthFiles(
       }
       claudeJson = parsed as Record<string, unknown>;
     }
-  } catch {
-    // Invalid session metadata must not survive as an opaque OAuth signal.
-    sourceExists = true;
-    claudeJson = {};
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      hasSyntaxError = true;
+    } else if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      sourceExists = false;
+      claudeJson = {};
+    } else {
+      // Invalid session metadata must not survive as an opaque OAuth signal.
+      sourceExists = true;
+      claudeJson = {};
+    }
   }
 
-  try {
-    const stat = fs.lstatSync(sessionClaudeJson);
-    if (stat.isSymbolicLink()) fs.unlinkSync(sessionClaudeJson);
-  } catch {
-    /* not found, ok */
-  }
-  const hadOauthAccount = 'oauthAccount' in claudeJson;
-  delete claudeJson.oauthAccount;
-  if (claudeJsonTemplatePath || sourceExists || hadOauthAccount) {
-    fs.writeFileSync(
-      sessionClaudeJson,
-      JSON.stringify(claudeJson, null, 2) + '\n',
-      { mode: 0o600 },
-    );
+  if (!hasSyntaxError) {
+    try {
+      const stat = fs.lstatSync(sessionClaudeJson);
+      if (stat.isSymbolicLink()) fs.unlinkSync(sessionClaudeJson);
+    } catch {
+      /* not found, ok */
+    }
+    const hadOauthAccount = 'oauthAccount' in claudeJson;
+    delete claudeJson.oauthAccount;
+    if (claudeJsonTemplatePath || sourceExists || hadOauthAccount) {
+      const tmpPath = `${sessionClaudeJson}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        fs.writeFileSync(tmpPath, JSON.stringify(claudeJson, null, 2) + '\n', {
+          flag: 'wx',
+          mode: 0o600,
+        });
+        fs.renameSync(tmpPath, sessionClaudeJson);
+      } finally {
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {
+          /* already renamed or never created */
+        }
+      }
+    }
   }
 
   const credentialsPath = path.join(sessionDir, '.credentials.json');
@@ -314,12 +507,20 @@ const REQUIRED_SETTINGS_ENV: Record<string, string> = {
   // and Claude's native auto-memory must not create a second truth source.
   CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '0',
   CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
-  // 禁用 SDK 附件注入（token_usage, changed_files, todo_reminders 等 20+ 种动态消息）。
-  // 这些附件在每次 query() 时动态生成但不持久化到 JSONL，导致跨进程的消息数组
-  // 前缀不匹配，prompt cache 永远失效（cache_read 始终 = 11224 静态 system prompt）。
-  // 禁用后历史消息的缓存前缀跨 query() 保持一致，实现 1M 上下文下的增量缓存。
-  CLAUDE_CODE_DISABLE_ATTACHMENTS: '1',
 };
+
+/**
+ * Keys an older HappyClaw forced into session settings.json and must now be
+ * removed from it, unless the selected native layer sets them itself.
+ *
+ * CLAUDE_CODE_DISABLE_ATTACHMENTS was forced to keep the prompt-cache prefix
+ * stable across query() processes. Claude Code 2.1.296 treats it like bare
+ * mode: the turn-start attachment pass is skipped, so the skill listing,
+ * nested CLAUDE.md and todo reminders never reach the model and every
+ * selected Skill is invisible. A resumed process now replays the same message
+ * prefix with attachments on, so the old cache rationale no longer applies.
+ */
+const RETIRED_SETTINGS_ENV_KEYS = ['CLAUDE_CODE_DISABLE_ATTACHMENTS'] as const;
 
 function isSettingsRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -365,11 +566,38 @@ function removePreviousSettingsProjection(
   return cleaned;
 }
 
-function readSettingsRecord(filePath: string): Record<string, unknown> {
+function writeAtomicFile(
+  filePath: string,
+  contents: string,
+  mode: number,
+): void {
+  const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, contents, { flag: 'wx', mode });
+    fs.renameSync(tmpPath, filePath);
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function readSettingsRecord(
+  filePath: string,
+  options?: { ignoreSyntaxError?: boolean },
+): Record<string, unknown> {
   try {
     const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
     return isSettingsRecord(parsed) ? parsed : {};
-  } catch {
+  } catch (error) {
+    if (
+      !options?.ignoreSyntaxError &&
+      (error instanceof SyntaxError || (error as Error)?.name === 'SyntaxError')
+    ) {
+      throw error;
+    }
     return {};
   }
 }
@@ -387,8 +615,26 @@ function ensureSettingsJson(
     path.dirname(settingsFile),
     '.happyclaw-native-settings.json',
   );
-  const current = readSettingsRecord(settingsFile);
-  const previousProjection = readSettingsRecord(projectionFile);
+  let current: Record<string, unknown>;
+  try {
+    current = readSettingsRecord(settingsFile);
+  } catch (error) {
+    if (
+      error instanceof SyntaxError ||
+      (error as Error)?.name === 'SyntaxError'
+    ) {
+      return;
+    }
+    throw error;
+  }
+  let previousProjection: Record<string, unknown>;
+  try {
+    previousProjection = readSettingsRecord(projectionFile, {
+      ignoreSyntaxError: true,
+    });
+  } catch {
+    previousProjection = {};
+  }
   const existing = mergeSettingsRecord(
     removePreviousSettingsProjection(current, previousProjection),
     options?.baseSettings ?? {},
@@ -396,6 +642,12 @@ function ensureSettingsJson(
 
   const existingEnv = (existing.env as Record<string, string>) || {};
   const mergedEnv = { ...existingEnv, ...REQUIRED_SETTINGS_ENV };
+  const baseEnv = isSettingsRecord(options?.baseSettings?.env)
+    ? options.baseSettings.env
+    : {};
+  for (const key of RETIRED_SETTINGS_ENV_KEYS) {
+    if (!Object.hasOwn(baseEnv, key)) delete mergedEnv[key];
+  }
   const merged: Record<string, unknown> = { ...existing, env: mergedEnv };
 
   // Merge user-configured MCP servers into settings by default. AgentProfile
@@ -420,7 +672,7 @@ function ensureSettingsJson(
     /* write anyway */
   }
   if (settingsChanged) {
-    fs.writeFileSync(settingsFile, newContent, { mode: 0o644 });
+    writeAtomicFile(settingsFile, newContent, 0o644);
   }
 
   const projectionContent = `${JSON.stringify(options?.baseSettings ?? {}, null, 2)}\n`;
@@ -434,7 +686,7 @@ function ensureSettingsJson(
   } catch {
     /* write anyway */
   }
-  fs.writeFileSync(projectionFile, projectionContent, { mode: 0o600 });
+  writeAtomicFile(projectionFile, projectionContent, 0o600);
 }
 
 export interface ContainerInput {
@@ -571,6 +823,30 @@ function quarantineFromOutput(
     return;
   }
   providerPool.reportFailure(profileId, true, output.providerRateLimitResetsAt);
+}
+
+/**
+ * Reconcile a runner's provider-failure verdict with what the embedded Codex
+ * gateway last answered it. Claude Code reports every exhausted 429 as an
+ * account-wide limit, but a throttle the gateway applied itself (its local
+ * per-runner window, a token refresh in backoff) says nothing about the
+ * ChatGPT account and must not quarantine the provider. A rejected refresh
+ * grant stays an account verdict, with a notice naming the remedy.
+ */
+export function applyCodexGatewayVerdict(
+  output: ContainerOutput,
+  lease: Pick<CodexGatewayRunnerLease, 'lastVerdict'>,
+): void {
+  if (!output.providerFailure) return;
+  if (resolveProviderFailureClass(output) !== 'account') return;
+  switch (lease.lastVerdict) {
+    case 'local_transient':
+      output.providerFailureClass = 'transient';
+      break;
+    case 'reauth_required':
+      output.providerFailureNotice ??= CODEX_REAUTH_REQUIRED_USER_NOTICE;
+      break;
+  }
 }
 
 /**
@@ -987,23 +1263,6 @@ function getAgentProfileMcpPolicyMode(
 }
 
 /**
- * Resolve the model configuration that *pins* provider selection, or null when
- * selection should go through the balancing pool.
- *
- * An explicit Agent-level `modelConfigId` is authoritative: a top-level Agent
- * owns exactly one complete model configuration and must never be rerouted to a
- * different gateway or subscription.
- *
- * With no Agent-level choice, every enabled configuration belongs to the
- * automatic pool. A single enabled configuration is treated as pinned only to
- * keep the existing single-provider lifecycle efficient; multiple enabled
- * configurations must fall through to balancing.
- *
- * Every decision derived from "is selection pinned?" must call this, or the
- * sites disagree: selection would rotate while failure handling still treats
- * the provider as pinned (and therefore terminal).
- */
-/**
  * Pick the model tier this turn should run on.
  *
  * Per-model quotas are per account, so the pool drains the primary tier —
@@ -1057,28 +1316,85 @@ function stickyBindingCanServeTier(
   return !providerPool.isModelQuarantined(boundId, model);
 }
 
+/**
+ * Resolve the model configuration that *pins* provider selection, or null when
+ * selection should go through the balancing pool.
+ *
+ * An explicit conversation pick or Agent-level `modelConfigId` is
+ * authoritative: a top-level Agent owns exactly one complete model
+ * configuration and must never be rerouted to a different gateway or
+ * subscription.
+ *
+ * With neither, the configuration the operator marked as the global default
+ * pins (unless the Workspace brings its own provider environment). Only when
+ * no default is set does every enabled configuration belong to the automatic
+ * pool: a single enabled configuration is treated as pinned to keep the
+ * single-provider lifecycle efficient, and multiple enabled configurations
+ * fall through to balancing.
+ *
+ * Every decision derived from "is selection pinned?" must call this, or the
+ * sites disagree: selection would rotate while failure handling still treats
+ * the provider as pinned (and therefore terminal).
+ */
 function resolvePinnedModelConfigId(
   modelConfigId?: string | null,
+  session?: { groupFolder: string; agentId?: string | null },
 ): string | null {
+  const sessionSelection = session
+    ? resolveSessionModelSelection(session.groupFolder, session.agentId)
+    : null;
+  if (sessionSelection) return sessionSelection;
   if (modelConfigId) return modelConfigId;
+  // The global default is the weakest explicit choice: a Workspace that
+  // carries its own provider environment keeps it.
+  const defaultProvider = getUsableDefaultProvider();
+  if (
+    defaultProvider &&
+    !(session && workspaceHasProviderEnv(session.groupFolder))
+  ) {
+    return defaultProvider.id;
+  }
   const enabledProviders = getEnabledProviders();
   return enabledProviders.length === 1 ? enabledProviders[0].id : null;
+}
+
+/** Whether the Workspace brings its own provider environment, bypassing the pool. */
+function workspaceHasProviderEnv(groupFolder: string): boolean {
+  const override = getContainerEnvConfig(groupFolder);
+  return !!(
+    override.anthropicApiKey ||
+    override.anthropicAuthToken ||
+    override.anthropicBaseUrl
+  );
+}
+
+/**
+ * The model configuration the user picked for this conversation in the chat
+ * composer. It outranks the Agent's binding because it is the more specific
+ * choice; like the Agent binding it may name a configuration that is not in
+ * the automatic pool. A selection whose configuration has since been deleted
+ * or lost its credential degrades to the default instead of failing the turn.
+ */
+export function resolveSessionModelSelection(
+  groupFolder: string,
+  agentId?: string | null,
+): string | null {
+  const selected = getSessionModelSelection(groupFolder, agentId);
+  if (!selected) return null;
+  const provider = getProviders().find((item) => item.id === selected);
+  return provider && providerHasCredentials(provider) ? selected : null;
 }
 
 /** Whether a completed user turn must release its runner for the next pick. */
 export function shouldRotatePoolProviderAfterTurn(
   groupFolder: string,
   modelConfigId?: string | null,
+  agentId?: string | null,
 ): boolean {
-  if (resolvePinnedModelConfigId(modelConfigId)) return false;
-  const override = getContainerEnvConfig(groupFolder);
-  if (
-    override.anthropicApiKey ||
-    override.anthropicAuthToken ||
-    override.anthropicBaseUrl
-  ) {
+  if (resolvePinnedModelConfigId(modelConfigId, { groupFolder, agentId })) {
     return false;
   }
+  if (workspaceHasProviderEnv(groupFolder)) return false;
   return (
     getEnabledProviders().length > 1 &&
     getBalancingConfig().strategy !== 'failover'
@@ -1089,14 +1405,26 @@ export function shouldRotatePoolProviderAfterTurn(
 export function closeRunnerAfterRotatingProviderTurn(
   rotationEnabled: boolean,
   rotationAlreadyScheduled: boolean,
-  output: Pick<ContainerOutput, 'providerFailure' | 'inputTurnCompleted'>,
+  output: Pick<
+    ContainerOutput,
+    'providerFailure' | 'inputTurnCompleted' | 'pendingBgTasks' | 'queryIdle'
+  >,
   closeRunner: () => void,
 ): boolean {
   if (
     !rotationEnabled ||
     rotationAlreadyScheduled ||
     output.providerFailure ||
-    output.inputTurnCompleted !== true
+    output.inputTurnCompleted !== true ||
+    // A runner still holding background Tasks must stay alive: closing stdin
+    // would kill the sub-agents and drop their completion summary. Rotation
+    // is retried on the next healthy completion once they have settled.
+    (output.pendingBgTasks ?? 0) > 0 ||
+    // The result completed turn A while a follow-up IPC turn B was already
+    // piped into the same SDK stream. Closing now strands B without its own
+    // result, so the host treats the close as in-flight and replays/duplicates
+    // A's reply. Rotate on B's completion instead.
+    output.queryIdle === false
   ) {
     return false;
   }
@@ -1124,22 +1452,23 @@ export function willClearSessionOnProviderSwitch(
   agentId?: string | null,
   modelConfigId?: string | null,
 ): boolean {
-  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId);
+  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId, {
+    groupFolder,
+    agentId,
+  });
   const boundId = getSessionProviderId(groupFolder, agentId);
   if (selectedModelConfigId) {
-    return !!boundId && boundId !== selectedModelConfigId;
+    if (boundId && boundId !== selectedModelConfigId) return true;
+    return boundSessionModelWillChange(
+      groupFolder,
+      agentId,
+      selectedModelConfigId,
+    );
   }
 
   // Env-level provider override means the pool is bypassed entirely — no
   // pool-driven switch, so the session is never cleared on this account.
-  const override = getContainerEnvConfig(groupFolder);
-  if (
-    override.anthropicApiKey ||
-    override.anthropicAuthToken ||
-    override.anthropicBaseUrl
-  ) {
-    return false;
-  }
+  if (workspaceHasProviderEnv(groupFolder)) return false;
 
   if (!boundId) return false;
 
@@ -1173,10 +1502,144 @@ export function willClearSessionOnProviderSwitch(
   // Same second dimension the sticky path checks: a walled model tier moves
   // the session off a still-healthy account, and that switch must inject
   // history like any other.
-  return !stickyBindingCanServeTier(
-    boundId,
-    enabledProviders,
-    resolvePoolTierModel(enabledProviders),
+  if (
+    !stickyBindingCanServeTier(
+      boundId,
+      enabledProviders,
+      resolvePoolTierModel(enabledProviders),
+    )
+  ) {
+    return true;
+  }
+  // The binding stays, but a conversation that just left its pinned model
+  // returns to the configuration's own, and that is a model change.
+  return boundSessionModelWillChange(groupFolder, agentId, boundId);
+}
+
+/**
+ * Whether launching on `providerId` would change the model of a ChatGPT
+ * session that is still resumable. Mirrors withSessionModel, read-only.
+ */
+function boundSessionModelWillChange(
+  groupFolder: string,
+  agentId: string | null | undefined,
+  providerId: string,
+): boolean {
+  const provider = getProviders().find((item) => item.id === providerId);
+  if (!provider?.codexOAuthCredentials) return false;
+  const overrides = resolveSessionLaunchOverrides(
+    groupFolder,
+    agentId,
+    provider,
+    { warn: false },
+  );
+  return sessionModelHasChanged(
+    groupFolder,
+    agentId,
+    chatGptLaunchModel(overrides.model, provider),
+    chatGptDefaultModel(provider),
+  );
+}
+
+/**
+ * Providers the next pool selection for this session may return, among those
+ * holding Claude OAuth credentials. Mirrors trySelectPoolProvider's branches.
+ */
+export function launchOAuthRefreshCandidates(
+  groupFolder: string,
+  agentId?: string | null,
+  modelConfigId?: string | null,
+): string[] {
+  const pinned = resolvePinnedModelConfigId(modelConfigId, {
+    groupFolder,
+    agentId,
+  });
+  const providers = pinned
+    ? getProviders().filter((provider) => provider.id === pinned)
+    : (() => {
+        if (workspaceHasProviderEnv(groupFolder)) return [];
+        return getEnabledProviders();
+      })();
+  return providers
+    .filter((provider) => !!provider.claudeOAuthCredentials)
+    .map((provider) => provider.id);
+}
+
+/**
+ * When the access token is this close to expiry, a launch waits for the
+ * host refresh however long it takes (bounded by its own timeout):
+ * otherwise the runner's Claude Code would refresh the same token itself.
+ */
+const LAUNCH_REFRESH_BLOCKING_WINDOW_MS = 10 * 60_000;
+/** Otherwise a launch waits at most this long; the refresh keeps going. */
+const LAUNCH_REFRESH_WAIT_MS = 5_000;
+
+/**
+ * Renew the OAuth credentials a launch may use before the provider is
+ * selected, so the runner starts from host-refreshed credentials and the
+ * selection-to-spawn path stays synchronous. Never throws: a failed renewal
+ * leaves the stored credential, which Claude Code can still refresh.
+ */
+export async function refreshLaunchOAuthCredentials(
+  groupFolder: string,
+  agentId?: string | null,
+  modelConfigId?: string | null,
+  refresh: (
+    providerId: string,
+  ) => Promise<ClaudeOAuthRefreshOutcome> = refreshClaudeProviderOAuth,
+): Promise<void> {
+  let candidates: string[];
+  try {
+    candidates = launchOAuthRefreshCandidates(
+      groupFolder,
+      agentId,
+      modelConfigId,
+    );
+  } catch {
+    // Selection reports configuration errors with full context.
+    return;
+  }
+  const now = Date.now();
+  await Promise.all(
+    candidates.map(async (providerId) => {
+      const credentials = getProviders().find(
+        (provider) => provider.id === providerId,
+      )?.claudeOAuthCredentials;
+      if (
+        !credentials ||
+        !isClaudeOAuthRefreshDue(providerId, credentials, now)
+      ) {
+        return;
+      }
+      const refreshing = refresh(providerId).then(
+        (outcome) => {
+          if (outcome.status === 'failed' || outcome.status === 'backoff') {
+            logger.warn(
+              { groupFolder, providerId, outcome },
+              'Launch-time Claude OAuth refresh did not complete',
+            );
+          }
+        },
+        (err) => {
+          logger.warn(
+            { err, groupFolder, providerId },
+            'Launch-time Claude OAuth refresh failed',
+          );
+        },
+      );
+      if (credentials.expiresAt - now <= LAUNCH_REFRESH_BLOCKING_WINDOW_MS) {
+        await refreshing;
+        return;
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        refreshing,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, LAUNCH_REFRESH_WAIT_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+    }),
   );
 }
 
@@ -1197,7 +1660,17 @@ export function trySelectPoolProvider(
   agentId?: string | null,
   modelConfigId?: string | null,
   transientRetryProfileId?: string | null,
-): {
+): PoolProviderSelection | null {
+  const selection = selectPoolProvider(
+    groupFolder,
+    agentId,
+    modelConfigId,
+    transientRetryProfileId,
+  );
+  return selection ? withSessionModel(selection, groupFolder, agentId) : null;
+}
+
+export interface PoolProviderSelection {
   profileId: string;
   resolved: ResolvedProvider;
   previousProviderId?: string;
@@ -1207,8 +1680,71 @@ export function trySelectPoolProvider(
    * configured model walled, so this turn must run on the fallback model.
    */
   modelOverride?: string;
-} | null {
-  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId);
+  /**
+   * ChatGPT launches: the upstream model the Session's SDK session runs on,
+   * recorded so that a later launch can tell the model changed.
+   */
+  sessionModel?: string;
+  /**
+   * ChatGPT launches: the reasoning effort this conversation picked. It is
+   * minted into the gateway grant, never into the runner's environment.
+   */
+  sessionEffort?: string;
+}
+
+/**
+ * A ChatGPT session's encrypted reasoning only verifies for the model that
+ * issued it, so a conversation that changes model has to start a new SDK
+ * session, the same way one that changes provider does. Record the model this
+ * launch runs on and flag the reset when it differs from the recorded one.
+ */
+function withSessionModel(
+  selection: PoolProviderSelection,
+  groupFolder: string,
+  agentId: string | null | undefined,
+): PoolProviderSelection {
+  const { config } = selection.resolved;
+  if (!isCodexGatewayBaseUrl(config.anthropicBaseUrl)) return selection;
+  const provider = getProviders().find(
+    (item) => item.id === selection.profileId,
+  );
+  if (!provider) return selection;
+  const sessionModel = chatGptLaunchModel(
+    selection.modelOverride || config.anthropicModel,
+    provider,
+  );
+  const modelChanged =
+    !selection.resetSession &&
+    sessionModelHasChanged(
+      groupFolder,
+      agentId,
+      sessionModel,
+      chatGptDefaultModel(provider),
+    );
+  if (modelChanged) {
+    logger.info(
+      { groupFolder, agentId: agentId || null, providerId: provider.id },
+      'Conversation model changed; starting a new session',
+    );
+  }
+  setSessionModel(groupFolder, agentId, sessionModel);
+  return {
+    ...selection,
+    sessionModel,
+    ...(modelChanged ? { resetSession: true } : {}),
+  };
+}
+
+function selectPoolProvider(
+  groupFolder: string,
+  agentId?: string | null,
+  modelConfigId?: string | null,
+  transientRetryProfileId?: string | null,
+): PoolProviderSelection | null {
+  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId, {
+    groupFolder,
+    agentId,
+  });
   const existingBoundId = getSessionProviderId(groupFolder, agentId);
   if (selectedModelConfigId) {
     // Agent/single-enabled selection is authoritative. Workspace credentials must
@@ -1228,21 +1764,30 @@ export function trySelectPoolProvider(
     const resolved = resolveProviderById(selected.id);
     providerPool.acquireSession(selected.id);
     setSessionProviderId(groupFolder, agentId, selected.id);
+    // A ChatGPT conversation may run another of the account's models and at
+    // another effort. Only the main model is replaced: the OPUS / SONNET /
+    // SUBAGENT tiers follow it when the environment is built, and the haiku
+    // tier (background work) deliberately stays on the configuration's model.
+    const overrides = resolveSessionLaunchOverrides(
+      groupFolder,
+      agentId,
+      selected,
+    );
     return {
       profileId: selected.id,
-      resolved: { config: resolved.config, customEnv: resolved.customEnv },
+      resolved: {
+        config: overrides.model
+          ? { ...resolved.config, anthropicModel: overrides.model }
+          : resolved.config,
+        customEnv: resolved.customEnv,
+      },
       previousProviderId: existingBoundId,
       resetSession: !!existingBoundId && existingBoundId !== selected.id,
+      ...(overrides.effort ? { sessionEffort: overrides.effort } : {}),
     };
   }
 
-  const override = getContainerEnvConfig(groupFolder);
-  const hasOverride = !!(
-    override.anthropicApiKey ||
-    override.anthropicAuthToken ||
-    override.anthropicBaseUrl
-  );
-  if (hasOverride) return null;
+  if (workspaceHasProviderEnv(groupFolder)) return null;
 
   // Refresh pool state from V4 config
   const enabledProviders = getEnabledProviders();
@@ -1584,7 +2129,7 @@ export function cleanupContainerTaskRuntimeEnvDirs(
   }
 }
 
-export interface DockerOauthLaunchSnapshot {
+export interface OAuthLaunchSnapshot {
   credentialsFilePath: string;
   launchCredentials: ClaudeOAuthCredentials;
 }
@@ -1594,7 +2139,11 @@ interface PreparedVolumeMounts {
   claudeContextPlan: ReturnType<typeof buildClaudeContextPlan>;
   runtimeMcpServers: Record<string, Record<string, unknown>>;
   hostPlugins: SdkPluginConfig[];
-  dockerOauthLaunch: DockerOauthLaunchSnapshot | null;
+  dockerOauthLaunch: OAuthLaunchSnapshot | null;
+  /** Selected provider routes through the ChatGPT/Codex 订阅网关; docker run needs host.docker.internal. */
+  usesCodexGateway: boolean;
+  /** Selected provider endpoint was rewritten from host loopback to host.docker.internal. */
+  providerNeedsHostGateway: boolean;
 }
 
 function prepareVolumeMounts(
@@ -1616,6 +2165,8 @@ function prepareVolumeMounts(
     envLines: [],
     addHostGateway: false,
   },
+  /** Mints this runner's Codex gateway token; revoked when the runner exits. */
+  codexGatewayLease?: CodexGatewayRunnerLease,
 ): PreparedVolumeMounts {
   if (group.containerConfigError) {
     throw new AdditionalMountValidationError([
@@ -1759,14 +2310,53 @@ function prepareVolumeMounts(
   // Every selected Skill gets an explicit read-only mount. entrypoint rebuilds
   // /home/node/.claude/skills exclusively from this directory, so a real
   // directory persisted by an earlier container can never survive a restart.
+  // Workspace skills dir sits inside the RW /workspace/group bind and
+  // scanSkillDirectory accepts symlinks intentionally for host/user layers, so
+  // confine workspace skills to the group's real .claude/skills root (not
+  // realpath(skillsDir), which would follow a planted symlink).
+  let groupReal: string | null = null;
+  try {
+    groupReal = fs.realpathSync(path.join(GROUPS_DIR, group.folder));
+  } catch {
+    groupReal = null;
+  }
+  const workspaceSkillsRoot = groupReal
+    ? path.join(groupReal, '.claude', 'skills')
+    : null;
   for (const skill of claudeContextPlan.effectiveSkills.selected) {
     if (skill.source === 'plugin') continue;
     let hostPath = skill.path;
+    let realpathOk = true;
     try {
       hostPath = fs.realpathSync(hostPath);
     } catch {
       // The resolver already validated SKILL.md. Keep the original path so
       // Docker reports a deterministic mount error if it vanished afterward.
+      realpathOk = false;
+    }
+    if (skill.source === 'workspace') {
+      const rel = workspaceSkillsRoot
+        ? path.relative(workspaceSkillsRoot, hostPath)
+        : '';
+      if (
+        !realpathOk ||
+        !workspaceSkillsRoot ||
+        rel === '' ||
+        rel === '..' ||
+        rel.startsWith('..' + path.sep) ||
+        path.isAbsolute(rel)
+      ) {
+        logger.warn(
+          {
+            group: group.folder,
+            skillId: skill.id,
+            skillPath: skill.path,
+            resolvedPath: hostPath,
+          },
+          'Skipping workspace skill outside workspace skills root',
+        );
+        continue;
+      }
     }
     mounts.push({
       hostPath,
@@ -1880,7 +2470,27 @@ function prepareVolumeMounts(
       : null,
   );
   fs.mkdirSync(envDir, { recursive: true });
-  const globalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
+  const rawGlobalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
+  const codexLaunchConfig = resolveCodexGatewayLaunchConfig(
+    rawGlobalConfig,
+    'container',
+    codexGatewayLease,
+  );
+  // The gateway already resolves to host.docker.internal; this only rewrites
+  // a third-party relay configured on the host's loopback.
+  const containerBaseUrl = resolveContainerProviderBaseUrl(
+    codexLaunchConfig.anthropicBaseUrl,
+  );
+  const globalConfig = {
+    ...codexLaunchConfig,
+    anthropicBaseUrl: containerBaseUrl.baseUrl,
+  };
+  const usesCodexGateway = isCodexGatewayBaseUrl(
+    rawGlobalConfig.anthropicBaseUrl,
+  );
+  const providerNeedsHostGateway = containerBaseUrl.addHostGateway;
+  const providerRoutedToHost =
+    containerBaseUrl.baseUrl !== codexLaunchConfig.anthropicBaseUrl;
   const containerOverride = getContainerEnvConfig(group.folder);
   const effectiveContainerOverride = resolvedProvider
     ? { customEnv: containerOverride.customEnv }
@@ -1923,13 +2533,28 @@ function prepareVolumeMounts(
   );
   applyFallbackModelToEnvLines(envLines, containerTierEnv.runnerFallbackModel);
   if (containerTierEnv.model) {
+    const walledSubagentLine = `CLAUDE_CODE_SUBAGENT_MODEL=${rawGlobalConfig.anthropicModel}`;
+    let subagentFollowedPrimary = false;
     for (let i = envLines.length - 1; i >= 0; i--) {
       if (envLines[i].startsWith('ANTHROPIC_MODEL=')) envLines.splice(i, 1);
+      else if (envLines[i] === walledSubagentLine) {
+        envLines.splice(i, 1);
+        subagentFollowedPrimary = true;
+      }
     }
     envLines.push(`ANTHROPIC_MODEL=${containerTierEnv.model}`);
+    // Subagents that followed the walled primary model escalate with it.
+    if (subagentFollowedPrimary) {
+      envLines.push(`CLAUDE_CODE_SUBAGENT_MODEL=${containerTierEnv.model}`);
+    }
   }
   applyFeishuCliBindingToEnvLines(envLines, feishuCliBinding);
   applyContainerProxyEnvLines(envLines, containerProxy.envLines);
+  // Both the gateway and a rewritten loopback relay live on
+  // host.docker.internal, which a forwarded host proxy cannot resolve.
+  if (usesCodexGateway || providerRoutedToHost) {
+    applyCodexGatewayNoProxyToEnvLines(envLines);
+  }
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -2054,6 +2679,8 @@ function prepareVolumeMounts(
     runtimeMcpServers,
     hostPlugins: pluginSkills,
     dockerOauthLaunch,
+    usesCodexGateway,
+    providerNeedsHostGateway,
   };
 }
 
@@ -2126,25 +2753,69 @@ export function resolveContainerHostIdentity(
   };
 }
 
-function probeContainerSecurityOptions(): readonly string[] | null {
-  let securityOptions: readonly string[] | null = null;
+const SECURITY_OPTIONS_PROBE_ARGS = [
+  'info',
+  '--format',
+  '{{json .SecurityOptions}}',
+];
+const SECURITY_OPTIONS_PROBE_TIMEOUT_MS = 3_000;
+
+function parseSecurityOptions(raw: string): readonly string[] | null {
   try {
-    const raw = execFileSync(
-      'docker',
-      ['info', '--format', '{{json .SecurityOptions}}'],
-      { encoding: 'utf8', timeout: 3_000 },
-    ).trim();
-    const parsed: unknown = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(raw.trim());
     if (
       Array.isArray(parsed) &&
       parsed.every((option) => typeof option === 'string')
     ) {
-      securityOptions = parsed;
+      return parsed;
     }
   } catch {
-    // A missing/unsupported probe must not enable numeric id remapping.
+    /* fall through */
   }
-  return securityOptions;
+  return null;
+}
+
+function probeContainerSecurityOptions(): readonly string[] | null {
+  try {
+    return parseSecurityOptions(
+      execFileSync('docker', SECURITY_OPTIONS_PROBE_ARGS, {
+        encoding: 'utf8',
+        timeout: SECURITY_OPTIONS_PROBE_TIMEOUT_MS,
+      }),
+    );
+  } catch {
+    // A missing/unsupported probe must not enable numeric id remapping.
+    return null;
+  }
+}
+
+/**
+ * The same probe without holding the event loop for the docker CLI round
+ * trip (55-80 ms measured on Linux) on every launch.
+ */
+export function probeContainerSecurityOptionsAsync(): Promise<
+  readonly string[] | null
+> {
+  return new Promise((resolve) => {
+    try {
+      execFile(
+        'docker',
+        SECURITY_OPTIONS_PROBE_ARGS,
+        { encoding: 'utf8', timeout: SECURITY_OPTIONS_PROBE_TIMEOUT_MS },
+        (err, stdout) => {
+          // A missing/unsupported probe must not enable numeric id remapping.
+          resolve(err ? null : parseSecurityOptions(stdout));
+        },
+      );
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/** Only a Linux daemon's security options affect the identity decision. */
+function securityOptionsMatter(): boolean {
+  return process.platform === 'linux';
 }
 
 export function detectContainerHostIdentity(
@@ -2155,7 +2826,31 @@ export function detectContainerHostIdentity(
   // Probe every launch. Docker context/daemon security options can change
   // while HappyClaw is running; reusing an earlier direct result could bypass
   // rootless/userns fail-closed handling, while caching unknown blocks recovery.
-  const securityOptions = readSecurityOptions();
+  const securityOptions = securityOptionsMatter()
+    ? readSecurityOptions()
+    : null;
+  return resolveContainerHostIdentity({
+    platform: process.platform,
+    uid: process.getuid?.(),
+    gid: process.getgid?.(),
+    securityOptions,
+  });
+}
+
+/** detectContainerHostIdentity() for launches: still probed every time. */
+export async function detectContainerHostIdentityAsync(
+  readSecurityOptions: () => Promise<
+    readonly string[] | null
+  > = probeContainerSecurityOptionsAsync,
+): Promise<ContainerHostIdentity> {
+  let securityOptions: readonly string[] | null = null;
+  if (securityOptionsMatter()) {
+    try {
+      securityOptions = await readSecurityOptions();
+    } catch {
+      securityOptions = null;
+    }
+  }
   return resolveContainerHostIdentity({
     platform: process.platform,
     uid: process.getuid?.(),
@@ -2165,6 +2860,38 @@ export function detectContainerHostIdentity(
 }
 
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
+
+/**
+ * A provider endpoint on the host's loopback (a local relay such as
+ * CLIProxyAPI) is unreachable from inside a bridge container. Route it through
+ * host.docker.internal, as the proxy settings do; on Linux that name needs the
+ * host-gateway mapping and the relay must listen on an address the Docker
+ * bridge reaches.
+ */
+export function resolveContainerProviderBaseUrl(
+  baseUrl: string,
+  platform: NodeJS.Platform = process.platform,
+): { baseUrl: string; addHostGateway: boolean } {
+  if (!baseUrl) return { baseUrl, addHostGateway: false };
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    return { baseUrl, addHostGateway: false };
+  }
+  if (!LOOPBACK_HOSTNAMES.has(normalizedProxyHostname(parsed))) {
+    return { baseUrl, addHostGateway: false };
+  }
+  parsed.hostname = 'host.docker.internal';
+  return {
+    // URL serialization adds a trailing slash to a bare origin; keep the
+    // admin's path shape so the SDK joins `/v1/messages` the same way.
+    baseUrl: baseUrl.endsWith('/')
+      ? parsed.toString()
+      : parsed.toString().replace(/\/$/, ''),
+    addHostGateway: platform === 'linux',
+  };
+}
 
 export interface ResolvedContainerProxyConfig {
   /** Shell env assignments written to the per-container 0600 runtime file. */
@@ -2267,6 +2994,20 @@ export function applyContainerProxyEnvLines(
   }
 }
 
+/** Keep the local gateway hop out of any proxy configured for the runner. */
+function applyCodexGatewayNoProxyToEnvLines(envLines: string[]): void {
+  const env: Record<string, string | undefined> = {};
+  for (const key of ['NO_PROXY', 'no_proxy']) {
+    const index = envLines.findIndex((line) => line.startsWith(`${key}=`));
+    if (index >= 0) {
+      env[key] = envLines[index].slice(key.length + 1);
+      envLines.splice(index, 1);
+    }
+  }
+  applyCodexGatewayNoProxy(env, 'container');
+  envLines.push(`NO_PROXY=${env.NO_PROXY}`, `no_proxy=${env.no_proxy}`);
+}
+
 export function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -2276,6 +3017,11 @@ export function buildContainerArgs(
   containerImage = CONTAINER_IMAGE,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+  // Hardening from the Agent SDK secure-deployment guidance that this image
+  // tolerates: the entrypoint drops root with runuser and Chromium runs with
+  // --no-sandbox, so nothing needs a setuid privilege gain; the pids limit
+  // only stops runaway forks and stays far above browser and build loads.
+  args.push('--security-opt', 'no-new-privileges', '--pids-limit', '4096');
 
   // Set timezone so container Node.js processes use local time (Asia/Shanghai)
   args.push('-e', `TZ=${tz}`);
@@ -2311,14 +3057,17 @@ export function buildContainerArgs(
 }
 
 /**
- * Reconcile a Docker SDK credential rotation at a safe output/exit boundary.
- * The lower-level helper performs the launch-snapshot CAS; on success, fan the
- * adopted credential out to other persisted sessions so the next runner does
- * not start from an invalidated refresh token.
+ * Reconcile a runner's own credential rotation at a safe output/exit
+ * boundary: Docker runners, and host runners wherever Claude Code keeps its
+ * credentials in the session `.credentials.json` (everywhere but macOS, where
+ * the Keychain reconciliation owns it). The lower-level helper performs the
+ * launch-snapshot CAS (newer expiry wins); on success, fan the adopted
+ * credential out to other persisted sessions so the next runner does not start
+ * from an invalidated refresh token.
  */
-export function reconcileDockerOAuthAfterExit(
+export function reconcileSessionOAuthAfterExit(
   providerId: string | null,
-  launch: DockerOauthLaunchSnapshot | null,
+  launch: OAuthLaunchSnapshot | null,
   dependencies: {
     reconcile?: typeof reconcileDockerOAuthCredentials;
     fanOutUpdatedCredentials?: (providerId: string) => void;
@@ -2394,10 +3143,21 @@ export async function runContainerAgent(
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
+  // Probed per launch as before, but asynchronously and ahead of provider
+  // selection, so everything from selection to spawn stays one synchronous
+  // step while the docker CLI round trip no longer blocks the event loop.
+  const hostIdentity = await detectContainerHostIdentityAsync();
   const sessionAgentId = input.sessionAgentId ?? input.agentId;
 
   const groupDir = path.join(GROUPS_DIR, group.folder);
   mkdirForContainer(groupDir);
+  // Like the probe above, the host-owned OAuth renewal awaits ahead of the
+  // synchronous selection-to-spawn block.
+  await refreshLaunchOAuthCredentials(
+    group.folder,
+    sessionAgentId,
+    input.agentProfile?.modelConfigId,
+  );
 
   // ─── Provider Pool selection ───
   const poolResult = trySelectPoolProvider(
@@ -2413,6 +3173,7 @@ export async function runContainerAgent(
   const resolvedProvider = poolResult?.resolved;
   const modelSelectionPinned = !!resolvePinnedModelConfigId(
     input.agentProfile?.modelConfigId,
+    { groupFolder: group.folder, agentId: sessionAgentId },
   );
   let providerFailureReported = false;
   let providerFailureTerminal: boolean | undefined;
@@ -2432,6 +3193,15 @@ export async function runContainerAgent(
     workspaceMemoryCapabilityScope,
     input.turnId,
   );
+  const codexGatewayLease = new CodexGatewayRunnerLease({
+    kind: 'container',
+    groupFolder: group.folder,
+    agentId: input.agentId ?? null,
+    sessionAgentId: sessionAgentId ?? null,
+    taskRunId: input.taskRunId ?? null,
+    agentEffort: resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
+    sessionEffort: poolResult?.sessionEffort,
+  });
   try {
     const isAdminHome = !!input.isAdminHome;
     // Per-user skills: always mount if the group has an owner
@@ -2453,6 +3223,7 @@ export async function runContainerAgent(
       poolResult?.modelOverride,
       modelSelectionPinned,
       containerProxy,
+      codexGatewayLease,
     );
     const mounts = preparedLaunch.mounts;
     const dockerPlugins = group.created_by
@@ -2494,8 +3265,13 @@ export async function runContainerAgent(
       mounts,
       containerName,
       TIMEZONE,
-      detectContainerHostIdentity(),
-      { addHostGateway: containerProxy.addHostGateway },
+      hostIdentity,
+      {
+        addHostGateway:
+          containerProxy.addHostGateway ||
+          preparedLaunch.usesCodexGateway ||
+          preparedLaunch.providerNeedsHostGateway,
+      },
       containerImage,
     );
 
@@ -2600,7 +3376,7 @@ export async function runContainerAgent(
       const reconcileDockerOAuth = (
         phase: 'output' | 'exit',
       ): DockerOAuthReconcileOutcome | 'error' | null => {
-        const outcome = reconcileDockerOAuthAfterExit(
+        const outcome = reconcileSessionOAuthAfterExit(
           selectedProfileId,
           preparedLaunch.dockerOauthLaunch,
         );
@@ -2633,6 +3409,7 @@ export async function runContainerAgent(
         return outcome;
       };
       const handleOutput = async (output: ContainerOutput): Promise<void> => {
+        applyCodexGatewayVerdict(output, codexGatewayLease);
         if (
           output.providerQuotaObservation ||
           output.inputTurnCompleted === true ||
@@ -2834,6 +3611,7 @@ export async function runContainerAgent(
       });
     });
 
+    applyCodexGatewayVerdict(result, codexGatewayLease);
     // ─── Provider Pool health reporting ───
     if (selectedProfileId) {
       if (result.providerFailure) {
@@ -2878,6 +3656,7 @@ export async function runContainerAgent(
 
     return result;
   } finally {
+    codexGatewayLease.revoke();
     revokeWorkspaceMemoryWriteCapability(
       workspaceMemoryCapabilityScope,
       workspaceMemoryRunnerInstanceId,
@@ -3515,6 +4294,11 @@ export async function runHostAgent(
   delete hostEnv['XPC_FLAGS'];
 
   // ─── Provider Pool selection (host mode) ───
+  await refreshLaunchOAuthCredentials(
+    group.folder,
+    sessionAgentId,
+    input.agentProfile?.modelConfigId,
+  );
   const containerOverride = getContainerEnvConfig(group.folder);
   const hostPoolResult = trySelectPoolProvider(
     group.folder,
@@ -3528,13 +4312,15 @@ export async function runHostAgent(
     : null;
   const hostModelSelectionPinned = !!resolvePinnedModelConfigId(
     input.agentProfile?.modelConfigId,
+    { groupFolder: group.folder, agentId: sessionAgentId },
   );
-  const globalConfig =
+  const rawGlobalConfig =
     hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
   let hostProviderFailureReported = false;
   let hostProviderFailureTerminal: boolean | undefined;
   let hostProviderFailureMaintenance = false;
   let hostHealthyInputTurnCompleted = false;
+  let hostOauthLaunch: OAuthLaunchSnapshot | null = null;
   input = applyProviderSwitchToInput(input, hostPoolResult, sessionAgentId);
 
   const workspaceMemoryCapabilityScope: WorkspaceMemoryCapabilityScope = {
@@ -3549,7 +4335,22 @@ export async function runHostAgent(
     workspaceMemoryCapabilityScope,
     input.turnId,
   );
+  const codexGatewayLease = new CodexGatewayRunnerLease({
+    kind: 'host',
+    groupFolder: group.folder,
+    agentId: input.agentId ?? null,
+    sessionAgentId: sessionAgentId ?? null,
+    taskRunId: input.taskRunId ?? null,
+    agentEffort: resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
+    sessionEffort: hostPoolResult?.sessionEffort,
+  });
   try {
+    // Minted inside try so the finally below always revokes the token.
+    const globalConfig = resolveCodexGatewayLaunchConfig(
+      rawGlobalConfig,
+      'host',
+      codexGatewayLease,
+    );
     // 配置层环境变量
     const envLines = buildContainerEnvLines(
       globalConfig,
@@ -3582,7 +4383,19 @@ export async function runHostAgent(
     } else {
       delete hostEnv['HAPPYCLAW_FALLBACK_MODEL'];
     }
-    if (tierEnv.model) hostEnv['ANTHROPIC_MODEL'] = tierEnv.model;
+    if (tierEnv.model) {
+      // Subagents that followed the walled primary model escalate with it.
+      if (
+        hostEnv['CLAUDE_CODE_SUBAGENT_MODEL'] &&
+        hostEnv['CLAUDE_CODE_SUBAGENT_MODEL'] === rawGlobalConfig.anthropicModel
+      ) {
+        hostEnv['CLAUDE_CODE_SUBAGENT_MODEL'] = tierEnv.model;
+      }
+      hostEnv['ANTHROPIC_MODEL'] = tierEnv.model;
+    }
+    if (isCodexGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl)) {
+      applyCodexGatewayNoProxy(hostEnv, 'host');
+    }
 
     // Resolve symlinks up front: this exact string becomes CLAUDE_CONFIG_DIR
     // below, and the macOS Keychain entry the CLI reads is addressed by a
@@ -3681,6 +4494,15 @@ export async function runHostAgent(
           '无法写入宿主机会话 OAuth 凭据文件，已阻止启动',
         );
       }
+      // Off macOS, Claude Code refreshes into this file. Remember what was
+      // written so a rotation is persisted back instead of being overwritten
+      // by the stale stored credential on the next launch.
+      if (process.platform !== 'darwin') {
+        hostOauthLaunch = {
+          credentialsFilePath: path.join(groupSessionsDir, '.credentials.json'),
+          launchCredentials: effectiveOauth,
+        };
+      }
     }
 
     // Agent policy is authoritative; clear inherited legacy process env first.
@@ -3713,8 +4535,10 @@ export async function runHostAgent(
     // CLAUDE.md/rules/skills.
     hostEnv['CLAUDE_CONFIG_DIR'] = resolvedSessionsDir;
 
-    // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败
-    hostEnv['DEBUG_CLAUDE_AGENT_SDK'] = '1';
+    // No DEBUG_CLAUDE_AGENT_SDK: the SDK turns it into DEBUG=1 for the CLI,
+    // which then writes debug logs under CLAUDE_CONFIG_DIR/debug on every
+    // run. The runner captures CLI stderr through the SDK `stderr` option.
+    delete hostEnv['DEBUG_CLAUDE_AGENT_SDK'];
     // Claude Code 2.1.114+ 禁止 root 使用 --dangerously-skip-permissions，
     // IS_SANDBOX=1 告知 CLI 当前运行在受控环境中以绕过此限制。
     // host 模式由 happyclaw 主进程托管（见 permissionMode: 'bypassPermissions'），
@@ -3910,7 +4734,43 @@ export async function runHostAgent(
         clearTimeout(timeout);
         timeout = setTimeout(killOnTimeout, timeoutMs);
       };
+      const reconcileHostOAuth = (phase: 'output' | 'exit'): void => {
+        const outcome = reconcileSessionOAuthAfterExit(
+          hostSelectedProfileId,
+          hostOauthLaunch,
+        );
+        if (outcome === 'updated') {
+          logger.info(
+            { group: group.name, providerId: hostSelectedProfileId, phase },
+            'Persisted host SDK-refreshed OAuth credentials',
+          );
+        } else if (outcome === 'invalid' || outcome === 'not_newer') {
+          logger.warn(
+            {
+              group: group.name,
+              providerId: hostSelectedProfileId,
+              outcome,
+              phase,
+            },
+            'Ignored invalid host OAuth credential rewrite',
+          );
+        } else if (outcome === 'error') {
+          logger.warn(
+            { group: group.name, providerId: hostSelectedProfileId, phase },
+            'Host OAuth credential reconciliation failed',
+          );
+        }
+      };
       const handleOutput = async (output: ContainerOutput): Promise<void> => {
+        applyCodexGatewayVerdict(output, codexGatewayLease);
+        if (
+          output.providerQuotaObservation ||
+          output.inputTurnCompleted === true ||
+          output.status === 'success' ||
+          output.status === 'error'
+        ) {
+          reconcileHostOAuth('output');
+        }
         if (
           consumeProviderQuotaControlOutput(
             hostSelectedProfileId,
@@ -4035,6 +4895,7 @@ export async function runHostAgent(
         // background jobs that intentionally outlive this turn.
         if (proc.pid) cleanupHostBrowserResources(proc.pid);
         const duration = Date.now() - startTime;
+        reconcileHostOAuth('exit');
 
         const closeCtx: CloseHandlerContext = {
           groupName: group.name,
@@ -4085,6 +4946,7 @@ export async function runHostAgent(
       });
     });
 
+    applyCodexGatewayVerdict(hostResult, codexGatewayLease);
     // ─── Provider Pool health reporting (host mode) ───
     if (hostSelectedProfileId) {
       if (hostResult.providerFailure) {
@@ -4135,6 +4997,7 @@ export async function runHostAgent(
 
     return hostResult;
   } finally {
+    codexGatewayLease.revoke();
     revokeWorkspaceMemoryWriteCapability(
       workspaceMemoryCapabilityScope,
       workspaceMemoryRunnerInstanceId,
@@ -4188,11 +5051,16 @@ export async function runAgentWithModelFallback(
   }
   // A top-level Agent owns exactly one complete model configuration. Retrying
   // through other enabled configurations would violate that contract and can
-  // send a Workspace to a different gateway or official subscription. An
-  // auto-resolved default is not such a contract, so a multi-provider pool
-  // still retries across its members (see resolvePinnedModelConfigId).
+  // send a Workspace to a different gateway or official subscription. The
+  // global default binds the same way, but only because the operator chose
+  // it; with none chosen a multi-provider pool still retries across its
+  // members (see resolvePinnedModelConfigId).
   const selectedModelConfigId = resolvePinnedModelConfigId(
     input.agentProfile?.modelConfigId,
+    {
+      groupFolder: group.folder,
+      agentId: input.sessionAgentId ?? input.agentId,
+    },
   );
   const enabledProviders = getEnabledProviders();
   const fallbackTier = getSystemSettings().fallbackModel?.trim();

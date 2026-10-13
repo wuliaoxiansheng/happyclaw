@@ -4,18 +4,21 @@
  *
  * Manages:
  * - Text/thinking buffering and flushing
- * - Tool use start/end tracking (top-level, nested, Skill, Task)
+ * - Tool use start/end tracking (top-level, nested, Skill, Agent/Task)
  * - Sub-agent message conversion to StreamEvents
  * - Cleanup of residual tool states
  */
 
 import type { ContainerOutput, StreamEvent } from './types.js';
 import {
+  EARLY_INPUT_SCAN_MAX,
+  extractEarlyToolInputSummary,
   extractSkillName,
   shorten,
   summarizeToolInput,
   summarizeToolResult,
 } from './utils.js';
+import { extractToolResultFacts } from './tool-result-facts.js';
 import {
   workflowRunFromOutputFile,
   workflowRunFromTaskProgress,
@@ -23,6 +26,10 @@ import {
 } from './workflow-run.js';
 import type { WorkflowRunSnapshot } from './stream-event.types.js';
 import { BackgroundTaskDrainTracker } from './background-task-drain.js';
+
+// Bounds for the per-Task final-answer capture forwarded on task_notification.
+const SUB_AGENT_RESULT_MAX_CHARS = 16_000;
+const SUB_AGENT_RESULT_MAX_TASKS = 64;
 
 // SDK 任务终态（task_updated.patch.status 语义下"不会再有后续信号"的状态）。
 // web/src/stores/chat.ts、src/web.ts、src/index.ts 各有等价映射——SDK 新增
@@ -34,6 +41,9 @@ const SDK_TERMINAL_TASK_STATUSES = new Set([
   'stopped',
   'aborted',
 ]);
+
+// Tool calls remembered by id so a result can be matched to its tool's name.
+const MAX_TRACKED_TOOL_CALLS = 512;
 
 /** Tools with specialized input_json_delta handling — generic accumulation is skipped for these. */
 const SPECIAL_TOOLS = [
@@ -50,6 +60,44 @@ type LogFn = (message: string) => void;
 type PendingSubAgentMessage = {
   message: any;
   timer: ReturnType<typeof setTimeout>;
+};
+
+/**
+ * One top-level (main Agent) reasoning block, from content_block_start to the
+ * assistant frame that carries it. Sub-Agent blocks are never tracked.
+ */
+type MainThinkingBlock = {
+  messageId: string;
+  index: number;
+  /** redacted_thinking carries no text, only the signature. */
+  redacted: boolean;
+  startedAt: number;
+  /** Some of this block's text already left through thinking_delta. */
+  streamed: boolean;
+  /** The assistant frame holding this block has been processed. */
+  consumed: boolean;
+  /** content_block_stop arrived (or the block was closed at a boundary). */
+  stopped: boolean;
+  durationMs: number;
+  endEmitted: boolean;
+};
+
+/** A tool call seen on the stream, until its result comes back. */
+type ToolCallRecord = {
+  name: string;
+  /** tool_use_start went out, so a later input summary can follow it. */
+  announced: boolean;
+  parentToolUseId: string | null;
+  isNested: boolean;
+  /** The input summary last sent for the call. */
+  summary?: string;
+};
+
+/** SDK `tool_progress` heartbeats are forwarded at most once per interval. */
+type ToolProgressThrottle = {
+  lastEmitAt: number;
+  pending?: StreamEvent;
+  timer?: ReturnType<typeof setTimeout>;
 };
 
 export class StreamEventProcessor {
@@ -140,8 +188,16 @@ export class StreamEventProcessor {
       parentToolUseId: string | null;
       isNested: boolean;
       toolName: string;
+      /** The input summary sent before the complete input arrived. */
+      earlySummary?: string;
+      /** The scanned prefix held no summary; stop looking for one early. */
+      scanExhausted?: boolean;
     }
   >();
+
+  // Tool calls by tool_use_id: the name a tool_result is read by, and the input
+  // summary already sent for the call.
+  private readonly toolCalls = new Map<string, ToolCallRecord>();
 
   // Confirmed teammate Tasks (detected via team_name)
   private readonly teammateTaskToolUseIds = new Set<string>();
@@ -152,6 +208,15 @@ export class StreamEventProcessor {
 
   // Best available completion summary per Task/Agent tool_use_id.
   private readonly taskSummariesByToolUseId = new Map<string, string>();
+
+  // Latest text answer of each sub-agent, keyed by its Task tool_use_id. The
+  // last assistant API response that carried text is the sub-agent's final
+  // answer once its task settles; it rides on task_notification so the host
+  // can checkpoint finished sub-agent work for a replayed turn.
+  private readonly subAgentFinalTextByTask = new Map<
+    string,
+    { messageId: string | undefined; text: string }
+  >();
 
   // Track active nested tool per parent context (for synthetic tool_use_end)
   private readonly activeNestedToolByParent = new Map<
@@ -199,6 +264,12 @@ export class StreamEventProcessor {
     }
   >();
 
+  // tool_use_ids issued inside a sub-agent (raw parent_tool_use_id != null).
+  // A background task started by one of these tools reports its completion
+  // to that sub-agent, never to the main Agent, so it must not create
+  // main-Agent completion debt.
+  private readonly subAgentToolUseIds = new Set<string>();
+
   // Sub-agent active tools per parent task ID
   private readonly activeSubAgentToolsByTask = new Map<string, Set<string>>();
 
@@ -210,13 +281,42 @@ export class StreamEventProcessor {
   >();
   private readonly PENDING_SUBAGENT_TIMEOUT_MS = 30_000;
 
-  // 主 Agent thinking 是否已通过 content_block_delta 路径流出过。
-  // 某些模型仍按 delta 下发 thinking；若 delta 路径已消费，processAssistantMessage
-  // 必须跳过完整 block 的补发，避免同一段思考被 emit 两次。
-  private mainThinkingStreamed = false;
+  // 主 Agent 的 thinking 块按块登记（content_block_start 起、assistant 帧消费止）。
+  // 某些模型按 delta 下发 thinking，另一些只在完整 assistant 帧里给出整块：
+  // 帧到达时按块判断该块是否已流出，已流出的不再补发，避免同一段思考被 emit
+  // 两次；单个布尔在一条消息含多个 thinking 块（GPT 的多个 reasoning item）且
+  // assistant 帧被批量延后时会误判第二块。记录按 message id 分组，只保留最近几条。
+  private currentMainMessageId: string | null = null;
+  private implicitMessageCounter = 0;
+  private readonly openThinkingBlocks = new Map<number, MainThinkingBlock>();
+  private readonly thinkingBlocksByMessage = new Map<
+    string,
+    MainThinkingBlock[]
+  >();
+  private readonly MAX_TRACKED_THINKING_MESSAGES = 8;
+
+  // SDK tool_progress 心跳按 tool_use_id 节流：首帧立即发，其后每个 id 至少间隔
+  // 1s，被节流的帧只留最新一帧并在间隔结束时补发。
+  private readonly toolProgressThrottles = new Map<
+    string,
+    ToolProgressThrottle
+  >();
+  private readonly TOOL_PROGRESS_MIN_INTERVAL_MS = 1_000;
 
   constructor(emit: EmitFn, log: LogFn) {
-    this.emit = emit;
+    // Every outgoing frame passes through here, so a finished tool drops its
+    // throttled heartbeat whichever of the many code paths ended it.
+    this.emit = (output) => {
+      const streamEvent = output.streamEvent;
+      if (
+        streamEvent?.toolUseId &&
+        (streamEvent.eventType === 'tool_use_end' ||
+          streamEvent.eventType === 'tool_result')
+      ) {
+        this.dropToolProgressThrottle(streamEvent.toolUseId);
+      }
+      emit(output);
+    };
     this.log = log;
   }
 
@@ -406,6 +506,198 @@ export class StreamEventProcessor {
     }
   }
 
+  /**
+   * Flush buffered text/thinking right now. Called at every message and block
+   * boundary so what the previous block buffered always precedes the events of
+   * the next one (thinking_start, tool_use_start, task_start, ...).
+   */
+  private flushNow(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.flushBuffers();
+  }
+
+  /** Start tracking a top-level reasoning block and announce it. */
+  private openMainThinkingBlock(
+    index: number,
+    redacted: boolean,
+  ): MainThinkingBlock {
+    if (this.currentMainMessageId === null) {
+      this.currentMainMessageId = `implicit-${++this.implicitMessageCounter}`;
+    }
+    const messageId = this.currentMainMessageId;
+    const block: MainThinkingBlock = {
+      messageId,
+      index,
+      redacted,
+      startedAt: Date.now(),
+      streamed: false,
+      consumed: false,
+      stopped: false,
+      durationMs: 0,
+      endEmitted: false,
+    };
+    this.openThinkingBlocks.set(index, block);
+    let blocks = this.thinkingBlocksByMessage.get(messageId);
+    if (!blocks) {
+      blocks = [];
+      this.thinkingBlocksByMessage.set(messageId, blocks);
+      while (
+        this.thinkingBlocksByMessage.size > this.MAX_TRACKED_THINKING_MESSAGES
+      ) {
+        const oldest = this.thinkingBlocksByMessage.keys().next().value;
+        if (oldest === undefined) break;
+        this.thinkingBlocksByMessage.delete(oldest);
+      }
+    }
+    blocks.push(block);
+    this.emit({
+      status: 'stream',
+      result: null,
+      streamEvent: { eventType: 'thinking_start', agentScope: 'main' },
+    });
+    return block;
+  }
+
+  /** The delta path carried (part of) this block's text. */
+  private markMainThinkingStreamed(index: number): void {
+    const block =
+      this.openThinkingBlocks.get(index) ??
+      this.openMainThinkingBlock(index, false);
+    block.streamed = true;
+  }
+
+  private emitThinkingEnd(block: MainThinkingBlock): void {
+    if (block.endEmitted) return;
+    block.endEmitted = true;
+    this.emit({
+      status: 'stream',
+      result: null,
+      streamEvent: {
+        eventType: 'thinking_end',
+        agentScope: 'main',
+        thinkingDurationMs: block.durationMs,
+      },
+    });
+  }
+
+  /**
+   * content_block_stop of a top-level reasoning block. A block whose text has
+   * not left yet may still get it from its assistant frame (models that return
+   * the whole block at once), so its end waits for that frame to keep
+   * thinking_start → thinking_delta → thinking_end in order.
+   */
+  private stopMainThinkingBlock(index: number): void {
+    const block = this.openThinkingBlocks.get(index);
+    if (!block) return;
+    this.openThinkingBlocks.delete(index);
+    block.stopped = true;
+    block.durationMs = Math.max(0, Date.now() - block.startedAt);
+    if (block.redacted || block.streamed || block.consumed) {
+      this.emitThinkingEnd(block);
+    }
+  }
+
+  /** Announce the end of every block that is still waiting for one. */
+  private flushPendingThinkingEnds(): void {
+    for (const blocks of this.thinkingBlocksByMessage.values()) {
+      for (const block of blocks) {
+        if (block.stopped && !block.endEmitted) this.emitThinkingEnd(block);
+      }
+    }
+  }
+
+  /** A message boundary or the end of the query closes whatever is open. */
+  private closeMainThinkingBlocks(): void {
+    const now = Date.now();
+    for (const block of this.openThinkingBlocks.values()) {
+      block.stopped = true;
+      block.durationMs = Math.max(0, now - block.startedAt);
+    }
+    this.openThinkingBlocks.clear();
+    this.flushPendingThinkingEnds();
+  }
+
+  private forgetMainThinkingBlocks(): void {
+    this.openThinkingBlocks.clear();
+    this.thinkingBlocksByMessage.clear();
+    this.currentMainMessageId = null;
+  }
+
+  /**
+   * The tracked block an assistant frame's next reasoning block corresponds
+   * to. Blocks are consumed in order within their message; a frame without an
+   * id falls back to the oldest unconsumed block.
+   */
+  private nextThinkingBlockForFrame(
+    frameMessageId: string | undefined,
+  ): MainThinkingBlock | undefined {
+    if (frameMessageId) {
+      return this.thinkingBlocksByMessage
+        .get(frameMessageId)
+        ?.find((block) => !block.consumed);
+    }
+    for (const blocks of this.thinkingBlocksByMessage.values()) {
+      const block = blocks.find((candidate) => !candidate.consumed);
+      if (block) return block;
+    }
+    return undefined;
+  }
+
+  /**
+   * Forward an SDK tool_progress heartbeat, at most once per interval for each
+   * tool. A throttled frame is kept (only the latest) and sent when the
+   * interval ends.
+   */
+  private emitToolProgress(event: StreamEvent): void {
+    const toolUseId = event.toolUseId;
+    if (!toolUseId) {
+      this.emitStreamEvent(event);
+      return;
+    }
+    const now = Date.now();
+    const throttle = this.toolProgressThrottles.get(toolUseId);
+    if (
+      !throttle ||
+      now - throttle.lastEmitAt >= this.TOOL_PROGRESS_MIN_INTERVAL_MS
+    ) {
+      if (throttle?.timer) clearTimeout(throttle.timer);
+      this.toolProgressThrottles.set(toolUseId, { lastEmitAt: now });
+      this.emitStreamEvent(event);
+      return;
+    }
+    throttle.pending = event;
+    if (!throttle.timer) {
+      throttle.timer = setTimeout(
+        () => {
+          throttle.timer = undefined;
+          const pending = throttle.pending;
+          throttle.pending = undefined;
+          if (!pending) return;
+          throttle.lastEmitAt = Date.now();
+          this.emitStreamEvent(pending);
+        },
+        this.TOOL_PROGRESS_MIN_INTERVAL_MS - (now - throttle.lastEmitAt),
+      );
+    }
+  }
+
+  private dropToolProgressThrottle(toolUseId: string): void {
+    const throttle = this.toolProgressThrottles.get(toolUseId);
+    if (!throttle) return;
+    if (throttle.timer) clearTimeout(throttle.timer);
+    this.toolProgressThrottles.delete(toolUseId);
+  }
+
+  private dropAllToolProgressThrottles(): void {
+    for (const throttle of this.toolProgressThrottles.values()) {
+      if (throttle.timer) clearTimeout(throttle.timer);
+    }
+    this.toolProgressThrottles.clear();
+  }
+
   /** Clean up tools associated with a Task. */
   private cleanupTaskTools(taskId: string): void {
     const nested = this.activeNestedToolByParent.get(taskId);
@@ -461,11 +753,30 @@ export class StreamEventProcessor {
     // would close the message and the timer would later misclassify its text as
     // a new implicit AssistantMessage.
     if (event.type === 'message_stop') {
-      if (this.flushTimer) {
-        clearTimeout(this.flushTimer);
-        this.flushTimer = null;
+      this.flushNow();
+      if (!isNested) this.closeMainThinkingBlocks();
+    }
+    // Block boundaries flush too: the previous block's short tail must reach
+    // the host before this block's own events (thinking_start, tool_use_start,
+    // task_start, ...), not up to FLUSH_MS after them.
+    if (
+      event.type === 'content_block_start' ||
+      event.type === 'content_block_stop'
+    ) {
+      this.flushNow();
+      if (event.type === 'content_block_start' && !isNested) {
+        this.flushPendingThinkingEnds();
       }
-      this.flushBuffers();
+    }
+    if (event.type === 'message_start' && !isNested) {
+      this.flushNow();
+      // A message the previous one never closed is over once a new one starts.
+      this.closeMainThinkingBlocks();
+      const id = event.message?.id;
+      this.currentMainMessageId =
+        typeof id === 'string' && id
+          ? id
+          : `implicit-${++this.implicitMessageCounter}`;
     }
     if (event.type === 'message_start' || event.type === 'message_stop') {
       this.emitStreamEvent({
@@ -501,15 +812,69 @@ export class StreamEventProcessor {
       const block = event.content_block;
 
       if (block?.type === 'tool_use') {
+        if (isNested && block.id) this.subAgentToolUseIds.add(block.id);
         this.handleToolUseStart(block, parentToolUseId, isNested, event.index);
       } else if (block?.type === 'text') {
         this.handleTextBlockStart(parentToolUseId, isNested);
+      } else if (
+        !isNested &&
+        (block?.type === 'thinking' || block?.type === 'redacted_thinking')
+      ) {
+        this.openMainThinkingBlock(
+          typeof event.index === 'number' ? event.index : -1,
+          block.type === 'redacted_thinking',
+        );
       }
     } else if (event.type === 'content_block_delta') {
       this.handleContentBlockDelta(event, parentToolUseId);
+    } else if (event.type === 'content_block_stop' && !isNested) {
+      this.stopMainThinkingBlock(
+        typeof event.index === 'number' ? event.index : -1,
+      );
     }
 
     return true;
+  }
+
+  /** Remember a tool call for its result; the oldest ones go past the bound. */
+  private rememberToolCall(toolUseId: string, call: ToolCallRecord): void {
+    this.toolCalls.delete(toolUseId);
+    this.toolCalls.set(toolUseId, call);
+    while (this.toolCalls.size > MAX_TRACKED_TOOL_CALLS) {
+      const oldest = this.toolCalls.keys().next().value;
+      if (oldest === undefined) break;
+      this.toolCalls.delete(oldest);
+    }
+  }
+
+  /**
+   * Send a tool call's input summary as it settles (or is corrected). A
+   * sub-agent's tool has no entry in `toolCalls`, so the call says where it
+   * belongs.
+   */
+  private emitToolInputSummary(
+    toolUseId: string,
+    summary: string,
+    call: {
+      toolName: string;
+      parentToolUseId: string | null;
+      isNested: boolean;
+    },
+  ): void {
+    const tracked = this.toolCalls.get(toolUseId);
+    if (tracked) tracked.summary = summary;
+    this.emit({
+      status: 'stream',
+      result: null,
+      streamEvent: {
+        eventType: 'tool_progress',
+        toolName: call.toolName,
+        toolUseId,
+        parentToolUseId: call.parentToolUseId,
+        isNested: call.isNested,
+        toolInputSummary: summary,
+      },
+    });
   }
 
   /** Handle tool_use content_block_start. */
@@ -571,6 +936,7 @@ export class StreamEventProcessor {
       });
     }
 
+    const inputSummary = summarizeToolInput(block.input);
     this.emit({
       status: 'stream',
       result: null,
@@ -581,9 +947,21 @@ export class StreamEventProcessor {
         parentToolUseId: effectiveParentToolUseId,
         isNested: effectiveIsNested,
         skillName: extractSkillName(block.name, block.input),
-        toolInputSummary: summarizeToolInput(block.input),
+        toolInputSummary: inputSummary,
       },
     });
+    // A sub-agent's tool never has its result read here (that is for the main
+    // agent's messages), so remembering it would only crowd the table. A tool
+    // the main agent runs inside a Skill is its own and is remembered.
+    if (block.id && !isNested) {
+      this.rememberToolCall(block.id, {
+        name: block.name,
+        announced: true,
+        parentToolUseId: effectiveParentToolUseId,
+        isNested: effectiveIsNested,
+        summary: inputSummary,
+      });
+    }
 
     // Track Skill tool_use block
     if (block.name === 'Skill' && block.id) {
@@ -723,7 +1101,9 @@ export class StreamEventProcessor {
     } else if (delta?.type === 'thinking_delta' && delta.thinking) {
       const bufKey = parentToolUseId || this.BUF_MAIN;
       if (!parentToolUseId) {
-        this.mainThinkingStreamed = true;
+        this.markMainThinkingStreamed(
+          typeof event.index === 'number' ? event.index : -1,
+        );
         this.seenTextualResult = false;
       }
       this.getBuf(bufKey).think += delta.thinking;
@@ -856,9 +1236,13 @@ export class StreamEventProcessor {
     }
 
     // Accumulate generic tool input JSON for toolInputSummary.
-    // Only attempt JSON.parse when the accumulated string looks complete (ends with '}')
-    // to avoid O(n^2) repeated parse failures on large tool inputs.
-    // Cap at 10KB to avoid unbounded memory growth on tools with large inputs (Write, Edit).
+    // The summary goes out as soon as the first summary key (file_path,
+    // command, url, ...) has streamed in whole, rather than after the complete
+    // input: a large Write names its file long before its content ends.
+    // The complete JSON is parsed only when the accumulated string looks done
+    // (ends with '}') to avoid O(n^2) repeated parse failures, and holding is
+    // capped at 10KB; a larger input is summarized from the complete assistant
+    // message instead (see settleToolCalls).
     const GENERIC_INPUT_MAX = 10_240;
     const pendingGeneric = this.pendingGenericInput.get(blockIndex);
     if (pendingGeneric && !pendingGeneric.resolved) {
@@ -868,6 +1252,19 @@ export class StreamEventProcessor {
         return;
       }
       pendingGeneric.inputJson += partialJson;
+      if (!pendingGeneric.earlySummary && !pendingGeneric.scanExhausted) {
+        const early = extractEarlyToolInputSummary(pendingGeneric.inputJson);
+        if (early) {
+          pendingGeneric.earlySummary = early;
+          this.emitToolInputSummary(
+            pendingGeneric.toolUseId,
+            early,
+            pendingGeneric,
+          );
+        } else if (pendingGeneric.inputJson.length >= EARLY_INPUT_SCAN_MAX) {
+          pendingGeneric.scanExhausted = true;
+        }
+      }
       const trimmed = pendingGeneric.inputJson.trimEnd();
       const summary = trimmed.endsWith('}')
         ? summarizeToolInput(
@@ -883,41 +1280,36 @@ export class StreamEventProcessor {
       if (summary) {
         pendingGeneric.resolved = true;
         this.pendingGenericInput.delete(blockIndex);
-        this.emit({
-          status: 'stream',
-          result: null,
-          streamEvent: {
-            eventType: 'tool_progress',
-            toolName: pendingGeneric.toolName,
-            toolUseId: pendingGeneric.toolUseId,
-            parentToolUseId: pendingGeneric.parentToolUseId,
-            isNested: pendingGeneric.isNested,
-            toolInputSummary: summary,
-          },
-        });
+        // A key that streamed after the early summary may outrank it.
+        if (summary !== pendingGeneric.earlySummary) {
+          this.emitToolInputSummary(
+            pendingGeneric.toolUseId,
+            summary,
+            pendingGeneric,
+          );
+        }
       }
     }
   }
 
   /**
-   * Process a tool_progress message.
+   * Process a tool_progress message: the SDK's elapsed-time heartbeat of a
+   * running tool. It arrives several times a second, so it is throttled per
+   * tool (see emitToolProgress); the one-shot tool_progress events built from
+   * streamed tool input are not.
    */
   processToolProgress(message: any): void {
     const parentToolUseId =
       message.parent_tool_use_id === undefined
         ? null
         : message.parent_tool_use_id;
-    this.emit({
-      status: 'stream',
-      result: null,
-      streamEvent: {
-        eventType: 'tool_progress',
-        toolName: message.tool_name,
-        toolUseId: message.tool_use_id,
-        parentToolUseId,
-        isNested: parentToolUseId !== null,
-        elapsedSeconds: message.elapsed_time_seconds,
-      },
+    this.emitToolProgress({
+      eventType: 'tool_progress',
+      toolName: message.tool_name,
+      toolUseId: message.tool_use_id,
+      parentToolUseId,
+      isNested: parentToolUseId !== null,
+      elapsedSeconds: message.elapsed_time_seconds,
     });
   }
 
@@ -956,10 +1348,12 @@ export class StreamEventProcessor {
             taskStatus: 'completed',
             taskSummary: summary,
             summary,
+            taskResult: this.subAgentFinalTextByTask.get(id)?.text,
             isSynthetic: true,
             displayLevel: 'primary',
           },
         });
+        this.subAgentFinalTextByTask.delete(id);
       }
       this.taskToolUseIds.delete(id);
       this.backgroundTaskToolUseIds.delete(id);
@@ -1055,7 +1449,10 @@ export class StreamEventProcessor {
         message.task_id;
       const desc = message.description || message.prompt || '';
       if (message.task_id && !message.skip_transcript) {
-        this.backgroundDrain.taskStarted(message.task_id);
+        this.backgroundDrain.taskStarted(
+          message.task_id,
+          !this.isSubAgentOwnedTask(message),
+        );
         this.pendingSdkTasks.set(message.task_id, {
           description: desc,
           taskType:
@@ -1269,6 +1666,26 @@ export class StreamEventProcessor {
       });
       return true;
     }
+    // Claude Code 2.1.283+ forwards turn warnings and notices it used to drop
+    // (hook feedback, MCP sign-in notices, ...). prevent_continuation marks a
+    // turn that a hook stopped.
+    if (message.subtype === 'informational') {
+      const content =
+        typeof message.content === 'string' ? message.content : '';
+      const stopsTurn = message.prevent_continuation === true;
+      this.emitStreamEvent({
+        eventType: 'notification',
+        agentScope: 'system',
+        title: stopsTurn ? 'Claude Code stopped the turn' : 'Claude Code',
+        summary: content.slice(0, 500),
+        detail: content,
+        displayLevel:
+          stopsTurn || message.level === 'warning' ? 'primary' : 'detail',
+        messageUuid: message.uuid,
+        sessionId: message.session_id,
+      });
+      return true;
+    }
     if (message.subtype === 'local_command_output') {
       this.emitStreamEvent({
         eventType: 'notification',
@@ -1397,11 +1814,62 @@ export class StreamEventProcessor {
   }
 
   /**
+   * Remember the newest text answer of a sub-agent. SDK splits one API
+   * response into one assistant frame per content block, all sharing
+   * message.id, so blocks of the same response are joined and a newer
+   * response with text replaces the older one.
+   */
+  private recordSubAgentText(taskToolUseId: string, message: any): void {
+    const content = message.message?.content;
+    if (!Array.isArray(content)) return;
+    const text = content
+      .filter(
+        (block: any) =>
+          block?.type === 'text' && typeof block.text === 'string',
+      )
+      .map((block: any) => block.text as string)
+      .join('\n')
+      .trim();
+    if (!text) return;
+    const messageId =
+      typeof message.message?.id === 'string' ? message.message.id : undefined;
+    const previous = this.subAgentFinalTextByTask.get(taskToolUseId);
+    const joined =
+      previous && messageId !== undefined && previous.messageId === messageId
+        ? `${previous.text}\n${text}`
+        : text;
+    // Re-insert so Map order tracks recency for the size bound below.
+    this.subAgentFinalTextByTask.delete(taskToolUseId);
+    this.subAgentFinalTextByTask.set(taskToolUseId, {
+      messageId,
+      text:
+        joined.length > SUB_AGENT_RESULT_MAX_CHARS
+          ? `${joined.slice(0, SUB_AGENT_RESULT_MAX_CHARS)}…`
+          : joined,
+    });
+    while (this.subAgentFinalTextByTask.size > SUB_AGENT_RESULT_MAX_TASKS) {
+      const oldest = this.subAgentFinalTextByTask.keys().next().value;
+      if (oldest === undefined) break;
+      this.subAgentFinalTextByTask.delete(oldest);
+    }
+  }
+
+  /**
    * Process sub-agent messages (assistant/user with parent_tool_use_id that matches a Task).
    * Returns true if the message was handled as a sub-agent message.
    */
   processSubAgentMessage(message: any): boolean {
     const msgParentToolUseId = message.parent_tool_use_id ?? null;
+    if (msgParentToolUseId && message.type === 'assistant') {
+      const content = message.message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block?.type === 'tool_use' && typeof block.id === 'string') {
+            this.subAgentToolUseIds.add(block.id);
+          }
+        }
+      }
+    }
     if (!msgParentToolUseId || !this.taskToolUseIds.has(msgParentToolUseId)) {
       if (
         msgParentToolUseId &&
@@ -1414,6 +1882,7 @@ export class StreamEventProcessor {
     }
 
     if (message.type === 'assistant') {
+      this.recordSubAgentText(msgParentToolUseId, message);
       const subContent = message.message?.content as
         | Array<{
             type: string;
@@ -1596,36 +2065,81 @@ export class StreamEventProcessor {
    * tool_use_end is inferred from the partial stream and the result block was
    * previously dropped entirely, so we extract it here (truncated + sanitized)
    * and emit a `tool_result` event so the trace shows what a tool returned.
+   *
+   * The event also says how the call ended, apart from its text: `toolIsError`
+   * (the SDK's own `is_error`, so a failure with no output still reads as one;
+   * the SDK leaves it out on success, which is sent as false rather than left
+   * to the "⚠️" prefix a reader falls back on, since a successful output may
+   * itself begin with that emoji) and `toolResultFacts` (numbers from the SDK's
+   * structured `tool_use_result`).
    */
   processMainToolResults(message: any): void {
     if (message.type !== 'user') return;
     if ((message.parent_tool_use_id ?? null) !== null) return;
     const content = message.message?.content;
     if (!Array.isArray(content)) return;
-    for (const block of content as Array<{
-      type?: string;
+    const results = (content as Array<{ type?: string }>).filter(
+      (block) => block.type === 'tool_result',
+    );
+    // `tool_use_result` belongs to the message's one result; with several in
+    // a message there is no telling whose it is.
+    const structured =
+      results.length === 1 ? message.tool_use_result : undefined;
+    for (const block of results as Array<{
       tool_use_id?: string;
       content?: unknown;
       is_error?: boolean;
     }>) {
-      if (block.type === 'tool_result' && block.tool_use_id) {
-        const resultText = summarizeToolResult(block.content);
-        if (resultText) {
-          // is_error marks a failed tool call — prefix so failures stand out.
-          const shown = block.is_error ? `⚠️ ${resultText}` : resultText;
-          this.emit({
-            status: 'stream',
-            result: null,
-            streamEvent: {
-              eventType: 'tool_result',
-              toolUseId: block.tool_use_id,
-              toolResult: shown,
-              detail: shown,
-            },
-          });
-        }
+      if (!block.tool_use_id) continue;
+      const resultText = summarizeToolResult(block.content);
+      const isError = block.is_error === true;
+      const facts = extractToolResultFacts(
+        this.toolCalls.get(block.tool_use_id)?.name,
+        structured,
+        { isError, content: block.content },
+      );
+      // A failure is reported even when the tool printed nothing.
+      if (resultText || isError || facts) {
+        // is_error marks a failed tool call — prefix so failures stand out.
+        const shown = resultText && isError ? `⚠️ ${resultText}` : resultText;
+        this.emit({
+          status: 'stream',
+          result: null,
+          streamEvent: {
+            eventType: 'tool_result',
+            toolUseId: block.tool_use_id,
+            ...(shown ? { toolResult: shown, detail: shown } : {}),
+            toolIsError: isError,
+            ...(facts ? { toolResultFacts: facts } : {}),
+          },
+        });
       }
+      this.toolCalls.delete(block.tool_use_id);
+      this.endTopLevelToolOnResult(block.tool_use_id);
     }
+  }
+
+  /**
+   * A returned top-level tool is finished. Waiting for the next assistant
+   * message to infer its end left "正在运行命令" (and a spinning card) on
+   * screen for 5-6s per tool while the model was already planning its next
+   * step. Task tools end via their task lifecycle, and the active Skill keeps
+   * nesting the tools it runs, so both keep the inferred end.
+   */
+  private endTopLevelToolOnResult(toolUseId: string): void {
+    if (
+      toolUseId !== this.activeTopLevelToolUseId ||
+      this.taskToolUseIds.has(toolUseId) ||
+      toolUseId === this.activeSkillToolUseId
+    ) {
+      return;
+    }
+    this.emit({
+      status: 'stream',
+      result: null,
+      streamEvent: { eventType: 'tool_use_end', toolUseId },
+    });
+    this.activeTopLevelToolUseId = null;
   }
 
   /** Check if a tool_use was already resolved by the streaming accumulator. */
@@ -1640,6 +2154,46 @@ export class StreamEventProcessor {
   }
 
   /**
+   * The complete tool calls of a main-agent assistant message: remember the
+   * names of those never seen starting (a result is read by its tool's name),
+   * and settle the input summary of those that were. A summary can still be
+   * missing here (the input was too large to hold while streaming) or outranked
+   * by a key that streamed after the one sent early; the complete input has
+   * the final say.
+   */
+  private settleToolCalls(
+    content: Array<{
+      type?: string;
+      name?: string;
+      id?: string;
+      input?: unknown;
+    }>,
+  ): void {
+    for (const block of content) {
+      if (block?.type !== 'tool_use' || !block.id || !block.name) continue;
+      const call = this.toolCalls.get(block.id);
+      if (!call) {
+        this.rememberToolCall(block.id, {
+          name: block.name,
+          announced: false,
+          parentToolUseId: null,
+          isNested: false,
+        });
+        continue;
+      }
+      if (!call.announced || SPECIAL_TOOLS.includes(block.name)) continue;
+      const summary = summarizeToolInput(block.input);
+      if (summary && summary !== call.summary) {
+        this.emitToolInputSummary(block.id, summary, {
+          toolName: call.name,
+          parentToolUseId: call.parentToolUseId,
+          isNested: call.isNested,
+        });
+      }
+    }
+  }
+
+  /**
    * Process an assistant message for Skill/Task fallback extraction and pending tracker cleanup.
    */
   processAssistantMessage(message: any): void {
@@ -1649,21 +2203,34 @@ export class StreamEventProcessor {
     // 主 Agent thinking 补发:
     // - 子 Agent 消息 (parent_tool_use_id 非空) 的 thinking 已由 processSubAgentMessage
     //   emit (带 parentToolUseId), 这里若再 emit 会挂到主 Agent 气泡导致重复展示。
-    // - 主 Agent 若 delta 路径已消费过 thinking (mainThinkingStreamed=true),
-    //   再从完整 block emit 会导致同一段思考被显示两次。
+    // - 主 Agent 的每个 thinking 块按顺序对应 stream 阶段登记的一条记录；该块的
+    //   文本若已经通过 delta 路径流出，再从完整 block emit 会让同一段思考显示两次，
+    //   所以只补发没流出过的块（模型不走 stream 事件、或只给整块时）。
+    // - 补发的文本先于该块的 thinking_end，保持 start → delta → end 的顺序。
     const isSubAgent = (message.parent_tool_use_id ?? null) !== null;
-    if (!isSubAgent && !this.mainThinkingStreamed) {
+    if (!isSubAgent) {
+      const frameMessageId =
+        typeof message.message?.id === 'string'
+          ? message.message.id
+          : undefined;
       for (const block of content) {
-        if (block.type === 'thinking' && block.thinking) {
+        if (block?.type !== 'thinking' && block?.type !== 'redacted_thinking') {
+          continue;
+        }
+        const tracked = this.nextThinkingBlockForFrame(frameMessageId);
+        if (tracked) tracked.consumed = true;
+        if (block.type === 'thinking' && block.thinking && !tracked?.streamed) {
           this.emit({
             status: 'stream',
             result: null,
             streamEvent: { eventType: 'thinking_delta', text: block.thinking },
           });
         }
+        if (tracked?.stopped) this.emitThinkingEnd(tracked);
       }
     }
-    if (!isSubAgent) this.mainThinkingStreamed = false;
+
+    if (!isSubAgent) this.settleToolCalls(content);
 
     // Fallback: extract skill name from complete assistant message
     for (const block of content) {
@@ -1839,6 +2406,9 @@ export class StreamEventProcessor {
     output_file?: string;
     usage?: any;
   }): void {
+    if (this.isSubAgentOwnedTask(message)) {
+      this.backgroundDrain.markNonBlocking(message.task_id);
+    }
     this.backgroundDrain.taskNotification(message.task_id);
     this.settlePendingSdkTask(
       message.task_id,
@@ -1875,6 +2445,7 @@ export class StreamEventProcessor {
         taskStatus: message.status,
         taskSummary: message.summary,
         summary: message.summary,
+        taskResult: this.subAgentFinalTextByTask.get(effectiveToolUseId)?.text,
         outputFile: message.output_file,
         sdkTaskUsage: this.normalizeTaskUsage(message.usage),
         workflowRun: completedWorkflowRun,
@@ -1884,6 +2455,7 @@ export class StreamEventProcessor {
     });
     if (message.summary)
       this.taskSummariesByToolUseId.set(effectiveToolUseId, message.summary);
+    this.subAgentFinalTextByTask.delete(effectiveToolUseId);
     this.cleanupTaskTools(effectiveToolUseId);
     this.backgroundTaskToolUseIds.delete(effectiveToolUseId);
     this.workflowRunsByToolUseId.delete(effectiveToolUseId);
@@ -1903,6 +2475,29 @@ export class StreamEventProcessor {
     }
     // Clean up the mapping entry
     this.sdkTaskIdToToolUseId.delete(message.task_id);
+  }
+
+  /**
+   * A task started from inside a sub-agent (its Bash/Agent tool call has a
+   * non-null parent_tool_use_id, or it is a depth>1 agent spawn) delivers its
+   * completion notification to that sub-agent. The main Agent will never run
+   * a notification turn for it; the parent Task's own notification is the
+   * main-Agent obligation. The CLI's own `owned_by_subagent` flag (set on
+   * task_started for a sub-agent's local_bash, absent from the public d.ts)
+   * is trusted first; the tool-use heuristic covers everything else.
+   */
+  private isSubAgentOwnedTask(message: {
+    tool_use_id?: string;
+    spawn_depth?: number;
+    owned_by_subagent?: unknown;
+  }): boolean {
+    if (message.owned_by_subagent === true) return true;
+    if (typeof message.spawn_depth === 'number' && message.spawn_depth > 1) {
+      return true;
+    }
+    return (
+      !!message.tool_use_id && this.subAgentToolUseIds.has(message.tool_use_id)
+    );
   }
 
   private settlePendingSdkTask(
@@ -2040,6 +2635,10 @@ export class StreamEventProcessor {
     this.streamBufs.clear();
     this.fullTextAccumulator = '';
     this.lastThinkingTokenStatusAt = null;
+    // The spent stream stays hidden: no thinking_end for its open blocks and no
+    // late heartbeat of its tools.
+    this.forgetMainThinkingBlocks();
+    this.dropAllToolProgressThrottles();
     // Make cleanup clear rather than flush any late buffer from the spent SDK stream.
     this.seenTextualResult = true;
   }
@@ -2060,6 +2659,13 @@ export class StreamEventProcessor {
     } else {
       this.flushBuffers();
     }
+
+    // Reasoning blocks the stream never closed (interrupt, error, cut stream):
+    // announce their end so downstream state machines settle. Pending
+    // heartbeats of tools that are about to be ended below are dropped.
+    this.closeMainThinkingBlocks();
+    this.forgetMainThinkingBlocks();
+    this.dropAllToolProgressThrottles();
 
     // Emit tool_use_end for active top-level tool (except Task tools)
     if (this.activeTopLevelToolUseId) {
@@ -2157,6 +2763,7 @@ export class StreamEventProcessor {
     this.pendingSubAgentMessages.clear();
     this.taskSummariesByToolUseId.clear();
     this.sdkTaskIdToToolUseId.clear();
+    this.toolCalls.clear();
     this.lastThinkingTokenStatusAt = null;
   }
 

@@ -92,6 +92,60 @@ describe('frontend workspace interaction mode contract', () => {
     expect(messageList).toContain('interactionMode={interactionMode}');
   });
 
+  test('shows a proactive workspace process read-only and never its model text', () => {
+    const panel = read('web/src/components/chat/ProcessPanel.tsx');
+    const display = read('web/src/components/chat/StreamingDisplay.tsx');
+    const store = read('web/src/stores/chat.ts');
+
+    // The panel reads the steps, the tools and the plan; model text is never
+    // one of its inputs, and reasoning and the narration before a tool call
+    // (a step the host handed over whole) only reach it at the `full` level.
+    expect(panel).not.toMatch(/partialText|textTail|thinkingText:/);
+    expect(panel).toContain("commentary={visibility === 'full'}");
+    expect(panel).toContain("thinkingText={visibility === 'full'}");
+
+    // The spinner row stays and the panel follows it, above `hidden` only.
+    const proactive = display.slice(
+      display.indexOf("if (effectiveInteractionMode === 'proactive')"),
+      display.indexOf('// 计算是否有流式数据'),
+    );
+    expect(proactive).toContain('<ProcessPanel');
+    expect(proactive).toContain("processVisibility !== 'hidden'");
+    expect(proactive).toContain('显示过程');
+    expect(proactive).toContain('requestWorkspaceSettings(groupJid)');
+    expect(proactive).not.toMatch(/partialText|StreamingMarkdown/);
+
+    // The reducer checks again what the host sends, and spawn Agents keep the
+    // Assistant contract there too.
+    expect(store).toContain('filterProactiveStreamEvent(');
+    expect(store).toContain('isProactiveRuntime(get(), runtimeJid)');
+    expect(store).toContain("?.kind !== 'spawn'");
+  });
+
+  test('offers the process visibility in the workspace settings without a restart', () => {
+    const dialog = read(
+      'web/src/components/chat/WorkspaceInteractionModeDialog.tsx',
+    );
+    const selector = read(
+      'web/src/components/chat/ProcessVisibilitySelector.tsx',
+    );
+    const chatView = read('web/src/components/chat/ChatView.tsx');
+    const store = read('web/src/stores/chat.ts');
+
+    expect(selector).toContain('过程可见性');
+    expect(selector).toContain('不重启运行时');
+    expect(selector).toContain('不影响飞书等渠道');
+    expect(dialog).toContain('<ProcessVisibilitySelector');
+    // Only a proactive workspace has a process to show or hide.
+    expect(dialog).toContain(
+      "const visibilityApplies = draftMode === 'proactive'",
+    );
+    expect(chatView).toContain('updateProcessVisibility(groupJid, visibility)');
+    expect(chatView).toContain('workspaceSettingsRequest');
+    expect(store).toContain('process_visibility: requested,');
+    expect(store).not.toMatch(/process_visibility[\s\S]{0,200}restart/i);
+  });
+
   test('re-evaluates workspace read state when the active conversation changes', () => {
     const chatView = read('web/src/components/chat/ChatView.tsx');
     const store = read('web/src/stores/chat.ts');

@@ -527,7 +527,7 @@ describe('exact Web run state sequences', () => {
       },
     });
     apiGetMock.mockImplementation(async (path: string) => {
-      if (path === '/api/status') {
+      if (path === '/api/status/groups') {
         return {
           groups: [
             {
@@ -1211,4 +1211,367 @@ describe('API retry status event ordering and task isolation', () => {
     expect(useChatStore.getState().streaming[jid].systemStatus).toBeNull();
     flush();
   });
+});
+
+describe('canonical usage ownership', () => {
+  const jid = 'web:usage';
+  const agentId = 'usage-agent';
+  const runId = 'usage-run';
+  const usage = {
+    inputTokens: 19,
+    outputTokens: 7,
+    cacheReadInputTokens: 11,
+    cacheCreationInputTokens: 3,
+    reasoningTokens: 2,
+    costUSD: 0.1,
+    durationMs: 42,
+    numTurns: 1,
+  };
+  const final = (
+    inputTurnId: string,
+    owner = agentId,
+    workspace = jid,
+  ): Message => ({
+    id: `reply-${workspace}-${owner}-${inputTurnId}`,
+    chat_jid: owner ? `${workspace}#agent:${owner}` : workspace,
+    sender: 'happyclaw',
+    sender_name: 'HappyClaw',
+    content: 'done',
+    timestamp: '2026-10-07T00:00:00.000Z',
+    is_from_me: true,
+    turn_id: inputTurnId,
+    source_kind: 'sdk_final',
+    finalization_reason: 'completed',
+  });
+  function activate(owner = agentId, workspace = jid, query = runId): void {
+    const runtimeJid = owner ? `${workspace}#agent:${owner}` : workspace;
+    useChatStore.setState((s) => ({
+      activeRuns: {
+        ...s.activeRuns,
+        [runtimeJid]: {
+          chatJid: runtimeJid,
+          runId: query,
+          phase: 'running',
+          startedAt: '2026-10-07T00:00:00.000Z',
+        },
+      },
+    }));
+  }
+  function emit(
+    inputTurnId: string | undefined,
+    owner = agentId,
+    workspace = jid,
+    query = runId,
+    turnId = 'presentation-only',
+  ): void {
+    useChatStore.getState().handleStreamEvent(
+      workspace,
+      {
+        eventType: 'usage',
+        inputTurnId,
+        turnId,
+        usage,
+      },
+      owner || undefined,
+      query,
+    );
+  }
+  function replies(owner = agentId, workspace = jid): Message[] {
+    const rows = owner
+      ? useChatStore.getState().agentMessages[owner] || []
+      : useChatStore.getState().messages[workspace] || [];
+    const runtimeJid = owner ? `${workspace}#agent:${owner}` : workspace;
+    return rows.filter((row) => row.chat_jid === runtimeJid);
+  }
+  function receive(
+    inputTurnId: string,
+    owner = agentId,
+    workspace = jid,
+    overrides = {},
+  ): void {
+    useChatStore
+      .getState()
+      .handleWsNewMessage(
+        workspace,
+        { ...final(inputTurnId, owner, workspace), ...overrides },
+        owner || undefined,
+      );
+  }
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetChatStore();
+    saveAgentMessageSnapshotMock.mockResolvedValue(undefined);
+    apiPostMock.mockResolvedValue({ success: true });
+    apiDeleteMock.mockResolvedValue({ success: true });
+    apiGetMock.mockImplementation(async () => ({
+      groups: {},
+      agents: [],
+      messages: [],
+      hasMore: false,
+    }));
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  for (const owner of [agentId, '']) {
+    it(`updates the warm ${owner ? 'Agent' : 'main'} final using its canonical delivery ID`, () => {
+      activate(owner);
+      receive('input-a', owner);
+      receive('input-b', owner);
+      emit('input-b', owner);
+      expect(replies(owner)[0].token_usage).toBeUndefined();
+      expect(JSON.parse(replies(owner)[1].token_usage!)).toEqual(usage);
+      expect(useChatStore.getState().pendingMessageUsage).toEqual({});
+    });
+    it(`merges early ${owner ? 'Agent' : 'main'} usage into only its later final`, () => {
+      activate(owner);
+      emit('input-a', owner);
+      receive('input-b', owner);
+      expect(replies(owner)[0].token_usage).toBeUndefined();
+      receive('input-a', owner, jid, { source_kind: 'sdk_send_message' });
+      expect(
+        replies(owner).find((m) => m.turn_id === 'input-a')?.token_usage,
+      ).toBeUndefined();
+      expect(
+        Object.keys(useChatStore.getState().pendingMessageUsage),
+      ).toHaveLength(1);
+      receive('input-a', owner);
+      expect(
+        JSON.parse(
+          replies(owner).find((m) => m.turn_id === 'input-a')!.token_usage!,
+        ),
+      ).toEqual(usage);
+      expect(useChatStore.getState().pendingMessageUsage).toEqual({});
+    });
+    it(`never assigns delayed A usage to the latest ${owner ? 'Agent' : 'main'} B reply`, () => {
+      activate(owner);
+      receive('input-a', owner);
+      receive('input-b', owner);
+      emit('input-a', owner);
+      expect(JSON.parse(replies(owner)[0].token_usage!)).toEqual(usage);
+      expect(replies(owner)[1].token_usage).toBeUndefined();
+      emit('missing-a', owner);
+      expect(replies(owner)[1].token_usage).toBeUndefined();
+    });
+  }
+  for (const owner of [agentId, '']) {
+    const scope = owner ? 'Agent' : 'main';
+    function snapshot(
+      count: number,
+      projection?: 'input_total',
+      batch = false,
+    ): void {
+      useChatStore.getState().handleStreamEvent(
+        jid,
+        {
+          eventType: 'usage',
+          inputTurnId: 'input-total',
+          turnId: 'presentation-only',
+          usageProjection: projection,
+          usage: {
+            ...usage,
+            inputTokens: count,
+            ...(batch
+              ? { batchIndex: 1, batchCount: 2, eventId: 'legacy-result' }
+              : {}),
+          },
+        },
+        owner || undefined,
+        runId,
+      );
+    }
+    it(`replaces early ${scope} input_total snapshots without adding overlapping totals`, () => {
+      activate(owner);
+      snapshot(10, 'input_total');
+      snapshot(25, 'input_total');
+      receive('input-total', owner);
+      expect(JSON.parse(replies(owner)[0].token_usage!).inputTokens).toBe(25);
+      expect(useChatStore.getState().pendingMessageUsage).toEqual({});
+    });
+    it(`replaces visible ${scope} input_total snapshots and accepts authoritative corrections`, () => {
+      activate(owner);
+      receive('input-total', owner);
+      snapshot(25, 'input_total');
+      snapshot(50, 'input_total');
+      expect(JSON.parse(replies(owner)[0].token_usage!).inputTokens).toBe(50);
+      snapshot(40, 'input_total');
+      expect(JSON.parse(replies(owner)[0].token_usage!).inputTokens).toBe(40);
+    });
+    it(`continues accepting the ${scope} legacy host-merged batch snapshot`, () => {
+      activate(owner);
+      snapshot(20, undefined, true);
+      receive('input-total', owner);
+      expect(JSON.parse(replies(owner)[0].token_usage!).inputTokens).toBe(20);
+      snapshot(20, undefined, true);
+      expect(JSON.parse(replies(owner)[0].token_usage!).inputTokens).toBe(20);
+    });
+  }
+  it('rejects old query A usage after query B supersedes it', () => {
+    activate(agentId, jid, 'query-b');
+    receive('input-b');
+    emit('input-b', agentId, jid, 'query-a');
+    expect(replies()[0].token_usage).toBeUndefined();
+    expect(useChatStore.getState().pendingMessageUsage).toEqual({});
+  });
+  it('prefers canonical identity over a conflicting presentation ID', () => {
+    activate();
+    receive('canonical-a');
+    receive('presentation-only');
+    emit('canonical-a');
+    expect(JSON.parse(replies()[0].token_usage!)).toEqual(usage);
+    expect(replies()[1].token_usage).toBeUndefined();
+  });
+  it('supports old protocol only when its presentation ID exactly matches the final', () => {
+    activate();
+    receive('legacy-a');
+    receive('input-b');
+    emit(undefined, agentId, jid, runId, 'legacy-a');
+    expect(
+      JSON.parse(replies().find((m) => m.turn_id === 'legacy-a')!.token_usage!),
+    ).toEqual(usage);
+    emit(undefined, agentId, jid, runId, 'unknown');
+    emit(undefined, agentId, jid, runId, '');
+    expect(
+      replies().find((m) => m.turn_id === 'input-b')!.token_usage,
+    ).toBeUndefined();
+  });
+  it('keeps pending usage isolated by workspace and Agent', () => {
+    activate();
+    emit('shared-id');
+    receive('shared-id', 'other-agent');
+    receive('shared-id', '', jid);
+    receive('shared-id', agentId, 'web:other');
+    expect(replies('other-agent')[0].token_usage).toBeUndefined();
+    expect(replies('')[0].token_usage).toBeUndefined();
+    expect(replies(agentId, 'web:other')[0].token_usage).toBeUndefined();
+    receive('shared-id');
+    expect(JSON.parse(replies()[0].token_usage!)).toEqual(usage);
+  });
+  it('consumes pending usage when REST recovers a final missed over WS', async () => {
+    activate();
+    emit('rest-input');
+    apiGetMock.mockResolvedValueOnce({
+      messages: [final('rest-input')],
+      hasMore: false,
+    });
+    await useChatStore.getState().loadAgentMessages(jid, agentId);
+    expect(JSON.parse(replies()[0].token_usage!)).toEqual(usage);
+    expect(useChatStore.getState().pendingMessageUsage).toEqual({});
+    expect(saveAgentMessageSnapshotMock).toHaveBeenCalledWith(
+      jid,
+      agentId,
+      replies(),
+      false,
+    );
+  });
+  it('keeps authoritative final ledger totals when merging a pending usage event', () => {
+    activate();
+    emit('input-a');
+    const token_usage = JSON.stringify({ ...usage, inputTokens: 1000 });
+    receive('input-a', agentId, jid, { token_usage });
+    expect(replies()[0].token_usage).toBe(token_usage);
+    expect(useChatStore.getState().pendingMessageUsage).toEqual({});
+  });
+  it('preserves received usage when the same canonical final is projected again without usage', () => {
+    activate();
+    emit('input-a');
+    receive('input-a');
+    const before = replies()[0].token_usage;
+    receive('input-a', agentId, jid, { content: 'updated final' });
+    expect(replies()[0].token_usage).toBe(before);
+    const enriched = JSON.stringify({ ...usage, inputTokens: 1000 });
+    receive('input-a', agentId, jid, { token_usage: enriched });
+    expect(replies()[0].token_usage).toBe(enriched);
+  });
+  it('expires orphaned usage before accepting a final beyond five minutes', () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    activate();
+    emit('expired');
+    now += 5 * 60 * 1000 + 1;
+    receive('expired');
+    expect(replies()[0].token_usage).toBeUndefined();
+    expect(useChatStore.getState().pendingMessageUsage).toEqual({});
+  });
+  it('bounds orphaned usage and evicts the oldest input', () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now++);
+    activate();
+    for (let i = 0; i < 129; i++) emit(`input-${i}`);
+    expect(
+      Object.keys(useChatStore.getState().pendingMessageUsage),
+    ).toHaveLength(128);
+    receive('input-0');
+    expect(replies()[0].token_usage).toBeUndefined();
+    receive('input-128');
+    expect(JSON.parse(replies()[1].token_usage!)).toEqual(usage);
+  });
+  for (const reset of ['context_reset', 'context_fresh_window']) {
+    for (const owner of [agentId, '']) {
+      it(`clears only the ${owner ? 'Agent' : 'main'} cache on a remote ${reset} divider`, () => {
+        activate(owner);
+        activate('other-agent');
+        activate(agentId, 'web:other');
+        emit('input-reset', owner);
+        emit('input-other-agent', 'other-agent');
+        emit('input-other-workspace', agentId, 'web:other');
+        receive('divider', owner, jid, {
+          sender: '__system__',
+          content: reset,
+        });
+        const pending = Object.values(
+          useChatStore.getState().pendingMessageUsage,
+        );
+        expect(pending).toHaveLength(2);
+        expect(
+          pending.some((entry) => entry.inputTurnId === 'input-reset'),
+        ).toBe(false);
+      });
+    }
+  }
+  it('does not treat a user reset-looking message as a system divider', () => {
+    activate();
+    emit('input-a');
+    receive('user-row', agentId, jid, {
+      sender: 'user',
+      is_from_me: false,
+      content: 'context_reset',
+    });
+    expect(
+      Object.keys(useChatStore.getState().pendingMessageUsage),
+    ).toHaveLength(1);
+  });
+  it('clears only the reset Agent pending usage', async () => {
+    activate();
+    activate('other-agent');
+    emit('input-a');
+    emit('input-b', 'other-agent');
+    expect(await useChatStore.getState().resetSession(jid, agentId)).toBe(true);
+    const pending = Object.values(useChatStore.getState().pendingMessageUsage);
+    expect(pending).toHaveLength(1);
+    expect(pending[0].agentId).toBe('other-agent');
+  });
+  it('clears pending usage on Agent deletion', async () => {
+    activate();
+    emit('input-a');
+    expect(await useChatStore.getState().deleteAgentAction(jid, agentId)).toBe(
+      true,
+    );
+    expect(useChatStore.getState().pendingMessageUsage).toEqual({});
+  });
+  for (const action of ['clearHistory', 'deleteFlow'] as const) {
+    it(`clears all workspace pending usage after ${action}`, async () => {
+      activate();
+      activate('');
+      activate(agentId, 'web:other');
+      emit('input-a');
+      emit('input-main', '');
+      emit('input-other', agentId, 'web:other');
+      await useChatStore.getState()[action](jid);
+      const pending = Object.values(
+        useChatStore.getState().pendingMessageUsage,
+      );
+      expect(pending).toHaveLength(1);
+      expect(pending[0].chatJid).toBe('web:other');
+    });
+  }
 });

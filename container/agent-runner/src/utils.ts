@@ -111,8 +111,30 @@ export function redactInlineSecrets(value: string): string {
 }
 
 /**
+ * String fields that say what a tool call is about, best first: a shell
+ * command, a search query, the file a read or edit targets, a search pattern
+ * (before the directory it runs in), a URL (before the prompt asked of it).
+ */
+const INPUT_SUMMARY_KEYS: readonly string[] = [
+  'command',
+  'query',
+  'file_path',
+  'notebook_path',
+  'pattern',
+  'path',
+  'url',
+  'prompt',
+  'name',
+];
+
+function formatInputSummary(key: string, value: string): string {
+  return `${key}: ${shorten(redactInlineSecrets(value.trim()))}`;
+}
+
+/**
  * Summarize tool input for display in stream events.
- * Extracts key fields (command, query, path, etc.) or serializes the object.
+ * Extracts key fields (command, query, file_path, pattern, url, etc.) or
+ * serializes the object.
  */
 export function summarizeToolInput(input: unknown): string | undefined {
   if (input == null) return undefined;
@@ -123,19 +145,10 @@ export function summarizeToolInput(input: unknown): string | undefined {
 
   if (typeof input === 'object') {
     const obj = input as Record<string, unknown>;
-    const keyCandidates = [
-      'command',
-      'query',
-      'path',
-      'pattern',
-      'prompt',
-      'url',
-      'name',
-    ];
-    for (const key of keyCandidates) {
+    for (const key of INPUT_SUMMARY_KEYS) {
       const value = obj[key];
       if (typeof value === 'string' && value.trim()) {
-        return `${key}: ${shorten(redactInlineSecrets(value.trim()))}`;
+        return formatInputSummary(key, value);
       }
     }
     try {
@@ -149,6 +162,110 @@ export function summarizeToolInput(input: unknown): string | undefined {
   }
 
   return undefined;
+}
+
+/** How much of a streamed tool input is scanned for an early summary. */
+export const EARLY_INPUT_SCAN_MAX = 4096;
+
+/** The end of the JSON string that opens at `from`, or undefined if unclosed. */
+function jsonStringEnd(s: string, from: number): number | undefined {
+  for (let i = from + 1; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\') i++;
+    else if (c === '"') return i + 1;
+  }
+  return undefined;
+}
+
+/** The end of the JSON value that starts at `from`, or undefined if cut off. */
+function jsonValueEnd(s: string, from: number): number | undefined {
+  const first = s[from];
+  if (first === '"') return jsonStringEnd(s, from);
+  if (first === '{' || first === '[') {
+    let depth = 0;
+    for (let i = from; i < s.length; i++) {
+      const c = s[i];
+      if (c === '"') {
+        const end = jsonStringEnd(s, i);
+        if (end === undefined) return undefined;
+        i = end - 1;
+      } else if (c === '{' || c === '[') {
+        depth++;
+      } else if (c === '}' || c === ']') {
+        depth--;
+        if (depth === 0) return i + 1;
+      }
+    }
+    return undefined;
+  }
+  // A number or literal is only whole once a delimiter follows it.
+  let i = from;
+  while (i < s.length && !/[,}\]\s]/.test(s[i])) i++;
+  return i < s.length ? i : undefined;
+}
+
+function skipJsonSpace(s: string, from: number): number {
+  let i = from;
+  while (i < s.length && /\s/.test(s[i])) i++;
+  return i;
+}
+
+/**
+ * The summary a tool call's input already settles on, read from the first
+ * `EARLY_INPUT_SCAN_MAX` characters of its still-streaming JSON: the
+ * best-ranked summary key whose string value has arrived whole. A value cut
+ * off mid-string (or mid-escape) is never used and values of other types are
+ * skipped, so the result is one a full parse of the same input could give.
+ * Undefined while nothing usable has arrived. A key that streams later can
+ * still outrank the one found; the complete input settles that.
+ */
+export function extractEarlyToolInputSummary(
+  partialJson: string,
+): string | undefined {
+  const s =
+    partialJson.length > EARLY_INPUT_SCAN_MAX
+      ? partialJson.slice(0, EARLY_INPUT_SCAN_MAX)
+      : partialJson;
+  let i = skipJsonSpace(s, 0);
+  if (s[i] !== '{') return undefined;
+  i++;
+  let best: { rank: number; key: string; value: string } | undefined;
+  for (;;) {
+    i = skipJsonSpace(s, i);
+    if (i >= s.length) break;
+    if (s[i] === ',') {
+      i++;
+      continue;
+    }
+    if (s[i] !== '"') break;
+    const keyEnd = jsonStringEnd(s, i);
+    if (keyEnd === undefined) break;
+    let key: unknown;
+    try {
+      key = JSON.parse(s.slice(i, keyEnd));
+    } catch {
+      break;
+    }
+    i = skipJsonSpace(s, keyEnd);
+    if (s[i] !== ':') break;
+    i = skipJsonSpace(s, i + 1);
+    if (i >= s.length) break;
+    const valueEnd = jsonValueEnd(s, i);
+    if (valueEnd === undefined) break;
+    const rank = typeof key === 'string' ? INPUT_SUMMARY_KEYS.indexOf(key) : -1;
+    if (rank >= 0 && s[i] === '"' && (!best || rank < best.rank)) {
+      try {
+        const value: unknown = JSON.parse(s.slice(i, valueEnd));
+        if (typeof value === 'string' && value.trim()) {
+          best = { rank, key: key as string, value };
+        }
+      } catch {
+        // A malformed string is not a summary.
+      }
+    }
+    i = valueEnd;
+  }
+  return best && formatInputSummary(best.key, best.value);
 }
 
 /**

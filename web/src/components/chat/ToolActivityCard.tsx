@@ -1,6 +1,11 @@
+import { memo } from 'react';
+import { Check, Loader2, X } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { formatElapsedMs } from '../../utils/format-elapsed';
+
 /**
- * ToolActivityCard — structured mini-card for active tool calls.
- * Replaces the tiny pill rendering in StreamingDisplay for better readability.
+ * ToolActivityCard — structured mini-card for tool calls: a running one
+ * spins, a finished one keeps its row with a mark and how long it took.
  */
 
 interface ToolInfo {
@@ -15,23 +20,46 @@ interface ToolInfo {
   toolInput?: Record<string, unknown>;
 }
 
+export type ToolRowStatus = 'running' | 'done' | 'error';
+
 interface ToolActivityCardProps {
   tool: ToolInfo;
   localElapsed?: number;
 }
 
+/** `…/parent/leaf` for long paths so the interesting end stays visible. */
+export function shortenPath(value: string): string {
+  if (value.length <= 48 || !value.includes('/')) return value;
+  const parts = value.split('/').filter(Boolean);
+  return parts.length <= 2 ? value : `…/${parts.slice(-2).join('/')}`;
+}
+
+/** `bash -lc 'npm test'` → `npm test`. */
+export function stripShellWrapper(value: string): string {
+  const match =
+    /^(?:\/(?:usr\/)?bin\/)?(?:ba|z)?sh\s+-l?c\s+(['"])([\s\S]*)\1$/.exec(
+      value.trim(),
+    );
+  return match ? match[2] : value;
+}
+
 /** Extract the most relevant param from toolInputSummary for structured display. */
-function parseToolParam(toolName: string, summary?: string): { label: string; value: string } | null {
+function parseToolParam(
+  toolName: string,
+  summary?: string,
+): { label: string; value: string } | null {
   if (!summary) return null;
 
   switch (toolName) {
     case 'Read':
     case 'Write':
     case 'Edit':
+    case 'MultiEdit':
+    case 'NotebookEdit':
     case 'Glob':
-      return { label: 'path', value: summary };
+      return { label: 'path', value: shortenPath(summary) };
     case 'Bash':
-      return { label: 'cmd', value: summary };
+      return { label: 'cmd', value: stripShellWrapper(summary) };
     case 'Grep':
       return { label: 'pattern', value: summary };
     case 'Agent':
@@ -41,39 +69,204 @@ function parseToolParam(toolName: string, summary?: string): { label: string; va
   }
 }
 
-export function ToolActivityCard({ tool, localElapsed }: ToolActivityCardProps) {
-  const elapsed = tool.elapsedSeconds ?? localElapsed;
-  const isNested = tool.isNested === true;
-  const displayName = tool.toolName === 'Skill'
-    ? (tool.skillName || 'unknown')
-    : tool.toolName;
+/** Short verb for well-known tools; MCP tools read as `server.tool`. */
+export function describeToolName(
+  toolName: string,
+  skillName?: string,
+): { verb: string; hint?: string } {
+  switch (toolName) {
+    case 'Bash':
+      return { verb: '运行', hint: 'Bash' };
+    case 'Read':
+      return { verb: '读取', hint: 'Read' };
+    case 'Write':
+      return { verb: '写入', hint: 'Write' };
+    case 'Edit':
+    case 'MultiEdit':
+    case 'NotebookEdit':
+      return { verb: '编辑', hint: toolName };
+    case 'Glob':
+      return { verb: '查找文件', hint: 'Glob' };
+    case 'Grep':
+      return { verb: '搜索', hint: 'Grep' };
+    case 'WebSearch':
+      return { verb: '搜索网页', hint: 'WebSearch' };
+    case 'WebFetch':
+      return { verb: '读取网页', hint: 'WebFetch' };
+    case 'TodoWrite':
+      return { verb: '更新计划', hint: 'TodoWrite' };
+    case 'Task':
+    case 'Agent':
+      return { verb: '子 Agent', hint: toolName };
+    case 'Skill':
+      return { verb: skillName || 'unknown', hint: 'Skill' };
+    default: {
+      const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
+      if (mcp) return { verb: `${mcp[1]}.${mcp[2]}`, hint: toolName };
+      return { verb: toolName };
+    }
+  }
+}
 
-  const param = parseToolParam(tool.toolName, tool.toolInputSummary);
-  const isBash = tool.toolName === 'Bash';
+/** A call in a few words: its verb and, if it was given one, its parameter. */
+export function describeToolCall(
+  toolName: string,
+  summary?: string,
+  skillName?: string,
+): { verb: string; param?: string } {
+  const { verb } = describeToolName(toolName, skillName);
+  return { verb, param: parseToolParam(toolName, summary)?.value };
+}
 
+/** Phrase for the status line while a tool of this kind is running. */
+export function describeToolActivity(toolName: string): string {
+  switch (toolName) {
+    case 'Bash':
+      return '正在运行命令';
+    case 'Read':
+      return '正在读取文件';
+    case 'Glob':
+      return '正在查找文件';
+    case 'Grep':
+      return '正在搜索代码';
+    case 'WebSearch':
+    case 'WebFetch':
+      return '正在查阅网页';
+    case 'Write':
+    case 'Edit':
+    case 'MultiEdit':
+    case 'NotebookEdit':
+      return '正在修改文件';
+    case 'Task':
+    case 'Agent':
+      return '正在等待子 Agent';
+    case 'Skill':
+      return '正在使用技能';
+    case 'TodoWrite':
+      return '正在更新计划';
+    case 'AskUserQuestion':
+      return '等待你的回答';
+    default:
+      return '正在调用工具';
+  }
+}
+
+export interface ToolRowProps {
+  toolName: string;
+  skillName?: string;
+  /** What the call was given: a path, a command, a pattern. */
+  summary?: string;
+  status?: ToolRowStatus;
+  nested?: boolean;
+  /** A running call's time so far. */
+  elapsedSeconds?: number;
+  /** A finished call's time. */
+  durationMs?: number;
+  /** The start of what the call returned; a failed call always shows it. */
+  resultPreview?: string;
+  /** Show the result of a call that did not fail too. */
+  showResult?: boolean;
+}
+
+/** One tool call as a row: mark · tool · parameter · time. */
+export const ToolRow = memo(function ToolRow({
+  toolName,
+  skillName,
+  summary,
+  status = 'running',
+  nested = false,
+  elapsedSeconds,
+  durationMs,
+  resultPreview,
+  showResult = false,
+}: ToolRowProps) {
+  const { verb, hint } = describeToolName(toolName, skillName);
+  const param = parseToolParam(toolName, summary);
+  const isBash = toolName === 'Bash';
+  const running = status === 'running';
+  const failed = status === 'error';
+  const time = running
+    ? elapsedSeconds != null
+      ? `${Math.round(elapsedSeconds)}s`
+      : undefined
+    : durationMs != null
+      ? formatElapsedMs(durationMs)
+      : undefined;
+  const result = resultPreview && (failed || showResult) ? resultPreview : '';
+
+  // Codex-style activity row: mark · tool name · parameter · time.
   return (
-    <div className={`${isNested ? 'ml-4 border-l-2 border-brand-200 pl-2' : ''}`}>
-      <div className="rounded-lg border border-brand-200 bg-brand-50/50 px-2.5 py-1.5 text-[13px] font-sans">
-        {/* Header: tool name + elapsed */}
-        <div className="flex items-center gap-1.5">
-          <svg className="w-3 h-3 animate-spin text-primary flex-shrink-0" viewBox="0 0 24 24" fill="none">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-          </svg>
-          <span className="font-medium text-primary">{displayName}</span>
-          <span className="flex-1" />
-          {elapsed != null && (
-            <span className="text-muted-foreground tabular-nums">{Math.round(elapsed)}s</span>
-          )}
-        </div>
-        {/* Param line */}
-        {param && (
-          <div className={`mt-1 text-muted-foreground break-all max-h-16 overflow-y-auto ${isBash ? 'font-mono' : ''}`}>
-            <span className="text-muted-foreground/60">{param.label}: </span>
-            {param.value}
-          </div>
+    <div className={nested ? 'ml-3 border-l border-surface-border pl-2.5' : ''}>
+      <div className="flex min-h-7 items-center gap-2 rounded-md px-1 py-1 font-sans text-label">
+        {running ? (
+          <Loader2
+            aria-hidden="true"
+            className="size-3.5 shrink-0 animate-spin text-muted-foreground"
+          />
+        ) : failed ? (
+          <X aria-hidden="true" className="size-3.5 shrink-0 text-error" />
+        ) : (
+          <Check
+            aria-hidden="true"
+            className="size-3.5 shrink-0 text-faint-foreground"
+          />
         )}
+        <span
+          className={cn(
+            'shrink-0 font-medium',
+            running || failed ? 'text-foreground' : 'text-muted-foreground',
+          )}
+          title={hint}
+        >
+          {verb}
+        </span>
+        {param && (
+          <span
+            className={cn(
+              'min-w-0 flex-1 truncate text-muted-foreground',
+              isBash && 'font-mono text-caption leading-5',
+              !running && !failed && 'text-faint-foreground',
+            )}
+            title={summary}
+          >
+            {param.value}
+          </span>
+        )}
+        {!param && <span className="flex-1" />}
+        {time && (
+          <span className="shrink-0 text-caption text-faint-foreground tabular-nums">
+            {time}
+          </span>
+        )}
+        <span className="sr-only">
+          {running ? '，运行中' : failed ? '，失败' : '，已完成'}
+        </span>
       </div>
+      {result && (
+        <p
+          className={cn(
+            'mb-1 ml-6 line-clamp-2 text-caption break-words',
+            failed ? 'text-error' : 'text-muted-foreground',
+          )}
+        >
+          {result}
+        </p>
+      )}
     </div>
   );
-}
+});
+
+export const ToolActivityCard = memo(function ToolActivityCard({
+  tool,
+  localElapsed,
+}: ToolActivityCardProps) {
+  return (
+    <ToolRow
+      toolName={tool.toolName}
+      skillName={tool.skillName}
+      summary={tool.toolInputSummary}
+      nested={tool.isNested === true}
+      elapsedSeconds={tool.elapsedSeconds ?? localElapsed}
+    />
+  );
+});

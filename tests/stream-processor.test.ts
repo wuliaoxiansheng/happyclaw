@@ -158,6 +158,44 @@ describe('StreamEventProcessor observability mapping', () => {
     expect(processor.getBlockingPendingSdkTaskCount()).toBe(0);
   });
 
+  test('maps informational frames to notifications and surfaces turn stops', () => {
+    const { processor, outputs } = makeProcessor();
+    expect(
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'informational',
+        level: 'info',
+        content: 'MCP server docs needs authentication',
+        uuid: 'info-1',
+        session_id: 's',
+      }),
+    ).toBe(true);
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'informational',
+      level: 'notice',
+      content: 'Stop hook prevented continuation',
+      prevent_continuation: true,
+      uuid: 'info-2',
+      session_id: 's',
+    });
+    const events = outputs.map((output) => output.streamEvent);
+    expect(events).toEqual([
+      expect.objectContaining({
+        eventType: 'notification',
+        summary: 'MCP server docs needs authentication',
+        displayLevel: 'detail',
+        messageUuid: 'info-1',
+      }),
+      expect.objectContaining({
+        eventType: 'notification',
+        title: 'Claude Code stopped the turn',
+        summary: 'Stop hook prevented continuation',
+        displayLevel: 'primary',
+      }),
+    ]);
+  });
+
   test('merged background-completion placeholders settle their own debt but never complete the input', () => {
     const { processor } = makeProcessor();
     // Message order observed from Claude Code 2.1.280 when two background
@@ -216,6 +254,244 @@ describe('StreamEventProcessor observability mapping', () => {
     // the shared call that answers it has not run yet.
     processor.observeMergedCompletionPlaceholder();
     expect(processor.canCompleteObservedBackgroundResult()).toBe(false);
+  });
+
+  test('merged background completions settle the same way in the 0.3.292 frame order', () => {
+    const { processor } = makeProcessor();
+    // SDK 0.3.292 / Claude Code 2.1.292 send the level for a finishing task
+    // after its task_updated and task_notification, not before them.
+    for (const taskId of ['bash-a', 'bash-b']) {
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_started',
+        task_id: taskId,
+        description: taskId,
+        task_type: 'local_bash',
+      });
+    }
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'background_tasks_changed',
+      tasks: [{ task_id: 'bash-a' }, { task_id: 'bash-b' }],
+    });
+    for (const [taskId, remaining] of [
+      ['bash-a', [{ task_id: 'bash-b' }]],
+      ['bash-b', []],
+    ] as const) {
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_updated',
+        task_id: taskId,
+        patch: { status: 'completed' },
+      });
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: taskId,
+        status: 'completed',
+        summary: `${taskId} done`,
+      });
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'background_tasks_changed',
+        tasks: remaining,
+      });
+    }
+    expect(processor.getBlockingBackgroundCompletionDebtCount()).toBe(2);
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(0);
+
+    processor.observeMergedCompletionPlaceholder();
+    expect(processor.getBlockingBackgroundCompletionDebtCount()).toBe(1);
+    expect(processor.canCompleteObservedBackgroundResult()).toBe(false);
+
+    expect(processor.observeBackgroundResult('task-notification')).toBe(true);
+    expect(processor.getBlockingBackgroundCompletionDebtCount()).toBe(0);
+  });
+
+  test('a background agent completes the same way in both level orders', () => {
+    const run = (levelLast: boolean) => {
+      const { processor } = makeProcessor();
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'background_tasks_changed',
+        tasks: [{ task_id: 'agent-1', task_type: 'local_agent' }],
+      });
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_started',
+        task_id: 'agent-1',
+        tool_use_id: 'toolu_agent',
+        description: 'research',
+        task_type: 'local_agent',
+      });
+      const level = () =>
+        processor.processSystemMessage({
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          tasks: [],
+        });
+      if (!levelLast) level();
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_updated',
+        task_id: 'agent-1',
+        patch: { status: 'completed' },
+      });
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: 'agent-1',
+        status: 'completed',
+        summary: 'research done',
+      });
+      if (levelLast) level();
+      const debtsAfterEdges =
+        processor.getBlockingBackgroundCompletionDebtCount();
+      processor.observeBackgroundNotificationActivity();
+      return {
+        debtsAfterEdges,
+        pending: processor.getBlockingPendingSdkTaskCount(),
+        completed: processor.observeBackgroundResult('task-notification'),
+        debtsAfterResult: processor.getBlockingBackgroundCompletionDebtCount(),
+      };
+    };
+    // Frame order observed from Claude Code 2.1.296 (level last) must match
+    // the 2.1.280 order (level first).
+    expect(run(true)).toEqual(run(false));
+    expect(run(true)).toEqual({
+      debtsAfterEdges: 1,
+      pending: 0,
+      completed: true,
+      debtsAfterResult: 0,
+    });
+  });
+
+  test('background tasks started inside a sub-agent never create main-Agent completion debt', () => {
+    const { processor } = makeProcessor();
+    // Main Agent launches a background research sub-agent.
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'agent-research',
+      tool_use_id: 'toolu_agent',
+      description: 'Research',
+      task_type: 'local_agent',
+      is_backgrounded: true,
+      spawn_depth: 1,
+    });
+    // The sub-agent issues background Bash calls (parent_tool_use_id set), one
+    // seen via partial stream events and one only via the full message.
+    processor.processStreamEvent({
+      type: 'stream_event',
+      parent_tool_use_id: 'toolu_agent',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', name: 'Bash', id: 'toolu_bash_1' },
+      },
+    });
+    processor.processSubAgentMessage({
+      type: 'assistant',
+      parent_tool_use_id: 'toolu_agent',
+      message: {
+        content: [
+          { type: 'tool_use', name: 'Bash', id: 'toolu_bash_2', input: {} },
+        ],
+      },
+    });
+    for (const [taskId, toolUseId] of [
+      ['bash-1', 'toolu_bash_1'],
+      ['bash-2', 'toolu_bash_2'],
+    ]) {
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_started',
+        task_id: taskId,
+        tool_use_id: toolUseId,
+        description: taskId,
+        task_type: 'local_bash',
+        is_backgrounded: true,
+      });
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: taskId,
+        tool_use_id: toolUseId,
+        status: 'completed',
+        summary: `${taskId} done`,
+      });
+    }
+    // A nested Agent spawn (depth 2) belongs to the sub-agent as well.
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'agent-nested',
+      description: 'nested',
+      task_type: 'local_agent',
+      spawn_depth: 2,
+    });
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'agent-nested',
+      status: 'completed',
+      summary: 'nested done',
+    });
+    expect(processor.getBlockingBackgroundCompletionDebtCount()).toBe(0);
+
+    // Only the main Agent's own Task notification is an obligation.
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'agent-research',
+      tool_use_id: 'toolu_agent',
+      status: 'completed',
+      summary: 'research done',
+    });
+    expect(processor.getBlockingBackgroundCompletionDebtCount()).toBe(1);
+    processor.observeBackgroundNotificationActivity();
+    expect(processor.observeBackgroundResult('task-notification')).toBe(true);
+    expect(processor.getBlockingBackgroundProtocolCount()).toBe(0);
+  });
+
+  test('trusts the CLI owned_by_subagent flag before any sub-agent tool call is seen', () => {
+    const { processor } = makeProcessor();
+    // Claude Code marks a sub-agent's local_bash on task_started even when the
+    // sub-agent's tool_use frame never reached the main stream.
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'bash-sub',
+      tool_use_id: 'toolu_unseen',
+      description: 'sub-agent bash',
+      task_type: 'local_bash',
+      is_backgrounded: true,
+      owned_by_subagent: true,
+    });
+    // The main Agent's own background Bash carries no flag and stays a debt.
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'bash-main',
+      tool_use_id: 'toolu_main',
+      description: 'main bash',
+      task_type: 'local_bash',
+      is_backgrounded: true,
+    });
+    for (const [taskId, toolUseId] of [
+      ['bash-sub', 'toolu_unseen'],
+      ['bash-main', 'toolu_main'],
+    ]) {
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: taskId,
+        tool_use_id: toolUseId,
+        status: 'completed',
+        summary: `${taskId} done`,
+      });
+    }
+    expect(processor.getBlockingBackgroundCompletionDebtCount()).toBe(1);
   });
 
   test('treats stopped and aborted task_updated as terminal SDK statuses', () => {
@@ -520,5 +796,86 @@ describe('StreamEventProcessor card-consumer data contracts', () => {
     // null/undefined parentToolUseId ⟹ passes the `!parentToolUseId` guard ⟹ accumulates.
     expect(mainText?.parentToolUseId ?? null).toBeNull();
     expect(mainText?.agentScope).toBe('main');
+  });
+});
+
+describe('StreamEventProcessor main tool results', () => {
+  function startTool(
+    processor: StreamEventProcessor,
+    name: string,
+    id: string,
+    index = 0,
+  ) {
+    processor.processStreamEvent({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index,
+        content_block: { type: 'tool_use', name, id },
+      },
+    });
+  }
+
+  function returnResult(processor: StreamEventProcessor, id: string) {
+    processor.processMainToolResults({
+      type: 'user',
+      parent_tool_use_id: null,
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }],
+      },
+    });
+  }
+
+  const ends = (outputs: ContainerOutput[]) =>
+    outputs
+      .map((output) => output.streamEvent)
+      .filter((event) => event?.eventType === 'tool_use_end')
+      .map((event) => event?.toolUseId);
+
+  test('ends the active top-level tool as soon as its result returns', () => {
+    const { processor, outputs } = makeProcessor();
+    startTool(processor, 'Glob', 'toolu_glob');
+    returnResult(processor, 'toolu_glob');
+
+    const events = outputs.map((output) => output.streamEvent?.eventType);
+    expect(events.indexOf('tool_result')).toBeLessThan(
+      events.indexOf('tool_use_end'),
+    );
+    expect(ends(outputs)).toEqual(['toolu_glob']);
+
+    // The next text block no longer infers a second end for it.
+    processor.processStreamEvent({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'text', text: '' },
+      },
+    });
+    expect(ends(outputs)).toEqual(['toolu_glob']);
+  });
+
+  test('leaves Task and an active Skill to their own lifecycle', () => {
+    const { processor, outputs } = makeProcessor();
+    startTool(processor, 'Task', 'toolu_task');
+    returnResult(processor, 'toolu_task');
+    expect(ends(outputs)).toEqual([]);
+
+    const skill = makeProcessor();
+    startTool(skill.processor, 'Skill', 'toolu_skill');
+    returnResult(skill.processor, 'toolu_skill');
+    expect(ends(skill.outputs)).toEqual([]);
+  });
+
+  test('does not end a tool that is no longer the active one', () => {
+    const { processor, outputs } = makeProcessor();
+    startTool(processor, 'Read', 'toolu_a', 0);
+    startTool(processor, 'Read', 'toolu_b', 1);
+    // Starting B already ended A.
+    expect(ends(outputs)).toEqual(['toolu_a']);
+    returnResult(processor, 'toolu_a');
+    expect(ends(outputs)).toEqual(['toolu_a']);
+    returnResult(processor, 'toolu_b');
+    expect(ends(outputs)).toEqual(['toolu_a', 'toolu_b']);
   });
 });

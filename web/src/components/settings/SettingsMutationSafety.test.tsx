@@ -81,6 +81,7 @@ describe('BalancingSettings accessibility and persistence timing', () => {
             unhealthyThreshold: 3,
             recoveryIntervalMs: 300_000,
           }}
+          hasDefault={false}
           onChange={onChange}
           disabled={false}
           saving={false}

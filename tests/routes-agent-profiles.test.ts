@@ -185,7 +185,27 @@ describe('/api/agent-profiles routes', () => {
         }),
       ]),
     );
-    expect(listBody.model_configs[0]).not.toHaveProperty('is_default');
+    // Without a global default no configuration is marked as what an
+    // unbound Agent follows.
+    expect(
+      listBody.model_configs.every((item: any) => item.is_default === false),
+    ).toBe(true);
+
+    runtimeConfig.setDefaultModelConfig(selectedModel.id);
+    const defaulted = await (
+      await routes.request('/', { method: 'GET' })
+    ).json();
+    expect(
+      defaulted.model_configs.map((item: any) => [item.id, item.is_default]),
+    ).toEqual(
+      expect.arrayContaining([
+        [selectedModel.id, true],
+        [automaticModel.id, false],
+      ]),
+    );
+    // Choosing a configuration as the default switches it on; put it back.
+    runtimeConfig.setDefaultModelConfig(null);
+    runtimeConfig.setProviderEnabled(selectedModel.id, false);
 
     const createRes = await routes.request('/', {
       method: 'POST',

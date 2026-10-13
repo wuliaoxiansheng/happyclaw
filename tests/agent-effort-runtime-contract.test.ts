@@ -29,6 +29,19 @@ describe('Agent effort runtime contracts', () => {
     expect(calls).toHaveLength(2);
   });
 
+  test('host and container starts mint the conversation effort into the gateway lease', () => {
+    const host = read('src/container-runner.ts');
+    // The pick travels out of band: the SDK option cannot express every level.
+    expect(
+      host.match(
+        /sessionEffort: (?:hostPoolResult|poolResult)\?\.sessionEffort/g,
+      ),
+    ).toHaveLength(2);
+    expect(read('container/agent-runner/src/index.ts')).not.toContain(
+      'sessionEffort',
+    );
+  });
+
   test('runner passes the resolved value through the supported SDK option', () => {
     const runner = read('container/agent-runner/src/index.ts');
     expect(runner).toContain('...(agentEffort ? { effort: agentEffort } : {})');

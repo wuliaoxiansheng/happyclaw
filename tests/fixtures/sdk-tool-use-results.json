@@ -1,0 +1,266 @@
+{
+  "description": "Content-free tool_use_result shapes captured from the Claude Agent SDK (CLI 2.1.296, local stub upstream). Numbers and structure are real; every string the tool saw (paths, file text, command output, URLs) is a placeholder. webFetch and the grep count/files modes follow the SDK type declarations (sdk-tools.d.ts), which the stub run did not produce.",
+  "cases": {
+    "read": {
+      "toolName": "Read",
+      "content": "<content>",
+      "toolUseResult": {
+        "type": "text",
+        "file": {
+          "filePath": "<filePath>",
+          "content": "x\nx\nx\n",
+          "numLines": 4,
+          "startLine": 1,
+          "totalLines": 4
+        }
+      }
+    },
+    "readMissing": {
+      "toolName": "Read",
+      "isError": true,
+      "content": "File does not exist.",
+      "toolUseResult": "Error: File does not exist."
+    },
+    "bashSuccess": {
+      "toolName": "Bash",
+      "isError": false,
+      "content": "<content>",
+      "toolUseResult": {
+        "stdout": "<stdout>",
+        "stderr": "<stderr>",
+        "interrupted": false,
+        "isImage": false,
+        "noOutputExpected": false
+      }
+    },
+    "bashExit3": {
+      "toolName": "Bash",
+      "isError": true,
+      "content": "Exit code 3\n<output>",
+      "toolUseResult": "Error: Exit code 3\n<output>"
+    },
+    "bashExit1": {
+      "toolName": "Bash",
+      "isError": true,
+      "content": "Exit code 1",
+      "toolUseResult": "Error: Exit code 1"
+    },
+    "write": {
+      "toolName": "Write",
+      "content": "<content>",
+      "toolUseResult": {
+        "type": "create",
+        "filePath": "<filePath>",
+        "content": "x\nx\n",
+        "structuredPatch": [],
+        "originalFile": null,
+        "userModified": false
+      }
+    },
+    "writeUpdate": {
+      "toolName": "Write",
+      "content": "<content>",
+      "toolUseResult": {
+        "type": "update",
+        "filePath": "<filePath>",
+        "content": "x\nx\nx\nx\n",
+        "structuredPatch": [
+          {
+            "oldStart": 1,
+            "oldLines": 3,
+            "newStart": 1,
+            "newLines": 4,
+            "lines": [" x", " x", " x", "+x"]
+          }
+        ],
+        "originalFile": "<originalFile>",
+        "userModified": false
+      }
+    },
+    "edit": {
+      "toolName": "Edit",
+      "content": "<content>",
+      "toolUseResult": {
+        "filePath": "<filePath>",
+        "oldString": "<oldString>",
+        "newString": "<newString>",
+        "originalFile": "<originalFile>",
+        "structuredPatch": [
+          {
+            "oldStart": 1,
+            "oldLines": 3,
+            "newStart": 1,
+            "newLines": 3,
+            "lines": [" x", "-x", "+x", " x"]
+          }
+        ],
+        "userModified": false,
+        "replaceAll": false
+      }
+    },
+    "grepContent": {
+      "toolName": "Grep",
+      "content": "<content>",
+      "toolUseResult": {
+        "mode": "content",
+        "numFiles": 0,
+        "filenames": [],
+        "content": "<content>",
+        "numLines": 1,
+        "totalLines": 1
+      }
+    },
+    "glob": {
+      "toolName": "Glob",
+      "content": "<content>",
+      "toolUseResult": {
+        "filenames": ["<filenames>", "<filenames>"],
+        "durationMs": 33,
+        "numFiles": 2,
+        "truncated": false,
+        "totalMatches": 2,
+        "countIsComplete": true
+      }
+    },
+    "agent": {
+      "toolName": "Agent",
+      "content": [
+        {
+          "type": "text",
+          "text": "<text>"
+        }
+      ],
+      "toolUseResult": {
+        "status": "completed",
+        "prompt": "<prompt>",
+        "agentId": "<agentId>",
+        "agentType": "general-purpose",
+        "harnessNoteCount": 0,
+        "harnessTailCount": 0,
+        "harnessSectionHash": "<harnessSectionHash>",
+        "content": [
+          {
+            "type": "text",
+            "text": "<text>"
+          }
+        ],
+        "resolvedModel": "stub-model",
+        "totalDurationMs": 2248,
+        "totalTokens": 190,
+        "totalToolUseCount": 2,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 120,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 30,
+          "output_tokens": 40,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard",
+          "fallback_credit": null
+        },
+        "toolStats": {
+          "readCount": 1,
+          "searchCount": 0,
+          "bashCount": 1,
+          "editFileCount": 0,
+          "linesAdded": 0,
+          "linesRemoved": 0,
+          "otherToolCount": 0
+        },
+        "canContinueAgent": true
+      }
+    },
+    "webSearch": {
+      "toolName": "WebSearch",
+      "content": "<content>",
+      "toolUseResult": {
+        "query": "<query>",
+        "results": [
+          {
+            "tool_use_id": "<tool_use_id>",
+            "content": [
+              {
+                "title": "<title>",
+                "url": "<url>"
+              }
+            ]
+          },
+          "<results>"
+        ],
+        "durationSeconds": 0.4714908599999999,
+        "searchCount": 1
+      }
+    },
+    "taskCreate": {
+      "toolName": "TaskCreate",
+      "content": "<content>",
+      "toolUseResult": {
+        "task": {
+          "id": "<id>",
+          "subject": "<subject>"
+        }
+      }
+    },
+    "taskList": {
+      "toolName": "TaskList",
+      "content": "<content>",
+      "toolUseResult": {
+        "tasks": [
+          {
+            "id": "<id>",
+            "subject": "<subject>",
+            "status": "in_progress",
+            "blockedBy": []
+          }
+        ]
+      }
+    },
+    "webFetch": {
+      "toolName": "WebFetch",
+      "isError": false,
+      "content": "<content>",
+      "toolUseResult": {
+        "bytes": 2048,
+        "code": 200,
+        "codeText": "OK",
+        "result": "<result>",
+        "durationMs": 311,
+        "url": "<url>"
+      }
+    },
+    "grepCount": {
+      "toolName": "Grep",
+      "isError": false,
+      "content": "<content>",
+      "toolUseResult": {
+        "mode": "count",
+        "numFiles": 3,
+        "filenames": [],
+        "content": "<content>",
+        "numMatches": 17
+      }
+    },
+    "grepFiles": {
+      "toolName": "Grep",
+      "isError": false,
+      "content": "<content>",
+      "toolUseResult": {
+        "mode": "files_with_matches",
+        "numFiles": 2,
+        "filenames": ["<filename>", "<filename>"]
+      }
+    }
+  }
+}

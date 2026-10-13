@@ -32,13 +32,15 @@ describe('product terminology', () => {
 
   test('keeps Claude SDK and subagent terminology technically explicit', () => {
     const login = read('web/src/pages/LoginPage.tsx');
-    const streaming = read('web/src/components/chat/StreamingDisplay.tsx');
+    // The sub-agent card moved out of the streaming display when the three
+    // renderings of one sub-agent became one.
+    const subAgent = read('web/src/components/chat/SubAgentCard.tsx');
     const workflow = read('web/src/components/chat/WorkflowRunCard.tsx');
     const tools = read('web/src/components/chat/ToolActivityCard.tsx');
     const readme = read('README.md');
 
     expect(login).toContain('Powered by Claude Agent SDK');
-    expect(streaming).toContain('子 Agent:');
+    expect(subAgent).toContain('子 Agent：');
     expect(workflow).toContain('个 Agent');
     expect(tools).toContain("case 'Agent':");
     expect(readme).toContain('Claude Agent SDK');

@@ -2,6 +2,7 @@
 // 自托管部署用 .env 配置 CORS_ALLOWED_ORIGINS（公网域名白名单）、自定义 env 等。
 // 必须作为 index.ts 的第一个 import，确保 config.ts / web.ts 在求值时已能读到这些值。
 // 缺少 .env 文件属正常情况（所有 env 均有默认值），静默忽略。
+import http from 'node:http';
 import { setGlobalDispatcher, EnvHttpProxyAgent } from 'undici';
 
 try {
@@ -13,7 +14,7 @@ try {
 
 // 让后端的 Node 全局 fetch（undici）走系统代理。
 // undici 默认【不读】HTTP_PROXY/HTTPS_PROXY 环境变量，导致 server-side fetch
-// （如官方 Claude OAuth 交换 https://api.anthropic.com/v1/oauth/token、连通性测试）
+// （如官方 Claude OAuth 交换 https://platform.claude.com/v1/oauth/token、连通性测试）
 // 用裸出口 IP 直连。在大陆裸 IP 会被 Anthropic 以 403 {"type":"forbidden",
 // "message":"Request not allowed"} 拒绝。这里在最早时机设置一次全局 dispatcher，
 // EnvHttpProxyAgent 会读取 HTTP_PROXY/HTTPS_PROXY 并遵守 NO_PROXY（localhost 等不走代理）。
@@ -29,6 +30,14 @@ const proxy =
 if (proxy) {
   try {
     setGlobalDispatcher(new EnvHttpProxyAgent());
+    // The pinned undici package registers its dispatcher where Node <= 25's
+    // built-in fetch looks for it. Node 26 bundles undici 8, which reads a new
+    // global slot that an undici 6 agent cannot serve, so its fetch would go
+    // direct. Node's own proxy support covers exactly those runtimes.
+    const setGlobalProxyFromEnv = (
+      http as { setGlobalProxyFromEnv?: () => unknown }
+    ).setGlobalProxyFromEnv;
+    if (typeof setGlobalProxyFromEnv === 'function') setGlobalProxyFromEnv();
     // logger 尚未初始化（本模块是最早的 import），用 console 输出一行启动提示。
     // 对代理串脱敏：去掉 userinfo（http://user:pass@host → http://***@host），避免凭据进日志。
     const safeProxy = proxy.replace(/\/\/[^/@]*@/, '//***@');

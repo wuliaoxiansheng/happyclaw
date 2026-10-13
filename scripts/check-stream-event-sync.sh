@@ -40,6 +40,13 @@ check_sync "$ROOT/shared/channel-prefixes.ts" \
   "$ROOT/src/channel-prefixes.ts" \
   "$ROOT/container/agent-runner/src/channel-prefixes.ts"
 
+# Reply step list + reasoning text helpers
+for name in thinking-text stream-steps; do
+  check_sync "$ROOT/shared/$name.ts" \
+    "$ROOT/src/$name.ts" \
+    "$ROOT/web/src/lib/$name.ts"
+done
+
 if [ "$FAIL" -eq 0 ]; then
   echo "All shared type copies are in sync."
 else

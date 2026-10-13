@@ -10,7 +10,6 @@ import {
   publishesFrameworkAnswer,
   resolveFrozenIpcInteractionMode,
   resolveRuntimeInteractionMode,
-  shouldBroadcastSdkStreamEvent,
   shouldResolveFrameworkPrimaryAnswer,
   shouldSendProactiveTailInterruptionNotice,
   usesNativeMessagePresentation,
@@ -228,42 +227,6 @@ describe('workspace interaction runtime policy', () => {
         spawnAgent: true,
       }).mode,
     ).toBe('assistant');
-  });
-
-  test('proactive exposes lifecycle boundaries but no SDK internals to Web', () => {
-    for (const statusText of ['requesting', 'idle', 'interrupted']) {
-      expect(
-        shouldBroadcastSdkStreamEvent('proactive', {
-          eventType: 'status',
-          statusText,
-        }),
-      ).toBe(true);
-    }
-    for (const eventType of [
-      'text_delta',
-      'thinking_delta',
-      'tool_use_start',
-      'tool_result',
-      'usage',
-      'workflow',
-      'task_start',
-      'task_notification',
-    ]) {
-      expect(shouldBroadcastSdkStreamEvent('proactive', { eventType })).toBe(
-        false,
-      );
-    }
-    expect(
-      shouldBroadcastSdkStreamEvent('proactive', {
-        eventType: 'status',
-        statusText: '正在深入分析…',
-      }),
-    ).toBe(false);
-    expect(
-      shouldBroadcastSdkStreamEvent('assistant', {
-        eventType: 'tool_use_start',
-      }),
-    ).toBe(true);
   });
 
   test('proactive permits healthy silence and treats a delivered utterance as irreversible', () => {

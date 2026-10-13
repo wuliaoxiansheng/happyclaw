@@ -54,6 +54,14 @@ export interface McpContext {
    * Cold starts use the triggering message id; IPC turns use the host-issued
    * delivery id from their receipt. */
   currentInputTurnId?: string | null;
+  currentQueryRunId?: string | null;
+  /** Set only by the runner when an input actually becomes current. */
+  channelTurnActivation?: {
+    inputTurnId: string;
+    provider?: string;
+    ready: Promise<void>;
+  };
+  channelTurnActivationSequence?: number;
   /** Exact Proactive input whose final native utterance received a physical
    * Host ACK. This is a per-runner latch used to seal the turn and suppress a
    * second final if an older CLI injects a no-visible-output companion. */
@@ -153,6 +161,68 @@ export async function pollIpcResult(
 
 function newRequestId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * Announce runner ownership before the SDK can execute this input's tools.
+ * The private signature prevents a model-written IPC file for a queued input
+ * from activating it. Tools await the host ACK even if no text has streamed.
+ */
+export function activateMcpChannelTurn(
+  ctx: McpContext,
+  timeoutMs = 30_000,
+): void {
+  const inputTurnId = ctx.currentInputTurnId;
+  if (!inputTurnId) return;
+  const sequence = (ctx.channelTurnActivationSequence ?? 0) + 1;
+  ctx.channelTurnActivationSequence = sequence;
+  const provider = ctx.channelContext?.provider;
+  const requiresHostActivation =
+    provider === 'feishu' || ctx.channelTurnActivation?.provider === 'feishu';
+  const ready = (async () => {
+    if (!requiresHostActivation) return;
+    const auth = ctx.workspaceMemoryMutationAuth;
+    if (!auth || !ctx.currentQueryRunId) {
+      throw new Error(
+        'Channel turn activation requires an admitted runner and query.',
+      );
+    }
+    const request: Record<string, unknown> & { requestId: string } = {
+      type: 'activate_channel_turn',
+      requestId: newRequestId(),
+      inputTurnId,
+      queryRunId: ctx.currentQueryRunId,
+      activationSequence: sequence,
+      runnerInstanceId: auth.runnerInstanceId,
+      timestamp: new Date().toISOString(),
+    };
+    request.mutationSignature = signWorkspaceMemoryMutation(
+      auth.secret,
+      {
+        groupFolder: ctx.groupFolder,
+        agentId: auth.agentId ?? null,
+        taskRunId: auth.taskRunId ?? null,
+      },
+      request,
+    );
+    const result = await pollIpcResult(
+      path.join(ctx.workspaceIpc, 'tasks'),
+      request,
+      'activate_channel_turn_result',
+      timeoutMs,
+    );
+    if (!result.success) {
+      throw new Error(
+        typeof result.error === 'string'
+          ? result.error
+          : 'Channel turn activation failed.',
+      );
+    }
+  })();
+  // Activation starts before there need be a tool consumer. Retain rejection
+  // for the tool's normal error path without an unhandled-rejection crash.
+  void ready.catch(() => {});
+  ctx.channelTurnActivation = { inputTurnId, provider, ready };
 }
 
 export interface WorkspaceMemorySnapshot {
@@ -553,6 +623,17 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
         'Feishu capability requires a current input turn correlation id.',
       );
     }
+    const inputTurnId = ctx.currentInputTurnId;
+    const activation = ctx.channelTurnActivation;
+    if (!activation || activation.inputTurnId !== inputTurnId) {
+      throw new Error('Feishu capability requires runner input activation.');
+    }
+    await activation.ready;
+    if (ctx.currentInputTurnId !== inputTurnId) {
+      throw new Error(
+        'Feishu capability input was superseded during activation.',
+      );
+    }
     const requestId = newRequestId();
     const result = await pollIpcResult(
       TASKS_DIR,
@@ -561,7 +642,7 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
         operation,
         requestId,
         chatJid: ctx.chatJid,
-        inputTurnId: ctx.currentInputTurnId,
+        inputTurnId,
         params,
         timestamp: new Date().toISOString(),
       },
@@ -2957,5 +3038,57 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  return tools;
+  return applyToolLoadingHints(tools);
+}
+
+/** Tools that only read state, so Claude Code may run them in parallel. */
+const READ_ONLY_TOOL_NAMES = new Set([
+  'get_channel_context',
+  'feishu_get_chat',
+  'feishu_list_members',
+  'feishu_get_user',
+  'feishu_get_history',
+  'list_tasks',
+  'list_task_runs',
+  'discord_get_history',
+  'discord_get_channel_info',
+  'discord_get_server_info',
+  'agent_profile_list',
+  'agent_profile_get',
+  'agent_profile_draft_get',
+  'agent_capability_catalog',
+  'workspace_memory_search',
+  'workspace_memory_get',
+]);
+
+/**
+ * Tools nearly every turn uses. With tool search on (the default against
+ * the Anthropic API) MCP tools are deferred, which costs a ToolSearch round
+ * trip before their first call; these are always sent with the prompt.
+ */
+const ALWAYS_LOADED_TOOL_NAMES = new Set([
+  'send_message',
+  'get_channel_context',
+  'workspace_memory_search',
+  'workspace_memory_get',
+]);
+
+/** The same hints `tool(name, ..., { annotations, alwaysLoad })` would set. */
+function applyToolLoadingHints(
+  tools: SdkMcpToolDefinition<any>[],
+): SdkMcpToolDefinition<any>[] {
+  return tools.map((definition) => {
+    const readOnly = READ_ONLY_TOOL_NAMES.has(definition.name);
+    const alwaysLoad = ALWAYS_LOADED_TOOL_NAMES.has(definition.name);
+    if (!readOnly && !alwaysLoad) return definition;
+    return {
+      ...definition,
+      ...(readOnly
+        ? { annotations: { ...definition.annotations, readOnlyHint: true } }
+        : {}),
+      ...(alwaysLoad
+        ? { _meta: { ...definition._meta, 'anthropic/alwaysLoad': true } }
+        : {}),
+    };
+  });
 }

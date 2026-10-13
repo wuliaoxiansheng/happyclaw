@@ -10,6 +10,8 @@ import * as replySource from '../src/channel-reply-source.js';
 import { resolveContainerOutputInputTurnId } from '../src/channel-output-correlation.js';
 import { stripRedundantCompletionPreamble } from '../src/reply-finalization.js';
 import { TurnOutputCoordinator } from '../src/turn-output-coordinator.js';
+import { InputUsageProjection } from '../src/input-usage-projection.js';
+import { hasUnfinishedProactiveOutput } from '../src/turn-outcome.js';
 import { getChannelType } from '../src/im-channel.js';
 import { channelTurnScope } from '../src/channel-turn-registry.js';
 import { createRuntimeSourceHarness } from './helpers/runtime-source.js';
@@ -56,10 +58,26 @@ function makeOutputRuntime(lane: 'main' | 'session') {
   const sendImWithRetry = vi.fn(async () => true);
   const broadcastNewMessage = vi.fn();
   const commitCursor = vi.fn();
+  const inputUsageProjection = new InputUsageProjection('initial-im-input');
+  inputUsageProjection.admit(inputId);
+  const agentInputUsageProjection = new InputUsageProjection(
+    'initial-im-input',
+  );
+  agentInputUsageProjection.admit(inputId);
   const globals: Record<string, any> = {
+    inputUsageProjection,
+    agentInputUsageProjection,
     ...replyDelivery,
     ...interactionRuntime,
     ...replySource,
+    // The Web projection and the turn traces are covered by their own tests.
+    resolveProcessVisibility: () => 'full',
+    turnTraces: {
+      observe: vi.fn(),
+      persist: vi.fn(() => false),
+      discard: vi.fn(),
+    },
+    persistProactiveTurnTrace: vi.fn(),
     crypto,
     getChannelType,
     channelTurnScope,
@@ -98,10 +116,12 @@ function makeOutputRuntime(lane: 'main' | 'session') {
     sentReplyByInput: new Map(),
     genuineReplyDeliveredByInput: new Map(),
     channelPhysicalDeliveryAckByInput: new Map(),
+    channelNonTerminalDeliveryAckByInput: new Map(),
     agentReplySentByInput: new Map(),
     agentAnyReplyProjectedByInput: new Map(),
     agentGenuineReplyDeliveredByInput: new Map(),
     agentPhysicalDeliveryAckByInput: new Map(),
+    agentNonTerminalDeliveryAckByInput: new Map(),
     turnOutputCoordinators: coordinators,
     agentTurnOutputCoordinators: coordinators,
     scheduledGroupRunsByInput: new Map(),
@@ -141,6 +161,10 @@ function makeOutputRuntime(lane: 'main' | 'session') {
     rotateProviderAfterAgentTurn: false,
     rotatingAgentTurnCompleted: false,
     closeRunnerAfterRotatingProviderTurn: () => false,
+    currentAgentChannelContext: undefined,
+    getMessageChannelTurnContext: () => null,
+    bindActiveChannelTurn: vi.fn(),
+    getFailedChannelOutboxForTurn: () => undefined,
     getAgent: () => ({ title_source: 'manual' }),
     extractLocalImImagePaths: () => [],
     ensureChatExists: db.ensureChatExists,
@@ -160,6 +184,12 @@ function makeOutputRuntime(lane: 'main' | 'session') {
     completeChannelRuntimesForOutput: async () => true,
     completeAgentChannelRuntimesForOutput: async () => true,
     commitCursor,
+    // No recall stop in these routing fixtures.
+    takeRecallStop: () => undefined,
+    mainRecallSuppression: false,
+    agentRecallSuppression: false,
+    mainRecalledInputIds: new Set(),
+    agentRecalledInputIds: new Set(),
   };
   const harness = createRuntimeSourceHarness(globals);
   harness.install('sendMessageWithOutcome');
@@ -184,6 +214,7 @@ function makeOutputRuntime(lane: 'main' | 'session') {
   ] as (output: Record<string, unknown>) => Promise<void>;
   return {
     globals,
+    harness,
     inputId,
     virtualChatJid,
     commitCursor,
@@ -264,6 +295,43 @@ describe('actual runtime callbacks preserve per-input reply destinations', () =>
       expect(fixture.sendImWithRetry).toHaveBeenCalledExactlyOnceWith(
         OLD_IM,
         'Delayed IM answer.',
+        [],
+        expect.objectContaining({ scopeToken: 'initial-scope' }),
+      );
+      expect(fixture.commitCursor).toHaveBeenCalledWith(inputId);
+      expect(fixture.globals.hadError).toBe(false);
+    },
+  );
+
+  test.each(['main', 'session'] as const)(
+    '%s still sends the final IM answer after a held background-task progress reply',
+    async (lane) => {
+      const fixture = makeOutputRuntime(lane);
+      const inputId = 'initial-im-input';
+      fixture.globals.replySourceImJid = null;
+      fixture.globals.channelOutboxScopesByInput.set(inputId, {
+        sourceJid: OLD_IM,
+        token: 'initial-scope',
+        turnRunId: 'initial-run',
+      });
+      fixture.globals.turnOutputCoordinators.set(
+        inputId,
+        new TurnOutputCoordinator(),
+      );
+      await fixture.emit({
+        status: 'success',
+        result: 'Started a background search.',
+        sourceKind: 'sdk_final',
+        finalizationReason: 'completed',
+        pendingBgTasks: 1,
+        inputTurnId: inputId,
+        sdkMessageUuid: 'sdk-held',
+      });
+      await fixture.emit(finalOutput(inputId, 'Found 16 remote roles.'));
+      expect(fixture.sendImWithRetry).toHaveBeenCalledTimes(2);
+      expect(fixture.sendImWithRetry).toHaveBeenLastCalledWith(
+        OLD_IM,
+        'Found 16 remote roles.',
         [],
         expect.objectContaining({ scopeToken: 'initial-scope' }),
       );
@@ -364,6 +432,7 @@ describe('actual message loop dispatches the unconsumed channel suffix', () => {
       lastAgentTimestamp: {},
       lastCommittedCursor: {},
       saveState: vi.fn(),
+      routerCursorPersistence: { markDirty: vi.fn() },
       logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       resolveEffectiveGroup: () => ({ effectiveGroup: group }),
       getWorkspaceInteractionMode: () => 'assistant',
@@ -560,3 +629,92 @@ describe('actual runtime mount-mode admission and resume safety', () => {
     expect(db.getSession(folder, 'agent-sibling')).toBe('sdk-agent');
   });
 });
+
+test.each(['main', 'session'] as const)(
+  '%s keeps a failed final retryable after a successful held checkpoint',
+  async (lane) => {
+    const fixture = makeOutputRuntime(lane);
+    const inputId = 'initial-im-input';
+    const scopes =
+      lane === 'main'
+        ? fixture.globals.channelOutboxScopesByInput
+        : fixture.globals.agentChannelOutboxScopesByInput;
+    const physical =
+      lane === 'main'
+        ? fixture.globals.channelPhysicalDeliveryAckByInput
+        : fixture.globals.agentPhysicalDeliveryAckByInput;
+    const progress =
+      lane === 'main'
+        ? fixture.globals.channelNonTerminalDeliveryAckByInput
+        : fixture.globals.agentNonTerminalDeliveryAckByInput;
+    const genuine =
+      lane === 'main'
+        ? fixture.globals.genuineReplyDeliveredByInput
+        : fixture.globals.agentGenuineReplyDeliveredByInput;
+    const replied =
+      lane === 'main'
+        ? fixture.globals.sentReplyByInput
+        : fixture.globals.agentReplySentByInput;
+    const coordinators =
+      lane === 'main'
+        ? fixture.globals.turnOutputCoordinators
+        : fixture.globals.agentTurnOutputCoordinators;
+    fixture.globals.replySourceImJid = null;
+    scopes.set(inputId, {
+      sourceJid: OLD_IM,
+      token: 'initial-scope',
+      turnRunId: 'initial-run',
+    });
+    coordinators.set(inputId, new TurnOutputCoordinator());
+    const runtime = {
+      runId: 'initial-run',
+      markFinalizing: () => true,
+      complete: vi.fn(() => true),
+      dispose: vi.fn(),
+    };
+    Object.assign(fixture.globals, {
+      channelTurnRuntimes: new Map([[inputId, runtime]]),
+      agentChannelTurnRuntimes: new Map([[inputId, runtime]]),
+      hasUnfinishedProactiveOutput,
+      getUncertainChannelOutboxForTurn: () => undefined,
+      getDeliveredChannelOutboxForTurn: () => undefined,
+      clearProcessingIndicatorForInput: vi.fn(),
+      clearAgentProcessingIndicatorForInput: vi.fn(),
+      markMainOutputSettled: vi.fn(),
+      markAgentOutputSettled: vi.fn(),
+    });
+    fixture.harness.install(
+      lane === 'main'
+        ? 'completeChannelRuntimesForOutput'
+        : 'completeAgentChannelRuntimesForOutput',
+      lane === 'main' ? 'processGroupMessages' : 'processAgentConversation',
+    );
+    fixture.sendImWithRetry
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    await fixture.emit({
+      status: 'success',
+      result: 'Search running.',
+      sourceKind: 'sdk_final',
+      finalizationReason: 'completed',
+      pendingBgTasks: 1,
+      inputTurnId: inputId,
+      sdkMessageUuid: 'sdk-held',
+    });
+    expect(progress.get(inputId)).toBe(true);
+    expect(physical.get(inputId)).not.toBe(true);
+    await expect(
+      fixture.emit(finalOutput(inputId, 'Final results.')),
+    ).rejects.toThrow(/host_turn_settlement_failed/);
+    expect(genuine.get(inputId)).not.toBe(true);
+    expect(replied.get(inputId)).not.toBe(true);
+    expect(fixture.commitCursor).not.toHaveBeenCalled();
+    expect(runtime.complete).not.toHaveBeenCalled();
+    await fixture.emit(finalOutput(inputId, 'Final results.'));
+    expect(physical.get(inputId)).toBe(true);
+    expect(genuine.get(inputId)).toBe(true);
+    expect(runtime.complete).toHaveBeenCalledOnce();
+    expect(fixture.commitCursor).toHaveBeenCalledWith(inputId);
+  },
+);

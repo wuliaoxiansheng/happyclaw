@@ -24,10 +24,10 @@ import {
 import { storeChatMetadata, storeMessageDirect } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { logger } from './logger.js';
-import { GROUPS_DIR } from './config.js';
 import {
   saveDownloadedFile,
   MAX_FILE_SIZE,
+  resolveImDownloadRoot,
   sanitizeImFilename,
 } from './im-downloader.js';
 import { extractFileText } from './file-text-extractor.js';
@@ -1200,7 +1200,8 @@ async function buildFileContentBlock(params: {
   prefixLabel: string; // e.g. "引用文件" or "文件"
 }): Promise<string> {
   const { fileName, savedRelPath, groupFolder, prefixLabel } = params;
-  const absPath = path.join(GROUPS_DIR, groupFolder, savedRelPath);
+  // Same root the download was saved under (customCwd for Host workspaces).
+  const absPath = path.join(resolveImDownloadRoot(groupFolder), savedRelPath);
   const extracted = await extractFileText(absPath);
   const safeName = sanitizeFileName(fileName);
 
@@ -1224,6 +1225,30 @@ async function buildFileContentBlock(params: {
   }
 
   return `[${prefixLabel}: ${safeName} → ${savedRelPath}]`;
+}
+
+/**
+ * Disconnect a DWClient without letting a CONNECTING socket crash the host.
+ *
+ * The SDK's cleanup() calls socket.removeAllListeners() and then terminate().
+ * If its auto-reconnect handshake is still in flight, ws emits 'error' on the
+ * next tick ("closed before the connection was established") with no listener
+ * attached, which surfaces as an uncaughtException. Keep a no-op sink on the
+ * socket the SDK just discarded.
+ */
+function disconnectDWClient(dwClient: DWClient): void {
+  const socket = (
+    dwClient as unknown as {
+      socket?: {
+        listenerCount(event: string): number;
+        on(event: 'error', listener: () => void): unknown;
+      };
+    }
+  ).socket;
+  dwClient.disconnect();
+  if (socket && socket.listenerCount('error') === 0) {
+    socket.on('error', () => {});
+  }
 }
 
 // ─── Factory Function ───────────────────────────────────────────
@@ -2950,6 +2975,13 @@ export function createDingTalkConnection(
               'Temporarily disabled axios global proxy for dingtalk-stream SDK',
             );
           }
+          // `dingtalk-stream` calls the bare `axios` module internally (token
+          // fetch + WS endpoint resolution) with no timeout configured, same
+          // failure mode as the Feishu `defaultHttpInstance` bug — bound it
+          // once, permanently, unlike the proxy setting which is restored below.
+          if (axios.defaults && !axios.defaults.timeout) {
+            axios.defaults.timeout = DINGTALK_HTTPS_REQUEST_TIMEOUT_MS;
+          }
 
           // Create DWClient
           nextClient = new DWClient({
@@ -3043,8 +3075,7 @@ export function createDingTalkConnection(
         }
         if (nextClient) {
           try {
-            if (client === nextClient) client.disconnect();
-            else nextClient.disconnect();
+            disconnectDWClient(nextClient);
           } catch (cleanupError) {
             logger.warn(
               { cleanupError },
@@ -3067,7 +3098,7 @@ export function createDingTalkConnection(
       const currentClient = client;
       if (currentClient) {
         try {
-          currentClient.disconnect();
+          disconnectDWClient(currentClient);
         } catch (err) {
           logger.debug({ err }, 'Error disconnecting DingTalk client');
         }

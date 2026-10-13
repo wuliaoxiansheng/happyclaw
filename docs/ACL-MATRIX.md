@@ -50,6 +50,11 @@
 
 `/ws` 不是 Public。Upgrade 时必须同时通过 Cookie Session 与 Origin 校验。
 
+内嵌 ChatGPT/Codex 网关 `/gateway/chatgpt/v1/messages`（含 `/count_tokens`）不使用
+Cookie Session，也不是 Public：只接受当前存活 Runner 或宿主机一次性查询的临时网关
+token（Runner/查询退出即吊销），并拒绝带 `Forwarded`、`X-Forwarded-*`、`X-Real-IP`
+或来自非回环、非私网地址的请求。Provider 落盘的网关标识不是可用凭据。
+
 ## 3. 当前用户资源
 
 以下资源以登录用户 ID 为作用域，不接受客户端指定其他 owner：
@@ -83,7 +88,9 @@
 需要 Access 的典型操作：
 
 - 列表中的工作区投影
-- 读取消息与文件
+- 读取消息与文件，以及回合的思考摘要与执行轨迹
+  （`GET /api/groups/:jid/turn-traces/:turnId`，主动模式工作区另按下述过程可见性过滤）
+- 查看会话当前使用的模型配置
 - 发送普通消息
 - 查看 Runtime Session、绑定和项目能力
 - 打开 Web 终端前的资源检查
@@ -99,7 +106,11 @@ Host Workspace 在 Access 之外还要求 admin。
 `canModifyGroup()` 是 owner-only。需要 Modify 的典型操作：
 
 - 重命名、切换 Agent、修改执行方式
+- 修改回复模式与过程可见性（`PATCH /api/groups/:jid` 的 `interaction_mode`、
+  `process_visibility`，仅 `web:` 工作区；后者不重启运行时）
 - stop、interrupt、reset-session、clear-history
+- 切换会话模型与推理档位（`PUT /api/groups/:jid/model-selection`）；其中高于 `max` 的
+  推理档位（目前是 `ultra`）另需 `manage_system_config`
 - 创建、修改、删除 Runtime Session
 - 写入工作区 Skills/MCP
 - 修改群聊绑定、激活方式、响应对象和 owner
@@ -119,6 +130,36 @@ Home Workspace 永远不可删除。其他工作区必须通过 Modify，删除�
 自定义 AgentProfile 创建后默认不拥有 Workspace，因此也没有可访问的 Session 或
 Workspace Memory。只有 owner 显式新建/迁移非 Home Workspace 才建立归属；迁移时
 Memory 随 Workspace 保留，不跨 Workspace 复制。
+
+### 4.3.1 过程可见性与回合轨迹
+
+主动模式工作区的 `process_visibility` 同时约束实时广播和已存轨迹：
+
+| 级别       | 实时 WebSocket 过程事件 | `turn-traces` 与 `has_trace`                              |
+| ---------- | ----------------------- | --------------------------------------------------------- |
+| `hidden`   | 仅运行生命周期          | 404，消息不带 `has_trace`                                 |
+| `activity` | 工具、任务、todo 等结构 | 可读，`thinking` 为空，`steps` 中的思考步骤没有文本与标题 |
+| `full`     | 再加推理摘要与过程说明  | 完整                                                      |
+
+模型自己产出的文字（`text_delta`、工具结果文本、子 Agent 的提示词与回答）在任何级别
+都不会广播，也不会写入轨迹。唯一的例外是 `full` 级别的过程说明（`commentary`）：主
+Agent 在调用工具前写下的那段话，仅在确有工具调用跟在后面时才由宿主放行，只广播给
+Web、不写入轨迹；回合结尾的文字、未发送的回复和紧接着 `send_message` 调用的文字不放行
+（宿主逐个调用判断，不向前看，详见 `docs/API.md`）。
+工具结果事件上的 `toolIsError`（SDK 的 `is_error`，布尔）在任何级别都放行；
+`toolResultFacts`（工具做了什么的数字，如增删行数）只在 Assistant 模式下发，主动模式在
+任何级别都剥掉。
+
+过滤读取**当前**级别和**当前**模式，而不是回合运行时的：一个回合可能按 Assistant 契约
+记录（工作区当时还是 Assistant 模式，或渠道挂载的 `interaction_mode_override` 为
+`assistant` 的消息由 Assistant Runner 处理），之后在主动模式工作区里读取。所以主动模式
+工作区读取 `turn-traces` 时，无论回合怎么记录，`steps` 都不含过程说明（text 步骤）、发言
+工具 `send_message` 的步骤，tool/task 步骤也都没有 `resultPreview`（工具输出、子 Agent
+的回答、权限拒绝的原因）和 `resultFacts`，只留下调用的输入摘要和成败状态；`trace` 里
+“工具结果”“Task 启动”两类行没有 `detail`（工具输出、子 Agent 的提示词）。Assistant
+模式工作区与 fire-and-forget 的 Spawn Agent 不受该设置影响。轨迹的读取权限与消息
+列表相同：只有能读取该聊天历史的用户可读；admin 没有跨 owner bypass，无权限与不存在
+都返回 404。
 
 ### 4.4 环境变量
 
@@ -260,19 +301,33 @@ Owner Claim：
 命令由主进程 `handleCommand()` 处理，不经过 Web Middleware，但使用渠道 sender ID
 执行独立 Owner Gate。
 
-| 命令                                                      | 权限                                              |
-| --------------------------------------------------------- | ------------------------------------------------- |
-| `/list`、`/ls`、`/status`、`/where`                       | 只读                                              |
-| `/recall`、`/rc`                                          | 只读，带节流                                      |
-| `/allowlist`                                              | 只读                                              |
-| `/clear`、`/fresh`、`/bind`、`/unbind`、`/new`            | IM Owner                                          |
-| `/sw`、`/spawn`                                           | IM Owner                                          |
-| `/release_owner`                                          | IM Owner                                          |
-| `/owner_mention`                                          | 未认领群的 bootstrap，不可被 Owner Gate 锁死      |
-| `/allow`、`/disallow`                                     | Handler 内检查 IM Owner                           |
-| `/require_mention`                                        | Handler 内按当前 owner/策略检查                   |
-| 飞书 `/steer <消息>`、`/break`、`/clear`、`/fresh [备注]` | 必须结构化真实 @Bot，并通过当前 audience/激活策略 |
-| MCP `fresh_window`                                        | 当前会话 Agent 可调用；不走斜杠 owner gate        |
+| 命令                                           | 权限                                                                        |
+| ---------------------------------------------- | --------------------------------------------------------------------------- |
+| `/status`、`/where`                            | 只读，只描述本聊天自己的绑定                                                |
+| `/list`、`/ls`                                 | 私聊只读；群聊仅 IM Owner（列出 owner 全部工作区和会话）                    |
+| `/recall`、`/rc`                               | 私聊只读；群聊仅 IM Owner；带节流；只读取本条消息路由到的 Session           |
+| `/allowlist`                                   | 只读                                                                        |
+| `/clear`、`/fresh`、`/bind`、`/unbind`、`/new` | IM Owner                                                                    |
+| `/sw`、`/spawn`                                | IM Owner                                                                    |
+| `/release_owner`                               | IM Owner                                                                    |
+| `/owner_mention`                               | 未认领群的 bootstrap，不可被 Owner Gate 锁死                                |
+| `/allow`、`/disallow`                          | Handler 内检查 IM Owner                                                     |
+| `/require_mention`                             | Handler 内按当前 owner/策略检查                                             |
+| 飞书 `/steer <消息>`、`/break`                 | 群聊必须结构化真实 @Bot，并通过当前 audience/激活策略；不要求 owner         |
+| 飞书 `/clear`、`/fresh [备注]`（运行时控制）   | 群聊必须结构化真实 @Bot 且为 IM Owner（与斜杠 `/clear`、`/fresh` 同一边界） |
+| MCP `fresh_window`                             | 当前会话 Agent 可调用；不走斜杠 owner gate                                  |
+
+飞书群聊中由 `handleCommand()` 处理的通用斜杠命令同样必须结构化真实 @Bot，并通过 audience
+检查；它们不受激活闸门（`activation_mode`、`when_mentioned`、`disabled`）约束，
+`/require_mention`、`/owner_mention` 还豁免激活与 owner 认领阻断，保证 IM 侧可以
+恢复。群里不带 @Bot 的斜杠文本按普通消息处理。
+
+群聊判定：飞书 JID 不编码会话类型。优先采用连接器随消息传入的 `chatType`，首次
+收到私聊时持久化 `feishu_chat_mode=p2p`；否则按持久化的 `feishu_chat_mode` 判断，
+未知时按群聊处理（fail closed）。私聊中的 owner-required 命令在 owner 未知时认领
+发送者；群聊永不自动认领。运行时控制在群聊路由失败时回复目标不存在，只有私聊才由
+绑定解析目标，绝不回退到 Workspace 主会话。`/recall` 在话题群中只读取当前话题的
+Session，缺少话题元数据时拒绝，不回退到 Workspace 主会话。
 
 不同 Provider 的原生 sender ID namespace 不得混用。例如 QQ C2C 与 Group 使用不同
 ID 空间；owner 比对必须使用渠道适配器传入的规范化 ID。

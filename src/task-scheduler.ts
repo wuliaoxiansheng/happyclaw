@@ -102,12 +102,19 @@ import {
   buildAgentProfilePrompt,
   hasAgentProfilePrompts,
 } from './agent-profile-prompts.js';
-import { stripAgentInternalTags } from './utils.js';
+import {
+  isInternalOnlyAgentOutput,
+  SCHEDULED_TASK_SILENT_COMPLETION_NOTICE,
+  stripAgentInternalTags,
+} from './utils.js';
 import {
   markIsolatedTaskRunIpcComplete,
   tryCleanupCompletedIsolatedTaskRunIpc,
 } from './isolated-task-ipc.js';
-import { getScriptTaskHostExecutionError } from './script-task-policy.js';
+import {
+  getScriptTaskHostExecutionError,
+  resolveWorkspaceExecutionMode,
+} from './script-task-policy.js';
 import { resolveScheduledGroupDeliveryContract } from './reply-delivery.js';
 import { resolveRuntimeInteractionMode } from './workspace-interaction-runtime.js';
 import { explicitImDeliveryPhase } from './im-send-retry-policy.js';
@@ -165,16 +172,7 @@ function resolveTaskExecutionMode(
   // Legacy fallback: inherit from the original group
   const groups = deps.registeredGroups();
   const group = groups[task.chat_jid];
-  if (group) {
-    if (!group.is_home) {
-      const homeSibling = Object.values(groups).find(
-        (g) => g.folder === group.folder && g.is_home,
-      );
-      if (homeSibling) return homeSibling.executionMode || 'container';
-    }
-    return group.executionMode || 'container';
-  }
-  return 'container';
+  return group ? resolveWorkspaceExecutionMode(group, groups) : 'container';
 }
 
 function scriptTaskRuntimePolicyError(
@@ -525,6 +523,8 @@ export function formatScheduledTaskWorkspaceResult(input: {
   result: string | null;
   error: string | null;
   status?: 'success' | 'failed' | 'cancelled';
+  /** The Agent finished with only <internal> blocks on purpose. */
+  internalOnly?: boolean;
 }): string {
   const status =
     input.status ?? (input.error ? ('failed' as const) : ('success' as const));
@@ -555,7 +555,9 @@ export function formatScheduledTaskWorkspaceResult(input: {
       ? '本次运行已由用户取消。'
       : input.error
         ? '本次运行没有留下可展示的业务结果，请查看执行日志。'
-        : '本次运行已结束，但 Agent 没有返回可展示的业务结果。';
+        : input.internalOnly
+          ? SCHEDULED_TASK_SILENT_COMPLETION_NOTICE
+          : '本次运行已结束，但 Agent 没有返回可展示的业务结果。';
   return `${title}\n\n${metadata.join('\n')}\n\n${emptyNotice}`;
 }
 
@@ -1143,9 +1145,13 @@ async function runTaskInner(
       const durableRun = options.durableRun;
       const runId = durableRun.id;
       const cleanedResult = result ? stripAgentInternalTags(result) : null;
+      // An all-<internal> final is a deliberate silent completion that task
+      // prompts ask for ("Stage N done" without notifying anyone), not a
+      // missing business result.
+      const internalOnly = isInternalOnlyAgentOutput(result);
       const durableOutcomeError =
         error ||
-        (cleanedResult?.trim()
+        (cleanedResult?.trim() || internalOnly
           ? null
           : '定时任务已结束，但 Agent 没有返回可展示的完整业务结果。');
       const workspaceResult = formatScheduledTaskWorkspaceResult({
@@ -1153,6 +1159,7 @@ async function runTaskInner(
         runId,
         result: cleanedResult,
         error: durableOutcomeError,
+        internalOnly,
       });
       preparedDurableWorkspaceCommit = () =>
         completeIsolatedTaskRunWithWorkspaceResultIntent({
@@ -1516,6 +1523,7 @@ async function runTaskInner(
         runId,
         result: cleanedResult,
         error,
+        internalOnly: isInternalOnlyAgentOutput(result),
       });
       try {
         await deps.storeResultAndNotify(workspace.jid, workspaceResult, {

@@ -146,6 +146,9 @@ HappyClaw 区分不同层级的能力来源：
 
 内置 MCP 工具覆盖消息发送、定时任务、渠道查询、Skill 管理和记忆读写；实际开放的工具会根据用户权限、智能体策略、工作区模式和渠道上下文动态裁剪。
 
+添加远端服务时，参见[远端 MCP 配置与排查](docs/REMOTE-MCP.md)，按步骤填写 HTTP/SSE
+URL 与 Headers、选择作用域，并在指定智能体的最终生效能力中确认来源。
+
 ## 渠道接入
 
 每个用户都可以为同一渠道创建多个 Bot 账号，并为渠道会话显式选择绑定目标。
@@ -197,6 +200,8 @@ HappyClaw 可以同时配置多个 Claude Provider，并为新会话按策略选
 - **Failover** — 优先使用主 Provider，故障时切换。
 - **健康恢复** — 连续失败后暂时摘除，经过恢复窗口重新探测。
 - **会话粘性** — 已开始的会话保持 Provider 一致，避免上下文在模型之间漂移。
+- **默认模型** — 在模型配置页点击某个配置的「默认」，未手动选择模型的会话固定使用它，
+  不再参与上述分配；再次点击取消，恢复自动分配。对话页的模型选择器默认选中「默认」。
 
 ## 定时任务
 
@@ -322,6 +327,7 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | `MAX_FILE_SIZE_MB`                   | `50`                              | Web 和 IM 入站文件大小上限                                                         |
 | `CORS_ALLOWED_ORIGINS`               | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                 |
 | `TRUST_PROXY`                        | `false`                           | 位于可信反向代理后时设为 `true`                                                    |
+| `TRUST_PROXY_HOPS`                   | `1`                               | `X-Forwarded-For` 中可信代理层数（Cloudflare 在 Caddy 之前时设为 `2`）             |
 | `TZ`                                 | 系统时区                          | 日志与定时任务时区（建议 IANA 名称，如 `Asia/Shanghai`）；无效值回退并告警         |
 | `HTTPS_PROXY` / `HTTP_PROXY`         | 未设置                            | 独立配置 HTTPS/HTTP 出站代理；主进程与每个智能体容器都会使用，也接受对应的小写变量 |
 | `NO_PROXY`                           | 未设置                            | 独立配置不走代理的地址列表，也接受 `no_proxy`                                      |
@@ -433,6 +439,17 @@ location /ws {
 上传大文件时另需放宽 `client_max_body_size`（不小于 `MAX_FILE_SIZE_MB`，并预留
 multipart 开销）与 `client_body_timeout`。
 
+位于反向代理之后必须设置 `TRUST_PROXY=true`，否则所有请求都显示为代理自身的地址：
+代理在另一台主机时，全部用户共用同一个按 IP 的登录限流桶，几十次失败即可锁住所有人；
+代理在本机（loopback）时，按 IP 的限流不生效。开启后，客户端 IP（登录限流与审计日志
+使用）取自 `X-Forwarded-For` 中由可信代理追加的那一项：右数第 `TRUST_PROXY_HOPS` 个
+（默认 1，即 Caddy 或 nginx 直接面向用户时）。更靠左的条目由客户端提供，不被信任。
+
+密码哈希与校验（登录、注册、初始化、修改密码、管理员创建用户或重置密码）在一个有界的
+bcrypt 工作线程池中执行，最多同时排队 32 个任务。超出的突发请求会立即收到 HTTP 503
+（`服务繁忙，请稍后重试`，带 `Retry-After: 1`），且不计入登录或注册限流次数；
+客户端稍后重试即可。
+
 ## 开发与测试
 
 ### 常用命令
@@ -484,6 +501,7 @@ happyclaw/
 | [Web API](docs/API.md)                                                | REST API、认证、任务、渠道账号、智能体、用量等接口 |
 | [运行时架构](docs/RUNTIME-ARCHITECTURE.md)                            | 模块边界、依赖规则和性能预算                       |
 | [ACL 权限矩阵](docs/ACL-MATRIX.md)                                    | HTTP、WebSocket 与 IM 命令的权限要求               |
+| [远端 MCP 配置与排查](docs/REMOTE-MCP.md)                             | HTTP/SSE、Header、作用域、智能体生效确认与凭据保护 |
 | [Workspace Memory v2](docs/workspace-memory-v2.md)                    | Workspace 知识边界、数据模型、并发和 UI 语义       |
 | [智能体优先架构记录](docs/agent-first-architecture-plan.md)           | 智能体、工作区、运行会话与渠道挂载的迁移背景       |
 | [Plugin 自动化设计记录](docs/claude-code-plugin-automation-design.md) | Claude Code Plugin catalog 与运行快照的历史设计    |

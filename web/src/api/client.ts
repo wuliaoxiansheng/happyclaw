@@ -122,10 +122,11 @@ export const api = {
       body: body ? JSON.stringify(body) : undefined,
       ...(timeoutMs ? { timeoutMs } : {}),
     }),
-  put: <T>(path: string, body?: unknown) =>
+  put: <T>(path: string, body?: unknown, timeoutMs?: number) =>
     apiFetch<T>(path, {
       method: 'PUT',
       body: body ? JSON.stringify(body) : undefined,
+      ...(timeoutMs ? { timeoutMs } : {}),
     }),
   patch: <T>(path: string, body?: unknown, timeoutMs?: number) =>
     apiFetch<T>(path, {

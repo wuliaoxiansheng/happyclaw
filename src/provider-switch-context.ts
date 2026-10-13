@@ -1,5 +1,5 @@
 import { logger } from './logger.js';
-import { deleteSession, setSessionProviderId } from './db.js';
+import { deleteSession, setSessionModel, setSessionProviderId } from './db.js';
 import { buildRecentConversationHistoryContext } from './conversation-history.js';
 export interface ProviderSwitchInput {
   prompt: string;
@@ -14,12 +14,14 @@ export interface ProviderSwitchInput {
 }
 
 const PROVIDER_SWITCH_HISTORY_INTRO =
-  '检测到本次因切换 provider 需要使用新的底层模型 session。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。';
+  '检测到本次因切换 provider 或模型需要使用新的底层模型 session。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。';
 
 export interface ProviderSwitchSelection {
   profileId: string;
   previousProviderId?: string;
   resetSession?: boolean;
+  /** The upstream model the fresh session starts on (ChatGPT-gateway runs). */
+  sessionModel?: string | null;
 }
 
 function conversationHistoryChatJid(input: ProviderSwitchInput): string {
@@ -65,9 +67,11 @@ function seedPromptWithPersistedHistory<T extends ProviderSwitchInput>(
 }
 
 /**
- * Claude SDK sessions are bound to one OAuth account / provider. When the
- * pool fails over, drop the resume token and seed the replacement session
- * with HappyClaw's persisted transcript so prior user/assistant turns survive.
+ * Claude SDK sessions are bound to one OAuth account / provider, and a ChatGPT
+ * session's encrypted reasoning verifies only for the model that issued it.
+ * When the pool fails over or the conversation changes model, drop the resume
+ * token and seed the replacement session with HappyClaw's persisted
+ * transcript so prior user/assistant turns survive.
  *
  * Isolated scheduled tasks only drop the resume token.
  */
@@ -91,7 +95,8 @@ export function applyProviderSwitchToInput<T extends ProviderSwitchInput>(
   // deleteSession removes the whole sessions row, including the provider_id
   // binding trySelectPoolProvider just wrote. Re-bind the freshly-selected
   // provider so the next turn stays sticky to it instead of degrading to a
-  // fresh pool pick.
+  // fresh pool pick, and the model so the next launch compares against the
+  // model this new session actually starts on.
   if (input.sessionId) {
     deleteSession(input.groupFolder, sessionAgentId);
     setSessionProviderId(
@@ -99,6 +104,13 @@ export function applyProviderSwitchToInput<T extends ProviderSwitchInput>(
       sessionAgentId,
       poolResult.profileId,
     );
+    if (poolResult.sessionModel) {
+      setSessionModel(
+        input.groupFolder,
+        sessionAgentId,
+        poolResult.sessionModel,
+      );
+    }
   }
 
   return {

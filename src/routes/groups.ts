@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import {
@@ -10,6 +10,7 @@ import {
   GroupCreateSchema,
   GroupPatchSchema,
   ContainerEnvSchema,
+  SessionModelSelectionSchema,
 } from '../schemas.js';
 import type {
   AuthUser,
@@ -17,6 +18,7 @@ import type {
   RegisteredGroup,
   ExecutionMode,
   InteractionMode,
+  ProcessVisibility,
 } from '../types.js';
 import { checkGroupLimit } from '../billing.js';
 import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
@@ -78,7 +80,12 @@ import {
   getWorkspaceAgentProfileId,
   getWorkspaceInteractionMode,
   setWorkspaceInteractionMode,
+  getWorkspaceProcessVisibility,
+  setWorkspaceProcessVisibility,
   getUserById,
+  getSessionModelSelectionDetail,
+  setSessionModelSelection,
+  type SessionModelSelectionDetail,
 } from '../db.js';
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
@@ -90,10 +97,24 @@ import {
 } from '../agent-profile-runtime.js';
 import {
   getContainerEnvConfig,
+  getProviders,
+  getUsableDefaultProvider,
   getSystemSettings,
+  providerHasCredentials,
   saveContainerEnvConfig,
   toPublicContainerEnvConfig,
 } from '../runtime-config.js';
+import { resolveAgentSdkEffort } from '../agent-effort.js';
+import { updateLiveSessionEffort } from '../codex-gateway/runner-tokens.js';
+import { maybeRefreshCodexProviderCatalog } from '../codex-gateway/model-catalog-sync.js';
+import { hasPermission } from '../permissions.js';
+import {
+  buildCodexSelectionView,
+  chatGptDefaultModel,
+  readStoredChoice,
+  validateSessionChoice,
+  type CodexSelectionView,
+} from '../session-model-overrides.js';
 import { clearTargetAgentBindingsForDeletedAgents } from '../im-context-isolation.js';
 import { getChannelType } from '../im-channel.js';
 import { buildUnmountUpdate } from '../channel-mount-service.js';
@@ -113,6 +134,10 @@ import path from 'node:path';
 // SSRF helpers 抽到 ../url-safety.ts；本文件 re-export isPrivateHostname 以保留旧导入路径。
 import { getStreamingSession } from '../feishu-streaming-card.js';
 import { attachSessionWorkflowRuns } from '../session-workflows.js';
+import {
+  markMessagesWithTrace,
+  resolveTurnTraceExposure,
+} from '../turn-trace.js';
 import {
   invalidateThumbnails,
   presentMessagesForWeb,
@@ -164,7 +189,7 @@ type RegisteredGroupWithJid = RegisteredGroup & { jid: string };
  * as message display and broadcasts. A declared but stale binding fails
  * closed: we cannot safely infer which workspace's execution policy applies.
  */
-function resolveMessageExecutionGroup(
+export function resolveMessageExecutionGroup(
   physicalJid: string,
   physicalGroup: RegisteredGroupWithJid,
 ): RegisteredGroupWithJid | null {
@@ -196,6 +221,45 @@ function resolveMessageExecutionGroup(
   // Standalone legacy IM rows have no workspace projection. Preserve their
   // own access/execution contract rather than making historical data undeletable.
   return physicalGroup;
+}
+
+/**
+ * The chat JIDs whose messages a workspace's history shows: the workspace
+ * itself plus, for a home group, the IM chats of the same owner and folder.
+ * An IM chat bound to another workspace must stay out: its folder/created_by
+ * still point at the channel account's owner, so merging by folder + owner
+ * alone would surface another workspace's conversation in the owner's Home
+ * history.
+ */
+export function resolveMessageQueryJids(
+  jid: string,
+  group: RegisteredGroupWithJid,
+): string[] {
+  const queryJids = [jid];
+  if (!group.is_home) return queryJids;
+  for (const siblingJid of getJidsByFolder(group.folder)) {
+    if (siblingJid === jid) continue;
+    const siblingGroup = getRegisteredGroup(siblingJid);
+    if (!siblingGroup) continue;
+    const ownerMatch =
+      group.created_by && siblingGroup.created_by === group.created_by;
+    if (!ownerMatch) continue;
+    const attributionDeps = {
+      getRegisteredGroup,
+      getAgent,
+      getJidsByFolder,
+      getChannelMount,
+    };
+    const boundJid = resolveBoundWorkspaceJid(siblingJid, attributionDeps);
+    if (
+      (boundJid && boundJid !== jid) ||
+      (!boundJid && hasBoundWorkspaceReference(siblingJid, attributionDeps))
+    ) {
+      continue;
+    }
+    queryJids.push(siblingJid);
+  }
+  return queryJids;
 }
 
 function normalizeGroupName(name: unknown): string {
@@ -342,6 +406,7 @@ interface GroupPayloadItem {
   lastMessageTime?: string;
   execution_mode: 'container' | 'host';
   interaction_mode?: InteractionMode;
+  process_visibility?: ProcessVisibility;
   custom_cwd?: string;
   is_home?: boolean;
   is_my_home?: boolean;
@@ -435,6 +500,9 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       execution_mode: group.executionMode || 'container',
       interaction_mode: isWeb
         ? getWorkspaceInteractionMode(group.folder)
+        : undefined,
+      process_visibility: isWeb
+        ? getWorkspaceProcessVisibility(group.folder)
         : undefined,
       custom_cwd: isAdmin ? group.customCwd : undefined,
       is_home: isHome || undefined,
@@ -649,6 +717,9 @@ groupRoutes.post('/', authMiddleware, async (c) => {
         ? 'host'
         : 'container');
   const interactionMode = validation.data.interaction_mode ?? 'assistant';
+  // New workspaces show the activity of a proactive turn by default; existing
+  // ones stay hidden until their owner opts in.
+  const processVisibility = validation.data.process_visibility ?? 'activity';
   const customCwd = validation.data.custom_cwd; // Schema already trims and converts empty to undefined
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
@@ -1064,6 +1135,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
               folder,
               lockedProfile.id,
               interactionMode,
+              processVisibility,
             );
             setRegisteredGroup(jid, group);
             updateChatName(jid, name);
@@ -1135,6 +1207,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     lastMessageTime: now,
     execution_mode: group.executionMode || 'container',
     interaction_mode: interactionMode,
+    process_visibility: processVisibility,
     custom_cwd: isAdmin ? group.customCwd : undefined,
     is_my_home: undefined,
     can_modify: canModifyGroup(authUser, groupWithJid),
@@ -1179,6 +1252,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     activation_mode,
     execution_mode,
     interaction_mode,
+    process_visibility,
   } = validation.data;
   const name = rawName ? normalizeGroupName(rawName) : undefined;
 
@@ -1188,7 +1262,8 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     is_pinned === undefined &&
     activation_mode === undefined &&
     execution_mode === undefined &&
-    interaction_mode === undefined
+    interaction_mode === undefined &&
+    process_visibility === undefined
   ) {
     return c.json({ error: 'No fields to update' }, 400);
   }
@@ -1229,7 +1304,8 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     !name &&
     activation_mode === undefined &&
     execution_mode === undefined &&
-    interaction_mode === undefined;
+    interaction_mode === undefined &&
+    process_visibility === undefined;
   if (isPinOnly) {
     if (
       !canAccessGroup(
@@ -1267,6 +1343,12 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         403,
       );
     }
+    if (process_visibility !== undefined && !jid.startsWith('web:')) {
+      return c.json(
+        { error: 'Only web workspaces can change process visibility' },
+        403,
+      );
+    }
   }
 
   // Handle pin/unpin (per-user, separate table)
@@ -1283,12 +1365,15 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   // unbound. Refuse up front: throwing inside commitUpdate would surface as a
   // 500 and, on the quiesce path, only after the runtime was already stopped.
   if (
-    interaction_mode !== undefined &&
+    (interaction_mode !== undefined || process_visibility !== undefined) &&
     !getWorkspaceAgentProfileId(existing.folder)
   ) {
     return c.json(
       {
-        error: '该工作区未绑定智能体配置，因此无法修改回复模式。',
+        error:
+          interaction_mode !== undefined
+            ? '该工作区未绑定智能体配置，因此无法修改回复模式。'
+            : '该工作区未绑定智能体配置，因此无法修改过程可见性。',
         code: 'WORKSPACE_AGENT_PROFILE_MISSING',
       },
       409,
@@ -1304,26 +1389,18 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     execution_mode !== undefined ||
     interaction_mode !== undefined
   ) {
-    // Spread `...existing` instead of rebuilding from an explicit field list.
-    // setRegisteredGroup is INSERT OR REPLACE (full-row overwrite), so every
-    // field omitted from the object gets silently nulled. The old explicit list
-    // dropped owner_im_id / sender_allowlist / conversation_source /
-    // conversation_nav_mode / binding_mode / feishu_chat_mode /
-    // feishu_group_message_type on EVERY rename — wiping the IM owner-gate's
-    // security anchor and corrupting feishu_thread workspaces. Only override
-    // what this PATCH actually changes.
-    const updated: RegisteredGroup = {
-      ...existing,
-      name: name || existing.name,
-      executionMode:
-        execution_mode !== undefined
-          ? (execution_mode as ExecutionMode)
-          : existing.executionMode,
-      activation_mode:
-        activation_mode !== undefined
-          ? activation_mode
-          : existing.activation_mode,
-    };
+    // setRegisteredGroup is a full-column UPSERT, so every field on the object
+    // it receives is written. The old explicit field list dropped owner_im_id /
+    // sender_allowlist / conversation_source / conversation_nav_mode /
+    // binding_mode / feishu_chat_mode / feishu_group_message_type on EVERY
+    // rename. Spreading the pre-await `existing` snapshot has the same shape
+    // of bug under concurrency: this handler reads the row before
+    // `await c.req.json()`, and execution/interaction changes yield again
+    // inside quiesceWorkspaceRunnersAroundCommit before commitUpdate runs.
+    // A name-only PATCH can therefore put back activation_mode / owner_im_id
+    // after a concurrent writer committed. Re-read inside the commit and
+    // overlay only the keys this request actually changes. Do not change
+    // setRegisteredGroup itself — other callers depend on the full upsert.
 
     const commitUpdate = () => {
       if (
@@ -1339,6 +1416,18 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         activation_mode !== undefined ||
         execution_mode !== undefined
       ) {
+        const fresh = getRegisteredGroup(jid);
+        if (!fresh) {
+          throw new Error(`Group ${jid} not found during update commit`);
+        }
+        const updated: RegisteredGroup = {
+          ...fresh,
+          ...(name ? { name } : {}),
+          ...(execution_mode !== undefined
+            ? { executionMode: execution_mode as ExecutionMode }
+            : {}),
+          ...(activation_mode !== undefined ? { activation_mode } : {}),
+        };
         setRegisteredGroup(jid, updated);
         if (name) updateChatName(jid, name);
         deps.getRegisteredGroups()[jid] = updated;
@@ -1458,10 +1547,28 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     }
   }
 
+  // Process visibility is presentation only: unlike the interaction mode it
+  // changes nothing the Agent does, so it neither waits for the runtime to
+  // quiesce nor restarts it. A running turn follows the new value on its next
+  // event.
+  if (
+    process_visibility !== undefined &&
+    !setWorkspaceProcessVisibility(existing.folder, process_visibility)
+  ) {
+    return c.json(
+      {
+        error: '该工作区未绑定智能体配置，因此无法修改过程可见性。',
+        code: 'WORKSPACE_AGENT_PROFILE_MISSING',
+      },
+      409,
+    );
+  }
+
   return c.json({
     success: true,
     pinned_at,
     interaction_mode: getWorkspaceInteractionMode(existing.folder),
+    process_visibility: getWorkspaceProcessVisibility(existing.folder),
   });
 });
 
@@ -2136,6 +2243,313 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   return c.json({ success: true, dividerMessageId });
 });
 
+// ─── 会话模型选择（聊天输入框的模型选择器） ──────────────────────────
+// Session-level pick of a saved model configuration. No selection means the
+// conversation follows the default: the Agent's model configuration, else the
+// automatic pool of enabled configurations.
+
+type SessionModelSelectionScope =
+  | { error: Response }
+  | { group: RegisteredGroup; agentId: string | null };
+
+function resolveSessionModelSelectionScope(
+  c: Context<{ Variables: Variables }>,
+  agentIdInput: string | null | undefined,
+  requireModify: boolean,
+): SessionModelSelectionScope {
+  const jid = c.req.param('jid');
+  const group = jid ? getRegisteredGroup(jid) : undefined;
+  if (!jid || !group) {
+    return { error: c.json({ error: 'Group not found' }, 404) };
+  }
+  const authUser = c.get('user') as AuthUser;
+  const actor = { id: authUser.id, role: authUser.role };
+  if (!canAccessGroup(actor, group)) {
+    return { error: c.json({ error: 'Group not found' }, 404) };
+  }
+  if (requireModify && !canModifyGroup(actor, { ...group, jid })) {
+    return {
+      error: c.json(
+        { error: 'Only the workspace owner can change the model' },
+        403,
+      ),
+    };
+  }
+  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    return {
+      error: c.json(
+        { error: 'Insufficient permissions for host execution mode' },
+        403,
+      ),
+    };
+  }
+  const agentId = agentIdInput || null;
+  if (agentId) {
+    const agent = getAgent(agentId);
+    if (!agent || agent.chat_jid !== jid) {
+      return { error: c.json({ error: 'Agent not found' }, 404) };
+    }
+  }
+  return { group, agentId };
+}
+
+function buildSessionModelSelectionPayload(
+  group: RegisteredGroup,
+  agentId: string | null,
+  chooser: AuthUser,
+) {
+  const providers = getProviders();
+  const exists = (id: string | null | undefined): id is string =>
+    !!id && providers.some((provider) => provider.id === id);
+  const stored = getSessionModelSelectionDetail(group.folder, agentId);
+  const profile = peekAgentProfileForWorkspace(group.folder, group.created_by);
+  const enabled = providers.filter((provider) => provider.enabled);
+  const envOverride = getContainerEnvConfig(group.folder);
+  const canExceedCeiling = hasPermission(chooser, 'manage_system_config');
+  const agentEffort = resolveAgentSdkEffort(profile?.runtime_policy);
+
+  // Mirrors resolvePinnedModelConfigId: the order decides what a conversation
+  // that picked nothing actually runs on.
+  let defaultSource:
+    | 'agent'
+    | 'default'
+    | 'single'
+    | 'pool'
+    | 'workspace_env'
+    | 'none';
+  let defaultModelConfigId: string | null = null;
+  const globalDefault = getUsableDefaultProvider();
+  if (exists(profile?.model_config_id)) {
+    defaultSource = 'agent';
+    defaultModelConfigId = profile.model_config_id;
+  } else if (
+    envOverride.anthropicApiKey ||
+    envOverride.anthropicAuthToken ||
+    envOverride.anthropicBaseUrl
+  ) {
+    defaultSource = 'workspace_env';
+  } else if (globalDefault) {
+    defaultSource = 'default';
+    defaultModelConfigId = globalDefault.id;
+  } else if (enabled.length === 1) {
+    defaultSource = 'single';
+    defaultModelConfigId = enabled[0].id;
+  } else {
+    defaultSource = enabled.length > 1 ? 'pool' : 'none';
+  }
+
+  const codexViews = new Map<string, CodexSelectionView>();
+  const options = providers.map((provider) => {
+    const option = {
+      id: provider.id,
+      name: provider.name,
+      kind: provider.codexOAuthCredentials ? ('codex' as const) : provider.type,
+      enabled: provider.enabled,
+      model: provider.anthropicModel,
+      // A configuration without a credential (e.g. an old copy that lost its
+      // key) would fail every turn; the picker shows it but cannot pick it.
+      usable: providerHasCredentials(provider),
+    };
+    if (!provider.codexOAuthCredentials) return option;
+    // The list is the account's own once its catalog has been fetched; ask for
+    // a fresher one without making the picker wait for it.
+    maybeRefreshCodexProviderCatalog(provider.id, {
+      accountId: provider.codexOAuthCredentials.accountId,
+    });
+    const codex = buildCodexSelectionView(provider, {
+      canExceedCeiling,
+      agentEffort,
+    });
+    codexViews.set(provider.id, codex);
+    return { ...option, codex };
+  });
+
+  const selectedModelConfigId = exists(stored?.modelConfigId)
+    ? stored.modelConfigId
+    : null;
+  const view = selectedModelConfigId
+    ? codexViews.get(selectedModelConfigId)
+    : undefined;
+  // A stored model or effort the catalog or the chooser's permission no longer
+  // backs reads as unset, exactly as a runner launch would treat it.
+  const selected =
+    stored && view
+      ? readStoredChoice(view, stored, canExceedCeiling)
+      : { model: null, effort: null };
+
+  return {
+    selectedModelConfigId,
+    selectedModel: selected.model,
+    selectedEffort: selected.effort,
+    default: {
+      source: defaultSource,
+      modelConfigId: defaultModelConfigId,
+      enabledCount: enabled.length,
+    },
+    options,
+  };
+}
+
+/**
+ * What the runners of a conversation must do about a change of its choice.
+ *
+ * A different configuration or model starts a new SDK session on the next
+ * message, so the warm runner is retired (one already on the chosen
+ * configuration is spared only when no model is involved). A different effort
+ * needs no restart at all: the gateway reads it per request, so the live
+ * runners of the chosen configuration are pointed at it and keep running.
+ * Choosing nothing new does nothing.
+ */
+function applySessionChoiceChange(
+  deps: NonNullable<ReturnType<typeof getWebDeps>>,
+  group: RegisteredGroup,
+  agentId: string | null,
+  jid: string,
+  previous: SessionModelSelectionDetail | null,
+  next: {
+    modelConfigId: string | null;
+    model: string | null;
+    effort: string | null;
+  },
+): { drained: number; liveUpdated: number } {
+  const providers = getProviders();
+  // The model a configuration actually runs: its pick, else its own.
+  const launchKey = (
+    choice: { modelConfigId: string | null; model: string | null } | null,
+  ): string => {
+    if (!choice?.modelConfigId) return '';
+    const provider = providers.find((item) => item.id === choice.modelConfigId);
+    const model = provider?.codexOAuthCredentials
+      ? (choice.model ?? chatGptDefaultModel(provider))
+      : '';
+    return `${choice.modelConfigId}\u0000${model}`;
+  };
+  let drained = 0;
+  if (launchKey(previous) !== launchKey(next)) {
+    const target = previous?.model || next.model ? null : next.modelConfigId;
+    drained = deps.queue.drainRunnersForModelSelection(
+      agentId ? [`${jid}#agent:${agentId}`] : getJidsByFolder(group.folder),
+      target,
+    );
+  }
+  let liveUpdated = 0;
+  if ((previous?.effort ?? null) !== next.effort) {
+    liveUpdated = updateLiveSessionEffort(
+      {
+        groupFolder: group.folder,
+        sessionAgentId: agentId,
+        providerId: next.modelConfigId ?? undefined,
+      },
+      next.effort ?? undefined,
+    );
+  }
+  return { drained, liveUpdated };
+}
+
+// GET /api/groups/:jid/model-selection?agentId= - 读取会话模型选择
+groupRoutes.get('/:jid/model-selection', authMiddleware, (c) => {
+  const scope = resolveSessionModelSelectionScope(
+    c,
+    c.req.query('agentId'),
+    false,
+  );
+  if ('error' in scope) return scope.error;
+  return c.json(
+    buildSessionModelSelectionPayload(
+      scope.group,
+      scope.agentId,
+      c.get('user') as AuthUser,
+    ),
+  );
+});
+
+// PUT /api/groups/:jid/model-selection - 切换会话模型/推理档位（null 恢复默认）
+groupRoutes.put('/:jid/model-selection', authMiddleware, async (c) => {
+  const deps = getWebDeps();
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = SessionModelSelectionSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid request body' }, 400);
+  }
+  const scope = resolveSessionModelSelectionScope(c, parsed.data.agentId, true);
+  if ('error' in scope) return scope.error;
+  const { group, agentId } = scope;
+  const authUser = c.get('user') as AuthUser;
+  const modelConfigId = parsed.data.modelConfigId;
+  const requestedModel = parsed.data.model || null;
+  const requestedEffort = parsed.data.effort || null;
+  let model: string | null = null;
+  let effort: string | null = null;
+  if (modelConfigId) {
+    const target = getProviders().find(
+      (provider) => provider.id === modelConfigId,
+    );
+    if (!target) return c.json({ error: '模型配置不存在' }, 404);
+    if (!providerHasCredentials(target)) {
+      return c.json(
+        { error: '该模型配置缺少凭据，请先在模型配置中补全密钥或完成授权' },
+        400,
+      );
+    }
+    if (requestedModel || requestedEffort) {
+      const checked = validateSessionChoice(
+        target,
+        { model: requestedModel, effort: requestedEffort },
+        authUser,
+      );
+      if (!checked.ok) return c.json(checked.rejection, 400);
+      ({ model, effort } = checked);
+    }
+  } else if (requestedModel || requestedEffort) {
+    return c.json(
+      {
+        error: '选择模型或推理档位时需要同时指定模型配置',
+        code: 'MODEL_CONFIG_REQUIRED',
+      },
+      400,
+    );
+  }
+
+  const jid = c.req.param('jid');
+  const previous = getSessionModelSelectionDetail(group.folder, agentId);
+  setSessionModelSelection(group.folder, agentId, modelConfigId, authUser.id, {
+    model,
+    effort,
+  });
+
+  // A warm runner keeps the provider environment it was spawned with; retire
+  // it so the next message of this conversation starts on the new selection.
+  const { drained, liveUpdated } = applySessionChoiceChange(
+    deps,
+    group,
+    agentId,
+    jid,
+    previous,
+    { modelConfigId, model, effort },
+  );
+  logger.info(
+    {
+      jid,
+      folder: group.folder,
+      agentId,
+      previous: previous?.modelConfigId ?? null,
+      modelConfigId,
+      model,
+      effort,
+      drained,
+      liveUpdated,
+    },
+    'Session model selection updated',
+  );
+  return c.json({
+    ...buildSessionModelSelectionPayload(group, agentId, authUser),
+    drained,
+    liveUpdated,
+  });
+});
+
 // POST /api/groups/:jid/clear-history - 清除聊天历史
 groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
   const deps = getWebDeps();
@@ -2379,11 +2793,17 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
     }
 
     const virtualJid = `${jid}#agent:${agentIdParam}`;
+    const agentExposure = resolveTurnTraceExposure(group.folder, {
+      agentKind: agent.kind,
+    });
     if (afterSequence !== undefined || after) {
       const messages = await presentMessagesForWeb(
-        attachSessionWorkflowRuns(
-          getMessagesAfter(virtualJid, after, limit, afterSequence),
-          { groupFolder: group.folder, agentId: agentIdParam },
+        markMessagesWithTrace(
+          attachSessionWorkflowRuns(
+            getMessagesAfter(virtualJid, after, limit, afterSequence),
+            { groupFolder: group.folder, agentId: agentIdParam },
+          ),
+          agentExposure,
         ),
       );
       return c.json({ messages });
@@ -2391,52 +2811,34 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
     const rows = getMessagesPage(virtualJid, before, limit + 1, beforeSequence);
     const hasMore = rows.length > limit;
     const messages = await presentMessagesForWeb(
-      attachSessionWorkflowRuns(hasMore ? rows.slice(0, limit) : rows, {
-        groupFolder: group.folder,
-        agentId: agentIdParam,
-      }),
+      markMessagesWithTrace(
+        attachSessionWorkflowRuns(hasMore ? rows.slice(0, limit) : rows, {
+          groupFolder: group.folder,
+          agentId: agentIdParam,
+        }),
+        agentExposure,
+      ),
     );
     return c.json({ messages, hasMore });
   }
 
   // is_home 群组合并查询：将同一 owner、同 folder 下的 Web 与 IM 消息合并展示。
-  // 已绑定到其它工作区的 IM 会话必须排除：它的 folder/created_by 仍停留在渠道
-  // 账号归属人，若只按 folder + owner 合并，别的工作区的对话会出现在账号归属人
-  // 的 Home 历史里。
-  const queryJids = [jid];
-  if (group.is_home) {
-    const siblingJids = getJidsByFolder(group.folder);
-    for (const siblingJid of siblingJids) {
-      if (siblingJid === jid) continue;
-      const siblingGroup = getRegisteredGroup(siblingJid);
-      if (!siblingGroup) continue;
-      const ownerMatch =
-        group.created_by && siblingGroup.created_by === group.created_by;
-      if (!ownerMatch) continue;
-      const attributionDeps = {
-        getRegisteredGroup,
-        getAgent,
-        getJidsByFolder,
-        getChannelMount,
-      };
-      const boundJid = resolveBoundWorkspaceJid(siblingJid, attributionDeps);
-      if (
-        (boundJid && boundJid !== jid) ||
-        (!boundJid && hasBoundWorkspaceReference(siblingJid, attributionDeps))
-      ) {
-        continue;
-      }
-      queryJids.push(siblingJid);
-    }
-  }
+  const queryJids = resolveMessageQueryJids(jid, group);
+
+  // A turn's stored thinking/trace follows the workspace's current contract
+  // (a proactive workspace set to `hidden` lists none).
+  const exposure = resolveTurnTraceExposure(group.folder);
 
   if (queryJids.length === 1) {
     // 单 JID 走原路径
     if (afterSequence !== undefined || after) {
       const messages = await presentMessagesForWeb(
-        attachSessionWorkflowRuns(
-          getMessagesAfter(jid, after, limit, afterSequence),
-          { groupFolder: group.folder, agentId: null },
+        markMessagesWithTrace(
+          attachSessionWorkflowRuns(
+            getMessagesAfter(jid, after, limit, afterSequence),
+            { groupFolder: group.folder, agentId: null },
+          ),
+          exposure,
         ),
       );
       return c.json({ messages });
@@ -2444,10 +2846,13 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
     const rows = getMessagesPage(jid, before, limit + 1, beforeSequence);
     const hasMore = rows.length > limit;
     const messages = await presentMessagesForWeb(
-      attachSessionWorkflowRuns(hasMore ? rows.slice(0, limit) : rows, {
-        groupFolder: group.folder,
-        agentId: null,
-      }),
+      markMessagesWithTrace(
+        attachSessionWorkflowRuns(hasMore ? rows.slice(0, limit) : rows, {
+          groupFolder: group.folder,
+          agentId: null,
+        }),
+        exposure,
+      ),
     );
     return c.json({ messages, hasMore });
   }
@@ -2455,9 +2860,12 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   // 多 JID 合并查询
   if (afterSequence !== undefined || after) {
     const messages = await presentMessagesForWeb(
-      attachSessionWorkflowRuns(
-        getMessagesAfterMulti(queryJids, after, limit, afterSequence),
-        { groupFolder: group.folder, agentId: null },
+      markMessagesWithTrace(
+        attachSessionWorkflowRuns(
+          getMessagesAfterMulti(queryJids, after, limit, afterSequence),
+          { groupFolder: group.folder, agentId: null },
+        ),
+        exposure,
       ),
     );
     return c.json({ messages });
@@ -2470,10 +2878,13 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   );
   const hasMore = rows.length > limit;
   const messages = await presentMessagesForWeb(
-    attachSessionWorkflowRuns(hasMore ? rows.slice(0, limit) : rows, {
-      groupFolder: group.folder,
-      agentId: null,
-    }),
+    markMessagesWithTrace(
+      attachSessionWorkflowRuns(hasMore ? rows.slice(0, limit) : rows, {
+        groupFolder: group.folder,
+        agentId: null,
+      }),
+      exposure,
+    ),
   );
   return c.json({ messages, hasMore });
 });

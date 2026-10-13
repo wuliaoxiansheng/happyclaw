@@ -9,11 +9,22 @@ export function formatThinkingDuration(ms: number): string {
     const rounded = Math.round(totalSeconds * 10) / 10;
     return `已思考 ${rounded} 秒`;
   }
-  if (totalSeconds < 60) {
-    return `已思考 ${Math.round(totalSeconds)} 秒`;
-  }
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = Math.round(totalSeconds - minutes * 60);
+  // Round to whole seconds first, then split into minutes, so 59.6 s reads as
+  // "1 分" rather than "60 秒".
+  const wholeSeconds = Math.round(totalSeconds);
+  if (wholeSeconds < 60) return `已思考 ${wholeSeconds} 秒`;
+  const minutes = Math.floor(wholeSeconds / 60);
+  const seconds = wholeSeconds - minutes * 60;
   if (seconds === 0) return `已思考 ${minutes} 分`;
   return `已思考 ${minutes} 分 ${seconds} 秒`;
+}
+
+/**
+ * The collapsed reasoning label: how long it thought, or just that it did.
+ * Under a second reads as noise ("已思考 0.2 秒").
+ */
+export function thinkingLabel(durationMs: number | undefined): string {
+  return durationMs != null && durationMs >= 1000
+    ? formatThinkingDuration(durationMs)
+    : '思考过程';
 }

@@ -264,6 +264,9 @@ const InteractionModeSchema = z
   .enum(['assistant', 'proactive', 'persona'])
   .transform((mode) => (mode === 'persona' ? 'proactive' : mode));
 
+/** How much of a proactive turn's process the Web shows (see ProcessVisibility). */
+export const ProcessVisibilitySchema = z.enum(['hidden', 'activity', 'full']);
+
 export const ChannelMountInteractionModePatchSchema = z
   .object({
     interaction_mode_override: z.enum(['assistant', 'proactive']).nullable(),
@@ -286,6 +289,7 @@ export const GroupCreateSchema = z.object({
     .transform((val) => (val && val.trim() ? val.trim() : undefined)),
   execution_mode: z.enum(['container', 'host']).optional(),
   interaction_mode: InteractionModeSchema.optional(),
+  process_visibility: ProcessVisibilitySchema.optional(),
   custom_cwd: z
     .string()
     .optional()
@@ -303,6 +307,19 @@ export const GroupCreateSchema = z.object({
 
 export const GroupAgentProfilePatchSchema = z.object({
   agent_profile_id: z.string().trim().min(1),
+});
+
+/**
+ * Chat composer model picker: null returns the conversation to the default.
+ * `model` and `effort` pick inside a ChatGPT configuration; the request replaces
+ * the whole choice, so leaving them out follows the configuration's defaults.
+ * The catalog decides which values are valid, so they are plain strings here.
+ */
+export const SessionModelSelectionSchema = z.object({
+  agentId: z.string().trim().min(1).max(128).nullable().optional(),
+  modelConfigId: z.string().trim().min(1).max(128).nullable(),
+  model: z.string().trim().min(1).max(128).nullable().optional(),
+  effort: z.string().trim().min(1).max(32).nullable().optional(),
 });
 
 const AgentProfileRuntimePolicyModeSchema = z.enum([
@@ -645,10 +662,13 @@ export const GroupPatchSchema = z.object({
     .optional(),
   execution_mode: z.enum(['container', 'host']).optional(),
   interaction_mode: InteractionModeSchema.optional(),
+  process_visibility: ProcessVisibilitySchema.optional(),
 });
 
 export const LoginSchema = z.object({
-  username: z.string().min(1),
+  // Real usernames are ≤32 chars (validateUsername); 64 leaves headroom while
+  // bounding the rate-limiter keys a failed attempt can create.
+  username: z.string().min(1).max(64),
   password: z.string().min(1),
 });
 
@@ -1083,6 +1103,12 @@ const ClaudeOAuthCredentialsSchema = z.object({
   subscriptionType: z.string().optional(),
 });
 
+/**
+ * Raw paste for an official provider: `.credentials.json` content or a
+ * setup-token. Parsed server-side by parseClaudeCredentialInput.
+ */
+const ClaudeCredentialInputSchema = z.string().min(1).max(65536);
+
 const ProviderBaseUrlSchema = z
   .string()
   .max(2000)
@@ -1099,16 +1125,20 @@ const ProviderBaseUrlSchema = z
     { message: 'Base URL must be an HTTP(S) URL' },
   );
 
+const ProviderAuthModeSchema = z.enum(['bearer', 'x-api-key']);
+
 export const UnifiedProviderCreateSchema = z
   .object({
     name: z.string().min(1).max(64),
     type: z.enum(['official', 'third_party']),
     anthropicBaseUrl: ProviderBaseUrlSchema.optional(),
     anthropicAuthToken: z.string().max(2000).optional(),
+    anthropicAuthMode: ProviderAuthModeSchema.optional(),
     anthropicModel: z.string().max(128).optional(),
     anthropicApiKey: z.string().max(2000).optional(),
     claudeCodeOauthToken: z.string().max(2000).optional(),
     claudeOAuthCredentials: ClaudeOAuthCredentialsSchema.optional(),
+    claudeCredentialInput: ClaudeCredentialInputSchema.optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
     weight: z.number().int().min(1).max(100).optional(),
     enabled: z.boolean().optional(),
@@ -1131,19 +1161,41 @@ export const UnifiedProviderPatchSchema = z
   .object({
     name: z.string().min(1).max(64).optional(),
     anthropicBaseUrl: ProviderBaseUrlSchema.optional(),
+    anthropicAuthMode: ProviderAuthModeSchema.optional(),
     anthropicModel: z.string().max(128).optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
     weight: z.number().int().min(1).max(100).optional(),
+    // Third-party edits save the token with the other fields in one request,
+    // so a failed half can never leave the endpoint and its key out of sync.
+    anthropicAuthToken: z.string().trim().min(1).max(2000).optional(),
+    clearAnthropicAuthToken: z.boolean().optional(),
   })
   .refine(
     (data) =>
       data.name !== undefined ||
       data.anthropicBaseUrl !== undefined ||
+      data.anthropicAuthMode !== undefined ||
       data.anthropicModel !== undefined ||
       data.customEnv !== undefined ||
-      data.weight !== undefined,
+      data.weight !== undefined ||
+      data.anthropicAuthToken !== undefined ||
+      data.clearAnthropicAuthToken === true,
     { message: 'At least one field must be provided' },
   );
+
+/**
+ * Draft of a third-party endpoint to probe before (or without) saving. With a
+ * providerId, blank fields fall back to the stored provider — including its
+ * token, which is never sent back to the client.
+ */
+export const ProviderConnectivityTestSchema = z.object({
+  providerId: z.string().trim().min(1).max(64).optional(),
+  anthropicBaseUrl: ProviderBaseUrlSchema.optional(),
+  anthropicAuthToken: z.string().max(2000).optional(),
+  anthropicAuthMode: ProviderAuthModeSchema.optional(),
+  anthropicModel: z.string().max(128).optional(),
+  customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
+});
 
 export const UnifiedProviderSecretsSchema = z
   .object({
@@ -1155,10 +1207,12 @@ export const UnifiedProviderSecretsSchema = z
     clearClaudeCodeOauthToken: z.boolean().optional(),
     claudeOAuthCredentials: ClaudeOAuthCredentialsSchema.optional(),
     clearClaudeOAuthCredentials: z.boolean().optional(),
+    claudeCredentialInput: ClaudeCredentialInputSchema.optional(),
   })
   .refine(
     (data) => {
       return (
+        typeof data.claudeCredentialInput === 'string' ||
         typeof data.anthropicAuthToken === 'string' ||
         data.clearAnthropicAuthToken === true ||
         typeof data.anthropicApiKey === 'string' ||

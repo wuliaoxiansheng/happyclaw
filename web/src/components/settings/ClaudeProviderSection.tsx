@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Loader2 } from 'lucide-react';
+import { Loader2, Plus } from 'lucide-react';
 
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
+import { Button } from '@/components/ui/button';
 import { api } from '../../api/client';
 import type {
   BalancingConfig,
@@ -13,6 +14,8 @@ import { getErrorMessage } from './types';
 import { ProviderList } from './ProviderList';
 import { ProviderEditor } from './ProviderEditor';
 import { BalancingSettings } from './BalancingSettings';
+import { useVisibleInterval } from '../../hooks/useVisibleInterval';
+import { SettingsSection } from './SettingsLayout';
 
 interface ClaudeProviderSectionProps {
   setNotice: (msg: string | null) => void;
@@ -38,6 +41,9 @@ export function ClaudeProviderSection({
 }: ClaudeProviderSectionProps) {
   const [providers, setProviders] = useState<ProviderWithHealth[]>([]);
   const enabledCount = providers.filter((provider) => provider.enabled).length;
+  const [defaultModelConfigId, setDefaultModelConfigId] = useState<
+    string | null
+  >(null);
   const [balancing, setBalancing] = useState<BalancingConfig | null>(null);
   const balancingRef = useRef<BalancingConfig | null>(null);
   const balancingRevisionRef = useRef(0);
@@ -61,9 +67,6 @@ export function ClaudeProviderSection({
   const [pendingDeleteProvider, setPendingDeleteProvider] =
     useState<ProviderWithHealth | null>(null);
 
-  // 健康轮询标记
-  const healthTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
   // ─── 加载提供商列表 ──────────────────────────────────────────
   const loadProviders = useCallback(async () => {
     try {
@@ -71,6 +74,7 @@ export function ClaudeProviderSection({
         '/api/config/claude/providers',
       );
       setProviders(data.providers);
+      setDefaultModelConfigId(data.defaultModelConfigId ?? null);
       balancingRef.current = data.balancing;
       setBalancing(data.balancing);
     } catch (err) {
@@ -84,39 +88,23 @@ export function ClaudeProviderSection({
     loadProviders();
   }, [loadProviders]);
 
-  // ─── 健康状态轮询（启用 >= 2 个提供商时） ────────────────────
-  useEffect(() => {
-    if (healthTimerRef.current) {
-      clearInterval(healthTimerRef.current);
-      healthTimerRef.current = null;
+  // ─── 健康状态轮询（启用 >= 2 个提供商时，仅页面可见时） ──────
+  const pollHealth = useCallback(async () => {
+    try {
+      const data = await api.get<{ statuses: ProviderHealthStatus[] }>(
+        '/api/config/claude/providers/health',
+      );
+      setProviders((prev) =>
+        prev.map((p) => {
+          const updated = data.statuses.find((s) => s.profileId === p.id);
+          return updated ? { ...p, health: updated } : p;
+        }),
+      );
+    } catch {
+      // 静默忽略
     }
-
-    if (enabledCount < 2) return;
-
-    const pollHealth = async () => {
-      try {
-        const data = await api.get<{ statuses: ProviderHealthStatus[] }>(
-          '/api/config/claude/providers/health',
-        );
-        setProviders((prev) =>
-          prev.map((p) => {
-            const updated = data.statuses.find((s) => s.profileId === p.id);
-            return updated ? { ...p, health: updated } : p;
-          }),
-        );
-      } catch {
-        // 静默忽略
-      }
-    };
-
-    healthTimerRef.current = setInterval(pollHealth, 10000);
-    return () => {
-      if (healthTimerRef.current) {
-        clearInterval(healthTimerRef.current);
-        healthTimerRef.current = null;
-      }
-    };
-  }, [enabledCount]);
+  }, []);
+  useVisibleInterval(pollHealth, 10000, enabledCount >= 2);
 
   // ─── 切换提供商启用/禁用 ──────────────────────────────────────
   const handleToggle = useCallback(
@@ -147,6 +135,37 @@ export function ClaudeProviderSection({
     [loadProviders, setNotice, setError],
   );
 
+  // ─── 设为默认 / 取消默认（再次点击当前默认即取消）─────────────────
+  const handleSetDefault = useCallback(
+    async (provider: ProviderWithHealth) => {
+      const clearing = provider.id === defaultModelConfigId;
+      setTogglingId(provider.id);
+      try {
+        await api.put(
+          '/api/config/claude/default',
+          { modelConfigId: clearing ? null : provider.id },
+          120_000,
+        );
+        await loadProviders();
+        setNotice(
+          clearing
+            ? `已取消默认模型「${provider.name}」，未手动选择的对话恢复为在已启用配置间自动轮换`
+            : provider.enabled
+              ? `已将「${provider.name}」设为默认模型`
+              : `已将「${provider.name}」设为默认模型，并同时启用`,
+        );
+      } catch (err) {
+        // A 503 can mean the choice was persisted but runtime teardown failed
+        // afterward: reload so the badge shows what is really stored.
+        await loadProviders().catch(() => {});
+        setError(getErrorMessage(err, '设置默认模型失败'));
+      } finally {
+        setTogglingId(null);
+      }
+    },
+    [defaultModelConfigId, loadProviders, setNotice, setError],
+  );
+
   // ─── 重置健康状态 ─────────────────────────────────────────────
   const handleResetHealth = useCallback(
     async (provider: ProviderWithHealth) => {
@@ -172,8 +191,14 @@ export function ClaudeProviderSection({
     setPendingDeleteProvider(null);
 
     try {
-      await api.delete(`/api/config/claude/providers/${provider.id}`);
-      setNotice(`已删除模型配置「${provider.name}」`);
+      const result = await api.delete<{ defaultCleared?: boolean }>(
+        `/api/config/claude/providers/${provider.id}`,
+      );
+      setNotice(
+        result?.defaultCleared
+          ? `已删除模型配置「${provider.name}」；它是默认模型，未手动选择的对话已恢复为在已启用配置间自动轮换`
+          : `已删除模型配置「${provider.name}」`,
+      );
       await loadProviders();
     } catch (err) {
       setError(getErrorMessage(err, '删除模型配置失败'));
@@ -182,20 +207,18 @@ export function ClaudeProviderSection({
     }
   }, [pendingDeleteProvider, loadProviders, setNotice, setError]);
 
-  // ─── 复制第三方提供商 ────────────────────────────────────────────
+  // ─── 复制第三方提供商（服务端连同密钥一起复制，默认停用）─────────
   const handleDuplicate = useCallback(
     async (provider: ProviderWithHealth) => {
       try {
-        await api.post('/api/config/claude/providers', {
-          name: `${provider.name} (副本)`,
-          type: 'third_party',
-          anthropicBaseUrl: provider.anthropicBaseUrl,
-          anthropicModel: provider.anthropicModel,
-          customEnv: provider.customEnv,
-          enabled: false,
-        });
+        const copy = await api.post<ProviderWithHealth>(
+          `/api/config/claude/providers/${provider.id}/duplicate`,
+        );
         await loadProviders();
-        setNotice(`已复制模型配置「${provider.name}」，密钥需要重新填写`);
+        setNotice(`已复制模型配置「${provider.name}」，可直接修改模型后启用`);
+        // Same vendor, different model is the common case: open the copy.
+        setEditingProvider({ ...copy, health: null });
+        setEditorOpen(true);
       } catch (err) {
         setError(getErrorMessage(err, '复制模型配置失败'));
       }
@@ -257,48 +280,66 @@ export function ClaudeProviderSection({
     setEditingProvider(null);
   }, []);
 
+  const handleAdd = useCallback(() => {
+    setEditingProvider(null);
+    setEditorOpen(true);
+  }, []);
+
   const busy =
     loading || togglingId !== null || deletingId !== null || balancingSaving;
 
   if (loading && providers.length === 0) {
     return (
       <div className="flex items-center justify-center py-12">
-        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+        <Loader2 className="size-5 animate-spin text-muted-foreground" />
       </div>
     );
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       {/* 提供商列表 */}
-      <ProviderList
-        providers={providers}
-        onEdit={(p) => {
-          setEditingProvider(p);
-          setEditorOpen(true);
-        }}
-        onDelete={(p) => setPendingDeleteProvider(p)}
-        onToggle={handleToggle}
-        onResetHealth={handleResetHealth}
-        onDuplicate={handleDuplicate}
-        onAdd={() => {
-          setEditingProvider(null);
-          setEditorOpen(true);
-        }}
-        togglingId={togglingId}
-        deletingId={deletingId}
-        disabled={busy}
-      />
-
-      {/* 负载均衡设置：配置了多个模型时展示（池只在 >=2 启用时生效） */}
-      {balancing && providers.length >= 2 && (
-        <BalancingSettings
-          balancing={balancing}
-          onChange={handleBalancingChange}
+      <SettingsSection
+        title="模型配置列表"
+        description={`${providers.length} 个模型配置`}
+        actions={
+          providers.length > 0 && (
+            <Button onClick={handleAdd} disabled={busy}>
+              <Plus />
+              添加模型配置
+            </Button>
+          )
+        }
+      >
+        <ProviderList
+          providers={providers}
+          defaultModelConfigId={defaultModelConfigId}
+          onEdit={(p) => {
+            setEditingProvider(p);
+            setEditorOpen(true);
+          }}
+          onDelete={(p) => setPendingDeleteProvider(p)}
+          onToggle={handleToggle}
+          onSetDefault={handleSetDefault}
+          onResetHealth={handleResetHealth}
+          onDuplicate={handleDuplicate}
+          onAdd={handleAdd}
+          togglingId={togglingId}
+          deletingId={deletingId}
           disabled={busy}
-          saving={balancingSaving}
         />
-      )}
+
+        {/* 负载均衡设置：配置了多个模型时展示（池只在 >=2 启用时生效） */}
+        {balancing && providers.length >= 2 && (
+          <BalancingSettings
+            balancing={balancing}
+            hasDefault={defaultModelConfigId !== null}
+            onChange={handleBalancingChange}
+            disabled={busy}
+            saving={balancingSaving}
+          />
+        )}
+      </SettingsSection>
 
       {/* 编辑器弹窗 */}
       <ProviderEditor
@@ -318,7 +359,11 @@ export function ClaudeProviderSection({
         title="删除模型配置"
         message={
           pendingDeleteProvider
-            ? `确认删除模型配置「${pendingDeleteProvider.name}」？`
+            ? `确认删除模型配置「${pendingDeleteProvider.name}」？${
+                pendingDeleteProvider.id === defaultModelConfigId
+                  ? '它是当前默认模型，删除后未手动选择的对话会恢复为在已启用配置间自动轮换。'
+                  : ''
+              }`
             : '确认删除该模型配置？'
         }
         confirmText="确认删除"

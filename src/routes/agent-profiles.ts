@@ -69,7 +69,7 @@ import {
   getRunContextSnapshot,
   hashRuntimePolicy,
 } from '../run-context-snapshot.js';
-import { getProviders } from '../runtime-config.js';
+import { getProviders, getUsableDefaultProvider } from '../runtime-config.js';
 
 const agentProfileRoutes = new Hono<{ Variables: Variables }>();
 const AVATARS_DIR = path.join(DATA_DIR, 'avatars');
@@ -108,6 +108,8 @@ function usesFourPartPromptPayload(input: {
 agentProfileRoutes.get('/', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const profiles = listAgentProfilesForUser(user.id);
+  // What an Agent that binds no configuration actually follows.
+  const defaultModelConfigId = getUsableDefaultProvider()?.id ?? null;
   return c.json({
     profiles: profiles.map((profile) => ({
       ...profile,
@@ -123,6 +125,7 @@ agentProfileRoutes.get('/', authMiddleware, (c) => {
       type: provider.type,
       enabled: provider.enabled,
       anthropic_model: provider.anthropicModel,
+      is_default: provider.id === defaultModelConfigId,
     })),
   });
 });

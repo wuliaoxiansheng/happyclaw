@@ -151,7 +151,7 @@ describe('database upgrade safety gate', () => {
     process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR = migrationBackups;
     const backupsBeforeCurrentOnlyRefusal = fs.readdirSync(migrationBackups);
     expect(() => db.initDatabase({ requireCurrentSchema: true })).toThrow(
-      'Database must already be schema v75',
+      `Database must already be schema v${db.CURRENT_SCHEMA_VERSION}`,
     );
     expect(fs.readdirSync(migrationBackups)).toEqual(
       backupsBeforeCurrentOnlyRefusal,
@@ -190,9 +190,17 @@ describe('schema version head', () => {
     // one assertion that fails when the head moves, forcing whoever bumps it
     // to confirm the matching migration block — and a test covering it —
     // actually landed. Update the literal in the same commit as the migration.
-    // v75: adds mount-specific interaction overrides and records the SDK
-    // session's interaction contract without changing workspace defaults.
-    // Migration and restart coverage: channel-mount-interaction-mode.test.ts.
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(75);
+    // v78: session_model_selections, the chat composer's per-conversation
+    // model choice. Migration coverage:
+    // schema-v78-session-model-selections.test.ts.
+    // v79: that choice also pins a model and a reasoning effort
+    // (schema-v79-session-model-effort.test.ts).
+    // v80: workspace_agent_profiles.process_visibility, how much of a proactive
+    // turn's process the Web shows (schema-v80-process-visibility.test.ts).
+    // v81: turn_traces, the persisted thinking summary and execution trace of a
+    // turn (schema-v81-turn-traces.test.ts).
+    // v82: turn_traces.steps_json / steps_dropped, the turn's steps in the
+    // order they happened (schema-v82-turn-steps.test.ts).
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(82);
   });
 });

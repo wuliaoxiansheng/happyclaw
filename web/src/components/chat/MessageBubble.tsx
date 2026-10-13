@@ -1,30 +1,51 @@
-import { useState, memo, lazy, Suspense } from 'react';
+import { useState, useMemo, memo, lazy, Suspense } from 'react';
 import {
   Copy,
   Check,
-  ChevronDown,
-  ChevronUp,
   Ellipsis,
   ImageDown,
+  OctagonAlert,
+  TriangleAlert,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import {
   Tooltip,
   TooltipContent,
-  TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
-import { Message } from '../../stores/chat';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { IconButton } from '../common/IconButton';
+import { cn } from '@/lib/utils';
+import {
+  useChatStore,
+  type Message,
+  type ReplySteps,
+  type StreamingTraceEvent,
+  withoutToolResults,
+} from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { EmojiAvatar } from '../common/EmojiAvatar';
-import { MarkdownRenderer } from './MarkdownRenderer';
+import { FinalMarkdown } from './StreamingMarkdown';
+import { PermissionAlert, TracePanel } from './ExecutionTrace';
+import { ThinkingBlock } from './ThinkingBlock';
+import { ProcessCard, hasProcess } from './ProcessCard';
+import { LazyTurnTrace } from './LazyTurnTrace';
 import { MessageContextMenu } from './MessageContextMenu';
 import { ImageLightbox } from './ImageLightbox';
-import { mediumTap } from '../../hooks/useHaptic';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
-import { formatThinkingDuration } from '../../utils/thinking-duration';
+import { useStreamLayout } from '../../hooks/useStreamLayout';
+import { extractThinkingTitle } from '../../lib/thinking-text';
+import { normalizeInteractionMode } from '../../lib/interaction-mode';
+import { normalizeProcessVisibility } from '../../lib/process-visibility';
+import { visibleSteps } from '../../lib/process-steps';
 import { resolveAgentDisplayIdentity } from '../../utils/agent-identity';
-import { getPresentedMessageContent } from '../../lib/message-presentation';
+import {
+  getPresentedMessageContent,
+  incompleteReplyNote,
+} from '../../lib/message-presentation';
+import { copyToClipboard } from '../../utils/clipboard';
+import { toast } from 'sonner';
 import { getMessageDisplayTimestamp } from '../../lib/message-timeline';
 import {
   getAuthoritativeTokenBreakdown,
@@ -44,6 +65,10 @@ interface MessageBubbleProps {
   showTime: boolean;
   thinkingContent?: string;
   thinkingDurationMs?: number;
+  /** Tools and other steps the reply streamed, kept collapsed. */
+  traceEvents?: StreamingTraceEvent[];
+  /** The ordered steps the reply streamed (or the server kept). */
+  replySteps?: ReplySteps;
   agentName?: string;
   agentAvatarUrl?: string | null;
   agentAvatarEmoji?: string | null;
@@ -65,56 +90,34 @@ interface MessageAttachment {
   originalBytes?: number;
 }
 
-/** Collapsible reasoning block for AI messages */
-function ReasoningBlock({
-  content,
-  durationMs,
-}: {
-  content: string;
-  durationMs?: number;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const label =
-    durationMs != null && durationMs > 0
-      ? formatThinkingDuration(durationMs)
-      : 'Reasoning';
+// Shared formatters: toLocaleString with options builds a new formatter on
+// every call (~60µs each), twice per bubble render.
+const HOUR_MINUTE_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+});
+const FULL_TIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
 
-  return (
-    <div className="mb-3 rounded-xl border border-amber-200/60 dark:border-amber-700/40 bg-amber-50/40 dark:bg-amber-950/30 overflow-hidden">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3 py-2 pr-16 text-left hover:bg-amber-50/60 dark:hover:bg-amber-950/40 transition-colors"
-      >
-        <svg
-          className="w-4 h-4 text-amber-500 flex-shrink-0"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-        >
-          <path
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456z"
-          />
-        </svg>
-        <span className="text-xs font-medium text-amber-700 dark:text-amber-300">
-          {label}
-        </span>
-        <span className="flex-1" />
-        {expanded ? (
-          <ChevronUp className="w-3.5 h-3.5 text-amber-400" />
-        ) : (
-          <ChevronDown className="w-3.5 h-3.5 text-amber-400" />
-        )}
-      </button>
-      {expanded && (
-        <div className="px-3 pb-3 text-sm text-amber-900/70 dark:text-amber-300/70 whitespace-pre-wrap break-words max-h-64 overflow-y-auto border-t border-amber-100 dark:border-amber-800/40">
-          {content}
-        </div>
-      )}
-    </div>
-  );
+/** 今天显示 HH:mm，其余日期显示 MM-DD HH:mm；完整时间放在 title 里。 */
+function formatShortTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const now = new Date();
+  const hm = HOUR_MINUTE_FORMATTER.format(date);
+  if (date.toDateString() === now.toDateString()) return hm;
+  const md = `${date.getMonth() + 1}-${String(date.getDate()).padStart(2, '0')}`;
+  return date.getFullYear() === now.getFullYear()
+    ? `${md} ${hm}`
+    : `${date.getFullYear()}-${md} ${hm}`;
 }
 
 /** Parse and display token usage for AI messages */
@@ -150,11 +153,11 @@ function TokenUsageDisplay({
   };
 
   const summaryContent = (
-    <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-default">
+    <span className="inline-flex cursor-default items-center gap-1.5 font-sans text-micro text-faint-foreground tabular-nums transition-colors hover:text-muted-foreground">
       {displayTotal > 0 && <span>{formatNum(displayTotal)} tokens</span>}
       {usage.durationMs ? (
         <>
-          {displayTotal > 0 && <span className="opacity-40">·</span>}
+          {displayTotal > 0 && <span className="opacity-60">·</span>}
           <span>{(usage.durationMs / 1000).toFixed(1)}s</span>
         </>
       ) : null}
@@ -166,52 +169,48 @@ function TokenUsageDisplay({
   const hasDetails = displayTotal > 0 || primary !== null;
 
   if (!hasDetails) {
-    return <div className="mt-1.5">{summaryContent}</div>;
+    return summaryContent;
   }
 
   return (
-    <div className="mt-1.5">
-      <TooltipProvider delayDuration={200}>
-        <Tooltip>
-          <TooltipTrigger asChild>{summaryContent}</TooltipTrigger>
-          <TooltipContent side="bottom" align="start">
-            <div className="text-xs space-y-0.5">
-              {primary && (
-                <div className="opacity-70 font-medium mb-1">
-                  主模型：{primary[0]}
-                </div>
-              )}
-              {breakdown.totalTokens > 0 && (
-                <div>
-                  输入 {formatNum(breakdown.inputTokens)} / 输出{' '}
-                  {formatNum(breakdown.outputTokens)}
-                </div>
-              )}
-              {workflowTokens > 0 && (
-                <div className="opacity-70">
-                  Workflow Agent 合计 {formatNum(workflowTokens)}
-                </div>
-              )}
-              {(breakdown.cacheReadInputTokens > 0 ||
-                breakdown.cacheCreationInputTokens > 0 ||
-                breakdown.reasoningTokens > 0) && (
-                <div className="opacity-70">
-                  缓存读取 {formatNum(breakdown.cacheReadInputTokens)} /
-                  缓存写入 {formatNum(breakdown.cacheCreationInputTokens)} /
-                  推理 {formatNum(breakdown.reasoningTokens)}
-                </div>
-              )}
-              {primary && (
-                <div className="opacity-70">
-                  主模型输入 {formatNum(primary[1].inputTokens || 0)} / 输出{' '}
-                  {formatNum(primary[1].outputTokens || 0)}
-                </div>
-              )}
+    <Tooltip>
+      <TooltipTrigger asChild>{summaryContent}</TooltipTrigger>
+      <TooltipContent side="bottom" align="start">
+        <div className="text-xs space-y-0.5">
+          {primary && (
+            <div className="opacity-70 font-medium mb-1">
+              主模型：{primary[0]}
             </div>
-          </TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
-    </div>
+          )}
+          {breakdown.totalTokens > 0 && (
+            <div>
+              输入 {formatNum(breakdown.inputTokens)} / 输出{' '}
+              {formatNum(breakdown.outputTokens)}
+            </div>
+          )}
+          {workflowTokens > 0 && (
+            <div className="opacity-70">
+              Workflow Agent 合计 {formatNum(workflowTokens)}
+            </div>
+          )}
+          {(breakdown.cacheReadInputTokens > 0 ||
+            breakdown.cacheCreationInputTokens > 0 ||
+            breakdown.reasoningTokens > 0) && (
+            <div className="opacity-70">
+              缓存读取 {formatNum(breakdown.cacheReadInputTokens)} / 缓存写入{' '}
+              {formatNum(breakdown.cacheCreationInputTokens)} / 推理{' '}
+              {formatNum(breakdown.reasoningTokens)}
+            </div>
+          )}
+          {primary && (
+            <div className="opacity-70">
+              主模型输入 {formatNum(primary[1].inputTokens || 0)} / 输出{' '}
+              {formatNum(primary[1].outputTokens || 0)}
+            </div>
+          )}
+        </div>
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -221,6 +220,8 @@ export const MessageBubble = memo(
     showTime,
     thinkingContent,
     thinkingDurationMs,
+    traceEvents,
+    replySteps,
     agentName,
     agentAvatarUrl,
     agentAvatarEmoji,
@@ -231,12 +232,9 @@ export const MessageBubble = memo(
       images: string[];
       index: number;
     } | null>(null);
-    const [contextMenu, setContextMenu] = useState<{
-      x: number;
-      y: number;
-    } | null>(null);
     const [showShareDialog, setShowShareDialog] = useState(false);
     const currentUser = useAuthStore((s) => s.user);
+    const { layout } = useStreamLayout();
     const appearance = useAuthStore((s) => s.appearance);
     const agentIdentity = resolveAgentDisplayIdentity({
       agentName,
@@ -255,6 +253,79 @@ export const MessageBubble = memo(
           : undefined,
     });
     const { mode: displayMode } = useDisplayMode();
+    const thinkingTitle = useMemo(
+      () =>
+        thinkingContent
+          ? extractThinkingTitle(thinkingContent, { final: true })
+          : undefined,
+      [thinkingContent],
+    );
+    // What the server kept of a turn this tab did not stream, shown as the
+    // same rows and loaded when one is opened. A proactive workspace shows
+    // only what its owner chose: nothing when hidden, no reasoning text at
+    // the activity level.
+    const [openOnLoad, setOpenOnLoad] = useState<
+      'thinking' | 'trace' | 'process' | null
+    >(null);
+    const process = useChatStore((s) => {
+      const group = s.groups[message.chat_jid.replace(/#agent:.*$/, '')];
+      return normalizeInteractionMode(group?.interaction_mode) === 'proactive'
+        ? normalizeProcessVisibility(group?.process_visibility)
+        : 'full';
+    });
+    // A proactive workspace never shows what a tool returned, at any level.
+    const proactive = useChatStore(
+      (s) =>
+        normalizeInteractionMode(
+          s.groups[message.chat_jid.replace(/#agent:.*$/, '')]
+            ?.interaction_mode,
+        ) === 'proactive',
+    );
+    const loadTurnTrace = useChatStore((s) => s.loadTurnTrace);
+    // The steps this tab holds were read for the workspace as it was then. The
+    // caches are let go when its view changes; this is what shows meanwhile:
+    // the steps as the workspace shows them now.
+    const shownSteps = useMemo(
+      () =>
+        replySteps && proactive
+          ? {
+              ...replySteps,
+              steps: replySteps.steps.map(withoutToolResults),
+            }
+          : replySteps,
+      [replySteps, proactive],
+    );
+    // At the hidden level none of what this tab holds of the process is shown:
+    // it may have been read when the level was higher.
+    const processShown = process !== 'hidden';
+    // Reasoning without a summary still says how long the model thought.
+    const hasReasoning =
+      processShown && (!!thinkingContent || (thinkingDurationMs ?? 0) >= 1000);
+    // The timeline layout sums a reply up in the same card its streaming left
+    // off with: one row, the steps in order behind it. A reply without steps
+    // (an older turn) and the classic layout keep the reasoning and the trace
+    // as the two rows they always were.
+    const settledSteps =
+      processShown &&
+      layout === 'timeline' &&
+      shownSteps &&
+      hasProcess(visibleSteps(shownSteps.steps, process === 'full'))
+        ? shownSteps
+        : null;
+    // One row asked for both: the reasoning opens if there is any to read.
+    const openThinking =
+      openOnLoad === 'thinking' ||
+      (openOnLoad === 'process' && !!thinkingContent);
+    const openTrace =
+      openOnLoad === 'trace' || (openOnLoad === 'process' && !thinkingContent);
+    const traceOnServer =
+      message.is_from_me &&
+      !!message.has_trace &&
+      !!message.turn_id &&
+      processShown &&
+      !hasReasoning &&
+      !settledSteps &&
+      !(traceEvents && traceEvents.length > 0);
     const isUser = !message.is_from_me;
     const presentedContent = getPresentedMessageContent(message);
     const completedWorkflowRuns = message.workflow_runs?.filter(
@@ -264,17 +335,11 @@ export const MessageBubble = memo(
       presentedContent === message.content
         ? message
         : { ...message, content: presentedContent };
-    const time = new Date(getMessageDisplayTimestamp(message))
-      .toLocaleString('zh-CN', {
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false,
-      })
-      .replace(/\//g, '-');
+    const displayDate = new Date(getMessageDisplayTimestamp(message));
+    const time = Number.isNaN(displayDate.getTime())
+      ? 'Invalid Date'
+      : FULL_TIME_FORMATTER.format(displayDate).replace(/\//g, '-');
+    const shortTime = formatShortTime(getMessageDisplayTimestamp(message));
 
     // Parse image attachments
     const attachments: MessageAttachment[] = message.attachments
@@ -303,32 +368,75 @@ export const MessageBubble = memo(
 
     // Check if content is empty (only whitespace) and we have images
     const hasOnlyImages = !presentedContent.trim() && images.length > 0;
+    // Same base JID the stream rendered with, so its blocks' rendered trees
+    // are reused (links resolve against the workspace either way).
+    const markdownJid = message.chat_jid.replace(/#agent:.*$/, '');
+    const executionTrace = processShown &&
+      !settledSteps &&
+      traceEvents &&
+      traceEvents.length > 0 && (
+        <>
+          <PermissionAlert traceEvents={traceEvents} />
+          <TracePanel
+            traceEvents={traceEvents}
+            taskCount={0}
+            defaultExpanded={openTrace}
+          />
+        </>
+      );
+    // The streaming card, once settled, is shaped like this: a denied tool
+    // call above the summary row, the answer below.
+    const settledCard = settledSteps && (
+      <>
+        {traceEvents && traceEvents.length > 0 && (
+          <PermissionAlert traceEvents={traceEvents} />
+        )}
+        <ProcessCard
+          mode="settled"
+          steps={settledSteps.steps}
+          stepsDropped={settledSteps.dropped}
+          groupJid={markdownJid}
+          commentary={process === 'full'}
+          thinkingText={process === 'full'}
+          durationMs={thinkingDurationMs}
+          defaultOpen={openOnLoad !== null}
+          // Rebuilt steps are plausible, not exact: the reader who opens them
+          // gets the server's, and keeps these if it has none.
+          onOpenChange={
+            settledSteps.provisional
+              ? (open) => {
+                  if (open) void loadTurnTrace(message);
+                }
+              : undefined
+          }
+        />
+      </>
+    );
 
     const handleCopy = async () => {
       try {
-        await navigator.clipboard.writeText(presentedContent);
+        await copyToClipboard(presentedContent);
         setCopied(true);
         setTimeout(() => setCopied(false), 1500);
       } catch {
-        const textarea = document.createElement('textarea');
-        textarea.value = presentedContent;
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand('copy');
-        document.body.removeChild(textarea);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
+        toast.error('复制失败，请手动选择文本复制');
       }
     };
-
-    const handleMenuButton = (e: React.MouseEvent | React.TouchEvent) => {
-      e.stopPropagation();
-      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-      mediumTap();
-      setContextMenu({ x: rect.left, y: rect.bottom + 4 });
-    };
+    const incomplete = incompleteReplyNote(message);
+    const incompleteBadge = incomplete && (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span
+            tabIndex={0}
+            aria-label={`${incomplete.label}：${incomplete.detail}`}
+            className="inline-flex h-5 shrink-0 items-center rounded-md px-1.5 text-micro font-medium text-muted-foreground ring-1 ring-surface-border outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+          >
+            {incomplete.label}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>{incomplete.detail}</TooltipContent>
+      </Tooltip>
+    );
 
     // Context overflow system message
     if (
@@ -338,25 +446,26 @@ export const MessageBubble = memo(
       const errorMsg = message.content.replace(/^context_overflow:\s*/, '');
       return (
         <div className="mb-6">
-          {showTime && (
-            <div className="flex items-center gap-2 mb-2">
-              <span className="text-xs text-muted-foreground">{time}</span>
-              <span className="text-xs font-medium text-red-600">系统消息</span>
-            </div>
-          )}
-          <div className="relative bg-red-50 dark:bg-red-950/30 rounded-xl border border-red-200 dark:border-red-800/60 border-l-[3px] border-l-red-500 px-5 py-4">
-            <div className="flex items-start gap-3">
-              <div className="flex-shrink-0 w-6 h-6 bg-red-500 rounded-full flex items-center justify-center text-white font-bold text-sm">
-                !
-              </div>
-              <div className="flex-1">
-                <h3 className="text-sm font-semibold text-red-900 dark:text-red-200 mb-1">
+          <div className="flex items-start gap-3 rounded-xl bg-error/5 px-4 py-3 ring-1 ring-error/20">
+            <OctagonAlert className="mt-0.5 size-4 shrink-0 text-error" />
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="text-body font-medium text-foreground">
                   上下文溢出错误
                 </h3>
-                <p className="text-sm text-red-800 dark:text-red-300 leading-relaxed">
-                  {errorMsg}
-                </p>
+                <Badge variant="error">系统消息</Badge>
+                {showTime && (
+                  <span
+                    className="text-micro text-faint-foreground"
+                    title={time}
+                  >
+                    {shortTime}
+                  </span>
+                )}
               </div>
+              <p className="mt-1 text-body leading-relaxed text-muted-foreground">
+                {errorMsg}
+              </p>
             </div>
           </div>
         </div>
@@ -384,400 +493,55 @@ export const MessageBubble = memo(
       const resetMatch = displayMsg.match(/约\s*(\d+)\s*(小时|天)后重置/);
       return (
         <div className="mb-6">
-          {showTime && (
-            <div className="flex items-center gap-2 mb-2">
-              <span className="text-xs text-muted-foreground">{time}</span>
-              <span className="text-xs font-medium text-amber-600">
-                {isBalanceBlocked ? '余额提醒' : '配额提醒'}
-              </span>
-            </div>
-          )}
-          <div className="relative bg-amber-50 dark:bg-amber-950/30 rounded-xl border border-amber-200 dark:border-amber-800 border-l-[3px] border-l-amber-500 px-5 py-4">
-            <div className="flex items-start gap-3">
-              <div className="flex-shrink-0 w-6 h-6 bg-amber-500 rounded-full flex items-center justify-center text-white font-bold text-sm">
-                !
-              </div>
-              <div className="flex-1">
-                <div className="flex items-center gap-2 mb-1">
-                  <h3 className="text-sm font-semibold text-amber-900 dark:text-amber-200">
-                    {isBalanceBlocked ? '余额不足' : `${windowTag}配额已用完`}
-                  </h3>
-                  {!isBalanceBlocked && exceededWindow && (
-                    <span
-                      className={`px-1.5 py-0.5 text-[10px] rounded-full font-medium ${
-                        exceededWindow === 'daily'
-                          ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
-                          : exceededWindow === 'weekly'
-                            ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300'
-                            : 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300'
-                      }`}
-                    >
-                      {windowTag}限额
-                    </span>
-                  )}
-                </div>
-                <p className="text-sm text-amber-800 dark:text-amber-300 leading-relaxed">
-                  {displayMsg}
-                </p>
-                {resetMatch && (
-                  <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
-                    预计 {resetMatch[1]} {resetMatch[2]}后自动重置
-                  </p>
+          <div className="flex items-start gap-3 rounded-xl bg-warning/5 px-4 py-3 ring-1 ring-warning/25">
+            <TriangleAlert className="mt-0.5 size-4 shrink-0 text-warning" />
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="text-body font-medium text-foreground">
+                  {isBalanceBlocked ? '余额不足' : `${windowTag}配额已用完`}
+                </h3>
+                <Badge variant="warning">
+                  {isBalanceBlocked ? '余额提醒' : '配额提醒'}
+                </Badge>
+                {!isBalanceBlocked && exceededWindow && (
+                  <Badge variant="outline">{windowTag}限额</Badge>
                 )}
-                <Link
-                  to="/billing"
-                  className="inline-block mt-2 text-sm text-primary hover:underline font-medium"
-                >
-                  查看账单 &rarr;
-                </Link>
+                {showTime && (
+                  <span
+                    className="text-micro text-faint-foreground"
+                    title={time}
+                  >
+                    {shortTime}
+                  </span>
+                )}
               </div>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    // ── Compact mode: all messages left-aligned, no bubbles, full-width ──
-    if (displayMode === 'compact') {
-      const isAI = message.is_from_me;
-      const senderName = isAI
-        ? agentIdentity.name
-        : currentUser?.display_name || currentUser?.username || '我';
-
-      return (
-        <div className="group mb-2 border-b border-border pb-2">
-          {/* Sender line — no avatars in compact mode */}
-          <div className="flex items-center gap-1.5 mb-1">
-            <span
-              className={`text-xs font-semibold ${isAI ? 'text-primary' : 'text-muted-foreground'}`}
-            >
-              {senderName}
-            </span>
-            {showTime && (
-              <span className="text-[11px] text-muted-foreground">{time}</span>
-            )}
-            <button
-              onClick={handleCopy}
-              className="ml-1 w-5 h-5 rounded flex items-center justify-center text-muted-foreground/50 hover:text-foreground/70 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
-              title="复制"
-            >
-              {copied ? (
-                <Check className="w-3 h-3 text-primary" />
-              ) : (
-                <Copy className="w-3 h-3" />
-              )}
-            </button>
-            {isAI && (
-              <button
-                onClick={() => setShowShareDialog(true)}
-                className="w-5 h-5 rounded flex items-center justify-center text-muted-foreground/50 hover:text-foreground/70 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
-                title="导出为长图"
-                aria-label="导出为长图"
-              >
-                <ImageDown className="w-3 h-3" />
-              </button>
-            )}
-          </div>
-
-          {/* Dynamic Workflow */}
-          {completedWorkflowRuns?.map((run) => (
-            <WorkflowRunCard key={run.taskId} run={run} />
-          ))}
-
-          {/* Reasoning */}
-          {thinkingContent && (
-            <ReasoningBlock
-              content={thinkingContent}
-              durationMs={thinkingDurationMs}
-            />
-          )}
-
-          {/* Images */}
-          {images.length > 0 && (
-            <div className="flex flex-wrap gap-2 mb-2">
-              {images.map((img, i) => (
-                <img
-                  key={i}
-                  src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
-                  alt={img.name || `图片 ${i + 1}`}
-                  className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border border-border hover:border-primary transition-colors"
-                  onClick={() =>
-                    setLightboxState({ images: allImageSrcs, index: i })
-                  }
-                />
-              ))}
-            </div>
-          )}
-
-          {/* Content — strip first-child top margin for consistent spacing */}
-          {!hasOnlyImages && (
-            <div className="min-w-0 overflow-hidden [&>div>*:first-child]:!mt-0">
-              {isAI ? (
-                <MarkdownRenderer
-                  content={presentedContent}
-                  groupJid={message.chat_jid}
-                  variant="chat"
-                />
-              ) : (
-                <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words text-foreground">
-                  {presentedContent}
+              <p className="mt-1 text-body leading-relaxed text-muted-foreground">
+                {displayMsg}
+              </p>
+              {resetMatch && (
+                <p className="mt-1 text-caption text-muted-foreground">
+                  预计 {resetMatch[1]} {resetMatch[2]}后自动重置
                 </p>
               )}
+              <Link
+                to="/billing"
+                className="mt-2 inline-block text-body font-medium text-primary-text hover:underline"
+              >
+                查看账单 &rarr;
+              </Link>
             </div>
-          )}
-
-          {/* Token usage (compact mode) */}
-          {isAI && message.token_usage && (
-            <TokenUsageDisplay
-              tokenUsageJson={message.token_usage}
-              workflowRuns={completedWorkflowRuns}
-            />
-          )}
-
-          {lightboxState && (
-            <ImageLightbox
-              images={lightboxState.images}
-              initialIndex={lightboxState.index}
-              onClose={() => setLightboxState(null)}
-            />
-          )}
-          {contextMenu && (
-            <MessageContextMenu
-              content={presentedContent}
-              position={contextMenu}
-              onClose={() => setContextMenu(null)}
-              chatJid={message.chat_jid}
-              messageId={message.id}
-              onShareImage={isAI ? () => setShowShareDialog(true) : undefined}
-            />
-          )}
-          {showShareDialog && (
-            <Suspense>
-              <ShareImageDialog
-                onClose={() => setShowShareDialog(false)}
-                message={presentedMessage}
-                agentName={agentIdentity.name}
-                agentAvatarUrl={agentAvatarUrl}
-                agentAvatarEmoji={agentAvatarEmoji}
-                agentAvatarColor={agentAvatarColor}
-              />
-            </Suspense>
-          )}
+          </div>
         </div>
       );
     }
 
-    // ── Chat mode (default): bubble-style layout ──
-    if (isUser) {
-      // User message: right-aligned
-      return (
-        <div className="group flex justify-end mb-4">
-          <div className="flex flex-col items-end min-w-0 max-w-[75%]">
-            <div className="relative">
-              {/* Image attachments */}
-              {images.length > 0 && (
-                <div className="flex flex-wrap gap-2 mb-2 justify-end">
-                  {images.map((img, i) => (
-                    <img
-                      key={i}
-                      src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
-                      alt={img.name || `图片 ${i + 1}`}
-                      className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border-2 border-primary hover:border-primary transition-colors"
-                      onClick={() =>
-                        setLightboxState({ images: allImageSrcs, index: i })
-                      }
-                    />
-                  ))}
-                </div>
-              )}
-              {!hasOnlyImages && (
-                <div className="bg-muted text-foreground px-4 py-2.5 rounded-2xl rounded-tr-sm">
-                  <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words">
-                    {presentedContent}
-                  </p>
-                </div>
-              )}
-              {!hasOnlyImages && (
-                <button
-                  onClick={handleMenuButton}
-                  className="absolute -left-8 top-1/2 -translate-y-1/2 w-6 h-6 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/10 lg:opacity-0 lg:group-hover:opacity-100 transition-all cursor-pointer"
-                  title="更多"
-                  aria-label="消息菜单"
-                >
-                  <Ellipsis className="w-4 h-4" />
-                </button>
-              )}
-            </div>
-            {showTime && (
-              <span className="text-xs text-muted-foreground mt-1.5 mr-1">
-                {time}
-              </span>
-            )}
-          </div>
-
-          {lightboxState && (
-            <ImageLightbox
-              images={lightboxState.images}
-              initialIndex={lightboxState.index}
-              onClose={() => setLightboxState(null)}
-            />
-          )}
-          {contextMenu && (
-            <MessageContextMenu
-              content={presentedContent}
-              position={contextMenu}
-              onClose={() => setContextMenu(null)}
-              chatJid={message.chat_jid}
-              messageId={message.id}
-            />
-          )}
-        </div>
-      );
-    }
-
-    const senderName = agentIdentity.name;
-
-    return (
-      <div className="group mb-4">
-        {/* Mobile: compact avatar + name row */}
-        <div className="flex items-center gap-2 mb-1.5 lg:hidden">
-          <EmojiAvatar
-            imageUrl={agentIdentity.imageUrl}
-            emoji={agentIdentity.emoji}
-            color={agentIdentity.color}
-            fallbackChar={agentIdentity.fallbackChar}
-            size="sm"
-          />
-          <span className="text-xs text-muted-foreground font-medium">
-            {senderName}
-          </span>
-          {showTime && (
-            <span className="text-xs text-muted-foreground">{time}</span>
-          )}
-        </div>
-
-        {/* Desktop: horizontal avatar + content layout */}
-        <div className="lg:flex lg:gap-3">
-          <div className="hidden lg:block flex-shrink-0">
-            <EmojiAvatar
-              imageUrl={agentIdentity.imageUrl}
-              emoji={agentIdentity.emoji}
-              color={agentIdentity.color}
-              fallbackChar={agentIdentity.fallbackChar}
-              size="md"
-            />
-          </div>
-          <div className="flex-1 min-w-0">
-            {/* Desktop: name + time row */}
-            <div className="hidden lg:flex items-center gap-2 mb-1">
-              <span className="text-xs text-muted-foreground font-medium">
-                {senderName}
-              </span>
-              {showTime && (
-                <span className="text-xs text-muted-foreground">{time}</span>
-              )}
-            </div>
-
-            {/* Claude-style: no card container, direct content */}
-            <div className="overflow-hidden font-serif">
-              {completedWorkflowRuns?.map((run) => (
-                <WorkflowRunCard key={run.taskId} run={run} />
-              ))}
-
-              {/* Reasoning block — muted left border style */}
-              {thinkingContent && (
-                <ReasoningBlock
-                  content={thinkingContent}
-                  durationMs={thinkingDurationMs}
-                />
-              )}
-
-              {/* Image attachments */}
-              {images.length > 0 && (
-                <div className="flex flex-wrap gap-2 mb-3">
-                  {images.map((img, i) => (
-                    <img
-                      key={i}
-                      src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
-                      alt={img.name || `图片 ${i + 1}`}
-                      className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border border-border hover:border-primary transition-colors"
-                      onClick={() =>
-                        setLightboxState({ images: allImageSrcs, index: i })
-                      }
-                    />
-                  ))}
-                </div>
-              )}
-
-              {/* Content */}
-              {!hasOnlyImages && (
-                <div className="max-w-none overflow-hidden">
-                  <MarkdownRenderer
-                    content={presentedContent}
-                    groupJid={message.chat_jid}
-                    variant="chat"
-                  />
-                </div>
-              )}
-
-              {/* Token usage */}
-              {message.is_from_me && message.token_usage && (
-                <TokenUsageDisplay
-                  tokenUsageJson={message.token_usage}
-                  workflowRuns={completedWorkflowRuns}
-                />
-              )}
-            </div>
-
-            {/* Action toolbar — below content, Claude-style */}
-            <div className="flex items-center gap-0.5 mt-1 lg:opacity-0 lg:group-hover:opacity-100 transition-opacity">
-              <button
-                onClick={handleCopy}
-                className="h-7 px-2 rounded-md flex items-center gap-1 text-muted-foreground hover:text-foreground hover:bg-foreground/5 text-xs cursor-pointer transition-colors"
-                title="复制"
-                aria-label="复制消息"
-              >
-                {copied ? (
-                  <Check className="w-3.5 h-3.5 text-primary" />
-                ) : (
-                  <Copy className="w-3.5 h-3.5" />
-                )}
-              </button>
-              <button
-                onClick={() => setShowShareDialog(true)}
-                className="h-7 px-2 rounded-md flex items-center gap-1 text-muted-foreground hover:text-foreground hover:bg-foreground/5 text-xs max-lg:hidden cursor-pointer transition-colors"
-                title="分享"
-                aria-label="生成分享图片"
-              >
-                <ImageDown className="w-3.5 h-3.5" />
-              </button>
-              <button
-                onClick={handleMenuButton}
-                className="h-7 px-2 rounded-md flex items-center gap-1 text-muted-foreground hover:text-foreground hover:bg-foreground/5 text-xs cursor-pointer transition-colors"
-                title="更多"
-                aria-label="消息菜单"
-              >
-                <Ellipsis className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          </div>
-        </div>
-
+    const overlays = (
+      <>
         {lightboxState && (
           <ImageLightbox
             images={lightboxState.images}
             initialIndex={lightboxState.index}
             onClose={() => setLightboxState(null)}
-          />
-        )}
-        {contextMenu && (
-          <MessageContextMenu
-            content={presentedContent}
-            position={contextMenu}
-            onClose={() => setContextMenu(null)}
-            chatJid={message.chat_jid}
-            messageId={message.id}
-            onShareImage={() => setShowShareDialog(true)}
           />
         )}
         {showShareDialog && (
@@ -792,16 +556,323 @@ export const MessageBubble = memo(
             />
           </Suspense>
         )}
+      </>
+    );
+
+    const renderImages = (className?: string) =>
+      images.length > 0 && (
+        <div className={cn('mb-2 flex flex-wrap gap-2', className)}>
+          {images.map((img, i) => (
+            <button
+              key={i}
+              type="button"
+              onClick={() =>
+                setLightboxState({ images: allImageSrcs, index: i })
+              }
+              className="cursor-zoom-in overflow-hidden rounded-xl ring-1 ring-surface-border transition-shadow hover:ring-foreground/25"
+            >
+              <img
+                src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
+                alt={img.name || `图片 ${i + 1}`}
+                className="max-h-48 max-w-48 object-cover"
+              />
+            </button>
+          ))}
+        </div>
+      );
+
+    const menuButton = (
+      <Button
+        variant="ghost"
+        size="icon-xs"
+        aria-label="消息菜单"
+        className="text-muted-foreground pointer-coarse:size-10"
+      >
+        <Ellipsis />
+      </Button>
+    );
+
+    // ── Compact mode: all messages left-aligned, no bubbles, full-width ──
+    if (displayMode === 'compact') {
+      const isAI = message.is_from_me;
+      const senderName = isAI
+        ? agentIdentity.name
+        : currentUser?.display_name || currentUser?.username || '我';
+
+      return (
+        <div className="group mb-2 border-b border-surface-border pb-2">
+          {/* Sender line — no avatars in compact mode */}
+          <div className="mb-1 flex h-6 items-center gap-1.5">
+            <span
+              className={cn(
+                'text-caption font-medium',
+                isAI ? 'text-foreground' : 'text-muted-foreground',
+              )}
+            >
+              {senderName}
+            </span>
+            {showTime && (
+              <span className="text-micro text-faint-foreground" title={time}>
+                {shortTime}
+              </span>
+            )}
+            {incompleteBadge}
+            <div className="flex items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 has-[[aria-expanded=true]]:opacity-100 pointer-coarse:opacity-100">
+              {!hasOnlyImages && (
+                <IconButton
+                  label="复制"
+                  size="icon-xs"
+                  icon={
+                    copied ? <Check className="text-primary-text" /> : <Copy />
+                  }
+                  onClick={handleCopy}
+                  className="text-muted-foreground pointer-coarse:size-10"
+                />
+              )}
+              {isAI && (
+                <IconButton
+                  label="导出为长图"
+                  size="icon-xs"
+                  icon={<ImageDown />}
+                  onClick={() => setShowShareDialog(true)}
+                  className="text-muted-foreground pointer-coarse:size-10"
+                />
+              )}
+              <MessageContextMenu
+                content={presentedContent}
+                chatJid={message.chat_jid}
+                messageId={message.id}
+                onShareImage={isAI ? () => setShowShareDialog(true) : undefined}
+              >
+                {menuButton}
+              </MessageContextMenu>
+            </div>
+          </div>
+
+          {/* Process: the settled card, or the reasoning and the trace */}
+          {settledCard}
+          {!settledSteps && hasReasoning && (
+            <ThinkingBlock
+              text={thinkingContent ?? ''}
+              title={thinkingTitle}
+              durationMs={thinkingDurationMs}
+              withheld={process !== 'full'}
+              groupJid={markdownJid}
+              defaultExpanded={openThinking}
+            />
+          )}
+          {traceOnServer && (
+            <LazyTurnTrace
+              message={message}
+              reasoning={process === 'full'}
+              onRequest={setOpenOnLoad}
+            />
+          )}
+
+          {isAI && executionTrace}
+
+          {/* Dynamic Workflow */}
+          {completedWorkflowRuns?.map((run) => (
+            <WorkflowRunCard key={run.taskId} run={run} />
+          ))}
+
+          {renderImages()}
+
+          {/* Content — strip first-child top margin for consistent spacing */}
+          {!hasOnlyImages && (
+            <div className="min-w-0 overflow-hidden [&>div>*:first-child]:!mt-0">
+              {isAI ? (
+                <FinalMarkdown
+                  content={presentedContent}
+                  groupJid={markdownJid}
+                  variant="chat"
+                />
+              ) : (
+                <p className="text-body-lg break-words whitespace-pre-wrap text-foreground">
+                  {presentedContent}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Token usage (compact mode) */}
+          {isAI && message.token_usage && (
+            <div className="mt-1">
+              <TokenUsageDisplay
+                tokenUsageJson={message.token_usage}
+                workflowRuns={completedWorkflowRuns}
+              />
+            </div>
+          )}
+
+          {overlays}
+        </div>
+      );
+    }
+
+    // ── Chat mode (default): bubble-style layout ──
+    if (isUser) {
+      // User message: right-aligned
+      return (
+        <div className="group mb-5 flex justify-end">
+          <div className="flex max-w-[85%] min-w-0 flex-col items-end">
+            <div className="relative flex flex-col items-end">
+              {renderImages(cn('justify-end', hasOnlyImages && 'mb-0'))}
+              {!hasOnlyImages && (
+                <div className="rounded-[1.25rem] bg-muted px-4 py-2.5 text-foreground">
+                  <p className="text-body-lg break-words whitespace-pre-wrap">
+                    {presentedContent}
+                  </p>
+                </div>
+              )}
+              <div className="absolute top-1/2 -left-8 -translate-y-1/2 transition-opacity pointer-coarse:-left-11 lg:opacity-0 lg:group-hover:opacity-100 lg:focus-within:opacity-100 lg:has-[[aria-expanded=true]]:opacity-100">
+                <MessageContextMenu
+                  content={presentedContent}
+                  chatJid={message.chat_jid}
+                  messageId={message.id}
+                  align="end"
+                >
+                  {menuButton}
+                </MessageContextMenu>
+              </div>
+            </div>
+            {showTime && (
+              <span
+                className="mt-1 mr-1 text-micro text-faint-foreground opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100"
+                title={time}
+              >
+                {shortTime}
+              </span>
+            )}
+          </div>
+          {overlays}
+        </div>
+      );
+    }
+
+    const senderName = agentIdentity.name;
+
+    return (
+      <div className="group mb-6">
+        {/* Identity row: small avatar, name and time */}
+        <div className="mb-1.5 flex h-6 items-center gap-2">
+          <EmojiAvatar
+            imageUrl={agentIdentity.imageUrl}
+            emoji={agentIdentity.emoji}
+            color={agentIdentity.color}
+            fallbackChar={agentIdentity.fallbackChar}
+            size="sm"
+            className="size-6"
+          />
+          <span className="text-label font-medium text-foreground">
+            {senderName}
+          </span>
+          {showTime && (
+            <span className="text-micro text-faint-foreground" title={time}>
+              {shortTime}
+            </span>
+          )}
+        </div>
+
+        {/* Claude-style: no card container, direct content */}
+        <div className="overflow-hidden font-serif">
+          {settledCard}
+          {!settledSteps && hasReasoning && (
+            <ThinkingBlock
+              text={thinkingContent ?? ''}
+              title={thinkingTitle}
+              durationMs={thinkingDurationMs}
+              withheld={process !== 'full'}
+              groupJid={markdownJid}
+              defaultExpanded={openThinking}
+            />
+          )}
+          {traceOnServer && (
+            <LazyTurnTrace
+              message={message}
+              reasoning={process === 'full'}
+              onRequest={setOpenOnLoad}
+            />
+          )}
+
+          {executionTrace}
+
+          {completedWorkflowRuns?.map((run) => (
+            <WorkflowRunCard key={run.taskId} run={run} />
+          ))}
+
+          {renderImages('mb-3')}
+
+          {!hasOnlyImages && (
+            <div className="max-w-none overflow-hidden">
+              <FinalMarkdown
+                content={presentedContent}
+                groupJid={markdownJid}
+                variant="chat"
+              />
+            </div>
+          )}
+        </div>
+
+        {/* Action row: usage summary always (faint), actions on hover */}
+        <div className="mt-1.5 flex h-7 items-center gap-1.5 pointer-coarse:h-10">
+          {incompleteBadge}
+          {message.is_from_me && message.token_usage && (
+            <TokenUsageDisplay
+              tokenUsageJson={message.token_usage}
+              workflowRuns={completedWorkflowRuns}
+            />
+          )}
+          <div className="flex items-center gap-0.5 transition-opacity lg:opacity-0 lg:group-hover:opacity-100 lg:focus-within:opacity-100 lg:has-[[aria-expanded=true]]:opacity-100">
+            <IconButton
+              label="复制消息"
+              size="icon-xs"
+              icon={copied ? <Check className="text-primary-text" /> : <Copy />}
+              onClick={handleCopy}
+              className="text-muted-foreground pointer-coarse:size-10"
+            />
+            <IconButton
+              label="生成分享图片"
+              size="icon-xs"
+              icon={<ImageDown />}
+              onClick={() => setShowShareDialog(true)}
+              className="text-muted-foreground max-lg:hidden"
+            />
+            <MessageContextMenu
+              content={presentedContent}
+              chatJid={message.chat_jid}
+              messageId={message.id}
+              onShareImage={() => setShowShareDialog(true)}
+            >
+              {menuButton}
+            </MessageContextMenu>
+          </div>
+        </div>
+
+        {overlays}
       </div>
     );
   },
+  // Every message field the bubble renders: attachments and workflow runs
+  // used to be missing, so updates to them kept showing the stale version.
   (prev, next) =>
     prev.message.id === next.message.id &&
     prev.message.content === next.message.content &&
     prev.message.token_usage === next.message.token_usage &&
+    prev.message.attachments === next.message.attachments &&
+    prev.message.workflow_runs === next.message.workflow_runs &&
+    prev.message.source_kind === next.message.source_kind &&
+    prev.message.has_trace === next.message.has_trace &&
+    prev.message.turn_id === next.message.turn_id &&
+    prev.message.finalization_reason === next.message.finalization_reason &&
+    prev.message.timestamp === next.message.timestamp &&
+    prev.message.delivery_updated_at === next.message.delivery_updated_at &&
+    prev.message.delivery_status === next.message.delivery_status &&
     prev.showTime === next.showTime &&
     prev.thinkingContent === next.thinkingContent &&
     prev.thinkingDurationMs === next.thinkingDurationMs &&
+    prev.traceEvents === next.traceEvents &&
+    prev.replySteps === next.replySteps &&
     prev.agentName === next.agentName &&
     prev.agentAvatarUrl === next.agentAvatarUrl &&
     prev.agentAvatarEmoji === next.agentAvatarEmoji &&

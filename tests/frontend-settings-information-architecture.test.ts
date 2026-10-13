@@ -141,7 +141,10 @@ describe('settings information architecture', () => {
     expect(providerModel).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW');
     expect(provider).toContain('1M 上下文');
     expect(provider).toContain('系统预填 Claude Code 运行环境');
-    expect(providerList).not.toContain('设为默认');
+    // The default is a deliberate, clearable choice (按钮「默认」), not the
+    // old always-present "系统默认" pointer.
+    expect(providerList).toContain('onSetDefault');
+    expect(providerList).toContain('aria-pressed={isDefault}');
     expect(providerList).not.toContain('系统默认');
     expect(providerList).not.toContain('权重');
     expect(settings).toContain('toast.success(message)');
@@ -241,7 +244,12 @@ describe('settings information architecture', () => {
   });
 
   test('exposes main-session binding and complete mobile workspace actions', () => {
-    const sessions = read('web/src/components/chat/SessionSidebar.tsx');
+    const sessions = [
+      'web/src/components/chat/SessionSidebar.tsx',
+      'web/src/lib/session-presentation.ts',
+    ]
+      .map(read)
+      .join('\n');
     const chatView = read('web/src/components/chat/ChatView.tsx');
     const bindingDialog = read('web/src/components/chat/ImBindingDialog.tsx');
     const bindings = read('web/src/components/settings/BindingsSection.tsx');

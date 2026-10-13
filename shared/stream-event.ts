@@ -11,7 +11,19 @@
 
 export type StreamEventType =
   | 'text_delta'
+  /**
+   * What the model said before it called a tool, as one passage in `text`.
+   * Written by the host, never the Runner, and only for a proactive Workspace
+   * that shows its whole process: its `text_delta` stays private there, so this
+   * is the one way the narration between tool calls reaches the Web. Never the
+   * text that ends a turn.
+   */
+  | 'commentary'
   | 'thinking_delta'
+  /** The model opened a reasoning block, whether or not it returns any text. */
+  | 'thinking_start'
+  /** The reasoning block closed; `thinkingDurationMs` is the Runner's timing. */
+  | 'thinking_end'
   | 'tool_use_start'
   | 'tool_use_end'
   | 'tool_progress'
@@ -286,6 +298,48 @@ export interface ClaudeContextAudit {
   warnings: string[];
 }
 
+/**
+ * What a tool did, as numbers and flags, read by the Runner from the SDK's
+ * structured `tool_use_result`. Never a path, file content or model text, so a
+ * UI can show "+12 −3" or "读取 120 行" without carrying the result itself.
+ * Every field is optional: a tool fills what it knows. Declared identically in
+ * shared/stream-event.ts and shared/stream-steps.ts (tests keep them equal).
+ */
+export interface ToolResultFacts {
+  /** Lines an edit or write added / removed. */
+  added?: number;
+  removed?: number;
+  /** A Write created the file (rather than updating it). */
+  created?: boolean;
+  /** Read: lines returned, and the file's total. */
+  lines?: number;
+  totalLines?: number;
+  /** Glob / Grep: files and matches found. */
+  files?: number;
+  matches?: number;
+  /** A failed command's exit code (parsed from `Exit code N`). */
+  exitCode?: number;
+  /** WebFetch: HTTP status and bytes received. */
+  httpCode?: number;
+  bytes?: number;
+  /** WebSearch: searches made. */
+  searches?: number;
+  /** Duration the tool itself reported. */
+  durationMs?: number;
+  /** A sub-agent's totals, from the Task / Agent tool's result. */
+  agent?: {
+    toolUses?: number;
+    reads?: number;
+    searches?: number;
+    edits?: number;
+    commands?: number;
+    added?: number;
+    removed?: number;
+    tokens?: number;
+    durationMs?: number;
+  };
+}
+
 export interface StreamEvent {
   eventType: StreamEventType;
   /** Which runtime actor produced the event. */
@@ -294,6 +348,8 @@ export interface StreamEvent {
   queryRunId?: string;
   /** Correlates all stream events for a single user turn. */
   turnId?: string;
+  /** Immutable input identity for usage-to-answer correlation; IPC uses deliveryId. */
+  inputTurnId?: string;
   /** SDK session identifier if known. */
   sessionId?: string;
   /** SDK message uuid if known. */
@@ -317,7 +373,15 @@ export interface StreamEvent {
    *  `tool_result` events so the card/Web can surface what a tool returned,
    *  aligning the trace with what Claude Code shows. */
   toolResult?: string;
+  /** `tool_result` events: the SDK's own `is_error` flag. Authoritative; the
+   *  "⚠️" prefix of `toolResult` is the older signal and misses a failure with
+   *  no text. */
+  toolIsError?: boolean;
+  /** `tool_result` events: what the tool did, as numbers (see ToolResultFacts). */
+  toolResultFacts?: ToolResultFacts;
   elapsedSeconds?: number;
+  /** Wall-clock length of one reasoning block, set on `thinking_end`. */
+  thinkingDurationMs?: number;
   hookName?: string;
   hookEvent?: string;
   hookOutcome?: string;
@@ -326,6 +390,12 @@ export interface StreamEvent {
   taskId?: string;
   taskStatus?: string;
   taskSummary?: string;
+  /** Final text answer of a finished sub-agent Task, captured by the runner
+   *  from the sub-agent's own stream (bounded). Only set on
+   *  `task_notification`; the host checkpoints it so a replayed turn can reuse
+   *  finished sub-agent work instead of redoing it. Host-only: stripped
+   *  before stream events reach the Web. */
+  taskResult?: string;
   /** SDK task discriminant, e.g. `local_workflow` or `subagent`. */
   taskType?: string;
   /** Claude Code Workflow meta.name (only present for workflow tasks). */
@@ -366,6 +436,8 @@ export interface StreamEvent {
     content: string;
     status: 'pending' | 'in_progress' | 'completed';
   }>;
+  /** input_total is a complete per-input display snapshot, never a billable delta. */
+  usageProjection?: 'input_total';
   /** Token usage data emitted at query completion */
   usage?: {
     /** Stable logical run ID used to make analytics and billing idempotent. */

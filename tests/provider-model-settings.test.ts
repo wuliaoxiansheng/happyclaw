@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'vitest';
 
+import { isOneMillionContextModel as backendIsOneMillion } from '../src/runtime-config.js';
 import {
   buildDefaultProviderEnv,
   buildProviderModel,
+  isOneMillionContextModel,
   parseProviderModel,
 } from '../web/src/utils/provider-model.js';
 
@@ -40,6 +42,7 @@ describe('third-party provider model settings', () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2[1m]',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5.2[1m]',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5.2[1m]',
+      CLAUDE_CODE_SUBAGENT_MODEL: 'glm-5.2[1m]',
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       CLAUDE_CODE_EFFORT_LEVEL: 'max',
@@ -51,12 +54,44 @@ describe('third-party provider model settings', () => {
   test('keeps model-derived rows pending until a model is entered', () => {
     const rows = buildDefaultProviderEnv('', false);
 
-    expect(rows.filter((row) => row.source === 'model')).toHaveLength(3);
+    expect(rows.filter((row) => row.source === 'model')).toHaveLength(4);
     expect(rows.filter((row) => row.source === 'model')).toSatisfy((items) =>
       items.every((row) => row.value === ''),
     );
     expect(
       rows.find((row) => row.key === 'CLAUDE_CODE_AUTO_COMPACT_WINDOW')?.value,
     ).toBe('200000');
+  });
+
+  test('prefills the 1M compact window only for an explicit [1m] model, like the backend', () => {
+    const window = (model: string, oneMillionContext = false) =>
+      buildDefaultProviderEnv(model, oneMillionContext).find(
+        (row) => row.key === 'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+      )?.value;
+    // A gateway capped at 200K cannot be detected, so 1M-native Claude IDs
+    // keep the conservative default unless the provider opts into [1m].
+    expect(window('claude-sonnet-5-5')).toBe('200000');
+    expect(window('claude-sonnet-5-5', true)).toBe('1000000');
+    expect(window('claude-haiku-4-5')).toBe('200000');
+    expect(window('glm-5.2')).toBe('200000');
+
+    for (const model of [
+      'claude-fable-5-1',
+      'claude-opus-5-5',
+      'claude-opus-4-7',
+      'claude-opus-4-6',
+      'claude-sonnet-5-5',
+      'claude-sonnet-4-5-20250929',
+      'claude-haiku-5-5',
+      'claude-haiku-5',
+      'claude-haiku-4-5',
+      'glm-5.2',
+      'glm-5.2[1m]',
+      'deepseek-v4',
+    ]) {
+      expect(isOneMillionContextModel(model), model).toBe(
+        backendIsOneMillion(model),
+      );
+    }
   });
 });

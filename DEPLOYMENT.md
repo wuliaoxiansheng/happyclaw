@@ -18,6 +18,9 @@ Agent 镜像；`data/`、本机环境变量、Keychain、渠道凭据及 launchd
   `riba2534/happyclaw-agent:git-<完整提交 SHA>`。分支构建只发布不可变提交标签，不得推进
   公共 `latest`；Mac mini 不做本地镜像构建。
 - 明确记录本次远程分支名和预期提交 SHA，不使用浮动的本地工作树作为部署来源。
+- Mac mini 的安全 IPC 结果发布依赖 `/usr/bin/python3` 的原生目录相对系统调用。
+  在切换前检查 `open`、`rename` 和 `unlink` 均支持 `dir_fd`；能力缺失时不得降级为
+  路径写入或继续部署。
 
 连接并设置本次部署参数：
 
@@ -26,8 +29,7 @@ ssh macmini
 cd /Users/riba2534/airepo/happyclaw
 export HAPPYCLAW_DEPLOY_REF='codex/replace-with-remote-branch'
 export HAPPYCLAW_EXPECTED_SHA='replace-with-full-commit-sha'
-export HAPPYCLAW_PUBLIC_URL_PRIMARY='https://claw.riba2534.cn'
-export HAPPYCLAW_PUBLIC_URL_SECONDARY='https://claw.home.riba2534.cn:23333'
+export HAPPYCLAW_PUBLIC_URL='https://claw.home.riba2534.cn:23333'
 export HAPPYCLAW_AGENT_IMAGE='riba2534/happyclaw-agent:latest'
 # 分支不可变镜像会自动派生同 SHA 的 `-headroom` 能力标签；只有实际配置
 # headroom MCP 时 Docker 才按需拉取它。
@@ -43,6 +45,8 @@ test -z "$(git status --porcelain)" || {
   echo 'Remote worktree is not clean; deployment stopped.' >&2
   exit 1
 }
+
+/usr/bin/python3 -I -S -c 'import os; assert all(f in os.supports_dir_fd for f in (os.open, os.rename, os.unlink)), "Secure IPC dir_fd support unavailable"'
 
 export HAPPYCLAW_PREVIOUS_SHA="$(git rev-parse HEAD)"
 printf 'Rollback commit: %s\n' "$HAPPYCLAW_PREVIOUS_SHA"
@@ -112,8 +116,7 @@ launchctl print "gui/$(id -u)/com.riba2534.happyclaw" | head -40
 lsof -nP -iTCP:3000 -sTCP:LISTEN
 curl -fsS http://127.0.0.1:3000/api/config/appearance/public
 test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/auth/me)" = 401
-curl -fsS "$HAPPYCLAW_PUBLIC_URL_PRIMARY/api/health"
-curl -fsS "$HAPPYCLAW_PUBLIC_URL_SECONDARY/api/health"
+curl -fsS "$HAPPYCLAW_PUBLIC_URL/api/health"
 tail -100 "$HOME/Library/Logs/happyclaw/happyclaw.log"
 ```
 
@@ -127,7 +130,7 @@ tail -100 "$HOME/Library/Logs/happyclaw/happyclaw.log"
    不得回滚为旧值。
 5. 发起一个真实 Web Agent 回合；若本次涉及渠道或容器，再完成对应 IM 收发和 Container
    Agent 回合，确认流式输出、文件访问及最终回执正常。
-6. 检查两个生产公网入口的 `/api/health`、TLS 和静态资源加载均成功。
+6. 检查生产公网入口的 `/api/health`、TLS 和静态资源加载均成功。
 
 本地通过不等于部署完成；以上生产检查未通过时不得报告完成。
 

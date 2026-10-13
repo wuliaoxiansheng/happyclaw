@@ -1,6 +1,8 @@
 import { Bot, InputFile, type Context } from 'grammy';
+import { createRejectCooldown } from './reject-cooldown.js';
 import crypto from 'crypto';
 import fsPromises from 'node:fs/promises';
+import { readMp4VideoDimensions } from './mp4-video-dimensions.js';
 import { downloadHttpsBuffer } from './im-media-download.js';
 import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
@@ -542,7 +544,12 @@ export interface TelegramConnection {
     caption?: string,
     fileName?: string,
   ): Promise<void>;
-  sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
+  sendFile(
+    chatId: string,
+    filePath: string,
+    fileName: string,
+    options?: { asDocument?: boolean },
+  ): Promise<void>;
   sendChatAction(chatId: string, action: 'typing'): Promise<void>;
   clearAckReaction(chatId: string, inputMessageId: string): Promise<void>;
   isConnected(): boolean;
@@ -894,8 +901,8 @@ export function createTelegramConnection(
   }
 
   // Rate-limit rejection messages: one per chat per 5 minutes
-  const rejectTimestamps = new Map<string, number>();
   const REJECT_COOLDOWN_MS = 5 * 60 * 1000;
+  const rejectCooldown = createRejectCooldown(REJECT_COOLDOWN_MS);
   const nativeContextReported = new Set<string>();
 
   async function reportNativeContext(
@@ -983,10 +990,7 @@ export function createTelegramConnection(
       return false;
     }
 
-    const now = Date.now();
-    const lastReject = rejectTimestamps.get(input.jid) ?? 0;
-    if (now - lastReject >= REJECT_COOLDOWN_MS) {
-      rejectTimestamps.set(input.jid, now);
+    if (rejectCooldown.shouldNotify(input.jid)) {
       try {
         await input.reply(
           'This chat is not yet paired. Please send /pair <code> to connect.\n' +
@@ -1171,10 +1175,7 @@ export function createTelegramConnection(
 
             // ── Authorization check ──
             if (!opts.isChatAuthorized(jid)) {
-              const now = Date.now();
-              const lastReject = rejectTimestamps.get(jid) ?? 0;
-              if (now - lastReject >= REJECT_COOLDOWN_MS) {
-                rejectTimestamps.set(jid, now);
+              if (rejectCooldown.shouldNotify(jid)) {
                 await ctx.reply(
                   'This chat is not yet paired. Please send /pair <code> to connect.\n' +
                     'You can generate a pairing code from the web settings page.',
@@ -2282,6 +2283,7 @@ export function createTelegramConnection(
       chatId: string,
       filePath: string,
       fileName: string,
+      options?: { asDocument?: boolean },
     ): Promise<void> {
       const activeBot = requireOutboundBot();
 
@@ -2314,13 +2316,34 @@ export function createTelegramConnection(
         const threadOptions = target.messageThreadId
           ? { message_thread_id: target.messageThreadId }
           : {};
-        const fileKind = telegramOutboundFileKind(fileName);
+        const fileKind = options?.asDocument
+          ? 'document'
+          : telegramOutboundFileKind(fileName);
         if (fileKind === 'video') {
-          await activeBot.api.sendVideo(
-            target.chatId,
-            inputFile,
-            threadOptions,
+          const dimensions = await readMp4VideoDimensions(filePath).catch(
+            (err) => {
+              logger.warn({ err, fileName }, 'Failed to read MP4 dimensions');
+              return undefined;
+            },
           );
+          if (dimensions) {
+            await activeBot.api.sendVideo(target.chatId, inputFile, {
+              ...dimensions,
+              ...threadOptions,
+            });
+          } else {
+            // Choose a single presentation before the provider call. A failed
+            // sendVideo must never trigger a second, potentially duplicate send.
+            logger.warn(
+              { fileName },
+              'MP4 dimensions unavailable; sending original file as document',
+            );
+            await activeBot.api.sendDocument(
+              target.chatId,
+              inputFile,
+              threadOptions,
+            );
+          }
         } else if (fileKind === 'audio') {
           await activeBot.api.sendAudio(
             target.chatId,

@@ -1,10 +1,18 @@
 export type InteractionMode = 'assistant' | 'proactive';
+/**
+ * How much of a proactive turn's process is shown beside the spinner. Assistant
+ * workspaces always show their whole process, so it only matters for
+ * `proactive`: `hidden` is the spinner alone, `activity` adds phase/tools/
+ * sub-agents/todos (never model text), `full` also shows the reasoning summary.
+ */
+export type ProcessVisibility = 'hidden' | 'activity' | 'full';
 
 export interface GroupInfo {
   name: string;
   folder: string;
   added_at: string;
   interaction_mode: InteractionMode;
+  process_visibility?: ProcessVisibility;
   kind?: 'home' | 'main' | 'feishu' | 'web';
   is_home?: boolean;
   is_my_home?: boolean;
@@ -85,6 +93,8 @@ export interface ModelConfigOption {
   type: 'official' | 'third_party';
   enabled: boolean;
   anthropic_model: string;
+  /** The global default: what an Agent without a binding follows. */
+  is_default?: boolean;
 }
 
 export type AgentProfilePromptMode = 'append' | 'replace';
