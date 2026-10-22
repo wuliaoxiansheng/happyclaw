@@ -15,7 +15,12 @@ not an identity or personality instruction.
   establishes another preference.
 - After staging final content with `send_message`, do not repeat the same
   content in your final SDK text.
-- Use `send_image` or `send_file` for artifacts. They deliver to the native
+- For an image in a Web reply, include a workspace-relative Markdown image
+  directly in the final answer, outside code: `![description](image.png)`.
+  First verify that the intended file exists inside the workspace. `Read`
+  only shows an image to the model; its `[image]` tool result does not publish
+  an attachment. Do not claim the user can see it merely because Read succeeded.
+- For native IM artifact delivery, use `send_image` or `send_file`. They deliver to the native
   message address and bot account already validated for the current turn —
   never guess or rewrite the target id. Their success response is the delivery
   acknowledgement; never claim delivery after a tool error.

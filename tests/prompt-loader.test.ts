@@ -225,4 +225,35 @@ describe('rules that must survive prompt-variant splits', () => {
     // Task runs get no delivery contract — output.task.md carries the rule.
     expect(readPrompt('output.task.md')).toContain('不要猜测或改写目标 ID');
   });
+
+  test('every output variant separates image inspection from delivery', () => {
+    for (const name of [
+      'output.assistant.md',
+      'output.proactive.md',
+      'output.task.md',
+    ]) {
+      const body = readPrompt(name);
+      expect(body).toContain('`Read` 图片只让模型看到图片');
+      expect(body).toContain('`[image]`');
+      expect(body).toContain('先确认文件存在于当前工作区');
+      expect(body).toContain('不要自动公开工具读取的所有图片');
+      expect(body).toContain('不要放进代码块或行内代码');
+      expect(body).toContain('未验证浏览器渲染时');
+      expect(body).toContain('已过期时明确说明失效');
+      expect(body).toContain('重新发起登录仍需用户授权');
+      expect(body).toContain('`file://` 或 `sandbox:`');
+    }
+  });
+
+  test('images use the visible final carrier of each reply mode', () => {
+    expect(readPrompt('output.assistant.md')).toContain('在最终正文中直接写');
+    expect(readPrompt('output.proactive.md')).toContain(
+      '`send_message(delivery_role=final)` 正文',
+    );
+    expect(readPrompt('output.task.md')).toContain('最终 SDK Assistant 正文');
+    const delivery = readPrompt('delivery-contract.assistant.md');
+    expect(delivery).toContain('workspace-relative Markdown image');
+    expect(delivery).toContain('its `[image]` tool result does not publish');
+    expect(delivery).toContain('For native IM artifact delivery');
+  });
 });
