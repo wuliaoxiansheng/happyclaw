@@ -1219,7 +1219,7 @@ MESSAGING BEHAVIOR - The task output is sent to the user or group.
 
 SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
 \u2022 cron: Standard cron expression (e.g., "*/5 * * * *" for every 5 minutes, "0 9 * * *" for daily at 9am LOCAL time)
-\u2022 interval: Milliseconds between runs (e.g., "300000" for 5 minutes, "3600000" for 1 hour)
+\u2022 interval: Milliseconds between runs, minimum 60000 (e.g., "300000" for 5 minutes, "3600000" for 1 hour)
 \u2022 once: Local time WITHOUT "Z" suffix (e.g., "2026-02-01T15:30:00"). Do NOT use UTC/Z suffix.`,
       {
         prompt: z
@@ -1227,7 +1227,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           .optional()
           .default('')
           .describe(
-            'The action to perform on EACH run (agent mode), or task description (script mode). The repeat cadence is expressed by schedule_type/schedule_value — do NOT put scheduling words like "每隔N/每天/定期/提醒我/every N" into the prompt. This prompt is replayed verbatim to the agent on every trigger to execute, so write it as a direct imperative action, not as a request to schedule something.',
+            'The action to perform on EACH run (agent mode), or task description (script mode). Preserve the user\'s actual success and stop conditions: detecting a condition or notifying the user is not completion of the requested action. Do not silently replace execution with a notification. The repeat cadence is expressed by schedule_type/schedule_value — do NOT put scheduling words like "每隔N/每天/定期/提醒我/every N" into the prompt. This prompt is replayed verbatim to the agent on every trigger to execute, so write it as a direct imperative action, not as a request to schedule something.',
           ),
         schedule_type: z
           .enum(['cron', 'interval', 'once'])
@@ -1237,7 +1237,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
         schedule_value: z
           .string()
           .describe(
-            'cron: "*/5 * * * *" | interval: milliseconds like "300000" | once: local timestamp like "2026-02-01T15:30:00" (no Z suffix!)',
+            'cron: "*/5 * * * *" | interval: milliseconds, minimum "60000", e.g. "300000" | once: local timestamp like "2026-02-01T15:30:00" (no Z suffix!)',
           ),
         execution_type: z
           .enum(['agent', 'script'])
@@ -1688,7 +1688,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     // --- update_task ---
     tool(
       'update_task',
-      `Update an existing scheduled task IN PLACE. Strongly PREFER this over cancel_task + schedule_task when modifying an existing task: delete-then-recreate risks leaving a duplicate (if the delete silently fails) or losing the task entirely. Only the fields you pass are changed; omit a field to keep its current value.`,
+      `Update an existing scheduled task IN PLACE. Preserve the user's actual success and stop conditions; a notification is not proof that the requested action completed. Strongly PREFER this over cancel_task + schedule_task when modifying an existing task: delete-then-recreate risks leaving a duplicate (if the delete silently fails) or losing the task entirely. Only the fields you pass are changed; omit a field to keep its current value.`,
       {
         task_id: z.string().describe('The task ID to update'),
         expected_revision: z

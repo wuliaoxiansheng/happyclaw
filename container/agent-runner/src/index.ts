@@ -34,6 +34,7 @@ import {
 import { detectImageMimeTypeFromBase64Strict } from './image-detector.js';
 import { isClaudeAttachmentPassDisabled } from './claude-attachments.js';
 import { RUNNER_DISALLOWED_BUILTIN_TOOLS } from './builtin-tool-policy.js';
+import { createBrowserIntegrityGuard } from './browser-integrity.js';
 import { pluginLoadWarnings } from './sdk-init-audit.js';
 import { classifyPreInitErrorResult } from './startup-failure.js';
 import { pruneProcessedHistoryImagesInTranscript as pruneProcessedHistoryImagesInTranscriptFile } from './history-image-prune.js';
@@ -3015,6 +3016,10 @@ async function runQueryAttempt(
       },
       hooks: {
         PreToolUse: [
+          {
+            matcher: '^Bash$',
+            hooks: [createBrowserIntegrityGuard()],
+          },
           {
             matcher: WORKSPACE_MEMORY_WRITE_GUARD_MATCHER,
             hooks: [createWorkspaceMemoryWriteGuard()],
