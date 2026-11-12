@@ -1,3 +1,5 @@
+import type { AppearanceConfig } from '../stores/auth';
+
 const DEFAULT_AGENT_NAME = 'HappyClaw';
 
 export interface AgentDisplayIdentity {
@@ -14,9 +16,11 @@ export interface AgentIdentityOptions {
   avatarUrl?: string | null;
   avatarEmoji?: string | null;
   avatarColor?: string | null;
-  mainAvatarUrl?: string | null;
-  mainAvatarEmoji?: string | null;
-  mainAvatarColor?: string | null;
+  /** The user's global AI avatar, used when the Agent owns no avatar field. */
+  appearance?: Pick<
+    AppearanceConfig,
+    'aiAvatarUrl' | 'aiAvatarMode' | 'aiAvatarEmoji' | 'aiAvatarColor'
+  > | null;
 }
 
 /**
@@ -29,22 +33,21 @@ export function resolveAgentDisplayIdentity({
   avatarUrl,
   avatarEmoji,
   avatarColor,
-  mainAvatarUrl,
-  mainAvatarEmoji,
-  mainAvatarColor,
+  appearance,
 }: AgentIdentityOptions = {}): AgentDisplayIdentity {
   const name =
     agentName?.trim() || messageSenderName?.trim() || DEFAULT_AGENT_NAME;
   const hasProfileOverride = !!(avatarUrl || avatarEmoji || avatarColor);
+  const mainEmoji = appearance?.aiAvatarMode === 'emoji' ? appearance : null;
   const imageUrl = hasProfileOverride
     ? avatarUrl || undefined
-    : mainAvatarUrl || undefined;
+    : appearance?.aiAvatarUrl || undefined;
   const emoji = hasProfileOverride
     ? avatarEmoji || undefined
-    : mainAvatarEmoji || undefined;
+    : mainEmoji?.aiAvatarEmoji || undefined;
   const color = hasProfileOverride
     ? avatarColor || undefined
-    : mainAvatarColor || undefined;
+    : mainEmoji?.aiAvatarColor || undefined;
 
   return {
     name,

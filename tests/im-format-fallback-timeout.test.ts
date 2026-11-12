@@ -137,6 +137,8 @@ describe('Telegram HTML format fallback must not duplicate after timeout', () =>
         if (extra?.parse_mode === 'HTML') {
           throw grammyParseEntitiesError();
         }
+        // Like grammY, a successful send resolves with the sent Message.
+        return { message_id: physicalSends.length };
       },
     );
 

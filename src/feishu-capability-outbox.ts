@@ -71,7 +71,8 @@ export async function deliverFeishuCapabilityMutation(
   // passes the same request object to `execute`, so the uuid travels with it
   // without becoming part of the payload hash.
   if (
-    input.request.operation === 'send_card' &&
+    (input.request.operation === 'send_card' ||
+      input.request.operation === 'reply_text') &&
     input.request.providerUuid === undefined
   ) {
     input.request.providerUuid = feishuCapabilityUuid(idempotencyKey);

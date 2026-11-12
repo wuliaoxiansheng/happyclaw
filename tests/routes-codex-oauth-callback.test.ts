@@ -161,7 +161,20 @@ describe('POST /api/config/codex/oauth/callback', () => {
       codexOAuthNeedsReauth: false,
       codexOAuthLastRefreshError: null,
       codexDefaultEffort: 'low',
+      models: [],
     });
+    // There is no pool to join.
+    expect(provider).not.toHaveProperty('enabled');
+  });
+
+  test('a new login stays out of the legacy pool', async () => {
+    const state = await startFlow();
+    const response = await callback(state, callbackUrl(state));
+    expect(response.status).toBe(200);
+    const { id } = await response.json();
+    expect(runtimeConfig.readLegacyModelDefaults().enabledIds).not.toContain(
+      id,
+    );
   });
 
   test('an error= callback is explained and the flow stays usable', async () => {

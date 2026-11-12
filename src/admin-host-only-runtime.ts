@@ -6,7 +6,7 @@ import {
   setRouterState,
 } from './db.js';
 import {
-  getWorkspaceRuntimeJids,
+  collectWorkspaceRuntimeJids,
   type WorkspaceRuntimeQuiesceTarget,
 } from './agent-profile-runtime.js';
 import type { WebDeps } from './web-context.js';
@@ -124,19 +124,6 @@ export function listWorkspaceRuntimeTargetsForFolders(
   return Array.from(byFolder.values());
 }
 
-export function getRuntimeJidsForTargets(
-  deps: WebDeps,
-  targets: WorkspaceRuntimeQuiesceTarget[],
-): string[] {
-  return Array.from(
-    new Set(
-      targets.flatMap((target) =>
-        getWorkspaceRuntimeJids(deps, target.folder, target.primaryJid),
-      ),
-    ),
-  );
-}
-
 /** Rebuild the fail-closed queue gate after a process restart. */
 export function restorePendingAdminHostOnlyRuntimeSafetyBlocks(
   deps: WebDeps,
@@ -145,7 +132,7 @@ export function restorePendingAdminHostOnlyRuntimeSafetyBlocks(
   const pendingFolders = getPendingAdminHostOnlyCleanupFolders();
   if (pendingFolders.length === 0) return;
   const targets = listWorkspaceRuntimeTargetsForFolders(pendingFolders);
-  const runtimeJids = getRuntimeJidsForTargets(deps, targets);
+  const runtimeJids = collectWorkspaceRuntimeJids(deps, targets);
   if (runtimeJids.length === 0) return;
   deps.queue.blockGroupsForRuntimeSafety?.(
     runtimeJids,

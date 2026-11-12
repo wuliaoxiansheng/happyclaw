@@ -1,14 +1,23 @@
 import {
+  deleteSession,
   deleteWorkspaceSessions,
   getAllUsers,
+  getSession,
   listAgentProfilesForUser,
 } from './db.js';
 import {
+  collectWorkspaceRuntimeJids,
   getWorkspaceRuntimeJids,
   listWorkspaceGroupsForAgentProfile,
   quiesceWorkspaceRunnersAroundCommit,
+  WorkspaceRuntimeQuiesceError,
   type WorkspaceRuntimeQuiesceTarget,
 } from './agent-profile-runtime.js';
+import {
+  markFolderSessionsForHistoryReinjection,
+  markSessionForHistoryReinjection,
+} from './runtime-state-store.js';
+import { logger } from './logger.js';
 import { getWebDeps } from './web-context.js';
 
 export type CapabilityMutationImpact =
@@ -36,6 +45,30 @@ export class CapabilityRuntimeCommitError extends Error {
     );
     this.name = 'CapabilityRuntimeCommitError';
   }
+}
+
+/** Response body for a runtime-quiesce or uncertain-commit failure, else null. */
+export function capabilityRuntimeMutationFailure(
+  error: unknown,
+  action: string,
+) {
+  if (error instanceof WorkspaceRuntimeQuiesceError) {
+    return {
+      error: error.persisted
+        ? `${action} was saved, but runtime cleanup failed; retry the request`
+        : `Failed to stop affected workspaces; ${action} was not saved`,
+      persisted: error.persisted,
+      retryable: true,
+    };
+  }
+  if (error instanceof CapabilityRuntimeCommitError) {
+    return {
+      error: `${action} has an uncertain commit outcome; retry the request to finish fail-closed cleanup`,
+      persisted: 'unknown',
+      retryable: true,
+    };
+  }
+  return null;
 }
 
 function profileUsesCapability(
@@ -94,14 +127,45 @@ export function listCapabilityMutationRuntimeTargets(
   return Array.from(byFolder.values());
 }
 
+/** Intro of the history re-injected into a session reset by this module. */
+export const CAPABILITY_CHANGE_HISTORY_INTRO =
+  '检测到当前 workspace 可用的 Skill / MCP 已更新，底层模型 session 已重置以加载新的能力。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。';
+
+/**
+ * A capability change must start new SDK sessions, but the conversation
+ * itself goes on: each session that had one is marked so its next turn
+ * re-injects recent history, as an identity change does.
+ */
 function invalidateWorkspaceSessions(
   targets: WorkspaceRuntimeQuiesceTarget[],
 ): void {
-  const deps = getWebDeps();
   for (const target of targets) {
+    try {
+      markFolderSessionsForHistoryReinjection(target.folder);
+    } catch (err) {
+      // The hand-off is a courtesy; the reset itself must still happen.
+      logger.warn(
+        { err, folder: target.folder },
+        'Failed to record the history hand-off for reset sessions',
+      );
+    }
     deleteWorkspaceSessions(target.folder);
-    if (deps) delete deps.sessions[target.folder];
   }
+}
+
+/**
+ * A runner whose own tool call changed the capability set finished its turn
+ * on the old set and, while doing so, saved its SDK session again. Once it has
+ * closed, drop that session too so the next turn loads the new capabilities,
+ * with the same history hand-off as the other sessions.
+ */
+export function invalidateSessionAfterRunnerExit(
+  groupFolder: string,
+  agentId: string,
+): void {
+  if (!getSession(groupFolder, agentId)) return;
+  markSessionForHistoryReinjection(groupFolder, agentId);
+  deleteSession(groupFolder, agentId);
 }
 
 /**
@@ -129,13 +193,7 @@ export async function mutateCapabilityAroundRuntimeQuiesce<T>(
     return { value, invalidatedRuntimeJids: 0 };
   }
 
-  const knownRuntimeJids = Array.from(
-    new Set(
-      targets.flatMap((target) =>
-        getWorkspaceRuntimeJids(deps, target.folder, target.primaryJid),
-      ),
-    ),
-  );
+  const knownRuntimeJids = collectWorkspaceRuntimeJids(deps, targets);
   try {
     const result = await quiesceWorkspaceRunnersAroundCommit(
       deps,

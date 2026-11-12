@@ -14,24 +14,27 @@ const cookie = fs.readFileSync(cookieFile, 'utf8').trim();
 const nonce = `ACCEPT_${Date.now().toString(36)}`;
 const ownedWorkspaces = [];
 const workspaceFolders = new Map();
-const ownedTasks = [];
-const ownedRuns = [];
+const ownedAutomations = [];
 const cases = [];
 let profileId;
 let ws;
 let runPassed = false;
 const events = [];
 
-async function api(method, route, body) {
-  const response = await fetch(`${base}${route}`, {
+function request(method, route, body) {
+  return fetch(`${base}${route}`, {
     method,
     headers: { Cookie: cookie, 'Content-Type': 'application/json' },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(90_000),
   });
+}
+
+async function api(method, route, body) {
+  const response = await request(method, route, body);
   if (!response.ok)
     throw new Error(`${method} ${route}: HTTP ${response.status}`);
-  return response.json();
+  return response.status === 204 ? null : response.json();
 }
 
 async function waitUntil(predicate, timeoutMs = 180_000, pollMs = 200) {
@@ -43,16 +46,29 @@ async function waitUntil(predicate, timeoutMs = 180_000, pollMs = 200) {
   throw new Error('Acceptance condition timed out');
 }
 
+// Every workspace gets one session the cases address by default; a workspace
+// has no conversation of its own.
+const primarySessions = new Map();
+const sessionOf = (jid, agentId) => agentId ?? primarySessions.get(jid);
+const sessionJidOf = (jid, agentId) =>
+  `${jid}#agent:${sessionOf(jid, agentId)}`;
+
+// A session's run lifecycle and snapshots arrive under its own JID, the
+// rest under the workspace JID with its agentId.
 function scopedEvents(jid, agentId, after) {
+  agentId = sessionOf(jid, agentId);
+  const laneJid = `${jid}#agent:${agentId}`;
   return events
     .slice(after)
     .filter(
       (event) =>
-        event.chatJid === jid && (event.agentId || undefined) === agentId,
+        event.chatJid === laneJid ||
+        (event.chatJid === jid && (event.agentId || undefined) === agentId),
     );
 }
 
 async function turn(jid, prompt, marker, agentId) {
+  agentId = sessionOf(jid, agentId);
   const after = events.length;
   const started = Date.now();
   ws.send(
@@ -150,6 +166,12 @@ async function workspace(mode) {
   ownedWorkspaces.push(created.jid);
   workspaceFolders.set(created.jid, created.group.folder);
   assert.equal(created.group.execution_mode, mode);
+  const { session } = await api(
+    'POST',
+    `/api/groups/${encodeURIComponent(created.jid)}/sessions`,
+    { name: 'Acceptance primary' },
+  );
+  primarySessions.set(created.jid, session.id);
   return created.jid;
 }
 
@@ -186,7 +208,7 @@ function ledgerKey(record) {
   return JSON.stringify([record.eventId, record.model]);
 }
 
-async function ownedMainLedger(jid) {
+async function ownedSessionLedger(jid) {
   const folder = workspaceFolders.get(jid);
   assert(
     ownedWorkspaces.includes(jid) && typeof folder === 'string' && folder,
@@ -202,7 +224,7 @@ async function ownedMainLedger(jid) {
     for (let page = 1; page <= pageCount; page++) {
       const query = new URLSearchParams({
         groupFolder: folder,
-        agentId: '__main__',
+        agentId: sessionOf(jid),
         days: '2',
         pageSize: '500',
         page: String(page),
@@ -229,11 +251,11 @@ async function ownedMainLedger(jid) {
       for (const record of snapshot.records) {
         assert(
           record.groupFolder === folder &&
-            record.agentId === null &&
+            record.agentId === sessionOf(jid) &&
             typeof record.eventId === 'string' &&
             !!record.eventId &&
             typeof record.model === 'string',
-          'Ledger response escaped the owned main scope',
+          'Ledger response escaped the owned session scope',
         );
         const key = ledgerKey(record);
         if (records.has(key)) stable = false;
@@ -262,7 +284,7 @@ async function verifyBackgroundLedger(jid, final, before) {
   let matched = false;
   await waitUntil(
     async () => {
-      const after = await ownedMainLedger(jid);
+      const after = await ownedSessionLedger(jid);
       assert(
         [...before.keys()].every((key) => after.has(key)),
         'Owned ledger lost pre-existing records',
@@ -283,7 +305,7 @@ async function verifyBackgroundLedger(jid, final, before) {
       }
       const history = await api(
         'GET',
-        `/api/groups/${encodeURIComponent(jid)}/messages`,
+        `/api/groups/${encodeURIComponent(jid)}/messages?agentId=${encodeURIComponent(sessionOf(jid))}`,
       );
       const message = history.messages.find(
         (row) =>
@@ -345,7 +367,8 @@ async function run() {
   ws.on('message', (data) => {
     try {
       const event = JSON.parse(data.toString());
-      if (ownedWorkspaces.includes(event.chatJid)) events.push(event);
+      const workspaceJid = String(event.chatJid ?? '').split('#agent:')[0];
+      if (ownedWorkspaces.includes(workspaceJid)) events.push(event);
     } catch {
       /* ignore non-JSON heartbeats */
     }
@@ -402,6 +425,7 @@ async function run() {
       JSON.stringify({
         type: 'send_message',
         chatJid: jid,
+        agentId: sessionOf(jid),
         content:
           'Run Bash sleep 15 in the foreground. Wait until it finishes before replying.',
       }),
@@ -414,7 +438,7 @@ async function run() {
       ),
     );
     const sleepRunner = (await api('GET', '/api/status')).groups.find(
-      (group) => group.jid === jid,
+      (group) => group.jid === sessionJidOf(jid),
     );
     assert(
       sleepRunner?.queryInFlight && sleepRunner.queryId,
@@ -442,52 +466,71 @@ async function run() {
     );
     const interrupted = await api(
       'POST',
-      `/api/groups/${encodeURIComponent(jid)}/interrupt`,
+      `/api/groups/${encodeURIComponent(sessionJidOf(jid))}/interrupt`,
       {},
     );
     assert.equal(interrupted.interrupted, true);
     const followupOutcome = await followup;
     if (!followupOutcome.success) throw followupOutcome.error;
-    const taskMarker = `${nonce}_${mode}_SCHEDULED`;
-    const task = await api('POST', '/api/tasks', {
-      chat_jid: jid,
-      group_folder: workspaceFolders.get(jid),
-      schedule_type: 'interval',
-      schedule_value: '3600000',
-      context_mode: 'isolated',
-      execution_type: 'agent',
-      prompt: `Use a tool to write acceptance-scheduled.txt containing exactly ${taskMarker}, then reply exactly ${taskMarker}.`,
+    // Automation lifecycle: a manual automation bound to the primary session.
+    const automationMarker = `${nonce}_${mode}_AUTOMATION`;
+    const { automation } = await api('POST', '/api/automations', {
+      workspaceJid: jid,
+      name: `${nonce} ${mode} automation`,
+      prompt: `Use a tool to write acceptance-automation.txt containing exactly ${automationMarker}, then reply exactly ${automationMarker}.`,
+      schedule: { kind: 'manual' },
+      sessionMode: 'bound',
+      targetSessionJid: sessionJidOf(jid),
     });
-    ownedTasks.push(task.taskId);
-    const run = await api(
-      'POST',
-      `/api/tasks/${encodeURIComponent(task.taskId)}/runs`,
-      { idempotency_key: nonce },
-    );
-    ownedRuns.push(run.runId);
+    ownedAutomations.push(automation.id);
+    const automationRoute = `/api/automations/${encodeURIComponent(automation.id)}`;
+    const { run } = await api('POST', `${automationRoute}/run`, {});
     await waitUntil(
       async () => {
-        const current = (
-          await api('GET', `/api/tasks/runs/${encodeURIComponent(run.runId)}`)
-        ).run;
-        if (['failed', 'cancelled', 'missed'].includes(current.status))
-          throw new Error(`Acceptance task status: ${current.status}`);
-        if (!['success', 'delivered'].includes(current.status)) return false;
+        const current = (await api('GET', automationRoute)).runs.find(
+          (item) => item.id === run.id,
+        );
+        if (!current) return false;
+        if (
+          ['failed', 'skipped', 'cancelled', 'interrupted', 'missed'].includes(
+            current.status,
+          )
+        )
+          throw new Error(
+            `Acceptance automation run status: ${current.status}`,
+          );
+        if (current.status !== 'success') return false;
+        assert.equal(
+          current.sessionJid,
+          sessionJidOf(jid),
+          'Automation run did not reach its bound session',
+        );
         assert(
-          current.result?.includes(taskMarker),
-          'Scheduled model result is missing its marker',
+          current.resultText?.includes(automationMarker),
+          'Automation run result is missing its marker',
         );
         return true;
       },
       180_000,
       2000,
     );
-    await verifyFile(jid, 'acceptance-scheduled.txt', taskMarker);
-    cases.push({ marker: taskMarker, passed: true, scheduler: true });
+    await verifyFile(jid, 'acceptance-automation.txt', automationMarker);
+    const paused = await api('POST', `${automationRoute}/pause`, {});
+    assert.equal(paused.automation.status, 'paused');
+    const resumed = await api('POST', `${automationRoute}/resume`, {});
+    assert.equal(resumed.automation.status, 'active');
+    await api('DELETE', `${automationRoute}?sessions=keep`);
+    ownedAutomations.splice(ownedAutomations.indexOf(automation.id), 1);
+    const deleted = await request('GET', automationRoute);
+    assert.equal(deleted.status, 404, 'Deleted automation is still visible');
+    cases.push({ marker: automationMarker, passed: true, automation: true });
   }
+  // The retired scheduled-task API answers 410 instead of serving old clients.
+  assert.equal((await request('GET', '/api/tasks')).status, 410);
+  cases.push({ marker: `${nonce}_LEGACY_TASKS_GONE`, passed: true });
   const host = ownedWorkspaces[0];
   const bg = `${nonce}_BACKGROUND_DONE`;
-  const backgroundLedgerBefore = await ownedMainLedger(host);
+  const backgroundLedgerBefore = await ownedSessionLedger(host);
   const backgroundAfter = events.length;
   await turn(
     host,
@@ -582,54 +625,16 @@ try {
 } finally {
   ws?.close();
   let cleanupFailed = false;
-  for (const runId of ownedRuns) {
+  for (const automationId of ownedAutomations) {
     try {
-      const current = (
-        await api('GET', `/api/tasks/runs/${encodeURIComponent(runId)}`)
-      ).run;
-      if (['queued', 'running', 'retry_wait'].includes(current.status)) {
-        await api(
-          'POST',
-          `/api/tasks/runs/${encodeURIComponent(runId)}/cancel`,
-          {},
-        );
-        await waitUntil(async () => {
-          const run = (
-            await api('GET', `/api/tasks/runs/${encodeURIComponent(runId)}`)
-          ).run;
-          return !['queued', 'running', 'retry_wait'].includes(run.status);
-        }, 30_000);
-      }
-    } catch {
-      cleanupFailed = true;
-      console.error('Acceptance run cleanup failed');
-    }
-  }
-  for (const taskId of ownedTasks) {
-    try {
-      let task;
-      // Cancellation becomes durable before the process finishes stopping.
-      // Wait for the scheduler's process ownership to clear before deletion.
-      await waitUntil(
-        async () => {
-          const state = await api('GET', '/api/tasks');
-          task = state.tasks.find((item) => item.id === taskId);
-          return !state.runningTaskIds.includes(taskId);
-        },
-        60_000,
-        1000,
-      );
-      assert(task, 'Acceptance task is missing');
-      const deleted = await api(
+      // Deleting an automation cancels its queued and running runs.
+      await api(
         'DELETE',
-        `/api/tasks/${encodeURIComponent(taskId)}?expected_revision=${task.revision}`,
+        `/api/automations/${encodeURIComponent(automationId)}?sessions=keep`,
       );
-      await api('POST', '/api/tasks/purge', {
-        tasks: [{ id: taskId, expected_revision: deleted.task.revision }],
-      });
     } catch {
       cleanupFailed = true;
-      console.error('Acceptance task cleanup failed');
+      console.error('Acceptance automation cleanup failed');
     }
   }
   for (const jid of ownedWorkspaces.reverse()) {

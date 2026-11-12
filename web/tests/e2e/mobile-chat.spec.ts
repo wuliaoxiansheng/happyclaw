@@ -109,10 +109,31 @@ async function clickFile(sheet: Locator, fileName: string) {
 }
 
 async function wheelInside(page: Page, scrollPane: Locator, deltaY: number) {
+  if (page.context().browser()?.browserType().name() === 'webkit') {
+    // Mobile WebKit has no wheel, and a synthetic finger does not scroll:
+    // scroll the pane itself, which is what the scroll listeners see.
+    await scrollPane.evaluate((element, top) => {
+      element.scrollBy({ top, behavior: 'instant' });
+    }, deltaY);
+    return;
+  }
   const box = await scrollPane.boundingBox();
   if (!box) throw new Error('Expected scroll pane to have a bounding box');
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   await page.mouse.wheel(0, deltaY);
+}
+
+/**
+ * Opens a file row the way a keyboard does where a tap does not focus a
+ * button (WebKit, like iOS Safari), so there is a focus to return to.
+ */
+async function openRow(row: Locator, browserName: string) {
+  if (browserName === 'webkit') {
+    await row.focus();
+    await row.press('Enter');
+  } else {
+    await row.click();
+  }
 }
 
 test('idle scroll affordance is scoped and context nav follows scroll direction', async ({
@@ -167,6 +188,23 @@ test('idle scroll affordance is scoped and context nav follows scroll direction'
     'data-state',
     'open',
   );
+});
+
+test.describe('on a short phone', () => {
+  // An iPhone 14 in Safari; the half detent would leave the file list 0px.
+  test.use({ viewport: { width: 390, height: 664 } });
+
+  test('the context sheet opens full, so the file list shows', async ({
+    page,
+  }) => {
+    await prepareHarness(page);
+    const sheet = await openContextSheet(page);
+    expect((await sheet.boundingBox())!.height).toBe(664 - 64);
+    const list = sheet.getByTestId('file-list-scroll');
+    expect(
+      await list.evaluate((element) => element.clientHeight),
+    ).toBeGreaterThan(100);
+  });
 });
 
 test('markdown preview keeps focus and scroll inside nested modal layers', async ({
@@ -229,7 +267,12 @@ test('markdown preview keeps focus and scroll inside nested modal layers', async
 
 test('PDF bridge binds only after load and closes from the embedded window', async ({
   page,
+  browserName,
 }) => {
+  test.skip(
+    browserName === 'webkit',
+    'Playwright WebKit never loads a PDF in an iframe (no load event)',
+  );
   const { pdfRequestStarted, releasePdfResponse } = await prepareHarness(page, {
     deferPdfResponse: true,
   });
@@ -268,12 +311,13 @@ test('PDF bridge binds only after load and closes from the embedded window', asy
 
 test('direct image preview opens, traps focus, and restores it on Escape', async ({
   page,
+  browserName,
 }) => {
   await prepareHarness(page);
   const sheet = await openContextSheet(page);
   const returnTarget = sheet.getByRole('button', { name: /sample\.png/ });
   await returnTarget.scrollIntoViewIfNeeded();
-  await returnTarget.click();
+  await openRow(returnTarget, browserName);
 
   const preview = page.getByRole('dialog', { name: 'sample.png' });
   await expect(preview).toBeVisible();
@@ -378,3 +422,89 @@ for (const visibility of [
     else await expect(terminal).toHaveCount(0);
   });
 }
+
+test('the phone header’s ⋯ sheet says how full the context is; its buttons take 44px taps', async ({
+  page,
+}) => {
+  await page.route('**/api/groups/**/context-usage*', (route) =>
+    route.fulfill({
+      json: { usedTokens: 12_000, contextWindow: 200_000, percentage: 6 },
+    }),
+  );
+  await page.route('**/api/groups/**/model-selection*', (route) =>
+    route.fulfill({
+      json: {
+        selectedModelConfigId: null,
+        selectedModel: null,
+        selectedEffort: null,
+        default: { source: 'none', modelConfigId: null },
+        options: [
+          {
+            id: 'official',
+            name: 'Claude 官方',
+            kind: 'official',
+            model: 'opus',
+            usable: true,
+          },
+        ],
+      },
+    }),
+  );
+  await prepareHarness(page);
+  // The 40px capsule buttons take taps 22px out from their centre, except
+  // where the other button's face is.
+  const header = page.locator('[data-hc-chat-view] header').first();
+  const files = header.getByRole('button', { name: '展开上下文面板' });
+  const more = header.getByRole('button', { name: '更多选项' });
+  const hits = await page.evaluate(
+    ([filesLabel, moreLabel]) => {
+      const button = (label: string) =>
+        document.querySelector<HTMLElement>(
+          `[data-hc-chat-view] header button[aria-label="${label}"]`,
+        )!;
+      const hit = (x: number, y: number) =>
+        document.elementFromPoint(x, y)?.closest('button')?.ariaLabel;
+      return [filesLabel, moreLabel].map((label) => {
+        const box = button(label).getBoundingClientRect();
+        const cx = box.x + box.width / 2;
+        const cy = box.y + box.height / 2;
+        return {
+          up: hit(cx, cy - 21.5),
+          down: hit(cx, cy + 21.5),
+          left: hit(cx - 21.5, cy),
+          right: hit(cx + 21.5, cy),
+        };
+      });
+    },
+    ['展开上下文面板', '更多选项'],
+  );
+  expect(hits).toEqual([
+    {
+      up: '展开上下文面板',
+      down: '展开上下文面板',
+      left: '展开上下文面板',
+      // The neighbouring ⋯ starts right there.
+      right: '更多选项',
+    },
+    {
+      up: '更多选项',
+      down: '更多选项',
+      left: '展开上下文面板',
+      right: '更多选项',
+    },
+  ]);
+  await expect(files).toBeVisible();
+
+  await header.getByRole('button', { name: '更多选项' }).click();
+  const sheet = page.getByRole('dialog', { name: '更多选项' });
+  await expect(sheet.getByRole('button', { name: '切换模型' })).toBeVisible();
+  await settleAnimations(sheet);
+  // The usage row opens the model sheet, which shows the same figures.
+  await sheet
+    .getByRole('button', { name: '上下文 已用 12K / 200K（6%）' })
+    .click();
+  await expect(sheet).toHaveCount(0);
+  await expect(page.locator('[data-context-usage-line]')).toHaveText(
+    '上下文 已用 12K / 200K（6%）',
+  );
+});

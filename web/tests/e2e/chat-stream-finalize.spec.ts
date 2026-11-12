@@ -7,6 +7,9 @@ import { expect, test, type Page } from '@playwright/test';
 const HARNESS_PATH = '/tests/e2e/chat-scroll-harness.html';
 const JID = 'web:e2e-scroll';
 const OTHER_JID = 'web:e2e-scroll-other';
+/** The harness workspace's session, which streams. */
+const SESSION = 'scroll-session';
+const SESSION_JID = `${JID}#agent:${SESSION}`;
 
 declare global {
   interface Window {
@@ -68,9 +71,14 @@ async function streamEvent(
   chatJid = JID,
 ) {
   await page.evaluate(
-    ({ runId, event, chatJid }) =>
-      window.__chatScroll.wsEmit('stream_event', { chatJid, runId, event }),
-    { runId, event, chatJid },
+    ({ runId, event, chatJid, agentId }) =>
+      window.__chatScroll.wsEmit('stream_event', {
+        chatJid,
+        agentId,
+        runId,
+        event,
+      }),
+    { runId, event, chatJid, agentId: SESSION },
   );
 }
 
@@ -218,30 +226,43 @@ async function endRun(page: Page, runId: string) {
   });
 }
 
+/**
+ * The final reply of `runId`'s turn-1, as a new_message frame. The page stamps
+ * it (`emitFinal`): its clock is the one the history was written by.
+ */
+function finalFrame(runId: string) {
+  return {
+    chatJid: JID,
+    agentId: SESSION,
+    message: {
+      id: `final-${runId}`,
+      chat_jid: SESSION_JID,
+      sender: 'happyclaw-agent',
+      sender_name: '测试智能体',
+      content: REPLY,
+      is_from_me: true,
+      source_kind: 'sdk_final',
+      finalization_reason: 'completed',
+      turn_id: 'turn-1',
+    },
+  };
+}
+
 /** run_finished, then the final message 60ms later, as the server sends them. */
 async function finishLikeServer(page: Page, runId: string) {
   await page.evaluate(
-    ({ runId, chatJid, content }) => {
+    ({ runId, frame }) => {
       window.__chatScroll.runFinished(runId);
-      window.setTimeout(() => {
-        window.__chatScroll.wsEmit('new_message', {
-          chatJid,
-          message: {
-            id: `final-${runId}`,
-            chat_jid: chatJid,
-            sender: 'happyclaw-agent',
-            sender_name: '测试智能体',
-            content,
-            timestamp: new Date().toISOString(),
-            is_from_me: true,
-            source_kind: 'sdk_final',
-            finalization_reason: 'completed',
-            turn_id: 'turn-1',
-          },
-        });
-      }, 60);
+      window.setTimeout(
+        () =>
+          window.__chatScroll.wsEmit('new_message', {
+            ...frame,
+            message: { ...frame.message, timestamp: new Date().toISOString() },
+          }),
+        60,
+      );
     },
-    { runId, chatJid: JID, content: REPLY },
+    { runId, frame: finalFrame(runId) },
   );
   await page.waitForTimeout(1200);
   return page.evaluate(() => {
@@ -278,9 +299,53 @@ test('a pinned reader sees the reply swap to its final with no blank frame or ro
     .locator('[data-index]')
     .filter({ hasText: 'Paragraph 59:' });
   await expect(
-    reply.locator('[data-hc-process-card][data-mode="settled"]'),
-  ).toContainText(/1 个工具.*1 段思考/);
+    reply.locator('[data-hc-process-card][data-mode="settled"] > button'),
+  ).toHaveText(/^已工作 \d+s$/);
   await expect(reply.getByRole('button', { name: /执行详情/ })).toHaveCount(0);
+});
+
+test('a final that lands while the run still closes takes the card away at once', async ({
+  page,
+}) => {
+  await openHarness(page);
+  await streamTimelineReply(page, 'run-closing');
+  const stop = page.getByRole('button', { name: '停止当前运行' });
+  await expect(stop).toBeVisible();
+  await startSampling(page, 'Paragraph 59:');
+
+  // The final first, while the run is still closing.
+  await page.evaluate(
+    (frame) =>
+      window.__chatScroll.wsEmit('new_message', {
+        ...frame,
+        message: { ...frame.message, timestamp: new Date().toISOString() },
+      }),
+    finalFrame('run-closing'),
+  );
+  await page.waitForTimeout(800);
+
+  // Nothing of the card is left, not even a "preparing" row, while the run
+  // is still there to stop.
+  const block = page.locator('[data-hc-streaming-block]');
+  await expect(block).toHaveText('');
+  await expect(stop).toBeVisible();
+  const reply = page
+    .locator('[data-index]')
+    .filter({ hasText: 'Paragraph 59:' });
+  await expect(
+    reply.locator('[data-hc-process-card][data-mode="settled"] > button'),
+  ).toHaveText(/^已工作 \d+s$/);
+
+  // run_finished brings nothing back.
+  const frames = await endRun(page, 'run-closing');
+  await expect(block).toHaveText('');
+  await expect(stop).toHaveCount(0);
+
+  expect(frames.at(-1)?.final).toBe(true);
+  expect(frames.filter((f) => !f.whole)).toEqual([]);
+  // A pinned reader stays at the end through the swap.
+  expect(Math.max(...frames.map((f) => f.gap))).toBeLessThan(30);
+  await expect(page.getByRole('button', { name: /^回到底部/ })).toHaveCount(0);
 });
 
 test('a reader scrolled into the reply keeps their place through the finish', async ({
@@ -326,7 +391,7 @@ test('a reader scrolled into the reply keeps their place through the finish', as
 // size; Safari does not. Both are run, the second with that turned off, so the
 // card has to keep the place on its own.
 for (const anchoring of ['native', 'none'] as const) {
-  test(`a reader scrolled into the reply keeps their place when the card folds at the end of the run (scroll anchoring: ${anchoring})`, async ({
+  test(`a reader scrolled into the reply keeps their place at the end of the run (scroll anchoring: ${anchoring})`, async ({
     page,
   }) => {
     await openHarness(page);
@@ -358,16 +423,20 @@ async function readerFolds(page: Page) {
   });
   await page.waitForTimeout(400);
   const card = page.locator('[data-hc-process-card]');
+  // The process folded when the answer started: the end has nothing to fold.
   await expect(card).toHaveAttribute('data-mode', 'live');
+  await expect(card).toHaveAttribute('data-folded', '');
   const liveHeight = (await card.boundingBox())!.height;
   expect((await metrics(page)).gap).toBeGreaterThan(500);
 
   await startSampling(page, 'Paragraph 5:');
   const frames = await endRun(page, 'run-fold');
 
-  // The card folded, by more than the text moved: not at all.
+  // The card settled at its height, and the text did not move.
   await expect(card).toHaveAttribute('data-mode', 'settled');
-  expect((await card.boundingBox())!.height).toBeLessThan(liveHeight - 20);
+  expect(
+    Math.abs((await card.boundingBox())!.height - liveHeight),
+  ).toBeLessThan(1);
   expect(frames.filter((f) => !f.whole)).toEqual([]);
   const ys = frames.map((f) => f.anchorY);
   expect(ys.every((y) => y !== null)).toBe(true);
@@ -376,20 +445,71 @@ async function readerFolds(page: Page) {
   ).toBeLessThan(3);
 }
 
-test('a pinned reader stays at the end, and the answer stays put, when the card folds', async ({
+test('a pinned reader stays at the end, and the answer stays put, as the card folds when the answer starts', async ({
+  page,
+}) => {
+  await openHarness(page);
+  await page.evaluate(() => window.__chatScroll.runStarted('run-fold-start'));
+  const turn = { turnId: 'turn-fold-start' };
+  for (const [id, name, summary] of [
+    ['tool-a', 'Read', 'README.md'],
+    ['tool-b', 'Bash', 'npm test'],
+    ['tool-c', 'Grep', 'useChatStore'],
+  ]) {
+    await streamEvent(page, 'run-fold-start', {
+      eventType: 'tool_use_start',
+      toolName: name,
+      toolUseId: id,
+      toolInputSummary: summary,
+      ...turn,
+    });
+    await streamEvent(page, 'run-fold-start', {
+      eventType: 'tool_result',
+      toolUseId: id,
+      toolResult: 'ok',
+      ...turn,
+    });
+  }
+  const card = page.locator('[data-hc-process-card]');
+  await expect(card.getByRole('listitem')).toHaveCount(3);
+  const workingHeight = (await card.boundingBox())!.height;
+  await page.waitForTimeout(400);
+  expect((await metrics(page)).gap).toBeLessThan(24);
+
+  const chunks = REPLY.match(/[\s\S]{1,400}/g) ?? [];
+  for (const text of chunks.slice(0, 3)) {
+    await streamEvent(page, 'run-fold-start', {
+      eventType: 'text_delta',
+      text,
+      ...turn,
+    });
+  }
+  await page.waitForTimeout(800);
+
+  await expect(card).toHaveAttribute('data-folded', '');
+  expect((await card.boundingBox())!.height).toBeLessThan(workingHeight - 20);
+  // The fold above the answer never pulled the reader off the end.
+  expect((await metrics(page)).gap).toBeLessThan(24);
+  await expect(page.getByRole('button', { name: /^回到底部/ })).toHaveCount(0);
+});
+
+test('a pinned reader stays at the end, and the answer stays put, at the end of the run', async ({
   page,
 }) => {
   await openHarness(page);
   await streamReply(page, 'run-fold-pinned');
   const card = page.locator('[data-hc-process-card]');
   await expect(card).toHaveAttribute('data-mode', 'live');
+  await expect(card).toHaveAttribute('data-folded', '');
   const liveHeight = (await card.boundingBox())!.height;
 
   await startSampling(page, 'Paragraph 59:');
   const frames = await endRun(page, 'run-fold-pinned');
 
   await expect(card).toHaveAttribute('data-mode', 'settled');
-  expect((await card.boundingBox())!.height).toBeLessThan(liveHeight - 20);
+  expect(
+    Math.abs((await card.boundingBox())!.height - liveHeight),
+  ).toBeLessThan(1);
   expect(Math.max(...frames.map((f) => f.gap))).toBeLessThan(30);
   const ys = frames.map((f) => f.anchorY);
   expect(ys.every((y) => y !== null)).toBe(true);
@@ -447,8 +567,8 @@ test("the next queued run streams next to the previous reply until that reply's 
     .locator('[data-message-id="final-run-a"]')
     .filter({ hasText: 'Paragraph 59:' });
   await expect(
-    reply.locator('[data-hc-process-card][data-mode="settled"]'),
-  ).toContainText(/1 个工具.*1 段思考/);
+    reply.locator('[data-hc-process-card][data-mode="settled"] > button'),
+  ).toHaveText(/^已工作 \d+s$/);
 });
 
 test('a reconnect snapshot never cuts the reply this tab already shows', async ({
@@ -480,7 +600,7 @@ test('a reconnect snapshot never cuts the reply this tab already shows', async (
           turnId: 'turn-1',
         },
       }),
-    { chatJid: JID, tail: opening.slice(-4000) },
+    { chatJid: SESSION_JID, tail: opening.slice(-4000) },
   );
   await page.waitForTimeout(300);
   await expect(block.getByText(/^Kubernetes 调度入门/)).toBeVisible();
@@ -499,7 +619,7 @@ test('a reconnect snapshot never cuts the reply this tab already shows', async (
           turnId: 'turn-1',
         },
       }),
-    { chatJid: JID, full: `${opening}\n\n断线期间的新段落。` },
+    { chatJid: SESSION_JID, full: `${opening}\n\n断线期间的新段落。` },
   );
   await expect(block.getByText('断线期间的新段落。')).toBeVisible();
   await expect(block.getByText(/^Kubernetes 调度入门/)).toBeVisible();
@@ -547,7 +667,7 @@ test('a returned tool stops claiming to run and the status moves on', async ({
 }) => {
   await openHarness(page);
   await page.evaluate(() => window.__chatScroll.runStarted('run-tools'));
-  const block = page.locator('[data-hc-streaming-block]');
+  const phase = page.locator('[data-hc-run-status-bar] [data-hc-run-phase]');
 
   await streamEvent(page, 'run-tools', {
     eventType: 'tool_use_start',
@@ -555,15 +675,14 @@ test('a returned tool stops claiming to run and the status moves on', async ({
     toolUseId: 'tool-glob',
     toolInputSummary: '**/*.md',
   });
-  await expect(block.getByText('正在查找文件', { exact: true })).toBeVisible();
+  await expect(phase).toHaveText('查找文件');
 
   await streamEvent(page, 'run-tools', {
     eventType: 'tool_result',
     toolUseId: 'tool-glob',
     toolResult: 'README.md',
   });
-  await expect(block.getByText('正在思考', { exact: true })).toBeVisible();
-  await expect(block.getByText('正在查找文件', { exact: true })).toHaveCount(0);
+  await expect(phase).toHaveText('思考中');
 
   await streamEvent(page, 'run-tools', {
     eventType: 'tool_use_start',
@@ -571,13 +690,13 @@ test('a returned tool stops claiming to run and the status moves on', async ({
     toolUseId: 'tool-bash',
     toolInputSummary: 'ls',
   });
-  await expect(block.getByText('正在运行命令', { exact: true })).toBeVisible();
+  await expect(phase).toHaveText('运行命令');
   // The runner now ends it on its result too; the card goes either way.
   await streamEvent(page, 'run-tools', {
     eventType: 'tool_use_end',
     toolUseId: 'tool-bash',
   });
-  await expect(block.getByText('正在思考', { exact: true })).toBeVisible();
+  await expect(phase).toHaveText('思考中');
 });
 
 test('a timeline of steps folds into the finished message and the answer does not move', async ({
@@ -587,7 +706,14 @@ test('a timeline of steps folds into the finished message and the answer does no
   await streamTimelineReply(page, 'run-timeline');
   expect((await metrics(page)).gap).toBeLessThan(24);
 
-  // While it runs, the steps are rows in order and the answer is below them.
+  // While the answer streams the steps are folded into how long they took;
+  // opened, they are rows in order, and the answer is below them.
+  const live = page.locator('[data-hc-streaming-block] [data-hc-process-card]');
+  await expect(live).toHaveAttribute('data-folded', '');
+  const header = live.getByRole('button', { name: /^已工作 \d+s$/ });
+  await expect(header).toHaveAttribute('aria-expanded', 'false');
+  // Clicked where it is: a locator click would first scroll it into view.
+  await header.evaluate((el) => (el as HTMLElement).click());
   const timeline = page.getByRole('list', { name: '处理步骤' });
   await expect(timeline.getByRole('listitem')).toHaveCount(4);
   await expect(
@@ -597,14 +723,18 @@ test('a timeline of steps folds into the finished message and the answer does no
     timeline.getByRole('button', { name: /整理结论.*1\.8s/ }),
   ).toBeVisible();
 
+  // Opening them above the answer keeps a pinned reader at the end.
+  await page.waitForTimeout(400);
+  expect((await metrics(page)).gap).toBeLessThan(24);
+
   await startSampling(page, 'Paragraph 59:');
   const frames = await finishLikeServer(page, 'run-timeline');
 
   expect(frames.at(-1)?.final).toBe(true);
   expect(frames.filter((f) => !f.whole)).toEqual([]);
   expect(Math.max(...frames.map((f) => f.gap))).toBeLessThan(30);
-  // The live card folds to its summary row when the run ends and the final
-  // message shows the same row: the answer does not move.
+  // The final message's card is as the reader left the live one, open on
+  // the same steps: the answer does not move.
   const ys = frames.map((f) => f.anchorY);
   expect(ys.every((y) => y !== null)).toBe(true);
   expect(
@@ -612,19 +742,22 @@ test('a timeline of steps folds into the finished message and the answer does no
   ).toBeLessThan(3);
   await expect(page.getByRole('button', { name: /^回到底部/ })).toHaveCount(0);
 
-  // The final message folds the steps into the one summary row the settled
-  // card had: reasoning (both blocks) and tools, in order behind it.
+  // The final message keeps the steps behind the same one summary row:
+  // reasoning (both blocks) and tools, in order, open as the reader left them.
   const reply = page
     .locator('[data-index]')
     .filter({ hasText: 'Paragraph 59:' });
   const card = reply.locator('[data-hc-process-card]');
   await expect(card).toHaveAttribute('data-mode', 'settled');
-  await expect(card).toContainText(/已处理.*2 个工具.*2 段思考/);
+  await expect(card.locator('> button')).toHaveText(/^已工作 \d+s$/);
+  await expect(card.locator('> button')).toHaveAttribute(
+    'aria-expanded',
+    'true',
+  );
+  await expect(card.locator('[data-hc-work-counts]')).toHaveText(
+    '2 个工具 · 2 段思考',
+  );
   await expect(reply.getByRole('button', { name: /执行详情/ })).toHaveCount(0);
-  await expect(page.getByRole('list', { name: '处理步骤' })).toHaveCount(0);
-
-  // Opened, it lists the same steps in the same order as it did while streaming.
-  await card.getByRole('button', { name: /已处理/ }).click();
   const settled = reply.getByRole('list', { name: '处理步骤' });
   await expect(settled.getByRole('listitem')).toHaveCount(4);
   await expect(

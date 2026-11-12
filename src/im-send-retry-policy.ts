@@ -1,4 +1,5 @@
 import { isFeishuCardContentRejection } from './channel-delivery-failure.js';
+import { isFeishuChatGoneError } from './feishu-errors.js';
 
 export interface ImSendFailurePolicy {
   retryable: boolean;
@@ -83,7 +84,7 @@ function errorChainHasCode(error: unknown, expectedCode: string): boolean {
   return false;
 }
 
-function errorChain(error: unknown): Array<Record<string, unknown>> {
+export function errorChain(error: unknown): Array<Record<string, unknown>> {
   const chain: Array<Record<string, unknown>> = [];
   let current = error;
   const seen = new Set<unknown>();
@@ -215,23 +216,22 @@ export function classifyImSendFailure(error: unknown): ImSendFailureOutcome {
 }
 
 /**
- * Decide whether repeating a failed IM send can make progress. Delivery-stage
- * evidence alone must never revoke a persisted chat authorization or binding.
+ * Decide whether repeating a failed IM send can make progress and whether the
+ * failure is evidence that the concrete chat binding is unhealthy.
+ *
+ * Only the platform's own refusal saying the chat is gone for this bot counts
+ * toward removing the binding (which deletes its data); today that is a
+ * rejected send with a Feishu chat-gone code anywhere in the error chain. A pre-acceptance failure
+ * (DNS, a refused connection, no connected channel) never reached the
+ * platform: it is worth retrying, but says nothing about the chat.
  */
 export function imSendFailurePolicy(error: unknown): ImSendFailurePolicy {
   const outcome = classifyImSendFailure(error);
-  if (outcome !== 'pre_accept') {
-    return {
-      retryable: false,
-      countsTowardChannelRemoval: false,
-      outcome,
-    };
-  }
   return {
-    retryable: true,
-    // No request reached the provider, so offline/DNS/proxy/local failures
-    // cannot establish that the remote chat or its pairing is invalid.
-    countsTowardChannelRemoval: false,
+    retryable: outcome === 'pre_accept',
+    countsTowardChannelRemoval:
+      outcome === 'rejected' &&
+      errorChain(error).some((item) => isFeishuChatGoneError(item)),
     outcome,
   };
 }

@@ -14,6 +14,14 @@ export const lazyCreateContainerDialog = preloadedComponent(
   Nothing,
 );
 
+export const lazyImBindingDialog = preloadedComponent(
+  () =>
+    import('../chat/ImBindingDialog').then((m) => ({
+      default: m.ImBindingDialog,
+    })),
+  Nothing,
+);
+
 export const lazyBugReportDialog = preloadedComponent(
   () =>
     import('./BugReportDialog').then((m) => ({ default: m.BugReportDialog })),

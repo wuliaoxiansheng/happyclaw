@@ -41,7 +41,7 @@ const BOTTOM = 26;
 const PLOT_HEIGHT = HEIGHT - TOP - BOTTOM;
 const GRID_STEPS = 4;
 
-function formatCost(value: number): string {
+export function formatCost(value: number): string {
   if (value >= 1) return `$${value.toFixed(2)}`;
   if (value >= 0.01) return `$${value.toFixed(3)}`;
   if (value > 0) return `$${value.toFixed(4)}`;

@@ -69,9 +69,11 @@ describe('stale routes are rejected before connector side effects', () => {
     expect(routeResolve).toBeGreaterThan(-1);
     expect(slashCheck).toBeLessThan(routeResolve);
 
+    // Persistence goes through persistTelegramInbound (store, queue offer,
+    // projection), which every handler calls after its route is resolved.
     expectRouteBeforeSideEffects(body, 'const resolvedRoute =', [
       'opts.onNewChat(jid, chatName)',
-      'storeMessageDirect(',
+      'persistTelegramInbound(opts, {',
     ]);
   });
 });

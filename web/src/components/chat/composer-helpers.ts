@@ -3,6 +3,29 @@
  * so the send/queue rules can be unit-tested without rendering it.
  */
 
+/** The server rejects longer message bodies (src/schemas.ts). */
+export const MAX_MESSAGE_CHARS = 64 * 1024;
+
+const UPLOADED_FILES_HEADER = '[我上传了以下文件到工作区，请查看并使用]';
+
+/** A message announcing files uploaded to the workspace ahead of its text. */
+export function withUploadedFiles(
+  text: string,
+  paths: readonly string[],
+): string {
+  if (paths.length === 0) return text;
+  const list = paths.map((path) => `- ${path}`).join('\n');
+  const prefix = `${UPLOADED_FILES_HEADER}\n${list}`;
+  return text ? `${prefix}\n\n${text}` : prefix;
+}
+
+/** The user's own text of a message built by `withUploadedFiles`. */
+export function withoutUploadedFiles(content: string): string {
+  if (!content.startsWith(`${UPLOADED_FILES_HEADER}\n`)) return content;
+  const gap = content.indexOf('\n\n');
+  return gap < 0 ? '' : content.slice(gap + 2);
+}
+
 /**
  * What the composer should hold after a send succeeded. The textarea stays
  * editable while the request is in flight, so anything typed after the send

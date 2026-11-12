@@ -12,10 +12,6 @@ const hostRunner = fs.readFileSync(
   'utf8',
 );
 const main = fs.readFileSync(path.join(root, 'src/index.ts'), 'utf8');
-const taskScheduler = fs.readFileSync(
-  path.join(root, 'src/task-scheduler.ts'),
-  'utf8',
-);
 
 describe('provider fallback source contracts', () => {
   test('cold/warm retry uses the failed turn payload rather than startup input', () => {
@@ -73,8 +69,6 @@ describe('provider fallback source contracts', () => {
     expect(
       hostRunner.match(/if \(output\.providerFailureRetrying\)/g),
     ).toHaveLength(2);
-    expect(hostRunner).toContain('!providerFailureReported &&');
-    expect(hostRunner).toContain('!hostProviderFailureReported &&');
     expect(hostRunner).not.toContain('ownerHomeFolder,\n    fallbackModel');
     expect(agentRunner).not.toMatch(
       /providerFailure:\s*true,\s*providerFailureRetrying:\s*true/,
@@ -105,34 +99,20 @@ describe('provider fallback source contracts', () => {
     expect(agentRunner).toContain('new SdkFirstResponseWatchdog(');
   });
 
-  test('host quarantines before projection and chooses retry vs terminal', () => {
+  test('host decides retry vs terminal before projection', () => {
     expect(
       hostRunner.match(/applyProviderFailureDisposition\(/g)?.length,
     ).toBeGreaterThanOrEqual(5);
     expect(hostRunner).toMatch(
-      /quarantineFromOutput\(selectedProfileId, output\);[\s\S]*?applyProviderFailureDisposition\([\s\S]*?await onOutput\(output\)/,
+      /providerId: selectedProfileId,\s*result: output\.result,[\s\S]*?applyProviderFailureDisposition\([\s\S]*?await onOutput\(output\)/,
     );
     expect(hostRunner).toMatch(
-      /quarantineFromOutput\(hostSelectedProfileId, output\);[\s\S]*?applyProviderFailureDisposition\([\s\S]*?await onOutput\(output\)/,
+      /providerId: hostSelectedProfileId,\s*result: output\.result,[\s\S]*?applyProviderFailureDisposition\([\s\S]*?await onOutput\(output\)/,
     );
-    // Quarantine granularity must follow the reported scope: a model wall may
-    // never take the whole account out of rotation, and the upstream reset
-    // stamp must reach the pool so the pair is not resurrected early.
-    expect(hostRunner).toContain("output.providerRateLimitScope === 'model'");
-    expect(hostRunner).toContain('providerPool.reportModelFailure(');
-    expect(hostRunner).toMatch(
-      /providerPool\.reportFailure\(profileId, true, output\.providerRateLimitResetsAt\)/,
-    );
-    // The terminal boundary spans both dimensions, not account health alone.
-    expect(hostRunner).toContain('poolCanStillServe()');
-    expect(hostRunner).toMatch(
-      /hasCandidateForTier\(primaryTier\)[\s\S]*?hasCandidateForTier\(fallbackModel\)/,
-    );
+    // A connection is authoritative: there is no pool to fail over to.
+    expect(hostRunner).not.toContain('providerPool');
     expect(agentRunner).toMatch(
       /publishProviderFailure\(\{\s*error: 'rate_limit',\s*failureClass: 'account',\s*rateLimitResetsAt: info\.resetsAt,\s*\}\)/,
-    );
-    expect(hostRunner).toMatch(
-      /providerPool\.refreshFromConfig\([\s\S]*?providerPool\.refreshRecoveryState\(\)/,
     );
   });
 
@@ -147,42 +127,17 @@ describe('provider fallback source contracts', () => {
     ).toHaveLength(2);
     expect(hostRunner).toContain('healthyInputTurnCompleted');
     expect(hostRunner).toContain('hostHealthyInputTurnCompleted');
-    expect(hostRunner).toContain(
-      'Provider failed after scheduled input completed; suppressing replay',
-    );
   });
 
   test('provider failures are visible only at pool exhaustion across interaction modes', () => {
     expect(main).not.toContain(
       'Provider failure result suppressed from user (silent switch)',
     );
-    expect(main.match(/Provider failure surfaced to user/g)).toHaveLength(2);
-    expect(main).toContain('result.providerFailureTerminal !== true');
+    expect(main.match(/Provider failure surfaced to user/g)).toHaveLength(1);
     expect(main).toContain('output.providerFailureTerminal !== true');
-    expect(main).toContain('rollbackIdleMainCardReservation(');
     expect(main).toContain('rollbackIdleAgentCardReservation(');
     expect(main).toMatch(
-      /!publishesFrameworkAnswer\(interactionMode\)\s*&&\s*!result\.providerFailure/,
-    );
-    expect(main).toMatch(
       /!publishesFrameworkAnswer\(interactionMode\)\s*&&\s*!output\.providerFailure/,
-    );
-  });
-
-  test('scheduled tasks classify exhausted providers as failures', () => {
-    expect(taskScheduler).toContain(
-      'streamedOutput.providerFailureTerminal === true',
-    );
-    // The upstream limit text, when the runner captured one, replaces the
-    // generic pool notice — but only on the terminal projection.
-    expect(taskScheduler).toContain(
-      'error = output.providerFailureNotice || PROVIDER_FAILURE_USER_NOTICE',
-    );
-    expect(taskScheduler).toMatch(
-      /streamedOutput\.providerFailureNotice \|\|\s*PROVIDER_FAILURE_USER_NOTICE/,
-    );
-    expect(hostRunner).toContain(
-      'Scheduled task provider failed; retrying the same prompt on another provider',
     );
   });
 });

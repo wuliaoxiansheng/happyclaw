@@ -34,6 +34,8 @@ import { useChatStore } from '../../stores/chat';
 import { api } from '../../api/client';
 import { showToast } from '../../utils/toast';
 import type { AgentInfo, AvailableImGroup } from '../../types';
+import { canCarryTeamMode } from '../../lib/team-mode';
+import { TeamModeDialog } from '../team/TeamModeDialog';
 import { ChannelAccountBadge, ChannelBadge } from '../settings/channel-meta';
 import {
   ACTIVATION_MODE_OPTIONS,
@@ -51,6 +53,7 @@ import {
 import {
   buildImBindingRequest,
   isBoundToImDestination,
+  notBindableMessage,
   resolveBindingTargetType,
   resolveBindingActivationMode,
   resolveBindingAudienceMode,
@@ -59,10 +62,9 @@ import {
 interface ImBindingDialogProps {
   open: boolean;
   groupJid: string;
-  /** session id for workspace-session binding; null for main session binding */
+  /** The session private chats and groups bind to; null binds the workspace's topic groups. */
   agentId: string | null;
   agent?: AgentInfo;
-  targetMode?: 'workspace' | 'session';
   onClose: () => void;
 }
 
@@ -170,7 +172,6 @@ export function ImBindingDialog({
   groupJid,
   agentId,
   agent,
-  targetMode = 'session',
   onClose,
 }: ImBindingDialogProps) {
   const [imGroups, setImGroups] = useState<AvailableImGroup[]>([]);
@@ -196,6 +197,7 @@ export function ImBindingDialog({
   const [audienceModes, setAudienceModes] = useState<
     Record<string, 'everyone' | 'owner_only'>
   >({});
+  const [teamGroup, setTeamGroup] = useState<AvailableImGroup | null>(null);
   const syncGeneration = useRef(0);
 
   const loadAvailableImGroups = useChatStore((s) => s.loadAvailableImGroups);
@@ -203,19 +205,16 @@ export function ImBindingDialog({
   const loadGroups = useChatStore((s) => s.loadGroups);
   const loadAgents = useChatStore((s) => s.loadAgents);
   const unbindImGroup = useChatStore((s) => s.unbindImGroup);
-  const unbindMainImGroup = useChatStore((s) => s.unbindMainImGroup);
   const unbindWorkspaceImGroup = useChatStore((s) => s.unbindWorkspaceImGroup);
 
-  const isMainMode = agentId === null;
-  const isWorkspaceMode = targetMode === 'workspace';
+  const isWorkspaceMode = agentId === null;
 
   const destination = useMemo(
-    () => ({
-      type: isWorkspaceMode ? ('workspace' as const) : ('session' as const),
-      groupJid,
-      ...(!isWorkspaceMode ? { sessionId: agentId ?? 'main' } : {}),
-    }),
-    [isWorkspaceMode, groupJid, agentId],
+    () =>
+      agentId === null
+        ? { type: 'workspace' as const, groupJid }
+        : { type: 'session' as const, groupJid, sessionId: agentId },
+    [groupJid, agentId],
   );
 
   const compatibleGroups = useMemo(
@@ -393,7 +392,6 @@ export function ImBindingDialog({
     channelFilter,
     filter,
     groupJid,
-    isMainMode,
   ]);
 
   const isBoundToThis = (group: AvailableImGroup): boolean =>
@@ -435,8 +433,8 @@ export function ImBindingDialog({
     setActionLoading(imJid);
     try {
       await bindCurrentTarget(group);
-    } catch {
-      showToast('绑定失败');
+    } catch (err) {
+      showToast('绑定失败', notBindableMessage(err) ?? undefined);
     } finally {
       setActionLoading(null);
     }
@@ -445,14 +443,10 @@ export function ImBindingDialog({
   const handleUnbind = async (imJid: string) => {
     setActionLoading(imJid);
     try {
-      let ok: boolean;
-      if (isWorkspaceMode || isMainMode) {
-        ok = isWorkspaceMode
+      const ok =
+        agentId === null
           ? await unbindWorkspaceImGroup(groupJid, imJid)
-          : await unbindMainImGroup(groupJid, imJid);
-      } else {
-        ok = await unbindImGroup(groupJid, agentId!, imJid);
-      }
+          : await unbindImGroup(groupJid, agentId, imJid);
       if (ok) {
         await reloadGroups();
       } else {
@@ -532,9 +526,7 @@ export function ImBindingDialog({
         : `会话「${group.bound_target_name}」`;
     }
     if (group.bound_main_jid && group.bound_target_name) {
-      return resolveBindingTargetType(group) === 'session'
-        ? `主会话「${group.bound_target_name}」`
-        : `工作区「${group.bound_target_name}」`;
+      return `工作区「${group.bound_target_name}」`;
     }
     return '其他对话';
   };
@@ -546,15 +538,15 @@ export function ImBindingDialog({
     setActionLoading(imJid);
     try {
       await bindCurrentTarget(rebindGroup, true);
-    } catch {
-      showToast('换绑失败');
+    } catch (err) {
+      showToast('换绑失败', notBindableMessage(err) ?? undefined);
     }
     setActionLoading(null);
   };
 
   const title = isWorkspaceMode
     ? '工作区绑定'
-    : `会话绑定${agent ? ` — ${agent.name}` : ' — 主会话'}`;
+    : `会话绑定 — ${agent?.name || '新会话'}`;
 
   const renderThreadCapability = (group: AvailableImGroup) => {
     if (group.conversation_kind !== 'topic') return null;
@@ -843,10 +835,22 @@ export function ImBindingDialog({
                       {(boundToThis || policyMismatch || boundToOther) && (
                         <div className="col-span-2 col-start-2 flex min-w-0 flex-col items-start gap-1.5">
                           {boundToThis && (
-                            <Badge variant="success">
-                              <Link2 />
-                              已绑定当前{isWorkspaceMode ? '工作区' : '会话'}
-                            </Badge>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <Badge variant="success">
+                                <Link2 />
+                                已绑定当前{isWorkspaceMode ? '工作区' : '会话'}
+                              </Badge>
+                              {!isWorkspaceMode && canCarryTeamMode(group) && (
+                                <Button
+                                  variant="outline"
+                                  size="xs"
+                                  onClick={() => setTeamGroup(group)}
+                                >
+                                  <Users />
+                                  团队模式
+                                </Button>
+                              )}
+                            </div>
                           )}
                           {policyMismatch && (
                             <div className="flex items-start gap-1 text-caption leading-5 text-warning">
@@ -1052,6 +1056,15 @@ export function ImBindingDialog({
         }
         confirmText="换绑"
       />
+
+      {teamGroup && (
+        <TeamModeDialog
+          workspaceJid={groupJid}
+          channelJid={teamGroup.jid}
+          channelName={teamGroup.name}
+          onClose={() => setTeamGroup(null)}
+        />
+      )}
     </>
   );
 }

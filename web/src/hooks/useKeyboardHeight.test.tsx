@@ -2,7 +2,7 @@
 
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, beforeEach, describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { useKeyboardHeight } from './useKeyboardHeight';
 
 (
@@ -11,6 +11,7 @@ import { useKeyboardHeight } from './useKeyboardHeight';
 
 class FakeVisualViewport extends EventTarget {
   height = window.innerHeight;
+  offsetTop = 0;
   scale = 1;
 }
 
@@ -28,13 +29,10 @@ function Probe() {
   return null;
 }
 
-const cssHeight = () =>
-  document.documentElement.style.getPropertyValue('--keyboard-height');
-
-async function resize(height: number, scale = 1) {
+async function resize(height: number, offsetTop = 0) {
   await act(async () => {
     viewport.height = height;
-    viewport.scale = scale;
+    viewport.offsetTop = offsetTop;
     viewport.dispatchEvent(new Event('resize'));
   });
 }
@@ -56,41 +54,37 @@ afterEach(async () => {
   root = null;
   container = null;
   latest = null;
-  document.documentElement.style.removeProperty('--keyboard-height');
   if (originalViewport) {
     Object.defineProperty(window, 'visualViewport', originalViewport);
   }
 });
 
 describe('useKeyboardHeight', () => {
-  test('pads for a software keyboard and resets when the composer unmounts', async () => {
+  test('keeps its shape and reads the shared viewport store', async () => {
     await act(async () => root?.render(<Probe />));
-    expect(cssHeight()).toBe('0px');
+    expect(latest).toEqual({ keyboardHeight: 0, isKeyboardVisible: false });
 
     await resize(window.innerHeight - 320);
     expect(latest).toEqual({ keyboardHeight: 320, isKeyboardVisible: true });
-    expect(cssHeight()).toBe('320px');
 
-    await act(async () => root?.unmount());
-    root = null;
-    expect(cssHeight()).toBe('');
+    await resize(window.innerHeight - 320, 120);
+    expect(latest).toEqual({ keyboardHeight: 200, isKeyboardVisible: true });
   });
 
-  test('picks up a keyboard that is already up when it mounts', async () => {
-    viewport.height = window.innerHeight - 280;
+  test('no longer scrolls focused fields into view', async () => {
+    vi.useFakeTimers();
     await act(async () => root?.render(<Probe />));
-    expect(latest?.keyboardHeight).toBe(280);
-    expect(cssHeight()).toBe('280px');
-  });
-
-  test('ignores pinch-zoom and sub-keyboard gaps', async () => {
-    await act(async () => root?.render(<Probe />));
-
-    await resize(window.innerHeight / 2, 2);
-    expect(latest).toEqual({ keyboardHeight: 0, isKeyboardVisible: false });
-    expect(cssHeight()).toBe('0px');
-
-    await resize(window.innerHeight - 20);
-    expect(latest?.isKeyboardVisible).toBe(false);
+    const input = document.createElement('input');
+    let scrolled = false;
+    input.scrollIntoView = () => {
+      scrolled = true;
+    };
+    document.body.appendChild(input);
+    input.focus();
+    input.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    vi.advanceTimersByTime(1000);
+    vi.useRealTimers();
+    expect(scrolled).toBe(false);
+    input.remove();
   });
 });

@@ -294,6 +294,11 @@ export interface ActiveTurnOutputCallbacks {
   /** Optional observability hook for progress/separate utterances. Unlike
    * onUtteranceDelivered this never settles or advances a durable input. */
   onNonTerminalDelivered?: () => void;
+  /**
+   * The channel the input came from: `im` when it has a native reply source,
+   * `web` when it has none. It decides where a proactive progress goes.
+   */
+  source?: 'web' | 'im';
 }
 
 interface ActiveTurnOutputBinding {
@@ -372,6 +377,11 @@ export class ActiveTurnOutputRegistry {
     return this.bindings.get(this.key(scopeKey, inputTurnId))?.coordinator;
   }
 
+  /** The channel the bound input came from, or undefined when unknown. */
+  sourceOf(scopeKey: string, inputTurnId: string): 'web' | 'im' | undefined {
+    return this.bindings.get(this.key(scopeKey, inputTurnId))?.callbacks.source;
+  }
+
   stage(input: StageTurnMessageInput): StageTurnMessageResult {
     const binding = this.bindings.get(
       this.key(input.scopeKey, input.inputTurnId),
@@ -400,6 +410,9 @@ export class ActiveTurnOutputRegistry {
       };
     }
     binding.coordinator.commitPreparedMessage(prepared);
+    if (input.role === 'progress') {
+      binding.callbacks.onNonTerminalDelivered?.();
+    }
     return { accepted: true, duplicate: false };
   }
 

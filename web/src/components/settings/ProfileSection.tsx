@@ -126,6 +126,7 @@ export function ProfileSection() {
           htmlFor="profile-username"
           control={
             <Input
+              variant="code"
               id="profile-username"
               value={username}
               onChange={(event) => setUsername(event.target.value)}

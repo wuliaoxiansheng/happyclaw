@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import { GROUPS_DIR, MAX_FILE_SIZE } from './config.js';
+import { MAX_FILE_SIZE } from './config.js';
+import { workspaceDirOf } from './workspace-dir.js';
 
 // MAX_FILE_SIZE 统一由 config.ts 定义（可通过 MAX_FILE_SIZE_MB 环境变量配置），
 // 此处 re-export 保持既有 import 路径不变。IM 渠道收文件与 Web 上传共用此上限。
@@ -86,11 +87,15 @@ export function sanitizeImFilename(raw: string | undefined | null): string {
 
 /**
  * Agent 视角的工作区根目录解析器。Host 模式配置了 customCwd 时，Runner 的
- * cwd 是 customCwd 而不是 data/groups/{folder}（与 Web 文件面板
- * getFileRootOverride 一致）；附件必须落在 Agent 用相对路径能打开的位置。
- * 由主进程在启动时注册；未注册或返回空值时回落到 GROUPS_DIR/{folder}。
+ * cwd 是 customCwd 而不是 data/groups/{folder}；IM 聊天绑定到有独立 worktree
+ * 的会话时是该 worktree（与 Web 文件面板一致）。附件必须落在 Agent 用相对路径
+ * 能打开的位置，所以解析器还会拿到这条消息被路由到的 JID（会话路由带 #agent:）。
+ * 由主进程在启动时注册；未注册或返回空值时回落到工作区目录（workspaceDirOf）。
  */
-type DownloadRootResolver = (groupFolder: string) => string | null | undefined;
+type DownloadRootResolver = (
+  groupFolder: string,
+  routeJid: string,
+) => string | null | undefined;
 let downloadRootResolver: DownloadRootResolver | null = null;
 
 export function setImDownloadRootResolver(
@@ -99,24 +104,28 @@ export function setImDownloadRootResolver(
   downloadRootResolver = resolver;
 }
 
-/** 当前 folder 的附件根目录（绝对路径）。 */
-export function resolveImDownloadRoot(groupFolder: string): string {
+/** 当前 folder 中被路由到 `routeJid` 的消息的附件根目录（绝对路径）。 */
+export function resolveImDownloadRoot(
+  groupFolder: string,
+  routeJid: string,
+): string {
   let override: string | null | undefined;
   try {
-    override = downloadRootResolver?.(groupFolder);
+    override = downloadRootResolver?.(groupFolder, routeJid);
   } catch {
     override = undefined;
   }
   return override && path.isAbsolute(override)
     ? override
-    : path.join(GROUPS_DIR, groupFolder);
+    : workspaceDirOf(groupFolder);
 }
 
 /**
  * 将 Buffer 写入 downloads/{channel}/{YYYY-MM-DD}/ 目录，
  * 返回 Agent 工作目录相对路径（如 downloads/feishu/2026-03-01/report.pdf）。
- * 工作目录为 resolveImDownloadRoot(groupFolder)：通常是 data/groups/{folder}，
- * Host 模式配置 customCwd 时为 customCwd。
+ * 工作目录为 resolveImDownloadRoot(groupFolder, routeJid)：通常是
+ * data/groups/{folder}，Host 模式配置 customCwd 时为 customCwd，聊天绑定的会话有
+ * 独立 worktree 时为该 worktree。
  * @throws FileTooLargeError 当 buffer.length > MAX_FILE_SIZE
  */
 export async function saveDownloadedFile(
@@ -132,13 +141,16 @@ export async function saveDownloadedFile(
     | 'wecom',
   originalFilename: string,
   buffer: Buffer,
+  /** The admitted route of the message (`resolveAdmittedChannelRoute`); a
+   * session route picks that session's worktree. */
+  routeJid: string,
 ): Promise<string> {
   if (buffer.length > MAX_FILE_SIZE) {
     throw new FileTooLargeError(originalFilename, buffer.length);
   }
 
   const dateStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-  const groupRoot = resolveImDownloadRoot(groupFolder);
+  const groupRoot = resolveImDownloadRoot(groupFolder, routeJid);
   const dir = path.join(groupRoot, 'downloads', channel, dateStr);
   fs.mkdirSync(dir, { recursive: true });
   assertDownloadDirInsideGroup(groupRoot, dir);

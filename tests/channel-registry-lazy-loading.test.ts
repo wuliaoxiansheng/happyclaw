@@ -147,8 +147,19 @@ describe('lazy channel implementation registry', () => {
         'utf8',
       );
       expect(source, connectorName).not.toContain("from './web.js'");
-      expect(source, connectorName).toContain('onMessagePersisted?.(');
+      // Directly, or through the shared persisted-input projection.
+      expect(
+        source.includes('onMessagePersisted?.(') ||
+          source.includes('projectChannelInbound('),
+        connectorName,
+      ).toBe(true);
     }
+    const projection = fs.readFileSync(
+      new URL('../src/im-connector-follow-up.ts', import.meta.url),
+      'utf8',
+    );
+    expect(projection).not.toContain("from './web.js'");
+    expect(projection).toContain('opts.onMessagePersisted?.(');
 
     const feishuSource = fs.readFileSync(
       new URL('../src/feishu.ts', import.meta.url),

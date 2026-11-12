@@ -103,6 +103,9 @@ const card = () => container.querySelector('[data-hc-process-card]');
 const header = () => container.querySelector('[data-hc-process-card] > button');
 const windowEl = () => container.querySelector('[data-hc-process-window]');
 const rows = () => [...container.querySelectorAll('[role="listitem"]')];
+/** What an opened, folded process says it used. */
+const counts = () =>
+  container.querySelector('[data-hc-work-counts]')?.textContent;
 const text = () => container.textContent ?? '';
 
 describe('hasProcess', () => {
@@ -332,6 +335,140 @@ describe('ProcessCard, live', () => {
     expect(windowEl()).toBeNull();
     expect(text()).toContain('用哪个方案？');
   });
+
+  it('keeps the question with the settled reply, after its call returned', async () => {
+    const asked = tool('q', 'AskUserQuestion', {
+      status: 'done',
+      questions: [{ question: '周末去哪？', options: ['爬山', '看展'] }],
+    });
+    await render(
+      <ProcessCard
+        {...props({ mode: 'settled', steps: [tool('a', 'Read'), asked] })}
+      />,
+    );
+    expect(text()).toContain('周末去哪？');
+    expect(text()).toContain('爬山');
+    expect(text()).toContain('看展');
+
+    // With nothing else to show, the question is still there.
+    await render(null);
+    await render(
+      <ProcessCard {...props({ mode: 'settled', steps: [asked] })} />,
+    );
+    expect(header()).toBeNull();
+    expect(text()).toContain('周末去哪？');
+  });
+});
+
+describe('ProcessCard, after cindy', () => {
+  const working = [
+    thinking({ at: 1000, endedAt: 3000, title: '确认范围', text: '先看。' }),
+    ...Array.from({ length: 7 }, (_, i) =>
+      tool(`w${i}`, 'Bash', {
+        at: 3000 + i * 1000,
+        endedAt: 3500 + i * 1000,
+        summary: `command: echo w${i}`,
+      }),
+    ),
+  ];
+
+  it('lists the latest five rows while it works, all of them once the reader asks', async () => {
+    await render(<ProcessCard {...props({ mode: 'live', steps: working })} />);
+    // The older ones fold into one row above the five.
+    expect(rows()).toHaveLength(6);
+    expect(text()).not.toContain('echo w1');
+    await click(header());
+    expect(windowEl()).toBeNull();
+    await click(header());
+    expect(rows()).toHaveLength(8);
+    expect(text()).toContain('echo w1');
+  });
+
+  it('times the process from its first step, in a monospace timer', async () => {
+    vi.setSystemTime(10_000);
+    await render(<ProcessCard {...props({ mode: 'live', steps: working })} />);
+    const timer = header()?.querySelector('.font-mono');
+    expect(timer?.textContent).toBe('9s');
+    await advance(3000);
+    expect(header()?.querySelector('.font-mono')?.textContent).toBe('12s');
+    expect(header()?.querySelector('svg.lucide-loader-circle')).not.toBeNull();
+  });
+
+  it('folds into how long it worked once the answer is being written', async () => {
+    await render(
+      <ProcessCard
+        {...props({ mode: 'live', steps: working, answering: true })}
+      />,
+    );
+    expect(header()?.textContent).toBe('已工作 9s');
+    expect(header()?.getAttribute('aria-expanded')).toBe('false');
+    expect(windowEl()).toBeNull();
+    expect(card()?.getAttribute('data-mode')).toBe('live');
+    expect(card()?.hasAttribute('data-folded')).toBe(true);
+    expect(header()?.querySelector('.font-mono')).toBeNull();
+    // Another tool after the text: at work again, open on its latest rows.
+    await render(<ProcessCard {...props({ mode: 'live', steps: working })} />);
+    expect(windowEl()).not.toBeNull();
+    expect(rows()).toHaveLength(6);
+  });
+
+  it('opens to all of it while the answer is being written, if the reader asks', async () => {
+    await render(
+      <ProcessCard
+        {...props({ mode: 'live', steps: working, answering: true })}
+      />,
+    );
+    await click(header());
+    expect(rows()).toHaveLength(8);
+    expect(counts()).toBe('7 个工具 · 1 段思考');
+  });
+
+  it('keeps the reader’s choice for the reply that takes its place', async () => {
+    // Opened while the answer was written: the finished reply's card is open.
+    await render(
+      <ProcessCard
+        {...props({
+          mode: 'live',
+          steps: working,
+          answering: true,
+          memoryKey: 'turn-opened',
+        })}
+      />,
+    );
+    await click(header());
+    await render(<div />);
+    await render(
+      <ProcessCard {...props({ steps: working, memoryKey: 'turn-opened' })} />,
+    );
+    expect(windowEl()).not.toBeNull();
+    // Closed while it worked: the finished reply's card stays closed, even
+    // when asked to open.
+    await render(
+      <ProcessCard
+        {...props({ mode: 'live', steps: working, memoryKey: 'turn-closed' })}
+      />,
+    );
+    await click(header());
+    await render(<div />);
+    await render(
+      <ProcessCard
+        {...props({
+          steps: working,
+          memoryKey: 'turn-closed',
+          defaultOpen: true,
+        })}
+      />,
+    );
+    expect(windowEl()).toBeNull();
+    // A reply nobody chose for follows its own state.
+    await render(<div />);
+    await render(
+      <ProcessCard
+        {...props({ steps: working, memoryKey: 'turn-untouched' })}
+      />,
+    );
+    expect(windowEl()).toBeNull();
+  });
 });
 
 describe('ProcessCard, manual open comes first', () => {
@@ -397,9 +534,11 @@ describe('ProcessCard, settled', () => {
     }),
   ];
 
-  it('is one line that says what the run did, folded', async () => {
+  it('is one line that says how long the process took, folded by a Layers icon', async () => {
     await render(<ProcessCard {...props({ steps })} />);
-    expect(header()?.textContent).toBe('已处理 14 秒 · 2 个工具 · 2 段思考');
+    expect(header()?.textContent).toBe('已工作 14s');
+    expect(header()?.querySelector('svg.lucide-layers')).not.toBeNull();
+    expect(card()?.hasAttribute('data-folded')).toBe(true);
     expect(header()?.getAttribute('aria-expanded')).toBe('false');
     expect(header()?.hasAttribute('aria-controls')).toBe(false);
     expect(windowEl()).toBeNull();
@@ -457,10 +596,10 @@ describe('ProcessCard, settled', () => {
     await render(
       <ProcessCard {...props({ steps: bare, durationMs: 21_000 })} />,
     );
-    expect(header()?.textContent).toBe('已处理 21 秒 · 1 个工具 · 1 段思考');
+    expect(header()?.textContent).toBe('已工作 21s');
   });
 
-  it('says only that it thought when there was no tool', async () => {
+  it('says what it used inside, once opened', async () => {
     await render(
       <ProcessCard
         {...props({
@@ -468,13 +607,16 @@ describe('ProcessCard, settled', () => {
         })}
       />,
     );
-    expect(header()?.textContent).toBe('已思考 12 秒');
+    expect(header()?.textContent).toBe('已工作 12s');
+    expect(text()).not.toContain('段思考');
+    await click(header());
+    expect(counts()).toBe('1 段思考');
     await render(
       <ProcessCard
         {...props({ steps: [tool('a', 'Read'), tool('b', 'Bash')] })}
       />,
     );
-    expect(header()?.textContent).toBe('已使用 2 个工具');
+    expect(counts()).toBe('2 个工具');
   });
 
   it('counts the failures, and shows what failed when opened', async () => {
@@ -492,8 +634,97 @@ describe('ProcessCard, settled', () => {
         })}
       />,
     );
-    expect(header()?.textContent).toContain('1 个失败');
+    expect(counts()).toBe('1 个工具 · 1 个失败');
     expect(text()).toContain('被权限策略拒绝');
+  });
+
+  it('says, folded, what went wrong and out of how many calls', async () => {
+    await render(
+      <ProcessCard
+        {...props({
+          steps: [
+            tool('a', 'Read'),
+            tool('b', 'Bash', { status: 'error', resultPreview: 'exit 1' }),
+            tool('c', 'Bash', {
+              status: 'error',
+              resultPreview: '被权限策略拒绝',
+              outcome: 'denied',
+            }),
+          ],
+        })}
+      />,
+    );
+    expect(header()?.textContent).toBe(
+      '已工作 1s · 3 个工具 · 1 个失败 · 1 个被拒绝',
+    );
+    const problems = header()?.querySelector('[data-hc-work-problems]');
+    expect(problems?.className).toContain('text-error');
+    expect(header()?.querySelector('svg.lucide-layers')).toBeNull();
+    expect(header()?.querySelector('[data-tool-state="error"]')).not.toBeNull();
+    // Opened, the counts under the line say it, and the line does not.
+    await click(header());
+    expect(header()?.textContent).toBe('已工作 1s');
+    expect(counts()).toBe('3 个工具 · 1 个失败 · 1 个被拒绝');
+  });
+
+  it('says a stop apart from a failure, in the warning colour', async () => {
+    await render(
+      <ProcessCard
+        {...props({
+          steps: [
+            tool('a', 'Read'),
+            // Stored before the outcome was kept: only the stop's word.
+            tool('b', 'Bash', { status: 'error', resultPreview: '已停止' }),
+          ],
+        })}
+      />,
+    );
+    expect(header()?.textContent).toBe('已工作 1s · 2 个工具 · 1 个已停止');
+    expect(
+      header()?.querySelector('[data-hc-work-problems]')?.className,
+    ).toContain('text-warning');
+    await click(header());
+    // One word for it: folded, spoken and in the row itself.
+    const spoken = rows()[1].querySelector('.sr-only')?.textContent ?? '';
+    expect(spoken).toContain('已停止');
+    expect(text()).not.toContain('已中断');
+    expect(
+      rows()[1].querySelector('[data-tool-state="stopped"]'),
+    ).not.toBeNull();
+  });
+
+  it('says a sub-agent a stop killed is stopped, not failed', async () => {
+    await render(
+      <ProcessCard
+        {...props({
+          steps: [{ ...taskStep, status: 'error', outcome: 'stopped' }],
+          taskStates: { 'task-1': { ...task, status: 'stopped' } },
+        })}
+      />,
+    );
+    expect(header()?.textContent).not.toContain('失败');
+    expect(header()?.textContent).toContain('1 个已停止');
+    await click(header());
+    expect(
+      rows()[0].querySelector('[data-tool-state="stopped"]'),
+    ).not.toBeNull();
+    expect(rows()[0].querySelector('[data-tool-state="error"]')).toBeNull();
+  });
+
+  it('adds nothing to the folded line when nothing went wrong', async () => {
+    await render(
+      <ProcessCard
+        {...props({
+          steps: [
+            tool('a', 'Read'),
+            // Never closed: not a failure.
+            tool('b', 'Bash', { status: 'running', endedAt: undefined }),
+          ],
+        })}
+      />,
+    );
+    expect(header()?.textContent).toMatch(/^已工作[^·]*$/);
+    expect(header()?.querySelector('svg.lucide-layers')).not.toBeNull();
   });
 
   it('draws nothing that runs, even for a step the stop caught in flight', async () => {
@@ -569,8 +800,8 @@ describe('ProcessCard, what the reader may see', () => {
     );
     expect(text()).not.toContain('我先改渲染循环');
     expect(rows()).toHaveLength(2);
-    // And it is not in the summary either.
-    expect(header()?.textContent).toBe('已处理 5 秒 · 1 个工具 · 1 段思考');
+    // And it is not counted either.
+    expect(counts()).toBe('1 个工具 · 1 段思考');
   });
 
   it('shows the commentary as a row that opens to its whole text', async () => {
@@ -633,6 +864,35 @@ describe('ProcessCard, the rows', () => {
     expect(rows()[0].textContent).toContain('1 个失败');
     expect(rows()[0].innerHTML).toContain('text-error');
 
+    // A group whose calls were only stopped or denied does not say it failed.
+    const stopped = [
+      tool('a', 'Read', {
+        status: 'error',
+        resultPreview: '已停止',
+        outcome: 'stopped',
+      }),
+      tool('b', 'Read'),
+    ];
+    await render(
+      <ProcessCard {...props({ steps: stopped, defaultOpen: true })} />,
+    );
+    expect(rows()[0].textContent).toContain('1 个已停止');
+    expect(rows()[0].textContent).toContain('，已停止');
+    expect(rows()[0].textContent).not.toContain('失败');
+    const denied = [
+      tool('a', 'Grep', {
+        status: 'error',
+        resultPreview: '被权限策略拒绝',
+        outcome: 'denied',
+      }),
+      tool('b', 'Read'),
+    ];
+    await render(
+      <ProcessCard {...props({ steps: denied, defaultOpen: true })} />,
+    );
+    expect(rows()[0].textContent).toContain('，已拒绝');
+    expect(rows()[0].textContent).not.toContain('失败');
+
     const running = [
       tool('a', 'Read'),
       tool('b', 'Read', { status: 'running', endedAt: undefined }),
@@ -671,17 +931,17 @@ describe('ProcessCard, the rows', () => {
     expect(rows()[0].querySelector('button')).toBeNull();
   });
 
-  it('folds the steps before the latest six into one row that opens', async () => {
+  it('folds the steps before the latest five into one row that opens', async () => {
     const many = Array.from({ length: 9 }, (_, i) =>
       tool(`t${i}`, 'Bash', { summary: `command: echo n${i}` }),
     );
     await render(<ProcessCard {...props({ mode: 'live', steps: many })} />);
     const folded = rows()[0].querySelector('button');
-    expect(folded?.textContent).toContain('较早 3 步 · 3 个工具');
-    expect(text()).not.toContain('echo n2');
-    expect(text()).toContain('echo n3');
+    expect(folded?.textContent).toContain('较早 4 步 · 4 个工具');
+    expect(text()).not.toContain('echo n3');
+    expect(text()).toContain('echo n4');
     await click(folded);
-    expect(text()).toContain('echo n2');
+    expect(text()).toContain('echo n3');
     expect(folded?.getAttribute('aria-expanded')).toBe('true');
   });
 

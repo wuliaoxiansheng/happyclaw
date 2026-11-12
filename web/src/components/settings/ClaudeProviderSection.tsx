@@ -1,20 +1,25 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Loader2, Plus } from 'lucide-react';
 
-import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { Button } from '@/components/ui/button';
 import { api } from '../../api/client';
-import type {
-  BalancingConfig,
-  ProviderWithHealth,
-  ProvidersListResponse,
-  ProviderHealthStatus,
-} from './types';
+import { confirmDialog } from '../../stores/confirm';
+import type { AgentProfile } from '../../types';
+import { getAgentProfileDisplayName } from '../../utils/agent-product';
+import type { ProvidersListResponse, UnifiedProviderPublic } from './types';
 import { getErrorMessage } from './types';
 import { ProviderList } from './ProviderList';
-import { ProviderEditor } from './ProviderEditor';
-import { BalancingSettings } from './BalancingSettings';
-import { useVisibleInterval } from '../../hooks/useVisibleInterval';
+import { AddModelWizardDialog } from './AddModelWizard';
+import {
+  ConnectionDetailDialog,
+  type ConnectionUpdate,
+} from './ConnectionDetailDialog';
+import {
+  PROVIDERS_API,
+  errorCopy,
+  testConnection,
+  testOutcome,
+} from './model-connections';
 import { SettingsSection } from './SettingsLayout';
 
 interface ClaudeProviderSectionProps {
@@ -22,271 +27,131 @@ interface ClaudeProviderSectionProps {
   setError: (msg: string | null) => void;
 }
 
-export function createBalancingMutationQueue() {
-  let tail: Promise<void> = Promise.resolve();
-
-  return function enqueue<T>(request: () => Promise<T>): Promise<T> {
-    const operation = tail.then(request);
-    tail = operation.then(
-      () => undefined,
-      () => undefined,
+/**
+ * The caller's Agents bound to a connection, by name. Best effort: the
+ * server refuses the delete either way while any Agent is bound.
+ */
+async function boundAgentNames(connectionId: string): Promise<string[]> {
+  try {
+    const data = await api.get<{ profiles: AgentProfile[] }>(
+      '/api/agent-profiles',
     );
-    return operation;
-  };
+    return data.profiles
+      .filter((profile) => profile.model_config_id === connectionId)
+      .map((profile) =>
+        profile.is_default
+          ? getAgentProfileDisplayName(profile.name)
+          : profile.name,
+      );
+  } catch {
+    return [];
+  }
 }
 
+/** Settings › 模型连接: add connections and keep them working. */
 export function ClaudeProviderSection({
   setNotice,
   setError,
 }: ClaudeProviderSectionProps) {
-  const [providers, setProviders] = useState<ProviderWithHealth[]>([]);
-  const enabledCount = providers.filter((provider) => provider.enabled).length;
-  const [defaultModelConfigId, setDefaultModelConfigId] = useState<
-    string | null
-  >(null);
-  const [balancing, setBalancing] = useState<BalancingConfig | null>(null);
-  const balancingRef = useRef<BalancingConfig | null>(null);
-  const balancingRevisionRef = useRef(0);
-  const balancingPendingRef = useRef(0);
-  const balancingQueueRef = useRef<ReturnType<
-    typeof createBalancingMutationQueue
-  > | null>(null);
-  balancingQueueRef.current ??= createBalancingMutationQueue();
-
+  const [providers, setProviders] = useState<UnifiedProviderPublic[]>([]);
   const [loading, setLoading] = useState(true);
-  const [togglingId, setTogglingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [balancingSaving, setBalancingSaving] = useState(false);
+  const [testingId, setTestingId] = useState<string | null>(null);
 
-  // 编辑器状态
-  const [editorOpen, setEditorOpen] = useState(false);
-  const [editingProvider, setEditingProvider] =
-    useState<ProviderWithHealth | null>(null);
+  // 添加向导与连接详情；详情跟随列表刷新，按 id 取最新数据
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const editing =
+    providers.find((provider) => provider.id === editingId) ?? null;
 
-  // 确认对话框
-  const [pendingDeleteProvider, setPendingDeleteProvider] =
-    useState<ProviderWithHealth | null>(null);
-
-  // ─── 加载提供商列表 ──────────────────────────────────────────
   const loadProviders = useCallback(async () => {
     try {
-      const data = await api.get<ProvidersListResponse>(
-        '/api/config/claude/providers',
-      );
+      const data = await api.get<ProvidersListResponse>(PROVIDERS_API);
       setProviders(data.providers);
-      setDefaultModelConfigId(data.defaultModelConfigId ?? null);
-      balancingRef.current = data.balancing;
-      setBalancing(data.balancing);
     } catch (err) {
-      setError(getErrorMessage(err, '加载模型配置列表失败'));
+      setError(getErrorMessage(err, '加载模型连接失败'));
     } finally {
       setLoading(false);
     }
   }, [setError]);
 
   useEffect(() => {
-    loadProviders();
+    void loadProviders();
   }, [loadProviders]);
 
-  // ─── 健康状态轮询（启用 >= 2 个提供商时，仅页面可见时） ──────
-  const pollHealth = useCallback(async () => {
-    try {
-      const data = await api.get<{ statuses: ProviderHealthStatus[] }>(
-        '/api/config/claude/providers/health',
-      );
+  const handleDelete = useCallback(
+    async (provider: UnifiedProviderPublic) => {
+      const agents = await boundAgentNames(provider.id);
+      if (agents.length > 0) {
+        setError(
+          `智能体「${agents.join('」「')}」绑定了「${provider.name}」，先在智能体设置里改选其他连接再删除`,
+        );
+        return;
+      }
+      const confirmed = await confirmDialog({
+        title: '删除模型连接',
+        message: `确认删除模型连接「${provider.name}」？对话里选了它的会改回智能体的默认模型。`,
+        confirmText: '确认删除',
+        variant: 'danger',
+      });
+      if (!confirmed) return;
+      setDeletingId(provider.id);
+      try {
+        await api.delete(`${PROVIDERS_API}/${encodeURIComponent(provider.id)}`);
+        setNotice(`已删除模型连接「${provider.name}」`);
+        await loadProviders();
+      } catch (err) {
+        setError(getErrorMessage(err, '删除模型连接失败'));
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [loadProviders, setNotice, setError],
+  );
+
+  // ─── 单个连接的变更：带字段时就地更新该行，否则整体重新加载 ─────
+  const handleConnectionChanged = useCallback(
+    (update?: ConnectionUpdate) => {
+      if (!update) {
+        void loadProviders();
+        return;
+      }
       setProviders((prev) =>
-        prev.map((p) => {
-          const updated = data.statuses.find((s) => s.profileId === p.id);
-          return updated ? { ...p, health: updated } : p;
-        }),
+        prev.map((provider) =>
+          provider.id === update.id ? { ...provider, ...update } : provider,
+        ),
       );
-    } catch {
-      // 静默忽略
-    }
-  }, []);
-  useVisibleInterval(pollHealth, 10000, enabledCount >= 2);
+    },
+    [loadProviders],
+  );
 
-  // ─── 切换提供商启用/禁用 ──────────────────────────────────────
-  const handleToggle = useCallback(
-    async (provider: ProviderWithHealth) => {
-      setTogglingId(provider.id);
+  // ─── 测试连接（服务端记录 lastTest）────────────────────────────
+  const handleTest = useCallback(
+    async (provider: UnifiedProviderPublic) => {
+      setTestingId(provider.id);
       try {
-        await api.post(
-          `/api/config/claude/providers/${provider.id}/toggle`,
-          { enabled: !provider.enabled },
-          120_000,
-        );
-        await loadProviders();
-        setNotice(
-          provider.enabled
-            ? `已禁用「${provider.name}」`
-            : `已启用「${provider.name}」`,
-        );
-      } catch (err) {
-        // A 503 can mean the target state was persisted but runtime teardown
-        // failed afterward. Reload instead of leaving a stale toggle that a
-        // user might click again and accidentally reverse.
+        const result = await testConnection({ providerId: provider.id });
+        const outcome = testOutcome(result);
+        if (outcome.ok) {
+          setNotice(`「${provider.name}」连接成功`);
+        } else {
+          const copy = errorCopy(outcome.code);
+          setError(`「${provider.name}」${copy.title}：${copy.hint}`);
+        }
+        // The server stored the result, and may have stored the header the
+        // test proved; read the list again.
         await loadProviders().catch(() => {});
-        setError(getErrorMessage(err, '切换模型配置状态失败'));
+      } catch (err) {
+        setError(getErrorMessage(err, '测试连接失败'));
       } finally {
-        setTogglingId(null);
+        setTestingId(null);
       }
     },
     [loadProviders, setNotice, setError],
   );
 
-  // ─── 设为默认 / 取消默认（再次点击当前默认即取消）─────────────────
-  const handleSetDefault = useCallback(
-    async (provider: ProviderWithHealth) => {
-      const clearing = provider.id === defaultModelConfigId;
-      setTogglingId(provider.id);
-      try {
-        await api.put(
-          '/api/config/claude/default',
-          { modelConfigId: clearing ? null : provider.id },
-          120_000,
-        );
-        await loadProviders();
-        setNotice(
-          clearing
-            ? `已取消默认模型「${provider.name}」，未手动选择的对话恢复为在已启用配置间自动轮换`
-            : provider.enabled
-              ? `已将「${provider.name}」设为默认模型`
-              : `已将「${provider.name}」设为默认模型，并同时启用`,
-        );
-      } catch (err) {
-        // A 503 can mean the choice was persisted but runtime teardown failed
-        // afterward: reload so the badge shows what is really stored.
-        await loadProviders().catch(() => {});
-        setError(getErrorMessage(err, '设置默认模型失败'));
-      } finally {
-        setTogglingId(null);
-      }
-    },
-    [defaultModelConfigId, loadProviders, setNotice, setError],
-  );
-
-  // ─── 重置健康状态 ─────────────────────────────────────────────
-  const handleResetHealth = useCallback(
-    async (provider: ProviderWithHealth) => {
-      try {
-        await api.post(
-          `/api/config/claude/providers/${provider.id}/reset-health`,
-        );
-        await loadProviders();
-        setNotice('健康状态已重置');
-      } catch (err) {
-        setError(getErrorMessage(err, '重置健康状态失败'));
-      }
-    },
-    [loadProviders, setNotice, setError],
-  );
-
-  // ─── 删除提供商 ───────────────────────────────────────────────
-  const handleDeleteConfirm = useCallback(async () => {
-    if (!pendingDeleteProvider) return;
-
-    const provider = pendingDeleteProvider;
-    setDeletingId(provider.id);
-    setPendingDeleteProvider(null);
-
-    try {
-      const result = await api.delete<{ defaultCleared?: boolean }>(
-        `/api/config/claude/providers/${provider.id}`,
-      );
-      setNotice(
-        result?.defaultCleared
-          ? `已删除模型配置「${provider.name}」；它是默认模型，未手动选择的对话已恢复为在已启用配置间自动轮换`
-          : `已删除模型配置「${provider.name}」`,
-      );
-      await loadProviders();
-    } catch (err) {
-      setError(getErrorMessage(err, '删除模型配置失败'));
-    } finally {
-      setDeletingId(null);
-    }
-  }, [pendingDeleteProvider, loadProviders, setNotice, setError]);
-
-  // ─── 复制第三方提供商（服务端连同密钥一起复制，默认停用）─────────
-  const handleDuplicate = useCallback(
-    async (provider: ProviderWithHealth) => {
-      try {
-        const copy = await api.post<ProviderWithHealth>(
-          `/api/config/claude/providers/${provider.id}/duplicate`,
-        );
-        await loadProviders();
-        setNotice(`已复制模型配置「${provider.name}」，可直接修改模型后启用`);
-        // Same vendor, different model is the common case: open the copy.
-        setEditingProvider({ ...copy, health: null });
-        setEditorOpen(true);
-      } catch (err) {
-        setError(getErrorMessage(err, '复制模型配置失败'));
-      }
-    },
-    [loadProviders, setNotice, setError],
-  );
-
-  // ─── 更新负载均衡设置 ─────────────────────────────────────────
-  const handleBalancingChange = useCallback(
-    async (updates: Partial<BalancingConfig>) => {
-      const current = balancingRef.current;
-      if (!current) return;
-      const next = { ...current, ...updates };
-      const revision = ++balancingRevisionRef.current;
-      balancingRef.current = next;
-      setBalancing(next);
-      balancingPendingRef.current += 1;
-      setBalancingSaving(true);
-
-      try {
-        // Serialize full-snapshot PUTs so the server cannot persist them in a
-        // different order. The revision guard also prevents a stale response
-        // from replacing a newer optimistic value in the UI.
-        const saved = await balancingQueueRef.current!(() =>
-          api.put<BalancingConfig>('/api/config/claude/balancing', next),
-        );
-        if (revision === balancingRevisionRef.current) {
-          balancingRef.current = saved;
-          setBalancing(saved);
-          setNotice('负载均衡设置已更新');
-        }
-      } catch (err) {
-        if (revision === balancingRevisionRef.current) {
-          await loadProviders().catch(() => {});
-          setError(getErrorMessage(err, '更新负载均衡设置失败'));
-        }
-      } finally {
-        balancingPendingRef.current = Math.max(
-          0,
-          balancingPendingRef.current - 1,
-        );
-        if (balancingPendingRef.current === 0) {
-          setBalancingSaving(false);
-        }
-      }
-    },
-    [loadProviders, setNotice, setError],
-  );
-
-  // ─── 编辑器回调 ───────────────────────────────────────────────
-  const handleEditorSave = useCallback(() => {
-    setEditorOpen(false);
-    setEditingProvider(null);
-    loadProviders();
-  }, [loadProviders]);
-
-  const handleEditorCancel = useCallback(() => {
-    setEditorOpen(false);
-    setEditingProvider(null);
-  }, []);
-
-  const handleAdd = useCallback(() => {
-    setEditingProvider(null);
-    setEditorOpen(true);
-  }, []);
-
-  const busy =
-    loading || togglingId !== null || deletingId !== null || balancingSaving;
+  const handleAdd = useCallback(() => setWizardOpen(true), []);
+  const busy = loading || deletingId !== null;
 
   if (loading && providers.length === 0) {
     return (
@@ -298,77 +163,55 @@ export function ClaudeProviderSection({
 
   return (
     <div className="space-y-6">
-      {/* 提供商列表 */}
       <SettingsSection
-        title="模型配置列表"
-        description={`${providers.length} 个模型配置`}
+        title="模型连接"
+        description={`${providers.length} 个连接；每个连接可以提供多个模型，聊天和智能体都可以选用。`}
         actions={
           providers.length > 0 && (
             <Button onClick={handleAdd} disabled={busy}>
               <Plus />
-              添加模型配置
+              添加模型连接
             </Button>
           )
         }
       >
         <ProviderList
           providers={providers}
-          defaultModelConfigId={defaultModelConfigId}
-          onEdit={(p) => {
-            setEditingProvider(p);
-            setEditorOpen(true);
-          }}
-          onDelete={(p) => setPendingDeleteProvider(p)}
-          onToggle={handleToggle}
-          onSetDefault={handleSetDefault}
-          onResetHealth={handleResetHealth}
-          onDuplicate={handleDuplicate}
+          onEdit={(provider) => setEditingId(provider.id)}
+          onTest={(provider) => void handleTest(provider)}
+          testingId={testingId}
+          onDelete={(provider) => void handleDelete(provider)}
           onAdd={handleAdd}
-          togglingId={togglingId}
           deletingId={deletingId}
           disabled={busy}
         />
-
-        {/* 负载均衡设置：配置了多个模型时展示（池只在 >=2 启用时生效） */}
-        {balancing && providers.length >= 2 && (
-          <BalancingSettings
-            balancing={balancing}
-            hasDefault={defaultModelConfigId !== null}
-            onChange={handleBalancingChange}
-            disabled={busy}
-            saving={balancingSaving}
-          />
-        )}
       </SettingsSection>
 
-      {/* 编辑器弹窗 */}
-      <ProviderEditor
-        open={editorOpen}
-        provider={editingProvider}
-        onSave={handleEditorSave}
-        onCancel={handleEditorCancel}
-        setNotice={setNotice}
-        setError={setError}
+      <AddModelWizardDialog
+        open={wizardOpen}
+        onClose={({ saved, verified, created }) => {
+          setWizardOpen(false);
+          if (saved) {
+            setNotice(
+              verified
+                ? `已添加模型连接「${saved.name}」`
+                : `已添加模型连接「${saved.name}」，尚未验证`,
+            );
+          } else if (created) {
+            setNotice(
+              `已创建模型连接「${created.name}」，可以在列表里继续配置`,
+            );
+          }
+          if (saved || created) void loadProviders();
+        }}
       />
 
-      {/* 确认删除对话框 */}
-      <ConfirmDialog
-        open={pendingDeleteProvider !== null}
-        onClose={() => setPendingDeleteProvider(null)}
-        onConfirm={handleDeleteConfirm}
-        title="删除模型配置"
-        message={
-          pendingDeleteProvider
-            ? `确认删除模型配置「${pendingDeleteProvider.name}」？${
-                pendingDeleteProvider.id === defaultModelConfigId
-                  ? '它是当前默认模型，删除后未手动选择的对话会恢复为在已启用配置间自动轮换。'
-                  : ''
-              }`
-            : '确认删除该模型配置？'
-        }
-        confirmText="确认删除"
-        confirmVariant="danger"
-        loading={deletingId !== null}
+      <ConnectionDetailDialog
+        provider={editing}
+        onClose={() => setEditingId(null)}
+        onChanged={handleConnectionChanged}
+        setNotice={setNotice}
+        setError={setError}
       />
     </div>
   );

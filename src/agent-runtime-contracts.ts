@@ -42,6 +42,11 @@ export interface ContainerOutput {
   providerRateLimitModel?: string;
   providerFailureClass?: 'account' | 'transient' | 'config';
   providerFailureTerminal?: boolean;
+  /**
+   * Host-only. Set on a non-terminal usage-limit failure that waits for the
+   * reset instead of ending the input: when to resume (epoch ms).
+   */
+  providerUsageLimitResumeAt?: number;
   providerFailureRetrying?: boolean;
   providerFailureMaintenance?: boolean;
   providerLivenessTimeout?: boolean;

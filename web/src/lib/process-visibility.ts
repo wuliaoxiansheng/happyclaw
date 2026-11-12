@@ -1,8 +1,7 @@
 import type { StreamEvent, WorkflowRunSnapshot } from '../stream-event.types';
-import type { StreamingTaskRuntimeState } from '../stores/chat';
+import type { StreamingState, StreamingTaskRuntimeState } from '../stores/chat';
 import type { ProcessVisibility } from '../types';
-
-export const DEFAULT_PROCESS_VISIBILITY: ProcessVisibility = 'hidden';
+import type { StreamingStep } from './stream-steps';
 
 /** Anything but a known level reads as hidden: older servers send nothing. */
 export function normalizeProcessVisibility(value: unknown): ProcessVisibility {
@@ -17,13 +16,13 @@ export const PROCESS_VISIBILITY_OPTIONS: ReadonlyArray<{
   {
     value: 'hidden',
     label: '隐藏',
-    description: '只显示“正在处理…”，不展示任何处理过程。',
+    description: '只显示“正在处理…”和智能体发来的进展，不展示处理过程。',
   },
   {
     value: 'activity',
     label: '仅活动',
     description:
-      '显示当前阶段、调用的工具、子 Agent 与计划，不显示模型的文字。',
+      '显示当前阶段、调用的工具、子 Agent、计划和智能体发来的进展，不显示模型的其他文字。',
   },
   {
     value: 'full',
@@ -64,6 +63,68 @@ const ACTIVITY_EVENTS = new Set<string>([
  * "latest tool", and it does not count among the tools used.
  */
 export const SPEECH_TOOL_NAME = 'mcp__happyclaw__send_message';
+
+/**
+ * Tools whose structured result is a workspace-memory receipt (`{ result, id, title }`)
+ * rather than arbitrary tool output or model prose.
+ */
+export const MEMORY_WRITE_TOOLS: ReadonlySet<string> = new Set([
+  'mcp__happyclaw__workspace_memory_remember',
+  'mcp__happyclaw__workspace_memory_update',
+]);
+
+const NO_CALLS: ReadonlySet<string> = new Set();
+
+/**
+ * A tool's result names only its call, so a memory receipt is told apart by
+ * the call: one of `memoryWriteCalls`, the calls whose start named a memory
+ * write tool. What any other tool returned is withheld, whatever it looks like.
+ */
+function keepsMemoryWriteReceipt(
+  event: StreamEvent,
+  memoryWriteCalls: ReadonlySet<string>,
+): boolean {
+  if (event.eventType !== 'tool_result' || event.toolIsError) return false;
+  if (event.toolName) return MEMORY_WRITE_TOOLS.has(event.toolName);
+  return !!event.toolUseId && memoryWriteCalls.has(event.toolUseId);
+}
+
+/**
+ * A progress statement the Agent sent the user during a Web turn: shown at
+ * every process visibility, and folded into the process once it replies.
+ */
+export function isProgressStep(step: StreamingStep): boolean {
+  return step.kind === 'text' && !!step.progress && !!step.text?.trim();
+}
+
+/** The text of the newest progress statement of a run. */
+export function latestProgress(
+  steps: readonly StreamingStep[] | undefined,
+): string | null {
+  for (let index = (steps?.length ?? 0) - 1; index >= 0; index -= 1) {
+    const step = steps![index];
+    if (isProgressStep(step)) return step.text ?? null;
+  }
+  return null;
+}
+
+/**
+ * Work a proactive turn does that its owner watches: a tool (the speech tool
+ * never reaches the process), a sub-agent or a plan. Reasoning and the model's
+ * requests are not: after it speaks, a turn asks the model once more to decide
+ * it is done, and that is not news.
+ */
+export function hasVisibleWork(streaming: StreamingState | undefined): boolean {
+  if (!streaming) return false;
+  return (
+    streaming.activeTools.length > 0 ||
+    Object.keys(streaming.taskStates).length > 0 ||
+    !!streaming.todos?.length ||
+    !!streaming.steps?.some(
+      (step) => step.kind === 'tool' || step.kind === 'task',
+    )
+  );
+}
 
 /** The part of a trace row the speech tool is told apart by. */
 interface TraceRowLike {
@@ -164,15 +225,18 @@ export function scrubTaskStates(
  * The part of a proactive turn's stream the Web may show. The host already
  * sends only this; the Web checks again, so a host that sends more (an older
  * or newer one, a bug) cannot put model text or reasoning on screen. Never
- * returns `text_delta`; reasoning text and the narration before a tool call
- * (`commentary`) only at `full`; tool results arrive without their text.
- * `null` means the event is dropped.
+ * returns `text_delta`; a progress statement the Agent sent at every level;
+ * reasoning text and the narration before a tool call (`commentary`) only at
+ * `full`; tool results arrive without their text, but for the receipt of a
+ * call in `memoryWriteCalls`. `null` means the event is dropped.
  */
 export function filterProactiveStreamEvent(
   visibility: ProcessVisibility,
   event: StreamEvent,
+  memoryWriteCalls: ReadonlySet<string> = NO_CALLS,
 ): StreamEvent | null {
   const type = event.eventType;
+  if (type === 'commentary' && event.progress) return event;
   if (visibility === 'hidden') {
     return type === 'status' &&
       !!event.statusText &&
@@ -184,14 +248,17 @@ export function filterProactiveStreamEvent(
     return visibility === 'full' ? event : null;
   }
   if (!ACTIVITY_EVENTS.has(type)) return null;
-  return scrubEvent(event);
+  return scrubEvent(event, memoryWriteCalls);
 }
 
 /**
  * What an allowed event still carries that is model text or what a tool or a
  * sub-agent was given or returned: the host strips these too.
  */
-function scrubEvent(event: StreamEvent): StreamEvent {
+function scrubEvent(
+  event: StreamEvent,
+  memoryWriteCalls: ReadonlySet<string>,
+): StreamEvent {
   const type = event.eventType;
   const strip: Partial<StreamEvent> = {};
   if (event.toolInput) strip.toolInput = undefined;
@@ -200,7 +267,9 @@ function scrubEvent(event: StreamEvent): StreamEvent {
   // not text, and stays: it is what lets a failed call read as failed.
   if (event.toolResultFacts) strip.toolResultFacts = undefined;
   if (type === 'tool_result') {
-    strip.toolResult = undefined;
+    if (!keepsMemoryWriteReceipt(event, memoryWriteCalls)) {
+      strip.toolResult = undefined;
+    }
     strip.detail = undefined;
   }
   if (type.startsWith('task_')) {

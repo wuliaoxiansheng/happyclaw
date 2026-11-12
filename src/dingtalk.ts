@@ -22,7 +22,6 @@ import {
   type DWClientDownStream,
 } from 'dingtalk-stream';
 import { storeChatMetadata, storeMessageDirect } from './db.js';
-import { notifyNewImMessage } from './message-notifier.js';
 import { logger } from './logger.js';
 import {
   saveDownloadedFile,
@@ -47,6 +46,20 @@ import {
   resolveAdmittedChannelRoute,
 } from './channel-admission.js';
 import { extractProviderTarget } from './channel-address.js';
+import {
+  groupSenderAdmission,
+  type ChannelCommandMention,
+  type GroupAudienceConnectOpts,
+  type GroupOwnerView,
+  type GroupSenderAdmission,
+} from './im-group-audience.js';
+import {
+  describeFollowUpOutcome,
+  parseConnectorRuntimeControl,
+  projectChannelInbound,
+  runSessionBreak,
+  type ChannelFollowUpConnectOpts,
+} from './im-connector-follow-up.js';
 import {
   ExactAsyncIndicatorRegistry,
   processingIndicatorKey,
@@ -132,6 +145,16 @@ export class DingTalkPartialDeliveryError extends Error {
       { cause },
     );
     this.name = 'DingTalkPartialDeliveryError';
+  }
+}
+
+/** A DingTalk REST call answered with an HTTP error; `status` is its code. */
+class DingTalkApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
   }
 }
 
@@ -389,7 +412,9 @@ export interface DingTalkConnectionConfig {
   clientSecret: string;
 }
 
-export interface DingTalkConnectOpts {
+/** Group audience senders are the robot callback's `senderId`. */
+export interface DingTalkConnectOpts
+  extends ChannelFollowUpConnectOpts, GroupAudienceConnectOpts {
   onReady?: () => void;
   onNewChat: (jid: string, name: string) => void;
   isChatAuthorized?: (jid: string) => boolean;
@@ -403,6 +428,7 @@ export interface DingTalkConnectOpts {
     chatJid: string,
     command: string,
     senderImId?: string,
+    mentions?: ChannelCommandMention[],
   ) => Promise<string | null>;
   resolveGroupFolder?: (jid: string) => string | undefined;
   resolveEffectiveChatJid?: (
@@ -414,10 +440,10 @@ export interface DingTalkConnectOpts {
   onBotRemovedFromGroup?: (chatJid: string) => void;
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
-  /** Resolve registered group for a jid (should return { activation_mode?: string }) */
+  /** Resolve the registered group for a jid (activation mode and owner). */
   resolveRegisteredGroup?: (
     jid: string,
-  ) => { activation_mode?: string } | undefined;
+  ) => ({ activation_mode?: string } & GroupOwnerView) | undefined;
   normalizeIncomingJid?: (jid: string) => string | null;
 }
 
@@ -1033,6 +1059,8 @@ interface DingTalkRobotMessage {
   robotCode?: string;
   /** True when this callback was delivered because the bot was @mentioned. */
   isInAtList?: boolean | string;
+  /** Members @mentioned in the message (the bot included). */
+  atUsers?: Array<{ dingtalkId?: string; staffId?: string }>;
   msgtype: string;
   originalMsgId?: string;
   text?: {
@@ -1058,6 +1086,24 @@ export function isDingTalkBotMentioned(
 ): boolean {
   const flag = (data as { isInAtList?: unknown }).isInAtList;
   return flag === true || flag === 'true';
+}
+
+/**
+ * Members a DingTalk group command names, for `/allow` and `/disallow`.
+ * `atUsers[].dingtalkId` is the same encrypted id the callback reports as
+ * `senderId`, so it is the namespace owner and allowlist entries use.
+ */
+export function dingTalkCommandMentions(data: {
+  atUsers?: unknown;
+  chatbotUserId?: string;
+}): ChannelCommandMention[] {
+  if (!Array.isArray(data.atUsers)) return [];
+  const ids = new Set<string>();
+  for (const user of data.atUsers as Array<Record<string, unknown>>) {
+    const id = user?.dingtalkId;
+    if (typeof id === 'string' && id && id !== data.chatbotUserId) ids.add(id);
+  }
+  return [...ids].map((imId) => ({ imId }));
 }
 
 function extractDingTalkAdmissionText(data: RobotMessage): string {
@@ -1197,11 +1243,17 @@ async function buildFileContentBlock(params: {
   fileName: string;
   savedRelPath: string;
   groupFolder: string;
+  /** The route passed to saveDownloadedFile. */
+  routeJid: string;
   prefixLabel: string; // e.g. "引用文件" or "文件"
 }): Promise<string> {
-  const { fileName, savedRelPath, groupFolder, prefixLabel } = params;
-  // Same root the download was saved under (customCwd for Host workspaces).
-  const absPath = path.join(resolveImDownloadRoot(groupFolder), savedRelPath);
+  const { fileName, savedRelPath, groupFolder, routeJid, prefixLabel } = params;
+  // Same root the download was saved under (customCwd for Host workspaces,
+  // the worktree of a bound session that has one).
+  const absPath = path.join(
+    resolveImDownloadRoot(groupFolder, routeJid),
+    savedRelPath,
+  );
   const extracted = await extractFileText(absPath);
   const safeName = sanitizeFileName(fileName);
 
@@ -1417,16 +1469,18 @@ export function createDingTalkConnection(
       const data = JSON.parse(text);
       if (statusCode && statusCode >= 400) {
         const errMsg = data.message || data.msg || text;
-        throw new Error(
+        throw new DingTalkApiError(
           `DingTalk API ${method} ${path} failed (${statusCode}): ${errMsg}`,
+          statusCode,
         );
       }
       return data as T;
     } catch (err) {
       if (err instanceof SyntaxError) {
         if (statusCode && statusCode >= 400) {
-          throw new Error(
+          throw new DingTalkApiError(
             `DingTalk API ${method} ${path} failed (${statusCode}): ${text}`,
+            statusCode,
           );
         }
         return {} as T;
@@ -1530,10 +1584,7 @@ export function createDingTalkConnection(
         logger.debug({ msgId, chatId }, 'DingTalk ack reaction attached');
         return { msgId, conversationId };
       } catch (err: any) {
-        // apiRequest throws plain Error objects (no .response property),
-        // so parse the status code from the error message string.
-        const match = err?.message?.match(/\((\d{3})\)/);
-        const status = match ? parseInt(match[1], 10) : 0;
+        const status = err instanceof DingTalkApiError ? err.status : 0;
         const isRetryable = status === 0 || (status >= 500 && status < 600);
         if (!isRetryable || i === ACK_REACTION_ATTACH_DELAYS.length - 1) {
           logger.debug(
@@ -2033,6 +2084,8 @@ export function createDingTalkConnection(
    */
   async function normalizeDingTalkImage(
     jid: string,
+    /** The admitted route; a session route picks that session's worktree. */
+    routeJid: string,
     opts: DingTalkConnectOpts,
     downloader: () => Promise<{ base64: string; mimeType: string } | null>,
     generation: number,
@@ -2068,6 +2121,7 @@ export function createDingTalkConnection(
           'dingtalk',
           filename,
           imgBuffer,
+          routeJid,
         );
         assertInboundGeneration(generation, signal);
         return {
@@ -2161,10 +2215,11 @@ export function createDingTalkConnection(
           ? `钉钉群 ${conversationId.slice(0, 8)}`
           : senderName;
 
+        const admissionText = extractDingTalkAdmissionText(data);
         const admission = await evaluateChannelAdmission({
           jid,
           chatName,
-          text: extractDingTalkAdmissionText(data),
+          text: admissionText,
           isChatAuthorized: opts.isChatAuthorized,
           onPairAttempt: opts.onPairAttempt,
         });
@@ -2242,7 +2297,24 @@ export function createDingTalkConnection(
         // Mention/owner gating runs before routing, registration, cache writes,
         // or attachment download. A rejected group message has zero business
         // side effects.
+        let audience: GroupSenderAdmission = 'admitted';
         if (isGroup) {
+          audience = groupSenderAdmission(
+            opts,
+            jid,
+            data.senderId,
+            admissionText,
+          );
+          // Only a plain text message can be dispatched as `/owner_mention`;
+          // never download media for a sender outside the audience.
+          if (
+            audience === 'rejected' ||
+            (audience === 'bootstrap' &&
+              (data.msgtype !== 'text' ||
+                (data as DingTalkRobotMessage).text?.isReplyMsg))
+          ) {
+            return;
+          }
           const mode = opts.resolveRegisteredGroup?.(jid)?.activation_mode;
           // Like WeCom, DingTalk only pushes group messages that @ the bot, so
           // that @ must never reopen a paused group.
@@ -2286,10 +2358,79 @@ export function createDingTalkConnection(
           }
         }
 
+        /** Run a slash command; true when it was consumed (answered or failed). */
+        const runSlashCommand = async (text: string): Promise<boolean> => {
+          const slashMatch = text.match(/^\/(\S+)(?:\s+(.*))?$/i);
+          if (!slashMatch || !opts.onCommand) return false;
+          const cmdBody = (
+            slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
+          ).trim();
+          try {
+            const reply = await opts.onCommand(
+              jid,
+              cmdBody,
+              data.senderId,
+              isGroup ? dingTalkCommandMentions(data) : [],
+            );
+            assertInboundGeneration(generation, signal);
+            if (!reply) return false;
+            if (data.sessionWebhook) {
+              await sendViaSessionWebhook(
+                data.sessionWebhook,
+                markdownToPlainText(reply),
+                isGroup,
+                signal,
+              );
+              assertInboundGeneration(generation, signal);
+            }
+            return true;
+          } catch (err) {
+            assertInboundGeneration(generation, signal);
+            logger.error({ jid, err }, 'DingTalk slash command failed');
+            return true;
+          }
+        };
+
+        // A sender outside the audience is only heard as `/owner_mention`:
+        // run that command now, before any registration, cache write or
+        // download, and drop the message whether or not it was consumed.
+        if (audience === 'bootstrap') {
+          await runSlashCommand(admissionText);
+          return;
+        }
+
         const resolvedRoute = resolveAdmittedChannelRoute(
           jid,
           opts.resolveEffectiveChatJid,
         );
+        // DingTalk pushes a group message only for an @mention and marks it
+        // with isInAtList; a 1:1 chat is addressed to the bot by construction.
+        const runtimeControl = parseConnectorRuntimeControl({
+          commandText: admissionText,
+          eligible: !isGroup || isDingTalkBotMentioned(data),
+          hasAttachments: data.msgtype !== 'text',
+        });
+        if (runtimeControl?.kind === 'break') {
+          const reply = await runSessionBreak(opts.onSessionBreak, {
+            sourceJid: jid,
+            targetJid: resolvedRoute?.targetJid,
+            senderImId: data.senderId ?? '',
+            chatType: isGroup ? 'group' : 'p2p',
+          });
+          assertInboundGeneration(generation, signal);
+          if (data.sessionWebhook) {
+            await sendViaSessionWebhook(
+              data.sessionWebhook,
+              markdownToPlainText(reply),
+              isGroup,
+              signal,
+            );
+            assertInboundGeneration(generation, signal);
+          }
+          return;
+        }
+        const steerText =
+          runtimeControl?.kind === 'steer' ? runtimeControl.text : undefined;
         if (!resolvedRoute) {
           logger.warn(
             { jid },
@@ -2353,7 +2494,7 @@ export function createDingTalkConnection(
 
         if (data.msgtype === 'text' && 'text' in data) {
           const textBlock = (data as DingTalkRobotMessage).text;
-          const userText = textBlock?.content?.trim() || '';
+          const userText = steerText ?? (textBlock?.content?.trim() || '');
           const reply = textBlock?.isReplyMsg
             ? extractRepliedMsg(
                 textBlock.repliedMsg,
@@ -2397,12 +2538,14 @@ export function createDingTalkConnection(
                     'dingtalk',
                     savedFilename,
                     fileBuffer,
+                    targetJid,
                   );
                   assertInboundGeneration(generation, signal);
                   const fileBlock = await buildFileContentBlock({
                     fileName,
                     savedRelPath: savedPath,
                     groupFolder,
+                    routeJid: targetJid,
                     prefixLabel: '引用文件',
                   });
                   assertInboundGeneration(generation, signal);
@@ -2433,6 +2576,7 @@ export function createDingTalkConnection(
               if (code) {
                 const normalized = await normalizeDingTalkImage(
                   jid,
+                  targetJid,
                   opts,
                   () =>
                     downloadDingTalkImageByDownloadCode(
@@ -2500,7 +2644,7 @@ export function createDingTalkConnection(
             { msgId, textParts, imageEntriesCount: imageCodes.length },
             'DingTalk richText parsed',
           );
-          const text = textParts.join('').trim();
+          const text = steerText ?? textParts.join('').trim();
           // Vision gets every inline-sized image; each saved image keeps its
           // own path label. Only a null normalize result is a failure — an
           // oversized image is saved without a Vision attachment.
@@ -2520,6 +2664,7 @@ export function createDingTalkConnection(
             const normalized = downloadCode
               ? await normalizeDingTalkImage(
                   jid,
+                  targetJid,
                   opts,
                   () =>
                     downloadDingTalkImageByDownloadCode(
@@ -2582,6 +2727,7 @@ export function createDingTalkConnection(
           const normalized = downloadCode
             ? await normalizeDingTalkImage(
                 jid,
+                targetJid,
                 opts,
                 () =>
                   downloadDingTalkImageByDownloadCode(
@@ -2640,12 +2786,14 @@ export function createDingTalkConnection(
                   'dingtalk',
                   savedFilename,
                   fileBuffer,
+                  targetJid,
                 );
                 assertInboundGeneration(generation, signal);
                 content = await buildFileContentBlock({
                   fileName,
                   savedRelPath: savedPath,
                   groupFolder,
+                  routeJid: targetJid,
                   prefixLabel: '文件',
                 });
                 assertInboundGeneration(generation, signal);
@@ -2697,6 +2845,7 @@ export function createDingTalkConnection(
                     'dingtalk',
                     `audio_${Date.now()}.${extension}`,
                     fileBuffer,
+                    targetJid,
                   );
                   assertInboundGeneration(generation, signal);
                   audioBlock = `[语音: audio.${extension} → ${savedPath}]`;
@@ -2749,12 +2898,14 @@ export function createDingTalkConnection(
                     'dingtalk',
                     `video_${Date.now()}.${videoType}`,
                     fileBuffer,
+                    targetJid,
                   );
                   assertInboundGeneration(generation, signal);
                   content = await buildFileContentBlock({
                     fileName,
                     savedRelPath: savedPath,
                     groupFolder,
+                    routeJid: targetJid,
                     prefixLabel: '视频',
                   });
                   assertInboundGeneration(generation, signal);
@@ -2778,6 +2929,7 @@ export function createDingTalkConnection(
           const normalized = contentUrl
             ? await normalizeDingTalkImage(
                 jid,
+                targetJid,
                 opts,
                 () =>
                   downloadDingTalkImageAsBase64(contentUrl, generation, signal),
@@ -2808,33 +2960,7 @@ export function createDingTalkConnection(
         // ── Authorized: process message ──
 
         // Handle slash commands
-        const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/i);
-        if (slashMatch && opts.onCommand) {
-          const cmdBody = (
-            slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
-          ).trim();
-          try {
-            const reply = await opts.onCommand(jid, cmdBody, data.senderId);
-            assertInboundGeneration(generation, signal);
-            if (reply) {
-              const plainText = markdownToPlainText(reply);
-              if (data.sessionWebhook) {
-                await sendViaSessionWebhook(
-                  data.sessionWebhook,
-                  plainText,
-                  isGroup,
-                  signal,
-                );
-                assertInboundGeneration(generation, signal);
-              }
-              return;
-            }
-          } catch (err) {
-            assertInboundGeneration(generation, signal);
-            logger.error({ jid, err }, 'DingTalk slash command failed');
-            return;
-          }
-        }
+        if (steerText === undefined && (await runSlashCommand(content))) return;
 
         // Route was resolved before registration and media download.
         const id = crypto.randomUUID();
@@ -2859,9 +2985,10 @@ export function createDingTalkConnection(
         // silently drops the message.
         dedup.markSeen(msgId);
 
+        let followUp = describeFollowUpOutcome({ disposition: 'started' });
         try {
-          opts.onMessagePersisted?.(
-            targetJid,
+          followUp = projectChannelInbound(
+            opts,
             {
               id,
               chat_jid: targetJid,
@@ -2873,7 +3000,10 @@ export function createDingTalkConnection(
               attachments: attachmentsJson,
               is_from_me: false,
             },
-            agentRouting?.agentId ?? undefined,
+            {
+              agentId: agentRouting?.agentId ?? undefined,
+              requestedMode: steerText === undefined ? undefined : 'steer',
+            },
           );
         } catch (err) {
           // Persistence is the ACK boundary. A notification hook failure must
@@ -2894,13 +3024,13 @@ export function createDingTalkConnection(
           )
           .catch(() => {});
 
-        try {
-          notifyNewImMessage();
-        } catch (err) {
-          logger.error(
-            { err, jid, targetJid, msgId },
-            'DingTalk post-persist notifier failed',
+        if (!followUp.shouldStartTurn) {
+          // Released by the host when the active run ends.
+          logger.info(
+            { jid, targetJid, msgId, disposition: followUp.disposition },
+            'DingTalk message queued behind the active run',
           );
+          return;
         }
 
         if (agentRouting?.agentId) {

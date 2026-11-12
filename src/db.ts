@@ -4,7 +4,7 @@ import Database from './sqlite-compat.js';
 import fs from 'fs';
 import path from 'path';
 
-import { STORE_DIR, GROUPS_DIR } from './config.js';
+import { STORE_DIR, TIMEZONE } from './config.js';
 import { normalizeAgentEffort } from './agent-effort.js';
 import { logger } from './logger.js';
 import { isValidWorkspaceFolderName } from './workspace-folder.js';
@@ -14,7 +14,6 @@ import {
   AgentBuilderDraft,
   AgentProfilePromptMode,
   AgentProfilePrompts,
-  AgentProfilePromptVersion,
   AgentProfileRuntimePolicy,
   AgentKind,
   AgentStatus,
@@ -49,16 +48,7 @@ import {
   ImContextBinding,
   RedeemCode,
   RegisteredGroup,
-  ScheduledTask,
   SubAgent,
-  ClaimedTaskRun,
-  TaskRun,
-  TaskRunDefinitionSnapshot,
-  TaskRunNotificationStatus,
-  TaskRunNotificationSummary,
-  TaskRunStatus,
-  TaskRunTrigger,
-  TaskRunLog,
   User,
   UserBalance,
   UserPublic,
@@ -82,8 +72,17 @@ import {
   normalizeAgentProfilePrompts,
   promptModeFromLegacyPreset,
 } from './agent-profile-prompts.js';
+import {
+  bindHappyClawPlatformIdentityHash,
+  canOwnerUseHostResources,
+  legacyHostSkillPolicy,
+  resolveEffectiveAgentRuntimePolicy,
+  type AgentProfileHostAccess,
+  type MainAgentContextSettings,
+} from './agent-profile-identity.js';
 import { assertDatabaseMaintenanceAccess } from './database-maintenance.js';
 import { CURRENT_SCHEMA_VERSION } from './schema-version.js';
+import { splitOneMillionSuffix } from './model-providers.js';
 import type {
   RouterCursorChange,
   RouterCursorKind,
@@ -106,6 +105,47 @@ import {
   HAPPYCLAW_OWNER_INTRODUCTION_FLOW_KEY,
   reconcileLegacyOwnerProfileMemory,
 } from './owner-profile-store.js';
+import { initSessionWorktreeStore } from './session-worktree-store.js';
+import {
+  assignWorkspaceRootDirIfNew,
+  deleteRecordedWorkdir,
+  ensureWorkspaceDirs,
+  initWorkspaceDirStore,
+} from './workspace-dir.js';
+import {
+  deleteWorkspaceAutomations,
+  initAutomationStore,
+  migrateLegacyScheduledTasks,
+} from './automation-store.js';
+import {
+  deleteWorkspaceWorkItems,
+  initWorkItemStore,
+} from './work-item-store.js';
+import {
+  deleteWebPushSubscriptionsForUser,
+  initWebPushStore,
+  moveWebPushSubscriptionsToSession,
+} from './web-push-store.js';
+import {
+  DEFAULT_WORK_MODE,
+  parseWorkMode,
+  type WorkMode,
+} from './work-items.js';
+import {
+  migrateLegacyMainSessions,
+  forgetOrphanedLegacyMainState,
+  relocateLegacyMainSessionDirectories,
+  type LegacyMainSessionMigrationReport,
+} from './legacy-main-session-migration.js';
+import { LEGACY_MAIN_SESSION_KEY_PREFIX } from './legacy-main-session-checks.js';
+import { keyPrefixRange } from './sql-key-prefix.js';
+import {
+  clearAgentSessionHistoryReinjections,
+  clearFolderRuntimeState,
+  clearSessionHistoryReinjection,
+  clearUsageLimitWait,
+  initRuntimeStateStore,
+} from './runtime-state-store.js';
 import { splitLegacyEmbeddedReferenceContent } from './message-prompt.js';
 
 let db: InstanceType<typeof Database>;
@@ -178,8 +218,8 @@ function stmts() {
           id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me,
           attachments, token_usage, channel_context, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason, task_id,
           delivery_mode, delivery_status, delivery_run_id, delivery_priority, delivery_updated_at,
-          history_recovery_allowed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          automation_run_id, history_recovery_allowed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
           COALESCE((
             SELECT history_recovery_allowed FROM messages
             WHERE id = ? AND chat_jid = ?
@@ -211,7 +251,8 @@ function stmts() {
           updated_at = datetime('now')`,
       ),
       getSessionWithUser: db.prepare(
-        `SELECT s.*, u.username, u.role, u.status, u.display_name, u.permissions, u.must_change_password
+        `SELECT s.*, u.username, u.role, u.status, u.display_name, u.permissions, u.must_change_password,
+                u.guest_owner_id
          FROM user_sessions s
          JOIN users u ON s.user_id = u.id
          WHERE s.id = ?`,
@@ -234,7 +275,7 @@ function stmts() {
       ),
       getMessagesSince: db.prepare(
         `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
-                m.attachments, m.channel_context, m.source_kind, m.task_id,
+                m.attachments, m.channel_context, m.source_kind, m.task_id, m.automation_run_id,
                 m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
                 m.delivery_updated_at, seq.sequence AS ingest_sequence
          FROM message_ingest_sequences seq
@@ -245,7 +286,7 @@ function stmts() {
       ),
       getMessagesSinceLimited: db.prepare(
         `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
-                m.attachments, m.channel_context, m.source_kind, m.task_id,
+                m.attachments, m.channel_context, m.source_kind, m.task_id, m.automation_run_id,
                 m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
                 m.delivery_updated_at, seq.sequence AS ingest_sequence
          FROM message_ingest_sequences seq
@@ -269,7 +310,7 @@ function getNewMessagesStmt(jidCount: number): any {
     const placeholders = Array(jidCount).fill('?').join(',');
     s = db.prepare(
       `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
-              m.attachments, m.channel_context, m.source_kind, m.task_id,
+              m.attachments, m.channel_context, m.source_kind, m.task_id, m.automation_run_id,
               m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
               m.delivery_updated_at, seq.sequence AS ingest_sequence
        FROM message_ingest_sequences seq
@@ -277,7 +318,7 @@ function getNewMessagesStmt(jidCount: number): any {
        WHERE seq.sequence > ?
          AND m.chat_jid IN (${placeholders})
          AND m.is_from_me = 0
-         AND COALESCE(m.source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt')
+         AND COALESCE(m.source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt', 'automation_prompt')
          AND COALESCE(m.delivery_status, '') NOT IN ('queued', 'promoting', 'cancelled', 'awaiting_companion', 'subsumed')
        ORDER BY seq.sequence ASC`,
     );
@@ -313,6 +354,8 @@ interface StoredMessageMeta {
   deliveryRunId?: string | null;
   deliveryPriority?: number | null;
   deliveryUpdatedAt?: string | null;
+  /** automation_runs.id of an automation_prompt input. */
+  automationRunId?: string | null;
 }
 
 function hasColumn(tableName: string, columnName: string): boolean {
@@ -589,8 +632,16 @@ const FK_CHECK_CLEAN_AT_KEY = 'foreign_key_check_clean_at';
 const FK_CHECK_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function initDatabase(
-  options: { requireCurrentSchema?: boolean } = {},
-): void {
+  options: {
+    requireCurrentSchema?: boolean;
+    /** False leaves session directories alone (the v88 report runs on a copy). */
+    relocateLegacySessionDirectories?: boolean;
+  } = {},
+): {
+  legacyMainSessions: LegacyMainSessionMigrationReport | null;
+  /** v88 mappings and OOM counters forgotten because their session is gone. */
+  forgottenLegacyMainState: { mappings: number; oomCounters: number };
+} {
   const dbPath = path.join(STORE_DIR, 'messages.db');
   assertDatabaseMaintenanceAccess(dbPath);
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -747,90 +798,6 @@ export function initDatabase(
     );
     CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp);
     CREATE INDEX IF NOT EXISTS idx_messages_jid_ts ON messages(chat_jid, timestamp);
-
-    CREATE TABLE IF NOT EXISTS scheduled_tasks (
-      id TEXT PRIMARY KEY,
-      group_folder TEXT NOT NULL,
-      chat_jid TEXT NOT NULL,
-      prompt TEXT NOT NULL,
-      schedule_type TEXT NOT NULL,
-      schedule_value TEXT NOT NULL,
-      context_mode TEXT DEFAULT 'isolated',
-      execution_type TEXT DEFAULT 'agent',
-      script_command TEXT,
-      next_run TEXT,
-      last_run TEXT,
-      last_result TEXT,
-      status TEXT DEFAULT 'active',
-      created_at TEXT NOT NULL,
-      created_by TEXT,
-      notify_channels TEXT,
-      running_until TEXT,
-      runner_id TEXT,
-      revision INTEGER NOT NULL DEFAULT 1,
-      updated_at TEXT NOT NULL DEFAULT '',
-      deleted_at TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_next_run ON scheduled_tasks(next_run);
-    CREATE INDEX IF NOT EXISTS idx_status ON scheduled_tasks(status);
-
-    CREATE TABLE IF NOT EXISTS task_run_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      task_id TEXT NOT NULL,
-      run_at TEXT NOT NULL,
-      duration_ms INTEGER NOT NULL,
-      status TEXT NOT NULL,
-      result TEXT,
-      error TEXT,
-      FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
-
-    CREATE TABLE IF NOT EXISTS task_runs (
-      id TEXT PRIMARY KEY,
-      task_id TEXT NOT NULL,
-      occurrence_key TEXT NOT NULL UNIQUE,
-      trigger_type TEXT NOT NULL,
-      idempotency_key TEXT,
-      scheduled_for TEXT NOT NULL,
-      definition_revision INTEGER NOT NULL,
-      definition_snapshot TEXT NOT NULL,
-      status TEXT NOT NULL,
-      attempt INTEGER NOT NULL DEFAULT 0,
-      available_at TEXT NOT NULL,
-      lease_owner TEXT,
-      lease_token INTEGER NOT NULL DEFAULT 0,
-      lease_expires_at TEXT,
-      started_at TEXT,
-      completed_at TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      duration_ms INTEGER NOT NULL DEFAULT 0,
-      result TEXT,
-      error TEXT,
-      notification_status TEXT NOT NULL DEFAULT 'pending',
-      notification_error TEXT,
-      notification_summary TEXT,
-      notification_payload TEXT,
-      notification_attempt INTEGER NOT NULL DEFAULT 0,
-      notification_available_at TEXT,
-      notification_lease_owner TEXT,
-      notification_lease_token INTEGER NOT NULL DEFAULT 0,
-      notification_lease_expires_at TEXT,
-      notification_lease_payload TEXT,
-      notification_generation INTEGER NOT NULL DEFAULT 0,
-      FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_task_runs_manual_idempotency
-      ON task_runs(task_id, idempotency_key)
-      WHERE idempotency_key IS NOT NULL;
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_task_runs_one_nonterminal
-      ON task_runs(task_id)
-      WHERE status IN ('queued', 'running', 'retry_wait');
-    CREATE INDEX IF NOT EXISTS idx_task_runs_due
-      ON task_runs(status, available_at, lease_expires_at);
-    CREATE INDEX IF NOT EXISTS idx_task_runs_task_created
-      ON task_runs(task_id, created_at DESC);
   `);
 
   // State tables (replacing JSON files)
@@ -1060,6 +1027,28 @@ export function initDatabase(
     );
   `);
 
+  // User pinned sessions (per-user session pinning inside a workspace)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_pinned_sessions (
+      user_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      pinned_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, agent_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_pinned_sessions_agent
+      ON user_pinned_sessions(agent_id);
+  `);
+
+  initSessionWorktreeStore(db);
+  // v89 -> v90: workspace_workdirs, the recorded directory of a Host
+  // workspace created in the workspace root (workspace-dir.ts). Its own
+  // folder-keyed table: `workspaces` is keyed by jid and is a projection that
+  // reconcileCanonicalRuntimeProjections prunes and rebuilds from
+  // registered_groups, so it cannot be the only copy of where files live.
+  // Additive; every existing workspace has no record and stays in
+  // data/groups/<folder>.
+  initWorkspaceDirStore(db);
+
   // v65 -> v66: HappyClaw Owner Profile remains a reserved Workspace Memory
   // item; this table tracks only its one-shot onboarding lifecycle. Duplicate
   // legacy items must be reconciled before the reserved-key unique index is
@@ -1184,6 +1173,28 @@ export function initDatabase(
   ensureColumn('turn_traces', 'steps_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn('turn_traces', 'steps_dropped', 'INTEGER NOT NULL DEFAULT 0');
 
+  // v85 -> v86: read-only guest accounts. A guest belongs to exactly one
+  // owner (`users.guest_owner_id`) and can only view the owner's workspaces
+  // listed in guest_workspace_grants. `owner_user_id` is denormalized so a
+  // grant whose workspace changed hands, or whose guest was re-parented, is
+  // never honoured (every check joins it against both users rows).
+  ensureColumn('users', 'guest_owner_id', 'TEXT');
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS guest_workspace_grants (
+      guest_user_id TEXT NOT NULL,
+      workspace_jid TEXT NOT NULL,
+      owner_user_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (guest_user_id, workspace_jid)
+    );
+    CREATE INDEX IF NOT EXISTS idx_guest_workspace_grants_workspace
+      ON guest_workspace_grants(workspace_jid);
+    CREATE INDEX IF NOT EXISTS idx_guest_workspace_grants_owner
+      ON guest_workspace_grants(owner_user_id);
+    CREATE INDEX IF NOT EXISTS idx_users_guest_owner
+      ON users(guest_owner_id);
+  `);
+
   // Top-level Agent Profiles: runtime identities/personas that own workspaces.
   // Do not confuse this with the legacy `agents` table above, which stores
   // workspace-scoped conversation/task/spawn agents.
@@ -1202,6 +1213,7 @@ export function initDatabase(
       avatar_color TEXT,
       avatar_url TEXT,
       model_config_id TEXT,
+      model TEXT,
       runtime_policy TEXT NOT NULL DEFAULT '{}',
       identity_hash TEXT NOT NULL DEFAULT '',
       version INTEGER NOT NULL DEFAULT 1,
@@ -1215,25 +1227,6 @@ export function initDatabase(
       WHERE is_default = 1 AND status = 'active';
     CREATE INDEX IF NOT EXISTS idx_agent_profiles_owner
       ON agent_profiles(owner_user_id, status);
-
-    CREATE TABLE IF NOT EXISTS agent_profile_prompt_versions (
-      id TEXT PRIMARY KEY,
-      agent_profile_id TEXT NOT NULL,
-      version INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      identity_prompt TEXT NOT NULL DEFAULT '',
-      soul_prompt TEXT NOT NULL DEFAULT '',
-      agents_prompt TEXT NOT NULL DEFAULT '',
-      tools_prompt TEXT NOT NULL DEFAULT '',
-      prompt_mode TEXT NOT NULL DEFAULT 'append',
-      identity_hash TEXT NOT NULL,
-      change_source TEXT NOT NULL DEFAULT 'update',
-      restored_from_version INTEGER,
-      created_at TEXT NOT NULL,
-      UNIQUE(agent_profile_id, version)
-    );
-    CREATE INDEX IF NOT EXISTS idx_agent_profile_prompt_versions_profile
-      ON agent_profile_prompt_versions(agent_profile_id, version DESC);
 
     CREATE TABLE IF NOT EXISTS agent_builder_drafts (
       id TEXT PRIMARY KEY,
@@ -1557,53 +1550,6 @@ export function initDatabase(
     'default_require_mention',
     'INTEGER NOT NULL DEFAULT 0',
   );
-  ensureColumn('scheduled_tasks', 'created_by', 'TEXT');
-  ensureColumn('scheduled_tasks', 'execution_type', "TEXT DEFAULT 'agent'");
-  ensureColumn('scheduled_tasks', 'script_command', 'TEXT');
-  ensureColumn('scheduled_tasks', 'notify_channels', 'TEXT');
-  ensureColumn('scheduled_tasks', 'execution_mode', 'TEXT');
-  ensureColumn('scheduled_tasks', 'workspace_jid', 'TEXT');
-  ensureColumn('scheduled_tasks', 'workspace_folder', 'TEXT');
-  ensureColumn('scheduled_tasks', 'running_until', 'TEXT');
-  ensureColumn('scheduled_tasks', 'runner_id', 'TEXT');
-  ensureColumn('scheduled_tasks', 'revision', 'INTEGER NOT NULL DEFAULT 1');
-  ensureColumn('scheduled_tasks', 'updated_at', "TEXT NOT NULL DEFAULT ''");
-  ensureColumn('scheduled_tasks', 'deleted_at', 'TEXT');
-  // v62 -> v63: a task stored only the workspace-level `chat_jid`, so execution
-  // had to re-derive its target and fell back to "any group in this folder,
-  // preferring web:". Capture the concrete delivery route instead — HappyClaw's
-  // JID already encodes provider, external chat, channel account and Feishu
-  // thread/root, so one column carries the whole binding. Existing rows are
-  // backfilled from `chat_jid`, which is exactly the route they used before.
-  ensureColumn('scheduled_tasks', 'delivery_route_jid', 'TEXT');
-  prepareCached(`UPDATE scheduled_tasks
-     SET delivery_route_jid = chat_jid
-     WHERE delivery_route_jid IS NULL AND chat_jid IS NOT NULL`).run();
-  ensureColumn('task_runs', 'notification_summary', 'TEXT');
-  ensureColumn('task_runs', 'notification_payload', 'TEXT');
-  ensureColumn(
-    'task_runs',
-    'notification_attempt',
-    'INTEGER NOT NULL DEFAULT 0',
-  );
-  ensureColumn('task_runs', 'notification_available_at', 'TEXT');
-  ensureColumn('task_runs', 'notification_lease_owner', 'TEXT');
-  ensureColumn(
-    'task_runs',
-    'notification_lease_token',
-    'INTEGER NOT NULL DEFAULT 0',
-  );
-  ensureColumn('task_runs', 'notification_lease_expires_at', 'TEXT');
-  ensureColumn('task_runs', 'notification_lease_payload', 'TEXT');
-  ensureColumn(
-    'task_runs',
-    'notification_generation',
-    'INTEGER NOT NULL DEFAULT 0',
-  );
-  // Old rows predate updated_at; created_at is the least-surprising baseline.
-  prepareCached(
-    "UPDATE scheduled_tasks SET updated_at = created_at WHERE updated_at = '' OR updated_at IS NULL",
-  ).run();
   ensureColumn('registered_groups', 'selected_skills', 'TEXT');
   ensureColumn('sessions', 'agent_id', "TEXT NOT NULL DEFAULT ''");
   ensureColumn('agents', 'kind', "TEXT NOT NULL DEFAULT 'task'");
@@ -1706,6 +1652,7 @@ export function initDatabase(
   ensureColumn('messages', 'delivery_run_id', 'TEXT');
   ensureColumn('messages', 'delivery_priority', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('messages', 'delivery_updated_at', 'TEXT');
+  ensureColumn('messages', 'automation_run_id', 'TEXT');
   // v72 -> v73: fence legacy workspace transcript rows that mixed private and
   // group messages without trusting provider-controlled timestamps. Existing
   // rows can be disabled for model recovery while future rows default to safe.
@@ -1745,6 +1692,10 @@ export function initDatabase(
   ensureColumn('agents', 'root_message_id', 'TEXT');
   ensureColumn('agents', 'title_source', 'TEXT');
   ensureColumn('agents', 'last_active_at', 'TEXT');
+  ensureColumn('agents', 'automation_id', 'TEXT');
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_agents_automation ON agents(automation_id)',
+  );
 
   // Add index on target_agent_id for fast lookup of IM bindings
   db.exec(
@@ -1805,24 +1756,6 @@ export function initDatabase(
     'attachments',
     'token_usage',
     'channel_context',
-  ]);
-  assertSchema('scheduled_tasks', [
-    'id',
-    'group_folder',
-    'chat_jid',
-    'prompt',
-    'schedule_type',
-    'schedule_value',
-    'context_mode',
-    'next_run',
-    'last_run',
-    'last_result',
-    'status',
-    'created_at',
-    'created_by',
-    'revision',
-    'updated_at',
-    'deleted_at',
   ]);
   assertSchema(
     'registered_groups',
@@ -2291,6 +2224,9 @@ export function initDatabase(
       ON agent_profiles(model_config_id)
       WHERE model_config_id IS NOT NULL;
   `);
+  // v82 -> v83: a configuration offers several models and an Agent may pick
+  // one of them. NULL runs the configuration's own default model.
+  ensureColumn('agent_profiles', 'model', 'TEXT');
   // v68 -> v69: make reasoning effort an explicit Agent runtime policy. The
   // inherited default preserves every existing Provider/SDK behavior, so this
   // migration normalizes JSON only and deliberately does not bump Agent
@@ -2321,26 +2257,6 @@ export function initDatabase(
     'confirmation_phrase',
     "TEXT NOT NULL DEFAULT ''",
   );
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS agent_profile_prompt_versions (
-      id TEXT PRIMARY KEY,
-      agent_profile_id TEXT NOT NULL,
-      version INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      identity_prompt TEXT NOT NULL DEFAULT '',
-      soul_prompt TEXT NOT NULL DEFAULT '',
-      agents_prompt TEXT NOT NULL DEFAULT '',
-      tools_prompt TEXT NOT NULL DEFAULT '',
-      prompt_mode TEXT NOT NULL DEFAULT 'append',
-      identity_hash TEXT NOT NULL,
-      change_source TEXT NOT NULL DEFAULT 'update',
-      restored_from_version INTEGER,
-      created_at TEXT NOT NULL,
-      UNIQUE(agent_profile_id, version)
-    );
-    CREATE INDEX IF NOT EXISTS idx_agent_profile_prompt_versions_profile
-      ON agent_profile_prompt_versions(agent_profile_id, version DESC);
-  `);
   if (promptSchemaVersion < 48) {
     const legacyRows = prepareCached(
       'SELECT * FROM agent_profiles',
@@ -2377,17 +2293,6 @@ export function initDatabase(
           identityHash,
           String(row.id),
         );
-        insertAgentProfilePromptVersionSnapshot({
-          profileId: String(row.id),
-          version: Number(row.version ?? 1),
-          name: String(row.name ?? ''),
-          prompts,
-          identityHash,
-          changeSource: 'migration',
-          createdAt: String(
-            row.updated_at ?? row.created_at ?? new Date().toISOString(),
-          ),
-        });
       }
     })();
   }
@@ -2619,6 +2524,14 @@ export function initDatabase(
     'process_visibility',
     "TEXT NOT NULL DEFAULT 'hidden' CHECK (process_visibility IN ('hidden', 'activity', 'full'))",
   );
+  // v88 -> v89: how the workspace's sessions take on work (multi-task mode).
+  // Every existing workspace keeps working as before ('single'). Same row and
+  // same place as process_visibility: before the binding backfill below.
+  ensureColumn(
+    'workspace_agent_profiles',
+    'work_mode',
+    "TEXT NOT NULL DEFAULT 'single' CHECK (work_mode IN ('single', 'multi'))",
+  );
 
   db.exec('DROP TABLE IF EXISTS group_members');
   backfillAgentProfileDefaultsAndWorkspaceMappings();
@@ -2700,6 +2613,17 @@ export function initDatabase(
   // schema and fenced APIs; db.ts only binds it to this process connection.
   createChannelReliabilitySchema(db);
   bindChannelReliabilityDatabase(db);
+  initRuntimeStateStore(db);
+  initAutomationStore(db);
+  // v86 -> v87: team mode (团队模式). work-item-store.ts owns its tables
+  // (team_mounts, work_items, work_item_subscriptions, work_item_events,
+  // work_decisions); they are new and additive, nothing is backfilled.
+  // v88 -> v89: work_items.origin / origin_agent_id / origin_input_id
+  // (multi-task mode); every existing item is a team item.
+  initWorkItemStore(db);
+  // v90 -> v91: Web Push subscriptions (web_push_subscriptions). The table is
+  // new and additive, nothing is backfilled.
+  initWebPushStore(db);
 
   // v63 -> v64: early Feishu reply enrichment embedded quoted ancestors in
   // messages.content, leaking prompt scaffolding into Web history and then
@@ -2847,9 +2771,81 @@ export function initDatabase(
     dropStrayRouterCursorBlobs();
   }
 
+  // v83 -> v84: Agents no longer keep a prompt history. The pre-migration
+  // backup still holds the old snapshots.
+  db.exec('DROP TABLE IF EXISTS agent_profile_prompt_versions');
+  // v83 -> v84: host Skills become an explicit per-Agent grant.
+  pinAgentProfileHostSkillPolicies();
+
+  // v84 -> v85: scheduled tasks become automations. Live tasks are
+  // converted, then the task tables and their usage-limit waits go; the
+  // pre-migration backup keeps the old rows. Old task messages stay in the
+  // transcript.
+  if (
+    (rawSchemaVersionBeforeInit === null ||
+      Number(rawSchemaVersionBeforeInit) < 85) &&
+    tableExists('scheduled_tasks')
+  ) {
+    db.transaction(() => {
+      const { converted, skipped, reassigned } = migrateLegacyScheduledTasks({
+        timezone: TIMEZONE,
+      });
+      for (const { taskId, from, to } of reassigned) {
+        logger.warn(
+          { taskId, from, to },
+          'Scheduled task creator is not the workspace owner; the automation goes to the owner',
+        );
+      }
+      for (const { taskId, reason } of skipped) {
+        logger.warn(
+          { taskId, reason },
+          'Scheduled task not converted to an automation',
+        );
+      }
+      db.exec(`
+        DROP TABLE IF EXISTS task_run_logs;
+        DROP TABLE IF EXISTS task_runs;
+        DROP TABLE IF EXISTS task_failure_notices;
+        DROP TABLE IF EXISTS scheduled_tasks;
+        DELETE FROM usage_limit_waits WHERE scope_key LIKE 'task-run:%';
+      `);
+      logger.info(
+        { converted, skipped: skipped.length },
+        'Converted scheduled tasks to automations',
+      );
+    })();
+  }
+
+  // v87 -> v88: each workspace's implicit main session becomes an ordinary
+  // conversation session (legacy-main-session-migration.ts). Last, so every
+  // table it moves state between exists and the binding projections above
+  // have been rebuilt.
+  const legacyMainSessions =
+    rawSchemaVersionBeforeInit === null ||
+    Number(rawSchemaVersionBeforeInit) < 88
+      ? migrateLegacyMainSessions(db)
+      : null;
+
   prepareCached(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', String(CURRENT_SCHEMA_VERSION));
+
+  // Every startup, before any Runner: forgets v88 mappings and OOM counters
+  // of sessions that no longer exist (a database write), then finishes a
+  // directory move a crash interrupted. Maintenance bootstraps
+  // (requireCurrentSchema) do neither; relocateLegacySessionDirectories:
+  // false skips only the move.
+  let forgottenLegacyMainState: { mappings: number; oomCounters: number } = {
+    mappings: 0,
+    oomCounters: 0,
+  };
+  if (!options.requireCurrentSchema) {
+    forgottenLegacyMainState = forgetOrphanedLegacyMainState(db);
+    if (options.relocateLegacySessionDirectories !== false) {
+      relocateLegacyMainSessionDirectories(db);
+    }
+  }
+  return { legacyMainSessions, forgottenLegacyMainState };
 }
 
 const LEGACY_ROUTER_CURSOR_BLOBS: ReadonlyArray<
@@ -3285,11 +3281,6 @@ function toUtf8String(value: unknown, warnField?: string): string {
   return coerced;
 }
 
-/** Variant that preserves null (vs the default '' fallback). */
-function toUtf8StringOrNull(value: unknown): string | null {
-  return value == null ? null : toUtf8String(value);
-}
-
 /** Normalize a raw message row from sqlite: decode content + boolify is_from_me.
  *  The is_from_me overload must come first — TS overload resolution stops at
  *  the first match and `NewMessage & { is_from_me: number }` is a subtype of
@@ -3402,6 +3393,7 @@ export function storeMessageDirect(
     meta?.deliveryRunId ?? null,
     meta?.deliveryPriority ?? 0,
     meta?.deliveryUpdatedAt ?? null,
+    meta?.automationRunId ?? null,
     effectiveMsgId,
     chatJid,
   );
@@ -3626,7 +3618,9 @@ export function findForwardBundleCommentTail(
              AND json_extract(channel_context, '$.message.contentLink.bundleId') = ?
              AND json_extract(channel_context, '$.message.contentLink.role') = 'forwarder_comment'
            ) OR (
-             json_extract(channel_context, '$.message.rootId') = ?
+             -- Main-chat quote replies carry only parentId.
+             IFNULL(json_extract(channel_context, '$.message.rootId'),
+                    json_extract(channel_context, '$.message.parentId')) = ?
              AND json_extract(channel_context, '$.message.parentId') = ?
              AND json_extract(channel_context, '$.message.type') IN ('text', 'post')
            )
@@ -3679,6 +3673,12 @@ function normalizeQueuedFollowUpRow(
     timestamp: String(row.timestamp),
     attachments: row.attachments ? String(row.attachments) : undefined,
     channel_context: parseChannelTurnContext(row.channel_context),
+    source_kind: row.source_kind
+      ? (String(row.source_kind) as MessageSourceKind)
+      : null,
+    automation_run_id: row.automation_run_id
+      ? String(row.automation_run_id)
+      : null,
     delivery_mode: (row.delivery_mode === 'steer'
       ? 'steer'
       : 'queue') as FollowUpMode,
@@ -3691,8 +3691,8 @@ function normalizeQueuedFollowUpRow(
 
 const FOLLOW_UP_SELECT = `
   SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp,
-         attachments, channel_context, delivery_mode, delivery_status, delivery_run_id,
-         delivery_priority,
+         attachments, channel_context, source_kind, automation_run_id,
+         delivery_mode, delivery_status, delivery_run_id, delivery_priority,
          (SELECT sequence FROM message_ingest_sequences seq
           WHERE seq.chat_jid = messages.chat_jid AND seq.message_id = messages.id)
            AS ingest_sequence
@@ -3732,6 +3732,52 @@ export function listQueuedFollowUps(chatJid: string): QueuedFollowUp[] {
        ORDER BY delivery_priority ASC, ingest_sequence ASC`,
     )
     .all(chatJid) as Array<Record<string, unknown>>;
+  return rows.map(normalizeQueuedFollowUpRow);
+}
+
+/** How many inputs each chat has queued, in one read; absent means none. */
+export function countQueuedFollowUpsByChat(
+  chatJids: string[],
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  if (chatJids.length === 0) return counts;
+  const rows = prepareCached(`SELECT chat_jid, COUNT(*) AS n
+       FROM messages
+       WHERE delivery_status IN ('queued', 'promoting')
+         AND chat_jid IN (SELECT value FROM json_each(?))
+       GROUP BY chat_jid`).all(JSON.stringify(chatJids)) as Array<{
+    chat_jid: string;
+    n: number;
+  }>;
+  for (const row of rows) counts.set(row.chat_jid, row.n);
+  return counts;
+}
+
+/**
+ * Queued inputs that arrived from a channel chat, in queue order: the only
+ * ones whose sender can leave a group's response audience. A Web-only
+ * Session has none, so its queue drain does no per-input work.
+ */
+export function listQueuedChannelFollowUps(chatJid: string): QueuedFollowUp[] {
+  const rows = prepareCached(`${FOLLOW_UP_SELECT}
+       WHERE chat_jid = ? AND delivery_status IN ('queued', 'promoting')
+         AND source_jid IS NOT NULL AND source_jid NOT LIKE 'web:%'
+       ORDER BY delivery_priority ASC, ingest_sequence ASC`).all(
+    chatJid,
+  ) as Array<Record<string, unknown>>;
+  return rows.map(normalizeQueuedFollowUpRow);
+}
+
+/** Queued automation inputs of a lane, for withdrawing ended runs. */
+export function listQueuedAutomationFollowUps(
+  chatJid: string,
+): QueuedFollowUp[] {
+  const rows = prepareCached(`${FOLLOW_UP_SELECT}
+       WHERE chat_jid = ? AND delivery_status = 'queued'
+         AND automation_run_id IS NOT NULL
+       ORDER BY delivery_priority ASC, ingest_sequence ASC`).all(
+    chatJid,
+  ) as Array<Record<string, unknown>>;
   return rows.map(normalizeQueuedFollowUpRow);
 }
 
@@ -4073,6 +4119,41 @@ export function cancelQueuedFollowUp(
 }
 
 /**
+ * Withdraw a queued input together with the late forward root it durably
+ * covers. A user cancel refuses this pair because it counts as admitted, but
+ * an input whose sender left the response audience must not run, and must
+ * not leave its covered root hidden as `subsumed` either.
+ */
+export function withdrawQueuedFollowUp(
+  chatJid: string,
+  messageId: string,
+  updatedAt = new Date().toISOString(),
+): { item: QueuedFollowUp; coveredRoots: QueuedFollowUp[] } | null {
+  return db.transaction(() => {
+    const item = transitionFollowUp(
+      chatJid,
+      messageId,
+      ['queued', 'promoting'],
+      'cancelled',
+      { updatedAt },
+    );
+    if (!item) return null;
+    const coveredRoots = (
+      prepareCached(`${FOLLOW_UP_SELECT}
+         WHERE chat_jid = ? AND delivery_status = 'subsumed'
+           AND delivery_run_id = ?`).all(chatJid, messageId) as Array<
+        Record<string, unknown>
+      >
+    ).map(normalizeQueuedFollowUpRow);
+    prepareCached(`UPDATE messages
+       SET delivery_status = 'cancelled', delivery_updated_at = ?
+       WHERE chat_jid = ? AND delivery_status = 'subsumed'
+         AND delivery_run_id = ?`).run(updatedAt, chatJid, messageId);
+    return { item, coveredRoots };
+  })();
+}
+
+/**
  * Atomically cancel the durable follow-up cutoff captured by `/break`.
  * Rows arriving after this synchronous transaction are not part of the
  * cutoff and continue through the normal queue. A covered late-forward root
@@ -4082,9 +4163,11 @@ export function cancelQueuedFollowUp(
 export function cancelQueuedFollowUpsAtCutoff(
   chatJid: string,
   updatedAt = new Date().toISOString(),
+  /** Queued inputs the cutoff leaves in the queue. */
+  keep: (item: QueuedFollowUp) => boolean = () => false,
 ): QueuedFollowUp[] {
   return db.transaction(() => {
-    const items = listQueuedFollowUps(chatJid);
+    const items = listQueuedFollowUps(chatJid).filter((item) => !keep(item));
     if (items.length === 0) return [];
     const cancelQueued = prepareCached(`UPDATE messages
        SET delivery_status = 'cancelled', delivery_updated_at = ?
@@ -4102,6 +4185,29 @@ export function cancelQueuedFollowUpsAtCutoff(
       cancelCoveredRoot.run(updatedAt, chatJid, item.id);
     }
     return items;
+  })();
+}
+
+/**
+ * Give stored messages new ingest sequences after every existing one in
+ * their chat, so a cursor that passed them while they waited in the queue
+ * reads them again once they are released.
+ */
+export function moveMessagesToIngestTail(
+  chatJid: string,
+  messageIds: readonly string[],
+): void {
+  const remove = prepareCached(
+    'DELETE FROM message_ingest_sequences WHERE chat_jid = ? AND message_id = ?',
+  );
+  const add = prepareCached(
+    'INSERT INTO message_ingest_sequences (chat_jid, message_id) VALUES (?, ?)',
+  );
+  db.transaction(() => {
+    for (const id of messageIds) {
+      remove.run(chatJid, id);
+      add.run(chatJid, id);
+    }
   })();
 }
 
@@ -4508,7 +4614,7 @@ export interface UsageQueryFilters {
   source?: string;
 }
 
-function buildUsageWhere(filters: UsageQueryFilters): {
+export function buildUsageWhere(filters: UsageQueryFilters): {
   sql: string;
   params: unknown[];
 } {
@@ -5003,3345 +5109,11 @@ export function getMessageCursor(
     : null;
 }
 
-type CreateTaskInput = Omit<
-  ScheduledTask,
-  'last_run' | 'last_result' | 'revision' | 'updated_at' | 'deleted_at'
-> &
-  Partial<Pick<ScheduledTask, 'revision' | 'updated_at' | 'deleted_at'>>;
-
-export function createTask(task: CreateTaskInput): void {
-  const updatedAt = task.updated_at ?? task.created_at;
-  prepareCached(`
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, execution_type, script_command, execution_mode, next_run, status, created_at, created_by, notify_channels, revision, updated_at, deleted_at, delivery_route_jid)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    task.id,
-    task.group_folder,
-    task.chat_jid,
-    toUtf8String(task.prompt, 'scheduled_tasks.prompt'),
-    task.schedule_type,
-    task.schedule_value,
-    task.context_mode || 'isolated',
-    task.execution_type || 'agent',
-    task.script_command == null
-      ? null
-      : toUtf8String(task.script_command, 'scheduled_tasks.script_command'),
-    task.execution_mode ?? null,
-    task.next_run,
-    task.status,
-    task.created_at,
-    task.created_by ?? null,
-    task.notify_channels != null ? JSON.stringify(task.notify_channels) : null,
-    task.revision ?? 1,
-    updatedAt,
-    task.deleted_at ?? null,
-    // Fall back to chat_jid so a caller that has no concrete route still records
-    // an explicit binding rather than leaving execution to re-derive one.
-    task.delivery_route_jid ?? task.chat_jid,
-  );
-}
-
-/** Parse notify_channels from JSON string stored in DB and normalize new fields */
-function mapTaskRow(row: unknown): ScheduledTask {
-  const r = row as any;
-  if (typeof r.notify_channels === 'string') {
-    try {
-      r.notify_channels = JSON.parse(r.notify_channels);
-    } catch {
-      r.notify_channels = null;
-    }
-  } else if (r.notify_channels === undefined) {
-    r.notify_channels = null;
-  }
-  // Normalize new nullable fields
-  if (r.execution_mode === undefined) r.execution_mode = null;
-  if (r.workspace_jid === undefined) r.workspace_jid = null;
-  if (r.workspace_folder === undefined) r.workspace_folder = null;
-  if (!Number.isInteger(r.revision) || r.revision < 1) r.revision = 1;
-  if (!r.updated_at) r.updated_at = r.created_at;
-  if (r.deleted_at === undefined) r.deleted_at = null;
-  // Rows written before the column existed behave as if bound to chat_jid,
-  // which is the route they actually used.
-  if (r.delivery_route_jid === undefined || r.delivery_route_jid === null) {
-    r.delivery_route_jid = r.chat_jid ?? null;
-  }
-  // Defensive: legacy BLOB cells in TEXT-affinity columns come back as Buffer.
-  r.prompt = toUtf8String(r.prompt);
-  if (r.script_command !== undefined)
-    r.script_command = toUtf8StringOrNull(r.script_command);
-  return r as ScheduledTask;
-}
-
-export function getTaskById(id: string): ScheduledTask | undefined {
-  const row = prepareCached('SELECT * FROM scheduled_tasks WHERE id = ?').get(
-    id,
-  );
-  return row ? mapTaskRow(row) : undefined;
-}
-
-export function getAllTasks(): ScheduledTask[] {
-  return prepareCached(
-    'SELECT * FROM scheduled_tasks WHERE deleted_at IS NULL ORDER BY created_at DESC',
-  )
-    .all()
-    .map(mapTaskRow);
-}
-
-export function getDeletedTasks(): ScheduledTask[] {
-  return prepareCached(
-    'SELECT * FROM scheduled_tasks WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC',
-  )
-    .all()
-    .map(mapTaskRow);
-}
-
-export interface WorkspaceTaskRebuildPause {
-  groupFolder: string;
-  tasks: Array<{
-    id: string;
-    originalStatus: ScheduledTask['status'];
-    originalNextRun: string | null;
-    preparedRevision: number;
-  }>;
-  activeRunIds: string[];
-}
-
-/**
- * Freeze every runnable task definition before workspace rebuild performs its
- * first await. Completed tasks cannot run, and genuinely parsing tasks must
- * keep their revision so an in-flight parser is not orphaned if rebuild later
- * rolls back. Failure recovery restores changed rows with CAS.
- */
-export function pauseWorkspaceTasksForRebuild(
-  groupFolder: string,
-): WorkspaceTaskRebuildPause {
-  return db
-    .transaction((): WorkspaceTaskRebuildPause => {
-      const tasks = prepareCached(`SELECT * FROM scheduled_tasks
-           WHERE group_folder = ? AND deleted_at IS NULL
-           ORDER BY id`)
-        .all(groupFolder)
-        .map(mapTaskRow);
-      const now = new Date().toISOString();
-      const pause = prepareCached(`UPDATE scheduled_tasks
-         SET status = 'parsing', next_run = NULL, running_until = NULL,
-             runner_id = NULL, revision = revision + 1, updated_at = ?
-         WHERE id = ? AND revision = ? AND deleted_at IS NULL`);
-      const snapshots: WorkspaceTaskRebuildPause['tasks'] = [];
-      for (const task of tasks) {
-        if (task.status === 'completed' || task.status === 'parsing') continue;
-        const result = pause.run(now, task.id, task.revision);
-        if (result.changes !== 1) {
-          throw new Error(
-            `Scheduled task changed while preparing workspace rebuild: ${task.id}`,
-          );
-        }
-        snapshots.push({
-          id: task.id,
-          originalStatus: task.status,
-          originalNextRun: task.next_run,
-          preparedRevision: task.revision + 1,
-        });
-      }
-      const activeRunIds = (
-        prepareCached(`SELECT tr.id
-             FROM task_runs tr
-             JOIN scheduled_tasks st ON st.id = tr.task_id
-             WHERE st.group_folder = ?
-               AND (
-                 tr.status IN ('queued','running','retry_wait')
-                 OR (
-                   tr.status = 'delivered'
-                   AND json_valid(tr.definition_snapshot)
-                   AND json_extract(
-                     tr.definition_snapshot,
-                     '$.context_mode'
-                   ) = 'group'
-                 )
-               )
-             ORDER BY tr.created_at, tr.id`).all(groupFolder) as Array<{
-          id: string;
-        }>
-      ).map((row) => row.id);
-      return { groupFolder, tasks: snapshots, activeRunIds };
-    })
-    .immediate();
-}
-
-/**
- * Best-effort CAS rollback for the preparatory task pause. A concurrent task
- * edit wins rather than being overwritten by rebuild failure recovery.
- */
-export function restoreWorkspaceTasksAfterFailedRebuild(
-  pause: WorkspaceTaskRebuildPause,
-): { restored: string[]; conflicts: string[] } {
-  return db
-    .transaction(() => {
-      const restored: string[] = [];
-      const conflicts: string[] = [];
-      const now = new Date().toISOString();
-      const restore = prepareCached(`UPDATE scheduled_tasks
-         SET status = ?, next_run = ?, revision = revision + 1, updated_at = ?
-         WHERE id = ? AND revision = ? AND deleted_at IS NULL`);
-      for (const task of pause.tasks) {
-        const result = restore.run(
-          task.originalStatus,
-          task.originalNextRun,
-          now,
-          task.id,
-          task.preparedRevision,
-        );
-        if (result.changes === 1) restored.push(task.id);
-        else conflicts.push(task.id);
-      }
-      return { restored, conflicts };
-    })
-    .immediate();
-}
-
-export function updateTask(
-  id: string,
-  updates: Partial<
-    Pick<
-      ScheduledTask,
-      | 'prompt'
-      | 'schedule_type'
-      | 'schedule_value'
-      | 'context_mode'
-      | 'execution_type'
-      | 'execution_mode'
-      | 'script_command'
-      | 'next_run'
-      | 'status'
-      | 'notify_channels'
-      | 'chat_jid'
-      | 'delivery_route_jid'
-      | 'group_folder'
-    >
-  >,
-): void {
-  const fields: string[] = [];
-  const values: unknown[] = [];
-
-  if (updates.prompt !== undefined) {
-    fields.push('prompt = ?');
-    values.push(toUtf8String(updates.prompt, 'scheduled_tasks.prompt'));
-  }
-  if (updates.schedule_type !== undefined) {
-    fields.push('schedule_type = ?');
-    values.push(updates.schedule_type);
-  }
-  if (updates.schedule_value !== undefined) {
-    fields.push('schedule_value = ?');
-    values.push(updates.schedule_value);
-  }
-  if (updates.context_mode !== undefined) {
-    fields.push('context_mode = ?');
-    values.push(updates.context_mode);
-  }
-  if (updates.execution_type !== undefined) {
-    fields.push('execution_type = ?');
-    values.push(updates.execution_type);
-  }
-  if (updates.execution_mode !== undefined) {
-    fields.push('execution_mode = ?');
-    values.push(updates.execution_mode);
-  }
-  if (updates.script_command !== undefined) {
-    fields.push('script_command = ?');
-    values.push(
-      updates.script_command == null
-        ? null
-        : toUtf8String(
-            updates.script_command,
-            'scheduled_tasks.script_command',
-          ),
-    );
-  }
-  if (updates.next_run !== undefined) {
-    fields.push('next_run = ?');
-    values.push(updates.next_run);
-  }
-  if (updates.status !== undefined) {
-    fields.push('status = ?');
-    values.push(updates.status);
-  }
-  if (updates.notify_channels !== undefined) {
-    fields.push('notify_channels = ?');
-    values.push(
-      updates.notify_channels != null
-        ? JSON.stringify(updates.notify_channels)
-        : null,
-    );
-  }
-  if (updates.chat_jid !== undefined) {
-    fields.push('chat_jid = ?');
-    values.push(updates.chat_jid);
-  }
-  if (updates.delivery_route_jid !== undefined) {
-    fields.push('delivery_route_jid = ?');
-    values.push(updates.delivery_route_jid);
-  }
-  if (updates.group_folder !== undefined) {
-    fields.push('group_folder = ?');
-    values.push(updates.group_folder);
-  }
-
-  if (fields.length === 0) return;
-
-  fields.push('revision = revision + 1');
-  fields.push('updated_at = ?');
-  values.push(new Date().toISOString());
-
-  values.push(id);
-  db.prepare(
-    `UPDATE scheduled_tasks SET ${fields.join(', ')} WHERE id = ? AND deleted_at IS NULL`,
-  ).run(...values);
-}
-
-export type TaskRevisionMutationResult =
-  | { status: 'updated'; task: ScheduledTask }
-  | { status: 'conflict'; task: ScheduledTask }
-  | { status: 'not_found' };
-
-export type TaskSoftDeleteMutationResult =
-  | TaskRevisionMutationResult
-  | { status: 'active_run'; task: ScheduledTask; run: TaskRun };
-
-export type TaskPermanentDeleteMutationResult =
-  | { status: 'deleted'; task_ids: string[] }
-  | { status: 'conflict'; task: ScheduledTask }
-  | { status: 'not_deleted'; task: ScheduledTask }
-  | { status: 'active_run'; task: ScheduledTask; run: TaskRun }
-  | { status: 'not_found'; task_id: string };
-
-/**
- * Optimistic mutation used by V2 REST/MCP callers. Legacy updateTask remains
- * available while all in-process clients migrate to this contract.
- */
-export function updateTaskWithRevision(
-  id: string,
-  expectedRevision: number,
-  updates: Parameters<typeof updateTask>[1],
-): TaskRevisionMutationResult {
-  const current = getTaskById(id);
-  if (!current || current.deleted_at) return { status: 'not_found' };
-  if (current.revision !== expectedRevision) {
-    return { status: 'conflict', task: current };
-  }
-
-  const fields: string[] = [];
-  const values: unknown[] = [];
-  const pushText = (field: string, value: unknown) => {
-    fields.push(`${field} = ?`);
-    values.push(value);
-  };
-  if (updates.prompt !== undefined)
-    pushText('prompt', toUtf8String(updates.prompt, 'scheduled_tasks.prompt'));
-  if (updates.schedule_type !== undefined)
-    pushText('schedule_type', updates.schedule_type);
-  if (updates.schedule_value !== undefined)
-    pushText('schedule_value', updates.schedule_value);
-  if (updates.context_mode !== undefined)
-    pushText('context_mode', updates.context_mode);
-  if (updates.execution_type !== undefined)
-    pushText('execution_type', updates.execution_type);
-  if (updates.execution_mode !== undefined)
-    pushText('execution_mode', updates.execution_mode);
-  if (updates.script_command !== undefined) {
-    pushText(
-      'script_command',
-      updates.script_command == null
-        ? null
-        : toUtf8String(
-            updates.script_command,
-            'scheduled_tasks.script_command',
-          ),
-    );
-  }
-  if (updates.next_run !== undefined) pushText('next_run', updates.next_run);
-  if (updates.status !== undefined) pushText('status', updates.status);
-  if (updates.notify_channels !== undefined) {
-    pushText(
-      'notify_channels',
-      updates.notify_channels == null
-        ? null
-        : JSON.stringify(updates.notify_channels),
-    );
-  }
-  if (updates.chat_jid !== undefined) pushText('chat_jid', updates.chat_jid);
-  if (updates.delivery_route_jid !== undefined)
-    pushText('delivery_route_jid', updates.delivery_route_jid);
-  if (updates.group_folder !== undefined)
-    pushText('group_folder', updates.group_folder);
-
-  if (fields.length === 0) return { status: 'updated', task: current };
-  fields.push('revision = revision + 1', 'updated_at = ?');
-  values.push(new Date().toISOString(), id, expectedRevision);
-  const result = db
-    .prepare(
-      `UPDATE scheduled_tasks SET ${fields.join(', ')}
-       WHERE id = ? AND revision = ? AND deleted_at IS NULL`,
-    )
-    .run(...values);
-  const latest = getTaskById(id);
-  if (result.changes === 1 && latest)
-    return { status: 'updated', task: latest };
-  if (!latest || latest.deleted_at) return { status: 'not_found' };
-  return { status: 'conflict', task: latest };
-}
-
-export function softDeleteTaskWithRevision(
-  id: string,
-  expectedRevision: number,
-): TaskSoftDeleteMutationResult {
-  return db
-    .transaction((): TaskSoftDeleteMutationResult => {
-      const current = getTaskById(id);
-      if (!current || current.deleted_at) return { status: 'not_found' };
-      if (current.revision !== expectedRevision) {
-        return { status: 'conflict', task: current };
-      }
-      const activeRun = getActiveTaskRunForTask(id);
-      if (activeRun) {
-        return { status: 'active_run', task: current, run: activeRun };
-      }
-      const now = new Date().toISOString();
-      const result = prepareCached(`UPDATE scheduled_tasks
-           SET deleted_at = ?, status = 'paused', next_run = NULL,
-               revision = revision + 1, updated_at = ?
-           WHERE id = ? AND revision = ? AND deleted_at IS NULL
-             AND NOT EXISTS (
-               SELECT 1 FROM task_runs
-               WHERE task_id = scheduled_tasks.id
-                 AND status IN ('queued','running','retry_wait')
-             )`).run(now, now, id, expectedRevision);
-      const latest = getTaskById(id);
-      if (result.changes === 1 && latest) {
-        return { status: 'updated', task: latest };
-      }
-      if (!latest || latest.deleted_at) return { status: 'not_found' };
-      const racedRun = getActiveTaskRunForTask(id);
-      if (racedRun) {
-        return { status: 'active_run', task: latest, run: racedRun };
-      }
-      return { status: 'conflict', task: latest };
-    })
-    .immediate();
-}
-
-/** Restore only the definition/history; the user must explicitly resume it. */
-export function restoreTaskWithRevision(
-  id: string,
-  expectedRevision: number,
-): TaskRevisionMutationResult {
-  return db
-    .transaction((): TaskRevisionMutationResult => {
-      const current = getTaskById(id);
-      if (!current) return { status: 'not_found' };
-      if (current.revision !== expectedRevision) {
-        return { status: 'conflict', task: current };
-      }
-      if (!current.deleted_at) return { status: 'updated', task: current };
-      const now = new Date().toISOString();
-      const result = prepareCached(`UPDATE scheduled_tasks
-           SET deleted_at = NULL, status = 'paused', next_run = NULL,
-               revision = revision + 1, updated_at = ?
-           WHERE id = ? AND revision = ? AND deleted_at IS NOT NULL`).run(
-        now,
-        id,
-        expectedRevision,
-      );
-      const latest = getTaskById(id);
-      if (result.changes === 1 && latest)
-        return { status: 'updated', task: latest };
-      if (!latest) return { status: 'not_found' };
-      return { status: 'conflict', task: latest };
-    })
-    .immediate();
-}
-
-/**
- * Permanently remove soft-deleted task definitions and their run history.
- * The whole batch is atomic: a stale revision, restored task, or active run
- * aborts the operation so "empty recycle bin" cannot silently skip records.
- */
-export function permanentlyDeleteTasksWithRevisions(
-  tasks: Array<{ id: string; expectedRevision: number }>,
-): TaskPermanentDeleteMutationResult {
-  return db
-    .transaction((): TaskPermanentDeleteMutationResult => {
-      const currentTasks: ScheduledTask[] = [];
-      for (const requested of tasks) {
-        const current = getTaskById(requested.id);
-        if (!current) {
-          return { status: 'not_found', task_id: requested.id };
-        }
-        if (current.revision !== requested.expectedRevision) {
-          return { status: 'conflict', task: current };
-        }
-        if (!current.deleted_at) {
-          return { status: 'not_deleted', task: current };
-        }
-        const activeRun = getActiveTaskRunForTask(requested.id);
-        if (activeRun) {
-          return { status: 'active_run', task: current, run: activeRun };
-        }
-        currentTasks.push(current);
-      }
-
-      const deleteRunLogs = prepareCached(
-        'DELETE FROM task_run_logs WHERE task_id = ?',
-      );
-      const deleteRuns = prepareCached(
-        'DELETE FROM task_runs WHERE task_id = ?',
-      );
-      const deleteDefinition = prepareCached(`DELETE FROM scheduled_tasks
-         WHERE id = ? AND revision = ? AND deleted_at IS NOT NULL`);
-      for (const task of currentTasks) {
-        deleteRunLogs.run(task.id);
-        deleteRuns.run(task.id);
-        const result = deleteDefinition.run(task.id, task.revision);
-        if (result.changes !== 1) {
-          throw new Error(
-            `Failed to permanently delete task ${task.id} after validation`,
-          );
-        }
-      }
-
-      return {
-        status: 'deleted',
-        task_ids: currentTasks.map((task) => task.id),
-      };
-    })
-    .immediate();
-}
-
-export function updateTaskWorkspace(
-  id: string,
-  workspaceJid: string,
-  workspaceFolder: string,
-): void {
-  prepareCached(
-    'UPDATE scheduled_tasks SET workspace_jid = ?, workspace_folder = ? WHERE id = ?',
-  ).run(workspaceJid, workspaceFolder, id);
-}
-
-export function deleteTask(id: string): void {
-  // Delete child records first (FK constraint)
-  prepareCached('DELETE FROM task_runs WHERE task_id = ?').run(id);
-  prepareCached('DELETE FROM task_run_logs WHERE task_id = ?').run(id);
-  prepareCached('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
-}
-
-export function getDueTasks(): ScheduledTask[] {
-  const now = new Date().toISOString();
-  return prepareCached(`
-	    SELECT * FROM scheduled_tasks
-	    WHERE status = 'active'
-	      AND deleted_at IS NULL
-	      AND next_run IS NOT NULL
-	      AND next_run <= ?
-	      AND (running_until IS NULL OR running_until <= ?)
-	    ORDER BY next_run
-	  `)
-    .all(now, now)
-    .map(mapTaskRow);
-}
-
-/** V2 ignores the legacy definition-level lease; ownership lives on task_runs. */
-export function getDueTaskDefinitionsV2(limit = 100): ScheduledTask[] {
-  const now = new Date().toISOString();
-  return prepareCached(`SELECT * FROM scheduled_tasks
-       WHERE status = 'active' AND deleted_at IS NULL
-         AND next_run IS NOT NULL AND next_run <= ?
-       ORDER BY next_run LIMIT ?`)
-    .all(now, limit)
-    .map(mapTaskRow);
-}
-
-// Clear every task's run lease (running_until/runner_id) unconditionally.
-// Must be called once at scheduler process startup, before the first
-// getDueTasks() poll: a lease held in the DB can only have been acquired by
-// a runner process that no longer exists (this process just started, and
-// its own in-memory runningTaskIds is freshly cleared too), so any lease
-// still on disk is stale by definition — leaving it in place would hide a
-// crash-interrupted task from getDueTasks() until the lease's absolute
-// expiry, and if that expiry lands past the backfill grace window the
-// interrupted run is silently skipped forever instead of retried.
-export function clearStaleTaskLeases(): number {
-  const result = prepareCached(`
-    UPDATE scheduled_tasks
-    SET running_until = NULL, runner_id = NULL
-    WHERE running_until IS NOT NULL OR runner_id IS NOT NULL
-  `).run();
-  return result.changes;
-}
-
-export function claimTaskForRun(
-  id: string,
-  runnerId: string,
-  leaseMs: number,
-): boolean {
-  const now = new Date();
-  const nowIso = now.toISOString();
-  const leaseUntil = new Date(now.getTime() + leaseMs).toISOString();
-  const result = prepareCached(`
-    UPDATE scheduled_tasks
-    SET runner_id = ?, running_until = ?
-    WHERE id = ?
-      AND status = 'active'
-      AND next_run IS NOT NULL
-      AND next_run <= ?
-      AND (running_until IS NULL OR running_until <= ?)
-  `).run(runnerId, leaseUntil, id, nowIso, nowIso);
-  return result.changes === 1;
-}
-
-export function updateTaskAfterRun(
-  id: string,
-  nextRun: string | null,
-  lastResult: string,
-): void {
-  const now = new Date().toISOString();
-  prepareCached(`
-    UPDATE scheduled_tasks
-	    SET next_run = ?, last_run = ?, last_result = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END,
-	        running_until = NULL, runner_id = NULL
-    WHERE id = ?
-  `).run(nextRun, now, lastResult, nextRun, id);
-}
-
-// Advance next_run for a task we deliberately did NOT execute (e.g. overdue
-// beyond the backfill grace window). Does not touch last_run, so the task
-// detail view continues to reflect the last *actual* run.
-export function advanceSkippedTask(id: string, nextRun: string | null): void {
-  prepareCached(`
-    UPDATE scheduled_tasks
-	    SET next_run = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END,
-	        running_until = NULL, runner_id = NULL
-    WHERE id = ?
-  `).run(nextRun, nextRun, id);
-}
-
-// Pause a recurring task that just ran but whose schedule produces no next_run
-// (corrupted schedule_value, cron parse failure). Unlike updateTaskAfterRun(null)
-// it does NOT flip status to 'completed' (which would silently disable it);
-// it records THIS run's last_run/last_result so the task detail view is accurate
-// and clears next_run so the owner can fix the schedule and re-activate.
-export function pauseTaskAfterRun(id: string, lastResult: string): void {
-  const now = new Date().toISOString();
-  prepareCached(`
-    UPDATE scheduled_tasks
-	    SET next_run = NULL, last_run = ?, last_result = ?, status = 'paused',
-	        running_until = NULL, runner_id = NULL
-    WHERE id = ?
-  `).run(now, lastResult, id);
-}
-
-interface TaskRunRow {
-  id: string;
-  task_id: string;
-  occurrence_key: string;
-  trigger_type: TaskRunTrigger;
-  idempotency_key: string | null;
-  scheduled_for: string;
-  definition_revision: number;
-  definition_snapshot: string;
-  status: TaskRunStatus;
-  attempt: number;
-  available_at: string;
-  lease_owner: string | null;
-  lease_token: number;
-  lease_expires_at: string | null;
-  started_at: string | null;
-  completed_at: string | null;
-  created_at: string;
-  updated_at: string;
-  duration_ms: number;
-  result: string | null;
-  error: string | null;
-  notification_status: TaskRunNotificationStatus;
-  notification_error: string | null;
-  notification_summary: string | null;
-  notification_payload: string | null;
-  notification_attempt: number;
-  notification_available_at: string | null;
-  notification_lease_owner: string | null;
-  notification_lease_token: number;
-  notification_lease_expires_at: string | null;
-  notification_lease_payload: string | null;
-  notification_generation: number;
-}
-
-function taskDefinitionSnapshot(
-  task: ScheduledTask,
-): TaskRunDefinitionSnapshot {
-  return {
-    prompt: task.prompt,
-    group_folder: task.group_folder,
-    chat_jid: task.chat_jid,
-    delivery_route_jid: task.delivery_route_jid ?? task.chat_jid,
-    context_mode: task.context_mode,
-    execution_type: task.execution_type,
-    execution_mode: task.execution_mode ?? null,
-    script_command: task.script_command,
-    notify_channels: task.notify_channels ?? null,
-  };
-}
-
-function mapTaskRunRow(row: TaskRunRow): TaskRun {
-  let snapshot: TaskRunDefinitionSnapshot;
-  try {
-    snapshot = JSON.parse(row.definition_snapshot) as TaskRunDefinitionSnapshot;
-    if (snapshot.delivery_route_jid === undefined) {
-      snapshot.delivery_route_jid = snapshot.chat_jid || null;
-    }
-  } catch {
-    snapshot = {
-      prompt: '',
-      group_folder: '',
-      chat_jid: '',
-      delivery_route_jid: null,
-      context_mode: 'isolated',
-      execution_type: 'agent',
-      execution_mode: null,
-      script_command: null,
-      notify_channels: null,
-    };
-  }
-  let notificationSummary: TaskRunNotificationSummary | null = null;
-  if (row.notification_summary) {
-    try {
-      notificationSummary = JSON.parse(
-        row.notification_summary,
-      ) as TaskRunNotificationSummary;
-    } catch {
-      notificationSummary = null;
-    }
-  }
-  return {
-    ...row,
-    definition_snapshot: snapshot,
-    notification_summary: notificationSummary,
-  };
-}
-
-function insertTaskRunRow(
-  task: ScheduledTask,
-  input: {
-    id: string;
-    occurrenceKey: string;
-    triggerType: TaskRunTrigger;
-    idempotencyKey: string | null;
-    scheduledFor: string;
-    status: 'queued' | 'missed';
-    availableAt: string;
-    result?: string | null;
-    error?: string | null;
-  },
-): void {
-  const now = new Date().toISOString();
-  const terminal = input.status === 'missed' ? now : null;
-  prepareCached(`INSERT INTO task_runs (
-       id, task_id, occurrence_key, trigger_type, idempotency_key,
-       scheduled_for, definition_revision, definition_snapshot, status,
-       attempt, available_at, lease_owner, lease_token, lease_expires_at,
-       started_at, completed_at, created_at, updated_at, duration_ms,
-       result, error, notification_status, notification_error,
-       notification_summary, notification_payload, notification_attempt,
-       notification_available_at, notification_lease_owner,
-       notification_lease_token, notification_lease_expires_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, 0, NULL,
-               NULL, ?, ?, ?, 0, ?, ?, ?, NULL,
-               NULL, NULL, 0, NULL, NULL, 0, NULL)`).run(
-    input.id,
-    task.id,
-    input.occurrenceKey,
-    input.triggerType,
-    input.idempotencyKey,
-    input.scheduledFor,
-    task.revision,
-    JSON.stringify(taskDefinitionSnapshot(task)),
-    input.status,
-    input.availableAt,
-    terminal,
-    now,
-    now,
-    input.result ?? null,
-    input.error ?? null,
-    input.status === 'missed' ? 'skipped' : 'pending',
-  );
-}
-
-export interface CreateTaskRunInput {
-  task: ScheduledTask;
-  triggerType: TaskRunTrigger;
-  scheduledFor?: string;
-  idempotencyKey?: string | null;
-  availableAt?: string;
-}
-
-export interface CreateTaskRunResult {
-  created: boolean;
-  reason?: 'duplicate' | 'active_conflict';
-  run: TaskRun;
-}
-
-/**
- * Create a manual occurrence. Scheduled/backfill occurrences should normally
- * use materializeTaskOccurrence so cursor advancement is atomic with creation.
- */
-export function createTaskRun(input: CreateTaskRunInput): CreateTaskRunResult {
-  const task = input.task;
-  if (task.deleted_at)
-    throw new Error('Cannot create a run for a deleted task');
-  const scheduledFor = input.scheduledFor ?? new Date().toISOString();
-  const idempotencyKey = input.idempotencyKey?.trim() || null;
-  const id = crypto.randomUUID();
-  const occurrenceKey =
-    input.triggerType === 'manual'
-      ? `${task.id}:manual:${idempotencyKey ?? id}`
-      : `${task.id}:${scheduledFor}`;
-  const availableAt = input.availableAt ?? new Date().toISOString();
-
-  return db.transaction(() => {
-    const existing = prepareCached(
-      'SELECT * FROM task_runs WHERE occurrence_key = ?',
-    ).get(occurrenceKey) as TaskRunRow | undefined;
-    if (existing) {
-      return {
-        created: false,
-        reason: 'duplicate' as const,
-        run: mapTaskRunRow(existing),
-      };
-    }
-    if (idempotencyKey) {
-      const idempotent = prepareCached(
-        'SELECT * FROM task_runs WHERE task_id = ? AND idempotency_key = ?',
-      ).get(task.id, idempotencyKey) as TaskRunRow | undefined;
-      if (idempotent) {
-        return {
-          created: false,
-          reason: 'duplicate' as const,
-          run: mapTaskRunRow(idempotent),
-        };
-      }
-    }
-    const active = prepareCached(`SELECT * FROM task_runs
-         WHERE task_id = ? AND status IN ('queued','running','retry_wait')
-         ORDER BY created_at LIMIT 1`).get(task.id) as TaskRunRow | undefined;
-    if (active) {
-      return {
-        created: false,
-        reason: 'active_conflict' as const,
-        run: mapTaskRunRow(active),
-      };
-    }
-    insertTaskRunRow(task, {
-      id,
-      occurrenceKey,
-      triggerType: input.triggerType,
-      idempotencyKey,
-      scheduledFor,
-      status: 'queued',
-      availableAt,
-    });
-    return {
-      created: true,
-      run: getTaskRunById(id)!,
-    };
-  })();
-}
-
-export interface MaterializeTaskOccurrenceInput {
-  taskId: string;
-  scheduledFor: string;
-  nextRun: string | null;
-  triggerType: 'scheduled' | 'backfill';
-  /** Intentionally skipped occurrences are persisted as terminal missed rows. */
-  missedReason?: string;
-}
-
-/**
- * Atomically materialize one due occurrence and advance its definition cursor.
- * A still-active previous occurrence never overlaps: this occurrence is
- * recorded as missed and the schedule continues.
- */
-export function materializeTaskOccurrence(
-  input: MaterializeTaskOccurrenceInput,
-): CreateTaskRunResult | undefined {
-  return db.transaction(() => {
-    const row = prepareCached(`SELECT * FROM scheduled_tasks
-         WHERE id = ? AND deleted_at IS NULL AND status = 'active'
-           AND next_run = ?`).get(input.taskId, input.scheduledFor);
-    if (!row) return undefined;
-    const task = mapTaskRow(row);
-    const occurrenceKey = `${task.id}:${input.scheduledFor}`;
-    const existing = prepareCached(
-      'SELECT * FROM task_runs WHERE occurrence_key = ?',
-    ).get(occurrenceKey) as TaskRunRow | undefined;
-    if (existing) {
-      return {
-        created: false,
-        reason: 'duplicate' as const,
-        run: mapTaskRunRow(existing),
-      };
-    }
-    const active = prepareCached(`SELECT * FROM task_runs
-         WHERE task_id = ? AND status IN ('queued','running','retry_wait')
-         ORDER BY created_at LIMIT 1`).get(task.id) as TaskRunRow | undefined;
-    const missedReason =
-      input.missedReason ??
-      (active
-        ? `Skipped: previous occurrence ${active.id} is still active`
-        : null);
-    const status = missedReason ? 'missed' : 'queued';
-    const runId = crypto.randomUUID();
-    insertTaskRunRow(task, {
-      id: runId,
-      occurrenceKey,
-      triggerType: input.triggerType,
-      idempotencyKey: null,
-      scheduledFor: input.scheduledFor,
-      status,
-      availableAt: new Date().toISOString(),
-      error: missedReason,
-    });
-    const now = new Date().toISOString();
-    prepareCached(`UPDATE scheduled_tasks
-       SET next_run = ?, updated_at = ?
-       WHERE id = ? AND next_run = ? AND deleted_at IS NULL`).run(
-      input.nextRun,
-      now,
-      task.id,
-      input.scheduledFor,
-    );
-    if (
-      status === 'missed' &&
-      task.schedule_type === 'once' &&
-      input.nextRun === null
-    ) {
-      prepareCached(`UPDATE scheduled_tasks SET status = 'completed', updated_at = ?
-         WHERE id = ? AND status = 'active' AND next_run IS NULL`).run(
-        now,
-        task.id,
-      );
-    }
-    return { created: true, run: getTaskRunById(runId)! };
-  })();
-}
-
-export function getTaskRunById(id: string): TaskRun | undefined {
-  const row = prepareCached('SELECT * FROM task_runs WHERE id = ?').get(id) as
-    | TaskRunRow
-    | undefined;
-  return row ? mapTaskRunRow(row) : undefined;
-}
-
-export function getActiveTaskRunForTask(taskId: string): TaskRun | undefined {
-  const row = prepareCached(`SELECT * FROM task_runs
-       WHERE task_id = ?
-         AND (
-           status IN ('queued','running','retry_wait')
-           OR (
-             status = 'delivered'
-             AND json_valid(definition_snapshot)
-             AND json_extract(definition_snapshot, '$.context_mode') = 'group'
-           )
-         )
-       ORDER BY
-         CASE WHEN status IN ('queued','running','retry_wait') THEN 0 ELSE 1 END,
-         created_at
-       LIMIT 1`).get(taskId) as TaskRunRow | undefined;
-  return row ? mapTaskRunRow(row) : undefined;
-}
-
-export function getTaskRunsForTask(taskId: string, limit = 20): TaskRun[] {
-  return (
-    prepareCached(`SELECT * FROM task_runs WHERE task_id = ?
-         ORDER BY created_at DESC LIMIT ?`).all(taskId, limit) as TaskRunRow[]
-  ).map(mapTaskRunRow);
-}
-
-export function getTaskRunsByStatus(
-  statuses: TaskRunStatus[],
-  limit = 100,
-): TaskRun[] {
-  if (statuses.length === 0) return [];
-  const placeholders = statuses.map(() => '?').join(',');
-  return (
-    db
-      .prepare(
-        `SELECT * FROM task_runs WHERE status IN (${placeholders})
-         ORDER BY available_at, created_at LIMIT ?`,
-      )
-      .all(...statuses, limit) as TaskRunRow[]
-  ).map(mapTaskRunRow);
-}
-
-export function claimNextTaskRun(
-  owner: string,
-  leaseMs: number,
-): ClaimedTaskRun | undefined {
-  const now = new Date();
-  const nowIso = now.toISOString();
-  const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
-  return db.transaction(() => {
-    const candidate = prepareCached(`SELECT * FROM task_runs
-         WHERE (
-           status IN ('queued','retry_wait') AND available_at <= ?
-         ) OR (
-           status = 'running' AND lease_expires_at IS NOT NULL
-             AND lease_expires_at <= ? AND started_at IS NULL
-         )
-         ORDER BY available_at, scheduled_for, created_at LIMIT 1`).get(
-      nowIso,
-      nowIso,
-    ) as TaskRunRow | undefined;
-    if (!candidate) return undefined;
-    const nextToken = candidate.lease_token + 1;
-    const result = prepareCached(`UPDATE task_runs
-         SET status = 'running', lease_owner = ?, lease_token = ?,
-             lease_expires_at = ?, attempt = attempt + 1,
-             updated_at = ?
-         WHERE id = ? AND (
-           (status IN ('queued','retry_wait') AND available_at <= ?)
-           OR (status = 'running' AND lease_expires_at IS NOT NULL
-               AND lease_expires_at <= ? AND started_at IS NULL)
-         )`).run(
-      owner,
-      nextToken,
-      expiresAt,
-      nowIso,
-      candidate.id,
-      nowIso,
-      nowIso,
-    );
-    if (result.changes !== 1) return undefined;
-    return getTaskRunById(candidate.id) as ClaimedTaskRun;
-  })();
-}
-
-/** Mark the irreversible execution boundary before invoking Agent/script/group. */
-export function markTaskRunExecutionStarted(
-  id: string,
-  owner: string,
-  token: number,
-): boolean {
-  const now = new Date().toISOString();
-  const result =
-    prepareCached(`UPDATE task_runs SET started_at = COALESCE(started_at, ?), updated_at = ?
-       WHERE id = ? AND status = 'running' AND lease_owner = ?
-         AND lease_token = ? AND lease_expires_at > ?
-         AND EXISTS (
-           SELECT 1 FROM scheduled_tasks
-           WHERE scheduled_tasks.id = task_runs.task_id
-             AND scheduled_tasks.deleted_at IS NULL
-             AND scheduled_tasks.status IN ('active','paused')
-         )`).run(now, now, id, owner, token, now);
-  return result.changes === 1;
-}
-
-/**
- * A process crash after execution started is not known-safe to replay. Record
- * it as interrupted instead of blindly repeating possible external effects.
- */
-export function failExpiredStartedTaskRuns(): number {
-  const now = new Date().toISOString();
-  return db.transaction(() => {
-    const expired = prepareCached(`SELECT id, task_id FROM task_runs
-         WHERE status = 'running' AND started_at IS NOT NULL
-           AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`).all(
-      now,
-    ) as Array<{ id: string; task_id: string }>;
-    if (expired.length === 0) return 0;
-    const failOne = prepareCached(`UPDATE task_runs
-       SET status = 'failed', completed_at = ?, updated_at = ?,
-           error = COALESCE(error, 'Process stopped after execution began; not retried to avoid duplicate side effects'),
-           notification_status = CASE
-             WHEN notification_status = 'pending'
-                  AND notification_payload IS NULL THEN 'skipped'
-             ELSE notification_status
-           END,
-           notification_lease_owner = NULL,
-           notification_lease_expires_at = NULL,
-           notification_lease_payload = NULL,
-           lease_owner = NULL, lease_expires_at = NULL,
-           lease_token = lease_token + 1
-       WHERE id = ? AND status = 'running' AND started_at IS NOT NULL
-         AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`);
-    let changed = 0;
-    const taskIdSet = new Set<string>();
-    for (const run of expired) {
-      const result = failOne.run(now, now, run.id, now);
-      if (result.changes === 1) {
-        changed++;
-        taskIdSet.add(run.task_id);
-      }
-    }
-    const taskIds = [...taskIdSet];
-    if (taskIds.length === 0) return 0;
-    const taskPlaceholders = taskIds.map(() => '?').join(',');
-    db.prepare(
-      `UPDATE scheduled_tasks SET status = 'completed', updated_at = ?
-       WHERE id IN (${taskPlaceholders}) AND schedule_type = 'once'
-         AND next_run IS NULL AND status IN ('active','paused')`,
-    ).run(now, ...taskIds);
-    return changed;
-  })();
-}
-
-/**
- * Lease expiry decides who may *take over*, never who may *commit*.
- *
- * `renew`/`release`/`complete` fence on `lease_owner` + `lease_token` only. A
- * worker whose lease lapsed while nobody claimed it still owns its result and
- * can settle it; the moment another owner claims the row the token advances and
- * every write from the old worker is rejected. Gating these writes on
- * `lease_expires_at > now` as well produced the opposite failure: a run that had
- * actually finished — possibly after already sending its output to the user —
- * could not be committed, stayed `running`, and was later marked `failed` by
- * `failExpiredStartedTaskRuns`. Because started runs are deliberately
- * at-most-once, that lost the execution outright and raised a false failure
- * alert.
- *
- * Every takeover path (`claimNextTaskRun`, `cancelTaskRun`,
- * `failExpiredStartedTaskRuns`) increments `lease_token`, so dropping the time
- * condition does not open a double-write window.
- */
-export function renewTaskRunLease(
-  id: string,
-  owner: string,
-  token: number,
-  leaseMs: number,
-): boolean {
-  const now = new Date();
-  const nowIso = now.toISOString();
-  const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
-  const result =
-    prepareCached(`UPDATE task_runs SET lease_expires_at = ?, updated_at = ?
-       WHERE id = ? AND status = 'running' AND lease_owner = ?
-         AND lease_token = ?`).run(expiresAt, nowIso, id, owner, token);
-  return result.changes === 1;
-}
-
-/**
- * `attempt` is incremented by `claimNextTaskRun`, so it counts claims. A
- * release that is not the run's own fault must give that budget back, otherwise
- * process shutdown burns the pre-execution retry allowance: five ordinary
- * restarts would permanently fail an occurrence that never executed once.
- * Mirrors the reference runtime's `incrementFailure=false` release.
- */
-export function releaseTaskRunForRetry(
-  id: string,
-  owner: string,
-  token: number,
-  availableAt: string,
-  error: string,
-  options: { countsAsAttempt?: boolean } = {},
-): boolean {
-  const now = new Date().toISOString();
-  const attemptExpr =
-    options.countsAsAttempt === false ? 'MAX(0, attempt - 1)' : 'attempt';
-  const result = db
-    .prepare(
-      `UPDATE task_runs
-       SET status = 'retry_wait', available_at = ?, error = ?,
-           attempt = ${attemptExpr},
-           lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-       WHERE id = ? AND status = 'running' AND lease_owner = ?
-         AND lease_token = ?`,
-    )
-    .run(availableAt, error, now, id, owner, token);
-  return result.changes === 1;
-}
-
-export interface CompleteTaskRunInput {
-  status: Extract<
-    TaskRunStatus,
-    'success' | 'failed' | 'cancelled' | 'delivered'
-  >;
-  result?: string | null;
-  error?: string | null;
-  notificationStatus?: TaskRunNotificationStatus;
-  notificationError?: string | null;
-}
-
-export function completeTaskRun(
-  id: string,
-  owner: string,
-  token: number,
-  input: CompleteTaskRunInput,
-): boolean {
-  const now = new Date().toISOString();
-  return db.transaction(() => {
-    const current = prepareCached('SELECT * FROM task_runs WHERE id = ?').get(
-      id,
-    ) as TaskRunRow | undefined;
-    // Fencing is owner+token only; see renewTaskRunLease for why an expired
-    // but unclaimed lease must still be able to settle its own result.
-    if (
-      !current ||
-      current.status !== 'running' ||
-      current.lease_owner !== owner ||
-      current.lease_token !== token
-    ) {
-      return false;
-    }
-    const startedAt = current.started_at
-      ? new Date(current.started_at).getTime()
-      : new Date(current.created_at).getTime();
-    const durationMs = Math.max(0, Date.now() - startedAt);
-    // IPC delivery can finish before the Agent process exits. Do not replace a
-    // real receipt with the isolated-run fallback `pending` value.
-    const requestedNotificationStatus =
-      input.notificationStatus ?? current.notification_status;
-    const effectiveNotificationStatus = current.notification_payload
-      ? requestedNotificationStatus === 'success' ||
-        requestedNotificationStatus === 'skipped'
-        ? current.notification_status === 'pending'
-          ? 'failed'
-          : current.notification_status
-        : requestedNotificationStatus === 'pending' &&
-            current.notification_status !== 'pending'
-          ? current.notification_status
-          : requestedNotificationStatus
-      : requestedNotificationStatus === 'pending' &&
-          current.notification_status !== 'pending'
-        ? current.notification_status
-        : requestedNotificationStatus;
-    const effectiveNotificationError =
-      effectiveNotificationStatus === current.notification_status &&
-      current.notification_status !== 'pending'
-        ? current.notification_error
-        : (input.notificationError ?? null);
-    const changed = prepareCached(`UPDATE task_runs
-         SET status = ?, result = ?, error = ?, notification_status = ?,
-             notification_error = ?, duration_ms = ?, completed_at = ?,
-             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-         WHERE id = ? AND status = 'running' AND lease_owner = ?
-           AND lease_token = ?`).run(
-      input.status,
-      input.result ?? null,
-      input.error ?? null,
-      effectiveNotificationStatus,
-      effectiveNotificationError,
-      durationMs,
-      now,
-      now,
-      id,
-      owner,
-      token,
-    );
-    if (changed.changes !== 1) return false;
-    const summary = input.error
-      ? `Error: ${input.error}`
-      : input.result?.slice(0, 200) ||
-        (input.status === 'delivered' ? 'Delivered' : 'Completed');
-    prepareCached(`UPDATE scheduled_tasks
-       SET last_run = ?, last_result = ?,
-           status = CASE
-             WHEN schedule_type = 'once' AND next_run IS NULL THEN 'completed'
-             ELSE status
-           END,
-           updated_at = ?
-       WHERE id = ?`).run(now, summary, now, current.task_id);
-    return true;
-  })();
-}
-
-/**
- * Atomically terminalize one fenced isolated execution and enqueue its
- * canonical Web workspace result.
- *
- * The Agent may already have performed arbitrary tool side effects by this
- * point, so persisting the execution terminal separately from the Web repair
- * intent would create an avoidable replay window. The notification worker
- * performs only the idempotent workspace projection; it never reruns Agent
- * work or interprets Agent-owned tools such as feishu-cli.
- */
-export function completeIsolatedTaskRunWithWorkspaceResultIntent(input: {
-  runId: string;
-  taskId: string;
-  leaseOwner: string;
-  leaseToken: number;
-  status: 'success' | 'failed';
-  result?: string | null;
-  error?: string | null;
-  payload: TaskRunTextNotificationPayload;
-}): boolean {
-  if (
-    input.payload.kind !== 'workspace_result' ||
-    input.payload.groupRunId ||
-    input.payload.groupTaskId ||
-    input.payload.options?.sourceKind !== 'scheduled_task_result' ||
-    input.payload.options.messageId !== `scheduled-task-result:${input.runId}`
-  ) {
-    return false;
-  }
-
-  const now = new Date();
-  const nowIso = now.toISOString();
-  return db.transaction(() => {
-    const current = prepareCached('SELECT * FROM task_runs WHERE id = ?').get(
-      input.runId,
-    ) as TaskRunRow | undefined;
-    if (
-      !current ||
-      current.task_id !== input.taskId ||
-      current.status !== 'running' ||
-      current.lease_owner !== input.leaseOwner ||
-      current.lease_token !== input.leaseToken
-    ) {
-      return false;
-    }
-
-    let currentPayload: TaskRunNotificationPayload | null = null;
-    let currentSummary: TaskRunNotificationSummary = {
-      attempted: 0,
-      succeeded: 0,
-      failed: 0,
-      failed_channels: [],
-    };
-    try {
-      currentPayload = current.notification_payload
-        ? (JSON.parse(
-            current.notification_payload,
-          ) as TaskRunNotificationPayload)
-        : null;
-      currentSummary = current.notification_summary
-        ? (JSON.parse(
-            current.notification_summary,
-          ) as TaskRunNotificationSummary)
-        : currentSummary;
-    } catch {
-      return false;
-    }
-
-    const mergedPayload = mergeTaskRunNotificationPayloads(
-      currentPayload,
-      input.payload,
-    );
-    if (!mergedPayload) return false;
-    const notificationStatus: TaskRunNotificationStatus =
-      current.notification_status === 'failed' ||
-      current.notification_status === 'partial_failed' ||
-      current.notification_status === 'uncertain'
-        ? current.notification_status
-        : 'pending';
-    const startedAt = current.started_at
-      ? new Date(current.started_at).getTime()
-      : new Date(current.created_at).getTime();
-    const durationMs = Math.max(0, now.getTime() - startedAt);
-    const availableAt =
-      current.notification_available_at &&
-      current.notification_available_at < nowIso
-        ? current.notification_available_at
-        : nowIso;
-    const changed = prepareCached(`UPDATE task_runs
-         SET status = ?, result = ?, error = ?,
-             notification_status = ?, notification_error = ?,
-             notification_summary = ?, notification_payload = ?,
-             notification_attempt = CASE
-               WHEN notification_lease_owner IS NULL THEN 0
-               ELSE notification_attempt
-             END,
-             notification_available_at = ?,
-             notification_generation = notification_generation + 1,
-             duration_ms = ?, completed_at = ?,
-             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-         WHERE id = ? AND task_id = ? AND status = 'running'
-           AND lease_owner = ? AND lease_token = ?`).run(
-      input.status,
-      input.result ?? null,
-      input.error ?? null,
-      notificationStatus,
-      current.notification_error,
-      JSON.stringify(currentSummary),
-      JSON.stringify(mergedPayload),
-      availableAt,
-      durationMs,
-      nowIso,
-      nowIso,
-      input.runId,
-      input.taskId,
-      input.leaseOwner,
-      input.leaseToken,
-    );
-    if (changed.changes !== 1) return false;
-
-    const summary = input.error
-      ? `Error: ${input.error}`
-      : input.result?.slice(0, 200) || 'Completed';
-    prepareCached(`UPDATE scheduled_tasks
-       SET last_run = ?, last_result = ?,
-           status = CASE
-             WHEN schedule_type = 'once' AND next_run IS NULL THEN 'completed'
-             ELSE status
-           END,
-           updated_at = ?
-       WHERE id = ?`).run(nowIso, summary, nowIso, input.taskId);
-    return true;
-  })();
-}
-
-export interface StoreScheduledGroupPromptInput {
-  runId: string;
-  taskId: string;
-  leaseOwner: string;
-  leaseToken: number;
-  messageId: string;
-  chatJid: string;
-  senderId: string;
-  senderName: string;
-  text: string;
-  queuedResult: string;
-  interactionMode: InteractionMode;
-}
-
-/**
- * Atomically cross the group-mode execution boundary.
- *
- * Persisting the prompt and releasing the run lease in separate transactions
- * leaves a crash window where the workspace later executes the prompt while
- * lease recovery marks its run failed. Keeping both writes under one SQLite
- * transaction makes either the prompt+delivered hand-off visible together or
- * neither visible.
- */
-export function storeScheduledGroupPromptAndCompleteRun(
-  input: StoreScheduledGroupPromptInput,
-): string {
-  if (
-    input.interactionMode !== 'assistant' &&
-    input.interactionMode !== 'proactive'
-  ) {
-    throw new Error('Invalid scheduled group interaction mode');
-  }
-  return db.transaction(() => {
-    const run =
-      prepareCached(`SELECT task_id, status, lease_owner, lease_token, started_at, created_at,
-                definition_snapshot
-         FROM task_runs WHERE id = ?`).get(input.runId) as
-        | Pick<
-            TaskRunRow,
-            | 'task_id'
-            | 'status'
-            | 'lease_owner'
-            | 'lease_token'
-            | 'started_at'
-            | 'created_at'
-            | 'definition_snapshot'
-          >
-        | undefined;
-    if (!run || run.task_id !== input.taskId) {
-      throw new Error(
-        `Group task run ${input.runId} does not belong to task ${input.taskId}`,
-      );
-    }
-
-    let definitionSnapshot: TaskRunDefinitionSnapshot;
-    try {
-      definitionSnapshot = JSON.parse(
-        run.definition_snapshot,
-      ) as TaskRunDefinitionSnapshot;
-    } catch {
-      throw new Error(
-        `Group task run ${input.runId} has an invalid definition snapshot`,
-      );
-    }
-    if (definitionSnapshot.context_mode !== 'group') {
-      throw new Error(`Task run ${input.runId} is not a group-mode occurrence`);
-    }
-    definitionSnapshot.interaction_mode = input.interactionMode;
-
-    ensureChatExists(input.chatJid);
-    const messageId = storeMessageDirect(
-      input.messageId,
-      input.chatJid,
-      input.senderId,
-      input.senderName,
-      input.text,
-      new Date().toISOString(),
-      false,
-      {
-        meta: {
-          sourceKind: 'scheduled_task_prompt',
-          taskId: input.taskId,
-        },
-      },
-    );
-
-    const now = new Date().toISOString();
-    const startedAt = run.started_at
-      ? new Date(run.started_at).getTime()
-      : new Date(run.created_at).getTime();
-    const durationMs = Math.max(0, Date.now() - startedAt);
-    const changed = prepareCached(`UPDATE task_runs
-         SET status = 'delivered', result = ?, error = NULL,
-             definition_snapshot = ?,
-             notification_status = 'skipped', notification_error = NULL,
-             duration_ms = ?, completed_at = ?,
-             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-         WHERE id = ? AND task_id = ? AND status = 'running'
-           AND lease_owner = ? AND lease_token = ?`).run(
-      input.queuedResult,
-      JSON.stringify(definitionSnapshot),
-      durationMs,
-      now,
-      now,
-      input.runId,
-      input.taskId,
-      input.leaseOwner,
-      input.leaseToken,
-    );
-    if (changed.changes !== 1) {
-      throw new Error(
-        `Group task run ${input.runId} lost its execution fence during prompt delivery`,
-      );
-    }
-    prepareCached(`UPDATE scheduled_tasks
-       SET last_run = ?, last_result = ?,
-           status = CASE
-             WHEN schedule_type = 'once' AND next_run IS NULL THEN 'completed'
-             ELSE status
-           END,
-           updated_at = ?
-       WHERE id = ?`).run(
-      now,
-      input.queuedResult.slice(0, 200),
-      now,
-      input.taskId,
-    );
-    return messageId;
-  })();
-}
-
-/**
- * Replace a group-mode run's queue acknowledgement with the exact Assistant
- * outcome produced by that scheduler-owned prompt.
- *
- * Group execution crosses an asynchronous workspace queue boundary, so its
- * lease is intentionally released as `delivered` after prompt injection. The
- * stable prompt message id later identifies this exact run. Only that terminal
- * hand-off state may be upgraded; ordinary conversations and another
- * occurrence of the same task cannot overwrite it.
- */
-export function finalizeDeliveredGroupTaskRun(
-  id: string,
-  taskId: string,
-  input: {
-    status?: 'success' | 'failed' | 'cancelled';
-    result?: string | null;
-    error?: string | null;
-  },
-): boolean {
-  return db.transaction(() =>
-    finalizeDeliveredGroupTaskRunInTransaction(id, taskId, input),
-  )();
-}
-
-function finalizeDeliveredGroupTaskRunInTransaction(
-  id: string,
-  taskId: string,
-  input: {
-    status?: 'success' | 'failed' | 'cancelled';
-    result?: string | null;
-    error?: string | null;
-  },
-): boolean {
-  const resultText = input.result?.trim() || null;
-  const errorText = input.error?.trim() || null;
-  const status = input.status ?? (errorText ? 'failed' : 'success');
-  const now = new Date().toISOString();
-  const current =
-    prepareCached(`SELECT task_id, status, result, error, completed_at
-         FROM task_runs WHERE id = ?`).get(id) as
-      | Pick<
-          TaskRunRow,
-          'task_id' | 'status' | 'result' | 'error' | 'completed_at'
-        >
-      | undefined;
-  if (!current || current.task_id !== taskId) return false;
-
-  // Duplicate SDK terminal frames and replay-safe Web writes are no-ops.
-  if (
-    current.status === status &&
-    current.result === resultText &&
-    current.error === errorText
-  ) {
-    return true;
-  }
-  if (current.status !== 'delivered') return false;
-
-  const changed = prepareCached(`UPDATE task_runs
-         SET status = ?, result = ?, error = ?, completed_at = ?,
-             duration_ms = CASE
-               WHEN started_at IS NULL THEN duration_ms
-               ELSE MAX(0, CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER))
-             END,
-             updated_at = ?
-         WHERE id = ? AND task_id = ? AND status = 'delivered'`).run(
-    status,
-    resultText,
-    errorText,
-    now,
-    now,
-    now,
-    id,
-    taskId,
-  );
-  if (changed.changes !== 1) return false;
-
-  const summary = errorText
-    ? `Error: ${errorText}`
-    : resultText?.slice(0, 200) || 'Completed';
-  // Do not let a late result from an older group occurrence overwrite a
-  // newer run's task-list summary.
-  prepareCached(`UPDATE scheduled_tasks
-       SET last_run = ?, last_result = ?, updated_at = ?
-       WHERE id = ?
-         AND (last_run = ? OR last_run IS NULL)`).run(
-    now,
-    summary,
-    now,
-    taskId,
-    current.completed_at,
-  );
-  return true;
-}
-
-export interface ScheduledGroupWorkspaceFinalization {
-  runId: string;
-  taskId: string;
-  status?: 'success' | 'failed' | 'cancelled';
-  result?: string | null;
-  error?: string | null;
-}
-
-export interface StoreScheduledGroupWorkspaceResultInput {
-  messageId: string;
-  chatJid: string;
-  senderId: string;
-  senderName: string;
-  text: string;
-  timestamp: string;
-  messageMeta?: {
-    turnId?: string;
-    sessionId?: string;
-    sdkMessageUuid?: string;
-    sourceKind?: MessageSourceKind;
-    finalizationReason?: MessageFinalizationReason;
-  };
-  finalizations: ScheduledGroupWorkspaceFinalization[];
-}
-
-/**
- * Atomically persist one canonical group result and terminalize every exact
- * scheduler occurrence represented by that result.
- *
- * The WebSocket broadcast deliberately happens at the caller after this
- * transaction commits. A crash before commit leaves both message and runs
- * untouched; a crash after commit leaves a durable message that polling can
- * recover while the stable scheduler prompts are already terminal.
- */
-export function storeScheduledGroupWorkspaceResultAndFinalize(
-  input: StoreScheduledGroupWorkspaceResultInput,
-): string {
-  if (input.finalizations.length === 0) {
-    throw new Error('Scheduled group workspace result has no run finalization');
-  }
-  return db.transaction(() => {
-    ensureChatExists(input.chatJid);
-    const messageId = storeMessageDirect(
-      input.messageId,
-      input.chatJid,
-      input.senderId,
-      input.senderName,
-      input.text,
-      input.timestamp,
-      true,
-      { meta: input.messageMeta },
-    );
-    for (const finalization of input.finalizations) {
-      if (
-        !finalizeDeliveredGroupTaskRunInTransaction(
-          finalization.runId,
-          finalization.taskId,
-          {
-            status: finalization.status,
-            result: finalization.result,
-            error: finalization.error,
-          },
-        )
-      ) {
-        throw new Error(
-          `Group task run ${finalization.runId} could not atomically accept its workspace result`,
-        );
-      }
-    }
-    return messageId;
-  })();
-}
-
-/** Cancellation increments the fencing token so a late worker cannot commit. */
-export function cancelTaskRun(
-  id: string,
-  reason = 'Cancelled by user',
-): boolean {
-  const now = new Date().toISOString();
-  return db.transaction(() => {
-    const current = prepareCached(`SELECT task_id FROM task_runs
-         WHERE id = ? AND status IN ('queued','running','retry_wait')`).get(
-      id,
-    ) as { task_id: string } | undefined;
-    if (!current) return false;
-    const result = prepareCached(`UPDATE task_runs
-         SET status = 'cancelled', error = ?, completed_at = ?, updated_at = ?,
-             notification_status = 'skipped', notification_error = NULL,
-             notification_payload = NULL, notification_available_at = NULL,
-             notification_lease_owner = NULL,
-             notification_lease_expires_at = NULL,
-             notification_lease_payload = NULL,
-             lease_owner = NULL, lease_expires_at = NULL,
-             lease_token = lease_token + 1
-         WHERE id = ? AND status IN ('queued','running','retry_wait')`).run(
-      reason,
-      now,
-      now,
-      id,
-    );
-    if (result.changes !== 1) return false;
-    prepareCached(`UPDATE scheduled_tasks SET status = 'completed', updated_at = ?
-       WHERE id = ? AND schedule_type = 'once' AND next_run IS NULL
-         AND status IN ('active','paused')`).run(now, current.task_id);
-    return true;
-  })();
-}
-
-/**
- * Cancel a group occurrence after its prompt crossed the workspace queue
- * boundary. `delivered` is terminal only for the scheduler worker; the Agent
- * still owes a business result, so user cancellation must remain available.
- *
- * The cancelled business terminal and its canonical Web projection intent are
- * committed together. The notification worker may then idempotently store and
- * broadcast the cancellation result without replaying Agent work.
- */
-export function cancelDeliveredGroupTaskRunWithWorkspaceIntent(input: {
-  runId: string;
-  taskId: string;
-  reason: string;
-  payload: TaskRunTextNotificationPayload;
-}): boolean {
-  if (
-    input.payload.kind !== 'workspace_result' ||
-    input.payload.groupRunId !== input.runId ||
-    input.payload.groupTaskId !== input.taskId ||
-    input.payload.groupStatus !== 'cancelled' ||
-    input.payload.groupResult !== null ||
-    input.payload.groupError !== input.reason ||
-    input.payload.options?.sourceKind !== 'scheduled_task_result' ||
-    input.payload.options.messageId !==
-      `scheduled-group-terminal:${input.runId}`
-  ) {
-    return false;
-  }
-  const payloadOptions = input.payload.options;
-
-  const now = new Date().toISOString();
-  return db.transaction(() => {
-    const current = prepareCached(`SELECT task_id, definition_snapshot
-           FROM task_runs
-          WHERE id = ? AND task_id = ? AND status = 'delivered'`).get(
-      input.runId,
-      input.taskId,
-    ) as Pick<TaskRunRow, 'task_id' | 'definition_snapshot'> | undefined;
-    if (!current) return false;
-
-    let snapshot: TaskRunDefinitionSnapshot;
-    try {
-      snapshot = JSON.parse(
-        current.definition_snapshot,
-      ) as TaskRunDefinitionSnapshot;
-    } catch {
-      return false;
-    }
-    const deliveryRouteJid = snapshot.delivery_route_jid || snapshot.chat_jid;
-    if (
-      snapshot.context_mode !== 'group' ||
-      input.payload.chatJid !== deliveryRouteJid ||
-      payloadOptions.workspaceFolder !== snapshot.group_folder
-    ) {
-      return false;
-    }
-
-    const summary: TaskRunNotificationSummary = {
-      attempted: 0,
-      succeeded: 0,
-      failed: 0,
-      failed_channels: [],
-    };
-    const changed = prepareCached(`UPDATE task_runs
-            SET status = 'cancelled', result = NULL, error = ?,
-                completed_at = ?, updated_at = ?,
-                duration_ms = CASE
-                  WHEN started_at IS NULL THEN duration_ms
-                  ELSE MAX(0, CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER))
-                END,
-                notification_status = 'pending',
-                notification_error = NULL,
-                notification_summary = ?,
-                notification_payload = ?,
-                notification_attempt = 0,
-                notification_available_at = ?,
-                notification_lease_owner = NULL,
-                notification_lease_expires_at = NULL,
-                notification_lease_payload = NULL,
-                notification_generation = notification_generation + 1,
-                lease_owner = NULL, lease_expires_at = NULL,
-                lease_token = lease_token + 1
-          WHERE id = ? AND task_id = ? AND status = 'delivered'`).run(
-      input.reason,
-      now,
-      now,
-      now,
-      JSON.stringify(summary),
-      JSON.stringify(input.payload),
-      now,
-      input.runId,
-      input.taskId,
-    );
-    if (changed.changes !== 1) return false;
-
-    prepareCached(`UPDATE scheduled_tasks SET status = 'completed', updated_at = ?
-       WHERE id = ? AND schedule_type = 'once' AND next_run IS NULL
-         AND status IN ('active','paused')`).run(now, input.taskId);
-    return true;
-  })();
-}
-
-export function updateTaskRunNotification(
-  id: string,
-  status: TaskRunNotificationStatus,
-  error: string | null = null,
-  summary: TaskRunNotificationSummary | null = null,
-): boolean {
-  return db.transaction(() => {
-    const current =
-      prepareCached(`SELECT status, notification_status, notification_error,
-                notification_summary, notification_payload
-         FROM task_runs WHERE id = ?`).get(id) as
-        | Pick<
-            TaskRunRow,
-            | 'status'
-            | 'notification_status'
-            | 'notification_error'
-            | 'notification_summary'
-            | 'notification_payload'
-          >
-        | undefined;
-    if (
-      !current ||
-      current.status === 'cancelled' ||
-      current.status === 'missed'
-    ) {
-      return false;
-    }
-
-    // A queued retry is authoritative evidence that delivery is unfinished.
-    // Never let a late/coarse status-only write hide durable retry work.
-    const preserveRetryState =
-      current.notification_payload !== null &&
-      (status === 'success' || status === 'skipped');
-    const effectiveStatus = preserveRetryState
-      ? current.notification_status === 'success' ||
-        current.notification_status === 'skipped'
-        ? 'failed'
-        : current.notification_status
-      : status;
-    const effectiveError = preserveRetryState
-      ? current.notification_error
-      : error;
-    const effectiveSummary = preserveRetryState
-      ? current.notification_summary
-      : summary
-        ? JSON.stringify(summary)
-        : null;
-
-    const result =
-      prepareCached(`UPDATE task_runs SET notification_status = ?, notification_error = ?,
-           notification_summary = ?,
-           notification_generation = notification_generation + 1,
-           updated_at = ? WHERE id = ? AND status NOT IN ('cancelled','missed')`).run(
-        effectiveStatus,
-        effectiveError,
-        effectiveSummary,
-        new Date().toISOString(),
-        id,
-      );
-    return result.changes === 1;
-  })();
-}
-
-export interface TaskRunTextNotificationPayload {
-  kind: 'store_result_and_notify' | 'send_message' | 'workspace_result';
-  chatJid: string;
-  text: string;
-  /** Optional group-mode terminal transition completed after Web persistence. */
-  groupRunId?: string;
-  groupTaskId?: string;
-  groupStatus?: 'success' | 'failed' | 'cancelled';
-  groupResult?: string | null;
-  groupError?: string | null;
-  options?: {
-    ownerId?: string;
-    notifyChannels?: string[] | null;
-    sourceKind?: string;
-    /** Stable id for replay-safe Web workspace projection. */
-    messageId?: string;
-    skipStore?: boolean;
-    workspaceFolder?: string;
-    /** The source IM received this exact message through a prior strict ACK. */
-    sourceAlreadyDelivered?: boolean;
-  };
-  sendOptions?: { source?: string };
-}
-
-export interface TaskRunImMessageNotificationPayload {
-  kind: 'im_message';
-  targetJid: string;
-  text: string;
-  localImagePaths: string[];
-}
-
-export interface TaskRunImImageNotificationPayload {
-  kind: 'im_image';
-  targetJid: string;
-  workspaceFolder: string;
-  filePath: string;
-  mimeType: string;
-  caption?: string;
-  fileName?: string;
-}
-
-export interface TaskRunImFileNotificationPayload {
-  kind: 'im_file';
-  targetJid: string;
-  workspaceFolder: string;
-  filePath: string;
-  fileName: string;
-}
-
-interface TaskRunImChannelNotificationBase {
-  /** Resolve the current binding for this channel again on durable retry. */
-  targetChannel: string;
-  ownerId: string;
-  workspaceFolder: string;
-}
-
-export interface TaskRunImChannelMessageNotificationPayload extends TaskRunImChannelNotificationBase {
-  kind: 'im_channel_message';
-  text: string;
-}
-
-export interface TaskRunImChannelImageNotificationPayload extends TaskRunImChannelNotificationBase {
-  kind: 'im_channel_image';
-  filePath: string;
-  mimeType: string;
-  caption?: string;
-  fileName?: string;
-}
-
-export interface TaskRunImChannelFileNotificationPayload extends TaskRunImChannelNotificationBase {
-  kind: 'im_channel_file';
-  filePath: string;
-  fileName: string;
-}
-
-export type TaskRunAtomicNotificationPayload =
-  | TaskRunTextNotificationPayload
-  | TaskRunImMessageNotificationPayload
-  | TaskRunImImageNotificationPayload
-  | TaskRunImFileNotificationPayload
-  | TaskRunImChannelMessageNotificationPayload
-  | TaskRunImChannelImageNotificationPayload
-  | TaskRunImChannelFileNotificationPayload;
-
-export type TaskRunNotificationPayload =
-  | TaskRunAtomicNotificationPayload
-  | { kind: 'batch'; items: TaskRunAtomicNotificationPayload[] };
-
-export interface TaskRunNotificationReceipt {
-  status: Exclude<TaskRunNotificationStatus, 'pending'>;
-  summary: TaskRunNotificationSummary;
-  error?: string | null;
-}
-
-export interface ClaimedTaskRunNotification {
-  runId: string;
-  payload: TaskRunNotificationPayload;
-  attempt: number;
-  owner: string;
-  token: number;
-  expiresAt: string;
-  generation: number;
-  notificationStatus: TaskRunNotificationStatus;
-  notificationSummary: TaskRunNotificationSummary | null;
-  notificationError: string | null;
-}
-
-const MAX_TASK_NOTIFICATION_ATTEMPTS = 5;
-const FINAL_NOTIFICATION_UNKNOWN_ERROR =
-  'Final notification attempt expired; delivery outcome is unknown';
-const PENDING_NOTIFICATION_RETRY_ERROR =
-  'Notification retry work remains pending delivery';
-
-function mergeTaskRunNotificationPayloads(
-  current: TaskRunNotificationPayload | null,
-  next: TaskRunNotificationPayload | undefined,
-): TaskRunNotificationPayload | null {
-  if (!next) return current;
-  const currentItems = !current
-    ? []
-    : current.kind === 'batch'
-      ? current.items
-      : [current];
-  const nextItems = next.kind === 'batch' ? next.items : [next];
-  const items = [
-    ...new Map(
-      [...currentItems, ...nextItems].map((item) => [
-        JSON.stringify(item),
-        item,
-      ]),
-    ).values(),
-  ];
-  return items.length === 1 ? items[0] : { kind: 'batch', items };
-}
-
-function notificationPayloadAddsNewWork(
-  current: TaskRunNotificationPayload | null,
-  next: TaskRunNotificationPayload | undefined,
-): boolean {
-  if (!next) return false;
-  const existing = new Set(
-    taskRunNotificationPayloadItems(current).map((item) =>
-      JSON.stringify(item),
-    ),
-  );
-  return taskRunNotificationPayloadItems(next).some(
-    (item) => !existing.has(JSON.stringify(item)),
-  );
-}
-
-function taskRunNotificationPayloadItems(
-  payload: TaskRunNotificationPayload | null | undefined,
-): TaskRunAtomicNotificationPayload[] {
-  if (!payload) return [];
-  return payload.kind === 'batch' ? payload.items : [payload];
-}
-
-function notificationPayloadOwnsCancelledGroupWorkspaceRun(
-  payload: TaskRunNotificationPayload | null | undefined,
-  runId: string,
-): boolean {
-  return taskRunNotificationPayloadItems(payload).some(
-    (item) =>
-      item.kind === 'workspace_result' &&
-      item.groupRunId === runId &&
-      Boolean(item.groupTaskId) &&
-      item.groupStatus === 'cancelled',
-  );
-}
-
-function cancelledGroupWorkspaceRetryPayload(
-  payload: TaskRunNotificationPayload | null | undefined,
-  runId: string,
-): TaskRunNotificationPayload | null {
-  const items = taskRunNotificationPayloadItems(payload).filter(
-    (item) =>
-      item.kind === 'workspace_result' &&
-      item.groupRunId === runId &&
-      Boolean(item.groupTaskId) &&
-      item.groupStatus === 'cancelled',
-  );
-  return items.length === 0
-    ? null
-    : items.length === 1
-      ? items[0]
-      : { kind: 'batch', items };
-}
-
-/**
- * Notification exhaustion must not leave the asynchronous group execution in
- * `delivered` forever. Execution and projection status remain independent:
- * settle the exact business outcome carried by the payload while the
- * notification row keeps its failed/unknown delivery audit.
- */
-function settleDiscardedGroupWorkspaceResults(
-  runId: string,
-  payload: TaskRunNotificationPayload | null | undefined,
-): number {
-  let settled = 0;
-  for (const item of taskRunNotificationPayloadItems(payload)) {
-    if (
-      item.kind !== 'workspace_result' ||
-      item.groupRunId !== runId ||
-      !item.groupTaskId
-    ) {
-      continue;
-    }
-    if (
-      finalizeDeliveredGroupTaskRunInTransaction(runId, item.groupTaskId, {
-        status: item.groupStatus,
-        result: item.groupResult,
-        error: item.groupError,
-      })
-    ) {
-      settled++;
-    }
-  }
-  return settled;
-}
-
-/** Remove exactly the atomic work owned by one claim from the latest queue. */
-function subtractTaskRunNotificationPayload(
-  current: TaskRunNotificationPayload | null,
-  claimed: TaskRunNotificationPayload,
-): TaskRunNotificationPayload | null {
-  const claimedCounts = new Map<string, number>();
-  for (const item of taskRunNotificationPayloadItems(claimed)) {
-    const key = JSON.stringify(item);
-    claimedCounts.set(key, (claimedCounts.get(key) ?? 0) + 1);
-  }
-  const remaining = taskRunNotificationPayloadItems(current).filter((item) => {
-    const key = JSON.stringify(item);
-    const count = claimedCounts.get(key) ?? 0;
-    if (count <= 0) return true;
-    claimedCounts.set(key, count - 1);
-    return false;
-  });
-  return remaining.length === 0
-    ? null
-    : remaining.length === 1
-      ? remaining[0]
-      : { kind: 'batch', items: remaining };
-}
-
-function notificationPayloadChannels(
-  payload: TaskRunNotificationPayload | null,
-): string[] {
-  return [
-    ...new Set(
-      taskRunNotificationPayloadItems(payload).map((item) =>
-        'targetJid' in item
-          ? item.targetJid.split(':', 1)[0] || item.targetJid
-          : 'targetChannel' in item
-            ? item.targetChannel
-            : (item.options?.notifyChannels?.[0] ?? item.chatJid),
-      ),
-    ),
-  ];
-}
-
-function subtractNotificationSummary(
-  current: TaskRunNotificationSummary | null,
-  baseline: TaskRunNotificationSummary | null,
-  remainingPayload: TaskRunNotificationPayload | null,
-): TaskRunNotificationSummary {
-  const attempted = Math.max(
-    0,
-    (current?.attempted ?? 0) - (baseline?.attempted ?? 0),
-  );
-  const succeeded = Math.max(
-    0,
-    (current?.succeeded ?? 0) - (baseline?.succeeded ?? 0),
-  );
-  const failed = Math.max(0, (current?.failed ?? 0) - (baseline?.failed ?? 0));
-  const uncertain = Math.max(
-    0,
-    (current?.uncertain ?? 0) - (baseline?.uncertain ?? 0),
-  );
-  let failedChannels: string[] = [];
-  if (failed > 0) {
-    const baselineChannels = new Set(baseline?.failed_channels ?? []);
-    failedChannels = (current?.failed_channels ?? []).filter(
-      (channel) => !baselineChannels.has(channel),
-    );
-    if (failedChannels.length === 0) {
-      failedChannels = notificationPayloadChannels(remainingPayload);
-    }
-    if (failedChannels.length === 0) {
-      failedChannels = [...(current?.failed_channels ?? [])];
-    }
-  }
-  const baselineUncertainChannels = new Set(baseline?.uncertain_channels ?? []);
-  const uncertainChannels = (current?.uncertain_channels ?? []).filter(
-    (channel) => !baselineUncertainChannels.has(channel),
-  );
-  return {
-    attempted,
-    succeeded,
-    failed,
-    failed_channels: failedChannels,
-    ...(uncertain > 0
-      ? {
-          uncertain,
-          uncertain_channels:
-            uncertainChannels.length > 0
-              ? uncertainChannels
-              : [...(current?.uncertain_channels ?? [])],
-        }
-      : {}),
-  };
-}
-
-function subtractNotificationError(
-  current: string | null,
-  baseline: string | null,
-): string | null {
-  if (!current || current === baseline) return null;
-  if (baseline && current.startsWith(`${baseline}; `)) {
-    return current.slice(baseline.length + 2) || null;
-  }
-  return current;
-}
-
-function removeNotificationError(
-  current: string | null,
-  removed: string | null | undefined,
-): string | null {
-  if (!current || !removed) return current;
-  if (current === removed) return null;
-  if (current.startsWith(`${removed}; `)) {
-    return current.slice(removed.length + 2) || null;
-  }
-  if (current.endsWith(`; ${removed}`)) {
-    return current.slice(0, -(removed.length + 2)) || null;
-  }
-  const marker = `; ${removed}; `;
-  const index = current.indexOf(marker);
-  if (index >= 0) {
-    return `${current.slice(0, index)}; ${current.slice(index + marker.length)}`;
-  }
-  return current;
-}
-
-function notificationStatusForSummary(
-  summary: TaskRunNotificationSummary,
-): TaskRunNotificationReceipt['status'] {
-  return (summary.uncertain ?? 0) > 0
-    ? 'uncertain'
-    : summary.failed === 0
-      ? summary.attempted === 0
-        ? 'skipped'
-        : 'success'
-      : summary.succeeded > 0
-        ? 'partial_failed'
-        : 'failed';
-}
-
-function mergeTaskRunNotificationReceipts(
-  currentStatus: TaskRunNotificationStatus,
-  currentSummary: TaskRunNotificationSummary | null,
-  currentError: string | null,
-  next: TaskRunNotificationReceipt,
-): TaskRunNotificationReceipt {
-  if (!currentSummary || currentStatus === 'pending') return next;
-  const summary: TaskRunNotificationSummary = {
-    attempted: currentSummary.attempted + next.summary.attempted,
-    succeeded: currentSummary.succeeded + next.summary.succeeded,
-    failed: currentSummary.failed + next.summary.failed,
-    failed_channels: [
-      ...new Set([
-        ...currentSummary.failed_channels,
-        ...next.summary.failed_channels,
-      ]),
-    ],
-    ...((currentSummary.uncertain ?? 0) + (next.summary.uncertain ?? 0) > 0
-      ? {
-          uncertain:
-            (currentSummary.uncertain ?? 0) + (next.summary.uncertain ?? 0),
-          uncertain_channels: [
-            ...new Set([
-              ...(currentSummary.uncertain_channels ?? []),
-              ...(next.summary.uncertain_channels ?? []),
-            ]),
-          ],
-        }
-      : {}),
-  };
-  return {
-    status: notificationStatusForSummary(summary),
-    summary,
-    error: [currentError, next.error].filter(Boolean).join('; ') || null,
-  };
-}
-
-function keepRetryWorkNonSuccessful(
-  receipt: TaskRunNotificationReceipt,
-  payload: TaskRunNotificationPayload | null,
-): TaskRunNotificationReceipt {
-  if (
-    !payload ||
-    (receipt.status !== 'success' && receipt.status !== 'skipped')
-  ) {
-    return receipt;
-  }
-  return {
-    ...receipt,
-    status: 'failed',
-    error: receipt.error || PENDING_NOTIFICATION_RETRY_ERROR,
-  };
-}
-
-/** Persist an immediate delivery receipt; failures become notification-only retry work. */
-export function recordTaskRunNotificationReceipt(
-  runId: string,
-  receipt: TaskRunNotificationReceipt,
-  retryPayload?: TaskRunNotificationPayload,
-): boolean {
-  return db.transaction(() =>
-    recordTaskRunNotificationReceiptInTransaction(runId, receipt, retryPayload),
-  )();
-}
-
-function recordTaskRunNotificationReceiptInTransaction(
-  runId: string,
-  receipt: TaskRunNotificationReceipt,
-  retryPayload?: TaskRunNotificationPayload,
-  allowCancelledWorkspaceRun = false,
-): boolean {
-  const now = new Date();
-  const row =
-    prepareCached(`SELECT status, notification_status, notification_error,
-                notification_summary, notification_payload,
-                notification_available_at,
-                notification_lease_owner,
-                notification_generation
-         FROM task_runs WHERE id = ?`).get(runId) as
-      | Pick<
-          TaskRunRow,
-          | 'status'
-          | 'notification_status'
-          | 'notification_error'
-          | 'notification_summary'
-          | 'notification_payload'
-          | 'notification_available_at'
-          | 'notification_lease_owner'
-          | 'notification_generation'
-        >
-      | undefined;
-  // Cancellation/misfire is authoritative. Late IPC files must not notify
-  // the user or resurrect notification-only retry work.
-  if (
-    !row ||
-    (row.status === 'cancelled' && !allowCancelledWorkspaceRun) ||
-    row.status === 'missed'
-  ) {
-    return false;
-  }
-  let currentSummary: TaskRunNotificationSummary | null = null;
-  let currentPayload: TaskRunNotificationPayload | null = null;
-  try {
-    currentSummary = row.notification_summary
-      ? (JSON.parse(row.notification_summary) as TaskRunNotificationSummary)
-      : null;
-    currentPayload = row.notification_payload
-      ? (JSON.parse(row.notification_payload) as TaskRunNotificationPayload)
-      : null;
-  } catch {
-    // A new valid receipt repairs malformed legacy/internal JSON.
-  }
-  let mergedReceipt = mergeTaskRunNotificationReceipts(
-    row.notification_status,
-    currentSummary,
-    row.notification_error,
-    receipt,
-  );
-  const shouldRetry =
-    (receipt.status === 'failed' ||
-      receipt.status === 'partial_failed' ||
-      receipt.status === 'uncertain') &&
-    !!retryPayload;
-  const mergedPayload = mergeTaskRunNotificationPayloads(
-    currentPayload,
-    shouldRetry ? retryPayload : undefined,
-  );
-  mergedReceipt = keepRetryWorkNonSuccessful(mergedReceipt, mergedPayload);
-  const addedNewRetryWork = notificationPayloadAddsNewWork(
-    currentPayload,
-    shouldRetry ? retryPayload : undefined,
-  );
-  const retryAt = new Date(now.getTime() + 1_000).toISOString();
-  const availableAt = mergedPayload
-    ? [
-        currentPayload && !row.notification_lease_owner
-          ? row.notification_available_at
-          : null,
-        shouldRetry ? retryAt : null,
-      ]
-        .filter((value): value is string => !!value)
-        .sort()[0] || retryAt
-    : null;
-  const result = prepareCached(`UPDATE task_runs
-         SET notification_status = ?, notification_error = ?,
-             notification_summary = ?, notification_payload = ?,
-             notification_attempt = CASE WHEN ? AND notification_lease_owner IS NULL THEN 0
-                                         ELSE notification_attempt END,
-             notification_available_at = ?,
-             notification_generation = notification_generation + 1,
-             updated_at = ?
-         WHERE id = ?
-           AND (
-             status NOT IN ('cancelled','missed')
-             OR (? = 1 AND status = 'cancelled')
-           )`).run(
-    mergedReceipt.status,
-    mergedReceipt.error ?? null,
-    JSON.stringify(mergedReceipt.summary),
-    mergedPayload ? JSON.stringify(mergedPayload) : null,
-    addedNewRetryWork ? 1 : 0,
-    availableAt,
-    now.toISOString(),
-    runId,
-    allowCancelledWorkspaceRun ? 1 : 0,
-  );
-  return result.changes === 1;
-}
-
-/**
- * Atomically persist canonical Web projection repair work and settle the exact
- * group execution outcome. Neither the notification repair nor the business
- * terminal is allowed to become visible alone across a crash.
- */
-export function recordGroupWorkspaceProjectionFailureAndFinalize(input: {
-  runId: string;
-  taskId: string;
-  receipt: TaskRunNotificationReceipt;
-  payload: TaskRunTextNotificationPayload;
-  status?: 'success' | 'failed' | 'cancelled';
-  result?: string | null;
-  error?: string | null;
-}): boolean {
-  if (
-    input.payload.kind !== 'workspace_result' ||
-    input.payload.groupRunId !== input.runId ||
-    input.payload.groupTaskId !== input.taskId
-  ) {
-    return false;
-  }
-  try {
-    return db.transaction(() => {
-      if (
-        !recordTaskRunNotificationReceiptInTransaction(
-          input.runId,
-          input.receipt,
-          input.payload,
-          input.status === 'cancelled',
-        )
-      ) {
-        return false;
-      }
-      if (
-        !finalizeDeliveredGroupTaskRunInTransaction(input.runId, input.taskId, {
-          status: input.status,
-          result: input.result,
-          error: input.error,
-        })
-      ) {
-        throw new Error(
-          `Group task run ${input.runId} could not atomically settle its workspace projection failure`,
-        );
-      }
-      return true;
-    })();
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Atomically supersede one provisional failure with its fallback outcome.
- * The exact retry item is consumed, while unrelated IPC/channel failures stay
- * durable. This is used when a strict source send fails but the normal owner
- * notification fallback subsequently succeeds (or yields better retry work).
- */
-export function replaceTaskRunNotificationReceipt(
-  runId: string,
-  previousReceipt: TaskRunNotificationReceipt,
-  previousPayload: TaskRunNotificationPayload,
-  nextReceipt: TaskRunNotificationReceipt,
-  nextRetryPayload?: TaskRunNotificationPayload,
-): boolean {
-  const now = new Date();
-  return db.transaction(() => {
-    const row =
-      prepareCached(`SELECT status, notification_status, notification_error,
-                notification_summary, notification_payload,
-                notification_attempt, notification_available_at,
-                notification_generation
-         FROM task_runs WHERE id = ?`).get(runId) as
-        | Pick<
-            TaskRunRow,
-            | 'status'
-            | 'notification_status'
-            | 'notification_error'
-            | 'notification_summary'
-            | 'notification_payload'
-            | 'notification_attempt'
-            | 'notification_available_at'
-            | 'notification_generation'
-          >
-        | undefined;
-    if (
-      !row ||
-      row.status === 'cancelled' ||
-      row.status === 'missed' ||
-      !row.notification_payload ||
-      !row.notification_summary
-    ) {
-      return false;
-    }
-
-    let currentPayload: TaskRunNotificationPayload;
-    let currentSummary: TaskRunNotificationSummary;
-    try {
-      currentPayload = JSON.parse(
-        row.notification_payload,
-      ) as TaskRunNotificationPayload;
-      currentSummary = JSON.parse(
-        row.notification_summary,
-      ) as TaskRunNotificationSummary;
-    } catch {
-      return false;
-    }
-    const previousItems = taskRunNotificationPayloadItems(previousPayload);
-    const remainingPayload = subtractTaskRunNotificationPayload(
-      currentPayload,
-      previousPayload,
-    );
-    if (
-      taskRunNotificationPayloadItems(currentPayload).length -
-        taskRunNotificationPayloadItems(remainingPayload).length !==
-      previousItems.length
-    ) {
-      return false;
-    }
-
-    const baseSummary: TaskRunNotificationSummary = {
-      attempted: Math.max(
-        0,
-        currentSummary.attempted - previousReceipt.summary.attempted,
-      ),
-      succeeded: Math.max(
-        0,
-        currentSummary.succeeded - previousReceipt.summary.succeeded,
-      ),
-      failed: Math.max(
-        0,
-        currentSummary.failed - previousReceipt.summary.failed,
-      ),
-      failed_channels: [],
-      uncertain: Math.max(
-        0,
-        (currentSummary.uncertain ?? 0) -
-          (previousReceipt.summary.uncertain ?? 0),
-      ),
-      uncertain_channels: [],
-    };
-    if (baseSummary.failed > 0) {
-      const removedChannels = new Set(previousReceipt.summary.failed_channels);
-      const remainingChannels = notificationPayloadChannels(remainingPayload);
-      baseSummary.failed_channels = [
-        ...new Set([
-          ...currentSummary.failed_channels.filter(
-            (channel) => !removedChannels.has(channel),
-          ),
-          ...remainingChannels,
-        ]),
-      ];
-      if (baseSummary.failed_channels.length === 0) {
-        baseSummary.failed_channels = [...currentSummary.failed_channels];
-      }
-    }
-    if ((baseSummary.uncertain ?? 0) > 0) {
-      const removedUncertainChannels = new Set(
-        previousReceipt.summary.uncertain_channels ?? [],
-      );
-      baseSummary.uncertain_channels = (
-        currentSummary.uncertain_channels ?? []
-      ).filter((channel) => !removedUncertainChannels.has(channel));
-    } else {
-      delete baseSummary.uncertain;
-      delete baseSummary.uncertain_channels;
-    }
-    const baseError = removeNotificationError(
-      row.notification_error,
-      previousReceipt.error,
-    );
-    const baseReceipt: TaskRunNotificationReceipt = {
-      status: notificationStatusForSummary(baseSummary),
-      summary: baseSummary,
-      error: baseError,
-    };
-    let mergedReceipt =
-      baseSummary.attempted === 0
-        ? nextReceipt
-        : mergeTaskRunNotificationReceipts(
-            baseReceipt.status,
-            baseReceipt.summary,
-            baseReceipt.error ?? null,
-            nextReceipt,
-          );
-    const shouldRetryNext =
-      (nextReceipt.status === 'failed' ||
-        nextReceipt.status === 'partial_failed' ||
-        nextReceipt.status === 'uncertain') &&
-      !!nextRetryPayload;
-    const mergedPayload = mergeTaskRunNotificationPayloads(
-      remainingPayload,
-      shouldRetryNext ? nextRetryPayload : undefined,
-    );
-    mergedReceipt = keepRetryWorkNonSuccessful(mergedReceipt, mergedPayload);
-    const addedNewRetryWork = notificationPayloadAddsNewWork(
-      remainingPayload,
-      shouldRetryNext ? nextRetryPayload : undefined,
-    );
-    const retryAt = new Date(now.getTime() + 1_000).toISOString();
-    const availableCandidates = [
-      remainingPayload ? row.notification_available_at : null,
-      shouldRetryNext ? retryAt : null,
-    ].filter((value): value is string => !!value);
-    const result = prepareCached(`UPDATE task_runs
-         SET notification_status = ?, notification_error = ?,
-             notification_summary = ?, notification_payload = ?,
-             notification_attempt = CASE WHEN ? THEN 0
-                                         ELSE notification_attempt END,
-             notification_available_at = ?,
-             notification_generation = notification_generation + 1,
-             updated_at = ?
-         WHERE id = ? AND notification_generation = ?
-           AND status NOT IN ('cancelled','missed')`).run(
-      mergedReceipt.status,
-      mergedReceipt.error ?? null,
-      JSON.stringify(mergedReceipt.summary),
-      mergedPayload ? JSON.stringify(mergedPayload) : null,
-      addedNewRetryWork ? 1 : 0,
-      mergedPayload ? (availableCandidates.sort()[0] ?? retryAt) : null,
-      now.toISOString(),
-      runId,
-      row.notification_generation,
-    );
-    return result.changes === 1;
-  })();
-}
-
-/** Mark a completed isolated run with no outbound IPC as intentionally skipped. */
-export function finalizeTaskRunNotificationIfPending(runId: string): boolean {
-  const now = new Date().toISOString();
-  const result = prepareCached(`UPDATE task_runs
-       SET notification_status = 'skipped', notification_error = NULL,
-           notification_summary = ?,
-           notification_generation = notification_generation + 1,
-           updated_at = ?
-       WHERE id = ? AND notification_status = 'pending'
-         AND notification_payload IS NULL
-         AND status NOT IN ('cancelled','missed')`).run(
-    JSON.stringify({
-      attempted: 0,
-      succeeded: 0,
-      failed: 0,
-      failed_channels: [],
-    } satisfies TaskRunNotificationSummary),
-    now,
-    runId,
-  );
-  return result.changes === 1;
-}
-
-export function claimNextTaskRunNotification(
-  owner: string,
-  leaseMs: number,
-): ClaimedTaskRunNotification | undefined {
-  return claimTaskRunNotification(owner, leaseMs);
-}
-
-/** Claim notification work for one known run (used by targeted recovery/tests). */
-export function claimTaskRunNotificationById(
-  runId: string,
-  owner: string,
-  leaseMs: number,
-): ClaimedTaskRunNotification | undefined {
-  return claimTaskRunNotification(owner, leaseMs, runId);
-}
-
-function claimTaskRunNotification(
-  owner: string,
-  leaseMs: number,
-  runId?: string,
-): ClaimedTaskRunNotification | undefined {
-  finalizeExpiredTaskRunNotificationAttempts();
-  const now = new Date();
-  const nowIso = now.toISOString();
-  const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
-  return db.transaction(() => {
-    const rows =
-      prepareCached(`SELECT id, status, notification_payload, notification_attempt,
-                notification_lease_token, notification_generation,
-                notification_status, notification_summary,
-                notification_error
-         FROM task_runs
-         WHERE notification_payload IS NOT NULL
-           AND (? IS NULL OR id = ?)
-           AND (
-             status IN ('success','failed','delivered')
-             OR (
-               status = 'cancelled'
-               AND CASE
-                 WHEN json_valid(notification_payload) THEN (
-                   (
-                     json_extract(notification_payload, '$.kind') = 'workspace_result'
-                     AND json_extract(notification_payload, '$.groupRunId') = id
-                     AND json_extract(notification_payload, '$.groupTaskId') IS NOT NULL
-                     AND json_extract(notification_payload, '$.groupStatus') = 'cancelled'
-                   )
-                   OR (
-                     json_extract(notification_payload, '$.kind') = 'batch'
-                     AND EXISTS (
-                       SELECT 1
-                       FROM json_each(notification_payload, '$.items') AS item
-                       WHERE json_extract(item.value, '$.kind') = 'workspace_result'
-                         AND json_extract(item.value, '$.groupRunId') = id
-                         AND json_extract(item.value, '$.groupTaskId') IS NOT NULL
-                         AND json_extract(item.value, '$.groupStatus') = 'cancelled'
-                     )
-                   )
-                 )
-                 ELSE 0
-               END
-             )
-           )
-           AND notification_attempt < ?
-           AND (
-             (notification_status IN ('failed','partial_failed','uncertain','pending')
-               AND notification_available_at IS NOT NULL
-               AND notification_available_at <= ?
-               AND notification_lease_owner IS NULL)
-             OR (notification_lease_expires_at IS NOT NULL
-                 AND notification_lease_expires_at <= ?)
-           )
-         ORDER BY CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END,
-                  notification_available_at, completed_at, created_at
-         LIMIT 32`).all(
-        runId ?? null,
-        runId ?? null,
-        MAX_TASK_NOTIFICATION_ATTEMPTS,
-        nowIso,
-        nowIso,
-      ) as Array<{
-        id: string;
-        status: TaskRunStatus;
-        notification_payload: string;
-        notification_attempt: number;
-        notification_lease_token: number;
-        notification_generation: number;
-        notification_status: TaskRunNotificationStatus;
-        notification_summary: string | null;
-        notification_error: string | null;
-      }>;
-    for (const row of rows) {
-      let payload: TaskRunNotificationPayload;
-      try {
-        payload = JSON.parse(
-          row.notification_payload,
-        ) as TaskRunNotificationPayload;
-      } catch {
-        prepareCached(`UPDATE task_runs SET notification_status='failed',
-             notification_error='Invalid persisted notification payload',
-             notification_payload=NULL, notification_available_at=NULL,
-             notification_lease_owner=NULL,
-             notification_lease_expires_at=NULL,
-             notification_lease_payload=NULL, updated_at=?
-           WHERE id=? AND notification_lease_token=?`).run(
-          nowIso,
-          row.id,
-          row.notification_lease_token,
-        );
-        continue;
-      }
-      if (
-        row.status === 'cancelled' &&
-        !notificationPayloadOwnsCancelledGroupWorkspaceRun(payload, row.id)
-      ) {
-        continue;
-      }
-
-      const token = row.notification_lease_token + 1;
-      const changed = prepareCached(`UPDATE task_runs
-         SET notification_lease_owner = ?, notification_lease_token = ?,
-             notification_lease_expires_at = ?,
-             notification_lease_payload = notification_payload,
-             notification_attempt = notification_attempt + 1,
-             updated_at = ?
-         WHERE id = ? AND notification_lease_token = ?`).run(
-        owner,
-        token,
-        expiresAt,
-        nowIso,
-        row.id,
-        row.notification_lease_token,
-      );
-      if (changed.changes !== 1) continue;
-      try {
-        return {
-          runId: row.id,
-          payload,
-          attempt: row.notification_attempt + 1,
-          owner,
-          token,
-          expiresAt,
-          generation: row.notification_generation,
-          notificationStatus: row.notification_status,
-          notificationSummary: row.notification_summary
-            ? (JSON.parse(
-                row.notification_summary,
-              ) as TaskRunNotificationSummary)
-            : null,
-          notificationError: row.notification_error,
-        };
-      } catch {
-        prepareCached(`UPDATE task_runs SET notification_status='failed',
-             notification_error='Invalid persisted notification payload',
-             notification_payload=NULL, notification_available_at=NULL,
-             notification_lease_owner=NULL,
-             notification_lease_expires_at=NULL,
-             notification_lease_payload=NULL, updated_at=?
-           WHERE id=? AND notification_lease_owner=?
-             AND notification_lease_token=?`).run(nowIso, row.id, owner, token);
-      }
-    }
-    return undefined;
-  })();
-}
-
-/** A crashed final notification attempt has an unknowable delivery outcome.
- * Fence it terminally instead of replaying (duplicate risk) or busy-looping. */
-export function finalizeExpiredTaskRunNotificationAttempts(): number {
-  const now = new Date().toISOString();
-  return db.transaction(() => {
-    const rows =
-      prepareCached(`SELECT id, status, notification_error, notification_summary,
-                notification_payload, notification_attempt,
-                notification_available_at, notification_lease_owner,
-                notification_lease_token, notification_lease_expires_at,
-                notification_lease_payload, notification_generation
-         FROM task_runs
-         WHERE notification_payload IS NOT NULL
-           AND notification_attempt >= ?
-           AND notification_lease_owner IS NOT NULL
-           AND notification_lease_expires_at IS NOT NULL
-           AND notification_lease_expires_at <= ?`).all(
-        MAX_TASK_NOTIFICATION_ATTEMPTS,
-        now,
-      ) as Array<
-        Pick<
-          TaskRunRow,
-          | 'id'
-          | 'status'
-          | 'notification_error'
-          | 'notification_summary'
-          | 'notification_payload'
-          | 'notification_attempt'
-          | 'notification_available_at'
-          | 'notification_lease_owner'
-          | 'notification_lease_token'
-          | 'notification_lease_expires_at'
-          | 'notification_lease_payload'
-          | 'notification_generation'
-        >
-      >;
-    let changed = 0;
-    for (const row of rows) {
-      let currentPayload: TaskRunNotificationPayload;
-      let claimedPayload: TaskRunNotificationPayload;
-      let currentSummary: TaskRunNotificationSummary | null = null;
-      try {
-        currentPayload = JSON.parse(
-          row.notification_payload!,
-        ) as TaskRunNotificationPayload;
-      } catch {
-        // Invalid work cannot be retried safely. Treat the whole opaque value as
-        // the expired claim so this row becomes terminal below.
-        currentPayload = { kind: 'batch', items: [] };
-      }
-      try {
-        // A v53 process may have crashed with a lease immediately before the
-        // v54 upgrade. With no snapshot, fail closed by treating all current
-        // work as the unknown final claim instead of replaying it.
-        claimedPayload = JSON.parse(
-          row.notification_lease_payload!,
-        ) as TaskRunNotificationPayload;
-      } catch {
-        claimedPayload = currentPayload;
-      }
-      try {
-        currentSummary = row.notification_summary
-          ? (JSON.parse(row.notification_summary) as TaskRunNotificationSummary)
-          : null;
-      } catch {
-        currentSummary = null;
-      }
-      let remainingPayload = subtractTaskRunNotificationPayload(
-        currentPayload,
-        claimedPayload,
-      );
-      const ownsCancelledGroupWorkspaceRun =
-        row.status === 'cancelled' &&
-        notificationPayloadOwnsCancelledGroupWorkspaceRun(
-          claimedPayload,
-          row.id,
-        );
-      if (ownsCancelledGroupWorkspaceRun) {
-        // Cancellation is authoritative. Late notification-only work appended
-        // before the cancellation became visible must not keep a cancelled
-        // run reclaimable forever.
-        remainingPayload = null;
-      }
-      const summary: TaskRunNotificationSummary = {
-        attempted: (currentSummary?.attempted ?? 0) + 1,
-        succeeded: currentSummary?.succeeded ?? 0,
-        failed: (currentSummary?.failed ?? 0) + 1,
-        failed_channels: [
-          ...new Set([
-            ...(currentSummary?.failed_channels ?? []),
-            ...notificationPayloadChannels(claimedPayload),
-          ]),
-        ],
-      };
-      const error = [row.notification_error, FINAL_NOTIFICATION_UNKNOWN_ERROR]
-        .filter(Boolean)
-        .join('; ');
-      const result = prepareCached(`UPDATE task_runs
-           SET notification_status = ?, notification_error = ?,
-               notification_summary = ?, notification_payload = ?,
-               notification_attempt = ?, notification_available_at = ?,
-               notification_lease_owner = NULL,
-               notification_lease_expires_at = NULL,
-               notification_lease_payload = NULL,
-               notification_generation = notification_generation + 1,
-               updated_at = ?
-           WHERE id = ? AND notification_lease_owner = ?
-             AND notification_lease_token = ?
-             AND notification_lease_expires_at <= ?
-             AND notification_generation = ?
-             AND (
-               status NOT IN ('cancelled','missed')
-               OR (? = 1 AND status = 'cancelled')
-             )`).run(
-        notificationStatusForSummary(summary),
-        error,
-        JSON.stringify(summary),
-        remainingPayload ? JSON.stringify(remainingPayload) : null,
-        remainingPayload ? 0 : row.notification_attempt,
-        remainingPayload
-          ? (row.notification_available_at ??
-              new Date(Date.now() + 1_000).toISOString())
-          : null,
-        now,
-        row.id,
-        row.notification_lease_owner,
-        row.notification_lease_token,
-        now,
-        row.notification_generation,
-        ownsCancelledGroupWorkspaceRun ? 1 : 0,
-      );
-      if (result.changes === 1) {
-        settleDiscardedGroupWorkspaceResults(row.id, claimedPayload);
-      }
-      changed += result.changes;
-    }
-    return changed;
-  })();
-}
-
-/** Extend one notification delivery lease without changing its fencing token. */
-export function renewTaskRunNotificationLease(
-  claim: ClaimedTaskRunNotification,
-  leaseMs: number,
-): boolean {
-  const now = new Date();
-  const nowIso = now.toISOString();
-  const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
-  const result =
-    prepareCached(`UPDATE task_runs SET notification_lease_expires_at = ?, updated_at = ?
-       WHERE id = ? AND notification_payload IS NOT NULL
-         AND notification_lease_owner = ? AND notification_lease_token = ?
-         AND notification_lease_expires_at > ?`).run(
-      expiresAt,
-      nowIso,
-      claim.runId,
-      claim.owner,
-      claim.token,
-      nowIso,
-    );
-  if (result.changes === 1) claim.expiresAt = expiresAt;
-  return result.changes === 1;
-}
-
-export function completeTaskRunNotificationAttempt(
-  claim: ClaimedTaskRunNotification,
-  receipt: TaskRunNotificationReceipt,
-  retryPayload?: TaskRunNotificationPayload,
-): boolean {
-  const now = new Date();
-  const nowIso = now.toISOString();
-  const workerRetryable =
-    (receipt.status === 'failed' ||
-      receipt.status === 'partial_failed' ||
-      receipt.status === 'uncertain') &&
-    claim.attempt < MAX_TASK_NOTIFICATION_ATTEMPTS &&
-    !!retryPayload;
-  const delayMs = Math.min(60_000, 1_000 * 2 ** Math.max(0, claim.attempt - 1));
-  const workerAvailableAt = workerRetryable
-    ? new Date(now.getTime() + delayMs).toISOString()
-    : null;
-  const ownsCancelledGroupWorkspaceRun =
-    notificationPayloadOwnsCancelledGroupWorkspaceRun(
-      claim.payload,
-      claim.runId,
-    );
-  return db.transaction(() => {
-    const row =
-      prepareCached(`SELECT status, notification_status, notification_error,
-                notification_summary, notification_payload,
-                notification_attempt, notification_available_at,
-                notification_lease_owner, notification_lease_token,
-                notification_lease_expires_at, notification_generation
-         FROM task_runs WHERE id = ?`).get(claim.runId) as
-        | Pick<
-            TaskRunRow,
-            | 'status'
-            | 'notification_status'
-            | 'notification_error'
-            | 'notification_summary'
-            | 'notification_payload'
-            | 'notification_attempt'
-            | 'notification_available_at'
-            | 'notification_lease_owner'
-            | 'notification_lease_token'
-            | 'notification_lease_expires_at'
-            | 'notification_generation'
-          >
-        | undefined;
-    if (
-      !row ||
-      (row.status === 'cancelled' && !ownsCancelledGroupWorkspaceRun) ||
-      row.status === 'missed' ||
-      row.notification_lease_owner !== claim.owner ||
-      row.notification_lease_token !== claim.token ||
-      !row.notification_lease_expires_at ||
-      row.notification_lease_expires_at <= nowIso
-    ) {
-      return false;
-    }
-
-    let currentPayload: TaskRunNotificationPayload | null = null;
-    let currentSummary: TaskRunNotificationSummary | null = null;
-    try {
-      currentPayload = row.notification_payload
-        ? (JSON.parse(row.notification_payload) as TaskRunNotificationPayload)
-        : null;
-      currentSummary = row.notification_summary
-        ? (JSON.parse(row.notification_summary) as TaskRunNotificationSummary)
-        : null;
-    } catch {
-      return false;
-    }
-
-    const concurrentWrite = row.notification_generation !== claim.generation;
-    const latePayload = concurrentWrite
-      ? subtractTaskRunNotificationPayload(currentPayload, claim.payload)
-      : null;
-    const cancelledAuthoritative =
-      row.status === 'cancelled' && ownsCancelledGroupWorkspaceRun;
-    const nextPayload = cancelledAuthoritative
-      ? workerRetryable
-        ? cancelledGroupWorkspaceRetryPayload(retryPayload, claim.runId)
-        : null
-      : mergeTaskRunNotificationPayloads(
-          latePayload,
-          workerRetryable ? retryPayload : undefined,
-        );
-
-    // A final-attempt crash is terminal historical evidence: later work may
-    // succeed, but it cannot retroactively prove that unknown delivery A did
-    // not happen. Preserve that audit receipt while settling fresh batch B.
-    const claimedSummaryIsHistoricalSuccess =
-      !!claim.notificationSummary &&
-      claim.notificationSummary.failed === 0 &&
-      (claim.notificationStatus === 'pending' ||
-        claim.notificationError === PENDING_NOTIFICATION_RETRY_ERROR);
-    const claimedSummaryHasUncertainty =
-      claim.notificationStatus === 'uncertain' &&
-      !!claim.notificationSummary &&
-      (claim.notificationSummary.uncertain ?? 0) > 0;
-    let nextReceipt =
-      currentSummary &&
-      row.notification_error?.includes(FINAL_NOTIFICATION_UNKNOWN_ERROR)
-        ? mergeTaskRunNotificationReceipts(
-            row.notification_status,
-            currentSummary,
-            row.notification_error,
-            receipt,
-          )
-        : claimedSummaryHasUncertainty && claim.notificationSummary
-          ? mergeTaskRunNotificationReceipts(
-              'uncertain',
-              claim.notificationSummary,
-              claim.notificationError,
-              receipt,
-            )
-          : claimedSummaryIsHistoricalSuccess && claim.notificationSummary
-            ? mergeTaskRunNotificationReceipts(
-                notificationStatusForSummary(claim.notificationSummary),
-                claim.notificationSummary,
-                null,
-                receipt,
-              )
-            : receipt;
-    if (concurrentWrite) {
-      const lateSummary = subtractNotificationSummary(
-        currentSummary,
-        claim.notificationSummary,
-        latePayload,
-      );
-      if (
-        lateSummary.attempted > 0 ||
-        lateSummary.succeeded > 0 ||
-        lateSummary.failed > 0
-      ) {
-        nextReceipt = mergeTaskRunNotificationReceipts(
-          nextReceipt.status,
-          nextReceipt.summary,
-          nextReceipt.error ?? null,
-          {
-            status: notificationStatusForSummary(lateSummary),
-            summary: lateSummary,
-            error: subtractNotificationError(
-              row.notification_error,
-              claim.notificationError,
-            ),
-          },
-        );
-      }
-    }
-    nextReceipt = keepRetryWorkNonSuccessful(nextReceipt, nextPayload);
-
-    const availableCandidates = [
-      latePayload ? row.notification_available_at : null,
-      workerRetryable ? workerAvailableAt : null,
-    ].filter((value): value is string => !!value);
-    const nextAvailableAt = nextPayload
-      ? (availableCandidates.sort()[0] ??
-        new Date(now.getTime() + 1_000).toISOString())
-      : null;
-    // The late payload was appended after this claim began and has not itself
-    // consumed an attempt. Reset the shared batch counter so its next claim is
-    // attempt 1 (and the merged batch receives a complete retry budget).
-    const nextAttempt =
-      latePayload && !cancelledAuthoritative ? 0 : row.notification_attempt;
-    const result = prepareCached(`UPDATE task_runs
-         SET notification_status = ?, notification_error = ?,
-             notification_summary = ?, notification_payload = ?,
-             notification_attempt = ?, notification_available_at = ?,
-             notification_lease_owner = NULL,
-             notification_lease_expires_at = NULL,
-             notification_lease_payload = NULL,
-             notification_generation = notification_generation + 1,
-             updated_at = ?
-         WHERE id = ? AND notification_lease_owner = ?
-           AND notification_lease_token = ?
-           AND notification_lease_expires_at > ?
-           AND notification_generation = ?
-           AND (
-             status NOT IN ('cancelled','missed')
-             OR (? = 1 AND status = 'cancelled')
-           )`).run(
-      nextReceipt.status,
-      nextReceipt.error ?? null,
-      JSON.stringify(nextReceipt.summary),
-      nextPayload ? JSON.stringify(nextPayload) : null,
-      nextAttempt,
-      nextAvailableAt,
-      nowIso,
-      claim.runId,
-      claim.owner,
-      claim.token,
-      nowIso,
-      row.notification_generation,
-      ownsCancelledGroupWorkspaceRun ? 1 : 0,
-    );
-    const discardedPayload =
-      !workerRetryable &&
-      (receipt.status === 'failed' ||
-        receipt.status === 'partial_failed' ||
-        receipt.status === 'uncertain')
-        ? (retryPayload ?? claim.payload)
-        : null;
-    if (result.changes === 1 && discardedPayload) {
-      settleDiscardedGroupWorkspaceResults(claim.runId, discardedPayload);
-    }
-    return result.changes === 1;
-  })();
-}
-
-/** Earliest retry/queued admission or expired running lease. */
-export function getNextTaskRunWakeAt(): string | null {
-  const now = new Date().toISOString();
-  const row = prepareCached(`SELECT MIN(wake_at) AS wake_at FROM (
-         SELECT available_at AS wake_at FROM task_runs
-           WHERE status IN ('queued','retry_wait')
-         UNION ALL
-         SELECT lease_expires_at AS wake_at FROM task_runs
-           WHERE status = 'running' AND lease_expires_at IS NOT NULL
-         UNION ALL
-         SELECT notification_available_at AS wake_at FROM task_runs
-           WHERE notification_payload IS NOT NULL
-             AND notification_attempt < 5
-             AND notification_available_at IS NOT NULL
-             AND notification_lease_owner IS NULL
-             AND status IN ('success','failed','delivered')
-             AND notification_status IN ('failed','partial_failed','uncertain','pending')
-         UNION ALL
-         SELECT notification_lease_expires_at AS wake_at FROM task_runs
-           WHERE notification_lease_owner IS NOT NULL
-             AND notification_lease_expires_at IS NOT NULL
-             AND (notification_attempt < 5 OR notification_lease_expires_at > ?)
-       )`).get(now) as { wake_at: string | null };
-  const cancelledWorkspaceRows =
-    prepareCached(`SELECT id, notification_payload, notification_available_at
-       FROM task_runs
-       WHERE status = 'cancelled'
-         AND notification_payload IS NOT NULL
-         AND notification_attempt < ?
-         AND notification_available_at IS NOT NULL
-         AND notification_lease_owner IS NULL
-         AND notification_status IN ('failed','partial_failed','uncertain','pending')`).all(
-      MAX_TASK_NOTIFICATION_ATTEMPTS,
-    ) as Array<{
-      id: string;
-      notification_payload: string;
-      notification_available_at: string;
-    }>;
-  let cancelledWakeAt: string | null = null;
-  for (const candidate of cancelledWorkspaceRows) {
-    try {
-      const payload = JSON.parse(
-        candidate.notification_payload,
-      ) as TaskRunNotificationPayload;
-      if (
-        !notificationPayloadOwnsCancelledGroupWorkspaceRun(
-          payload,
-          candidate.id,
-        )
-      ) {
-        continue;
-      }
-      if (
-        !cancelledWakeAt ||
-        candidate.notification_available_at < cancelledWakeAt
-      ) {
-        cancelledWakeAt = candidate.notification_available_at;
-      }
-    } catch {
-      // Invalid cancelled payloads are not scheduler-owned repair work.
-    }
-  }
-  return (
-    [row.wake_at, cancelledWakeAt]
-      .filter((value): value is string => !!value)
-      .sort()[0] ?? null
-  );
-}
-
-export function getNextScheduledTaskWakeAt(): string | null {
-  const row =
-    prepareCached(`SELECT MIN(next_run) AS wake_at FROM scheduled_tasks
-       WHERE status = 'active' AND deleted_at IS NULL AND next_run IS NOT NULL`).get() as {
-      wake_at: string | null;
-    };
-  return row.wake_at ?? null;
-}
-
-export function logTaskRun(log: TaskRunLog): void {
-  prepareCached(`
-    INSERT INTO task_run_logs (task_id, run_at, duration_ms, status, result, error)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(
-    log.task_id,
-    log.run_at,
-    log.duration_ms,
-    log.status,
-    log.result,
-    log.error,
-  );
-}
-
-export function logTaskRunStart(taskId: string): number {
-  const result = prepareCached(`
-    INSERT INTO task_run_logs (task_id, run_at, duration_ms, status, result, error)
-    VALUES (?, ?, 0, 'running', NULL, NULL)
-  `).run(taskId, new Date().toISOString());
-  return Number(result.lastInsertRowid);
-}
-
-export function updateTaskRunLog(
-  id: number,
-  updates: {
-    duration_ms: number;
-    status: 'success' | 'error';
-    result: string | null;
-    error: string | null;
-  },
-): void {
-  prepareCached(`
-    UPDATE task_run_logs SET duration_ms = ?, status = ?, result = ?, error = ?
-    WHERE id = ?
-  `).run(
-    updates.duration_ms,
-    updates.status,
-    updates.result,
-    updates.error,
-    id,
-  );
-}
-
-export function cleanupStaleRunningLogs(): number {
-  const result = prepareCached(`
-    UPDATE task_run_logs SET status = 'error', error = 'Process crashed before completion'
-    WHERE status = 'running'
-  `).run();
-  return result.changes;
-}
-
-export function cleanupOldTaskRunLogs(retentionDays = 30): number {
-  const cutoff = new Date(
-    Date.now() - retentionDays * 24 * 60 * 60 * 1000,
-  ).toISOString();
-  const result = prepareCached(
-    `DELETE FROM task_run_logs WHERE run_at < ?`,
-  ).run(cutoff);
-  const durable = prepareCached(`DELETE FROM task_runs
-       WHERE completed_at IS NOT NULL AND completed_at < ?
-         AND status IN ('success','failed','cancelled','missed')`).run(cutoff);
-  return result.changes + durable.changes;
-}
-
 export function cleanupOldDailyUsage(retentionDays = 90): number {
-  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000)
-    .toISOString()
-    .slice(0, 10);
+  // daily_usage.date is a local calendar day, so the cutoff is one too.
+  const cutoff = toLocalDateString(
+    new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000),
+  );
   const result = prepareCached('DELETE FROM daily_usage WHERE date < ?').run(
     cutoff,
   );
@@ -8373,23 +5145,6 @@ export function setRouterState(key: string, value: string): void {
   ).run(key, value);
 }
 
-/**
- * Persist several router_state keys in one transaction. The cursor save path
- * runs on every processed message batch; four independent auto-committed
- * writes meant four WAL syncs where one suffices.
- */
-export function setRouterStateBatch(
-  entries: ReadonlyArray<readonly [key: string, value: string]>,
-): void {
-  if (entries.length === 0) return;
-  const stmt = prepareCached(
-    'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
-  );
-  db.transaction(() => {
-    for (const [key, value] of entries) stmt.run(key, value);
-  })();
-}
-
 /** All chat JIDs currently present, for cursor-map pruning. */
 export function getAllChatJids(): string[] {
   return (
@@ -8405,8 +5160,8 @@ export function getRouterStateByPrefix(
   prefix: string,
 ): Array<{ key: string; value: string }> {
   return prepareCached(
-    'SELECT key, value FROM router_state WHERE key LIKE ?',
-  ).all(`${prefix}%`) as Array<{ key: string; value: string }>;
+    'SELECT key, value FROM router_state WHERE key >= @from AND key < @to',
+  ).all(keyPrefixRange(prefix)) as Array<{ key: string; value: string }>;
 }
 
 // --- Session accessors ---
@@ -8617,6 +5372,9 @@ export function setSession(
         effectiveAgentId,
       );
     }
+    if (sessionId) {
+      clearSessionHistoryReinjection(groupFolder, effectiveAgentId);
+    }
     syncWorkspaceRuntimeSessionProjection(groupFolder, effectiveAgentId);
   })();
 }
@@ -8708,8 +5466,9 @@ export function setSessionProviderId(
 
 /**
  * The upstream model the SDK session of a logical Session last ran on, or null
- * when none was recorded. Only ChatGPT-gateway runs record it: it is what
- * tells a launch that the model changed under a session it could resume.
+ * when none was recorded (a session from before models were tracked, or a
+ * pass-through relay that names none). It is what tells a launch that the
+ * model changed under a session it could resume.
  */
 export function getSessionModel(
   groupFolder: string,
@@ -8840,7 +5599,7 @@ export function setSessionModelSelection(
     groupFolder,
     effectiveAgentId,
     modelConfigId,
-    overrides?.model || null,
+    storedModelName(overrides?.model),
     overrides?.effort || null,
     updatedBy ?? null,
     new Date().toISOString(),
@@ -8954,6 +5713,33 @@ export function listTurnIdsWithTrace(
   return found;
 }
 
+/**
+ * Which of these turns have a stored trace holding a progress statement (the
+ * flag for message lists at the `hidden` level). Steps are stored as JSON, in
+ * which a quote inside a string value is escaped, so the pattern matches the
+ * `progress` key of a step and nothing a step says.
+ */
+export function listTurnIdsWithProgress(
+  chatJid: string,
+  turnIds: readonly string[],
+): Set<string> {
+  const found = new Set<string>();
+  if (!isDatabaseInitialized() || turnIds.length === 0) return found;
+  const CHUNK = 400;
+  for (let offset = 0; offset < turnIds.length; offset += CHUNK) {
+    const chunk = turnIds.slice(offset, offset + CHUNK);
+    const rows = db
+      .prepare(
+        `SELECT turn_id FROM turn_traces
+         WHERE chat_jid = ? AND turn_id IN (${chunk.map(() => '?').join(',')})
+           AND steps_json LIKE '%"progress":true%'`,
+      )
+      .all(chatJid, ...chunk) as Array<{ turn_id: string }>;
+    for (const row of rows) found.add(row.turn_id);
+  }
+  return found;
+}
+
 export function deleteTurnTracesForChat(chatJid: string): number {
   if (!isDatabaseInitialized()) return 0;
   return prepareCached('DELETE FROM turn_traces WHERE chat_jid = ?').run(
@@ -8998,14 +5784,12 @@ export function deleteTurnTraceIfOrphan(
 /** The chat and every Runtime Session chat (`{chat}#agent:{id}`) under it. */
 export function deleteTurnTracesForChatTree(chatJid: string): number {
   if (!isDatabaseInitialized()) return 0;
-  const sessionPrefix = `${chatJid}#agent:`;
   return (
     prepareCached('DELETE FROM turn_traces WHERE chat_jid = ?').run(chatJid)
       .changes +
-    // substr, not LIKE: a JID may contain the wildcard characters % and _.
     prepareCached(
-      'DELETE FROM turn_traces WHERE substr(chat_jid, 1, ?) = ?',
-    ).run([...sessionPrefix].length, sessionPrefix).changes
+      'DELETE FROM turn_traces WHERE chat_jid >= @from AND chat_jid < @to',
+    ).run(keyPrefixRange(`${chatJid}#agent:`)).changes
   );
 }
 
@@ -9056,9 +5840,9 @@ export function deleteAllSessionsForFolder(groupFolder: string): void {
     prepareCached(
       'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
     ).run(groupFolder);
-    prepareCached('DELETE FROM router_state WHERE key LIKE ?').run(
-      `channel_session_owner:${groupFolder}:%`,
-    );
+    prepareCached(
+      'DELETE FROM router_state WHERE key >= @from AND key < @to',
+    ).run(keyPrefixRange(`channel_session_owner:${groupFolder}:`));
   })();
 }
 
@@ -9509,90 +6293,155 @@ export function computeAgentProfileIdentityHash(
     .digest('hex');
 }
 
-function mapAgentProfilePromptVersionRow(
-  row: Record<string, unknown>,
-): AgentProfilePromptVersion {
-  return {
-    id: String(row.id),
-    agent_profile_id: String(row.agent_profile_id),
-    version: Number(row.version),
-    name: String(row.name),
-    identity_prompt: String(row.identity_prompt ?? ''),
-    soul_prompt: String(row.soul_prompt ?? ''),
-    agents_prompt: String(row.agents_prompt ?? ''),
-    tools_prompt: String(row.tools_prompt ?? ''),
-    prompt_mode: row.prompt_mode === 'replace' ? 'replace' : 'append',
-    identity_hash: String(row.identity_hash),
-    change_source:
-      row.change_source === 'create' ||
-      row.change_source === 'restore' ||
-      row.change_source === 'migration'
-        ? row.change_source
-        : 'update',
-    restored_from_version:
-      row.restored_from_version == null
-        ? null
-        : Number(row.restored_from_version),
-    created_at: String(row.created_at),
-  };
-}
-
-function insertAgentProfilePromptVersionSnapshot(input: {
-  profileId: string;
-  version: number;
-  name: string;
-  prompts: AgentProfilePrompts;
-  identityHash: string;
-  changeSource: AgentProfilePromptVersion['change_source'];
-  restoredFromVersion?: number | null;
-  createdAt?: string;
-}): void {
-  prepareCached(`INSERT OR IGNORE INTO agent_profile_prompt_versions (
-      id, agent_profile_id, version, name,
-      identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
-      identity_hash, change_source, restored_from_version, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    crypto.randomUUID(),
-    input.profileId,
-    input.version,
-    input.name,
-    input.prompts.identity_prompt,
-    input.prompts.soul_prompt,
-    input.prompts.agents_prompt,
-    input.prompts.tools_prompt,
-    input.prompts.prompt_mode,
-    input.identityHash,
-    input.changeSource,
-    input.restoredFromVersion ?? null,
-    input.createdAt ?? new Date().toISOString(),
+/** The identity a run of `profile` carries under its effective policy. */
+export function computeEffectiveAgentProfileIdentityHash(
+  profile: AgentProfilePrompts & Pick<AgentProfile, 'is_default' | 'name'>,
+  effectiveRuntimePolicy: AgentProfileRuntimePolicy,
+): string {
+  const identityHash = computeAgentProfileIdentityHash(
+    profile,
+    effectiveRuntimePolicy,
+    profile.name,
   );
+  return profile.is_default
+    ? bindHappyClawPlatformIdentityHash(identityHash)
+    : identityHash;
 }
 
-export function listAgentProfilePromptVersions(
-  profileId: string,
-  ownerUserId: string,
-): AgentProfilePromptVersion[] {
-  const profile = getAgentProfileForUser(profileId, ownerUserId);
-  if (!profile) return [];
-  const rows = prepareCached(`SELECT * FROM agent_profile_prompt_versions
-       WHERE agent_profile_id = ? ORDER BY version DESC`).all(
-    profileId,
-  ) as Array<Record<string, unknown>>;
-  return rows.map(mapAgentProfilePromptVersionRow);
+let readMainAgentContextSettings: (() => MainAgentContextSettings) | undefined;
+
+/**
+ * The main HappyClaw's context comes from system settings. runtime-config
+ * reads DATA_DIR as it loads, so db.ts does not import it; the module that
+ * resolves Agent runtime policy registers the reader when it loads, before
+ * the server calls initDatabase.
+ */
+export function registerMainAgentContextSettingsReader(
+  reader: () => MainAgentContextSettings,
+): void {
+  readMainAgentContextSettings = reader;
 }
 
-export function getAgentProfilePromptVersion(
-  profileId: string,
-  ownerUserId: string,
-  version: number,
-): AgentProfilePromptVersion | undefined {
-  const profile = getAgentProfileForUser(profileId, ownerUserId);
-  if (!profile) return undefined;
-  const row = prepareCached(`SELECT * FROM agent_profile_prompt_versions
-       WHERE agent_profile_id = ? AND version = ?`).get(profileId, version) as
-    | Record<string, unknown>
-    | undefined;
-  return row ? mapAgentProfilePromptVersionRow(row) : undefined;
+function knownAgentProfileHostAccess(
+  profile: Pick<AgentProfile, 'owner_user_id' | 'is_default'>,
+): AgentProfileHostAccess | undefined {
+  const canUseHostResources = canOwnerUseHostResources(
+    getUserById(profile.owner_user_id),
+  );
+  if (!profile.is_default) return { canUseHostResources };
+  const mainAgent = readMainAgentContextSettings?.();
+  return mainAgent ? { canUseHostResources, mainAgent } : undefined;
+}
+
+/** What the owner's role and the system settings allow `profile` to run with. */
+export function resolveAgentProfileHostAccess(
+  profile: Pick<AgentProfile, 'owner_user_id' | 'is_default'>,
+): AgentProfileHostAccess {
+  const access = knownAgentProfileHostAccess(profile);
+  if (!access) {
+    throw new Error('Main HappyClaw context settings reader is not registered');
+  }
+  return access;
+}
+
+/**
+ * The host Skill policy a profile saved without one has been running with,
+ * or undefined while the main HappyClaw's settings cannot be read (a
+ * maintenance tool); the next server start pins it then.
+ */
+function effectiveLegacyHostSkillPolicy(
+  profile: Pick<
+    AgentProfile,
+    'owner_user_id' | 'is_default' | 'runtime_policy'
+  >,
+): NonNullable<AgentProfileRuntimePolicy['skills']['host']> | undefined {
+  const access = knownAgentProfileHostAccess(profile);
+  return access
+    ? legacyHostSkillPolicy(
+        resolveEffectiveAgentRuntimePolicy(profile, access).context.source,
+      )
+    : undefined;
+}
+
+/**
+ * Pin `skills.host` on every active profile saved without one. The runner
+ * resolved a missing value from the effective context source (the main
+ * HappyClaw's comes from system settings) while the Web form read the
+ * persisted one, so saving only the main HappyClaw's model silently turned
+ * its host Skills off. The pinned value is what the runner resolved, so runs
+ * behave as before; SDK sessions recorded under the old identity hash move to
+ * the new one and the revision stays, so no conversation restarts.
+ */
+export function pinAgentProfileHostSkillPolicies(): number {
+  // Runs on every start; once pinned, the scan decodes nothing. Malformed
+  // JSON is decoded like the runner decodes it (to the default policy).
+  const pending = (
+    prepareCached(`SELECT * FROM agent_profiles
+       WHERE status = 'active'
+         AND CASE WHEN json_valid(runtime_policy)
+           THEN json_extract(runtime_policy, '$.skills.host') IS NULL
+           ELSE 1 END`).all() as Array<Record<string, unknown>>
+  )
+    .map(mapAgentProfileRow)
+    .filter((profile) => !profile.runtime_policy.skills.host);
+  if (pending.length === 0) return 0;
+
+  const updateProfile = prepareCached(
+    'UPDATE agent_profiles SET runtime_policy = ?, identity_hash = ? WHERE id = ?',
+  );
+  const carrySessions = prepareCached(
+    'UPDATE sessions SET identity_hash = ? WHERE agent_profile_id = ? AND identity_hash = ?',
+  );
+  const carryRuntimeSessions = prepareCached(
+    'UPDATE workspace_runtime_sessions SET identity_hash = ? WHERE agent_profile_id = ? AND identity_hash = ?',
+  );
+  let pinnedCount = 0;
+  let carried = 0;
+  db.transaction(() => {
+    for (const profile of pending) {
+      const access = knownAgentProfileHostAccess(profile);
+      if (!access) continue;
+      pinnedCount += 1;
+      const effective = resolveEffectiveAgentRuntimePolicy(profile, access);
+      const runtimePolicy = {
+        ...profile.runtime_policy,
+        skills: {
+          ...profile.runtime_policy.skills,
+          host: legacyHostSkillPolicy(effective.context.source),
+        },
+      };
+      const pinned = { ...profile, runtime_policy: runtimePolicy };
+      updateProfile.run(
+        serializeAgentProfileRuntimePolicy(runtimePolicy),
+        computeAgentProfileIdentityHash(pinned, runtimePolicy, pinned.name),
+        profile.id,
+      );
+      const before = computeEffectiveAgentProfileIdentityHash(
+        profile,
+        effective,
+      );
+      const after = computeEffectiveAgentProfileIdentityHash(
+        pinned,
+        resolveEffectiveAgentRuntimePolicy(pinned, access),
+      );
+      if (before === after) continue;
+      carried += carrySessions.run(after, profile.id, before).changes;
+      carryRuntimeSessions.run(after, profile.id, before);
+    }
+  })();
+  if (pinnedCount < pending.length) {
+    logger.warn(
+      { deferred: pending.length - pinnedCount },
+      'Main HappyClaw settings unavailable; host Skill policies are pinned at the next server start',
+    );
+  }
+  if (pinnedCount > 0) {
+    logger.info(
+      { profiles: pinnedCount, sessions: carried },
+      'Pinned explicit host Skill policies on Agent profiles',
+    );
+  }
+  return pinnedCount;
 }
 
 function mapAgentProfileRow(row: Record<string, unknown>): AgentProfile {
@@ -9625,6 +6474,14 @@ function mapAgentProfileRow(row: Record<string, unknown>): AgentProfile {
     model_config_id:
       typeof row.model_config_id === 'string' && row.model_config_id
         ? row.model_config_id
+        : null,
+    // A model only has a meaning inside the configuration that offers it.
+    model:
+      typeof row.model_config_id === 'string' &&
+      row.model_config_id &&
+      typeof row.model === 'string' &&
+      row.model
+        ? row.model
         : null,
     runtime_policy: runtimePolicy,
     identity_hash: String(
@@ -9855,6 +6712,11 @@ export function commitAgentBuilderDraft(
   })();
 }
 
+/** A model name as stored: never with Claude Code's `[1m]` switch. */
+function storedModelName(model: string | null | undefined): string | null {
+  return (model && splitOneMillionSuffix(model).model) || null;
+}
+
 const DEFAULT_AGENT_PROFILE_NAME = 'HappyClaw';
 const LEGACY_DEFAULT_AGENT_PROFILE_NAME = 'Default Agent';
 
@@ -9896,43 +6758,38 @@ export function getOrCreateDefaultAgentProfile(userId: string): AgentProfile {
   const name = DEFAULT_AGENT_PROFILE_NAME;
   const prompts = normalizeAgentProfilePrompts();
   const runtimePolicy = normalizeAgentProfileRuntimePolicy();
+  const hostSkills = effectiveLegacyHostSkillPolicy({
+    owner_user_id: userId,
+    is_default: true,
+    runtime_policy: runtimePolicy,
+  });
+  if (hostSkills) runtimePolicy.skills.host = hostSkills;
   const identityHash = computeAgentProfileIdentityHash(
     prompts,
     runtimePolicy,
     name,
   );
   const runtimePolicyJson = serializeAgentProfileRuntimePolicy(runtimePolicy);
-  db.transaction(() => {
-    prepareCached(`INSERT INTO agent_profiles (
-        id, owner_user_id, name,
-        identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
-        include_claude_preset, runtime_policy, identity_hash, version,
-        is_default, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 'active', ?, ?)`).run(
-      id,
-      userId,
-      name,
-      prompts.identity_prompt,
-      prompts.soul_prompt,
-      prompts.agents_prompt,
-      prompts.tools_prompt,
-      prompts.prompt_mode,
-      includeClaudePresetForMode(prompts.prompt_mode) ? 1 : 0,
-      runtimePolicyJson,
-      identityHash,
-      now,
-      now,
-    );
-    insertAgentProfilePromptVersionSnapshot({
-      profileId: id,
-      version: 1,
-      name,
-      prompts,
-      identityHash,
-      changeSource: 'create',
-      createdAt: now,
-    });
-  })();
+  prepareCached(`INSERT INTO agent_profiles (
+      id, owner_user_id, name,
+      identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
+      include_claude_preset, runtime_policy, identity_hash, version,
+      is_default, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 'active', ?, ?)`).run(
+    id,
+    userId,
+    name,
+    prompts.identity_prompt,
+    prompts.soul_prompt,
+    prompts.agents_prompt,
+    prompts.tools_prompt,
+    prompts.prompt_mode,
+    includeClaudePresetForMode(prompts.prompt_mode) ? 1 : 0,
+    runtimePolicyJson,
+    identityHash,
+    now,
+    now,
+  );
   return getAgentProfile(id)!;
 }
 
@@ -9958,7 +6815,10 @@ export function createAgentProfile(input: {
   includeClaudePreset?: boolean;
   avatarEmoji?: string | null;
   avatarColor?: string | null;
+  avatarUrl?: string | null;
   modelConfigId?: string | null;
+  /** A model of `modelConfigId`'s list; ignored without a configuration. */
+  model?: string | null;
   runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
 }): AgentProfile {
   const now = new Date().toISOString();
@@ -9972,47 +6832,41 @@ export function createAgentProfile(input: {
       input.promptMode ??
       promptModeFromLegacyPreset(input.includeClaudePreset ?? true),
   });
+  assertAgentProfileNameAvailable(input.ownerUserId, input.name);
   const runtimePolicy = normalizeAgentProfileRuntimePolicy(input.runtimePolicy);
+  // Host Skills are an explicit grant; nothing inherits them by omission.
+  runtimePolicy.skills.host ??= { mode: 'disabled', ids: [] };
   const runtimePolicyJson = serializeAgentProfileRuntimePolicy(runtimePolicy);
   const identityHash = computeAgentProfileIdentityHash(
     prompts,
     runtimePolicy,
     input.name,
   );
-  db.transaction(() => {
-    prepareCached(`INSERT INTO agent_profiles (
-        id, owner_user_id, name,
-        identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
-        include_claude_preset, avatar_emoji, avatar_color, model_config_id, runtime_policy, identity_hash, version,
-        is_default, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`).run(
-      id,
-      input.ownerUserId,
-      input.name,
-      prompts.identity_prompt,
-      prompts.soul_prompt,
-      prompts.agents_prompt,
-      prompts.tools_prompt,
-      prompts.prompt_mode,
-      includeClaudePresetForMode(prompts.prompt_mode) ? 1 : 0,
-      input.avatarEmoji ?? null,
-      input.avatarColor ?? null,
-      input.modelConfigId ?? null,
-      runtimePolicyJson,
-      identityHash,
-      now,
-      now,
-    );
-    insertAgentProfilePromptVersionSnapshot({
-      profileId: id,
-      version: 1,
-      name: input.name,
-      prompts,
-      identityHash,
-      changeSource: 'create',
-      createdAt: now,
-    });
-  })();
+  prepareCached(`INSERT INTO agent_profiles (
+      id, owner_user_id, name,
+      identity_prompt, soul_prompt, agents_prompt, tools_prompt, prompt_mode,
+      include_claude_preset, avatar_emoji, avatar_color, avatar_url, model_config_id, model, runtime_policy, identity_hash, version,
+      is_default, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?)`).run(
+    id,
+    input.ownerUserId,
+    input.name,
+    prompts.identity_prompt,
+    prompts.soul_prompt,
+    prompts.agents_prompt,
+    prompts.tools_prompt,
+    prompts.prompt_mode,
+    includeClaudePresetForMode(prompts.prompt_mode) ? 1 : 0,
+    input.avatarEmoji ?? null,
+    input.avatarColor ?? null,
+    input.avatarUrl ?? null,
+    input.modelConfigId ?? null,
+    (input.modelConfigId && storedModelName(input.model)) || null,
+    runtimePolicyJson,
+    identityHash,
+    now,
+    now,
+  );
   return getAgentProfile(id)!;
 }
 
@@ -10031,14 +6885,17 @@ export function updateAgentProfile(
     avatarColor?: string | null;
     avatarUrl?: string | null;
     modelConfigId?: string | null;
+    /** Null runs the configuration's default; another configuration clears it. */
+    model?: string | null;
     runtimePolicy?: RuntimePolicyInput | AgentProfileRuntimePolicy | null;
-    changeSource?: AgentProfilePromptVersion['change_source'];
-    restoredFromVersion?: number | null;
   },
 ): AgentProfile | undefined {
   const existing = getAgentProfileForUser(profileId, ownerUserId);
   if (!existing) return undefined;
   const nextName = updates.name ?? existing.name;
+  if (nextName !== existing.name) {
+    assertAgentProfileNameAvailable(ownerUserId, nextName, profileId);
+  }
   const nextPromptMode =
     updates.promptMode ??
     (updates.includeClaudePreset === undefined
@@ -10058,6 +6915,14 @@ export function updateAgentProfile(
           updates.runtimePolicy,
         )
       : existing.runtime_policy;
+  // A policy update that does not name the host grant keeps the one the
+  // profile runs with, pinned if it was still implicit.
+  if (updates.runtimePolicy !== undefined && !nextRuntimePolicy.skills.host) {
+    const host =
+      existing.runtime_policy.skills.host ??
+      effectiveLegacyHostSkillPolicy(existing);
+    if (host) nextRuntimePolicy.skills.host = host;
+  }
   const nextAvatarEmoji =
     updates.avatarEmoji === undefined
       ? existing.avatar_emoji
@@ -10073,66 +6938,75 @@ export function updateAgentProfile(
       ? existing.model_config_id
       : updates.modelConfigId;
   const modelConfigChanged = nextModelConfigId !== existing.model_config_id;
+  // The model is one of the configuration's: a new configuration (or none)
+  // starts from its default unless this very update names a model.
+  const nextModel = !nextModelConfigId
+    ? null
+    : updates.model !== undefined
+      ? storedModelName(updates.model)
+      : modelConfigChanged
+        ? null
+        : existing.model;
+  const modelChanged = nextModel !== existing.model;
   const nextHash = computeAgentProfileIdentityHash(
     nextPrompts,
     nextRuntimePolicy,
     nextName,
   );
   const identityChanged = nextHash !== existing.identity_hash;
-  const promptChanged =
-    nextPrompts.identity_prompt !== existing.identity_prompt ||
-    nextPrompts.soul_prompt !== existing.soul_prompt ||
-    nextPrompts.agents_prompt !== existing.agents_prompt ||
-    nextPrompts.tools_prompt !== existing.tools_prompt ||
-    nextPrompts.prompt_mode !== existing.prompt_mode;
+  // The version is the Agent's runtime revision: it advances with anything
+  // that changes how its runs behave so existing SDK sessions are invalidated.
   const nextVersion =
-    identityChanged || modelConfigChanged
+    identityChanged || modelConfigChanged || modelChanged
       ? existing.version + 1
       : existing.version;
   const now = new Date().toISOString();
-  db.transaction(() => {
-    prepareCached(`UPDATE agent_profiles
-       SET name = ?, identity_prompt = ?, soul_prompt = ?, agents_prompt = ?, tools_prompt = ?,
-           prompt_mode = ?, include_claude_preset = ?, avatar_emoji = ?, avatar_color = ?, avatar_url = ?, model_config_id = ?,
-           runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
-       WHERE id = ? AND owner_user_id = ? AND status = 'active'`).run(
-      nextName,
-      nextPrompts.identity_prompt,
-      nextPrompts.soul_prompt,
-      nextPrompts.agents_prompt,
-      nextPrompts.tools_prompt,
-      nextPrompts.prompt_mode,
-      includeClaudePresetForMode(nextPrompts.prompt_mode) ? 1 : 0,
-      nextAvatarEmoji,
-      nextAvatarColor,
-      nextAvatarUrl,
-      nextModelConfigId,
-      serializeAgentProfileRuntimePolicy(nextRuntimePolicy),
-      nextHash,
-      nextVersion,
-      now,
-      profileId,
-      ownerUserId,
-    );
-    // Runtime identity versions intentionally also advance for name and
-    // capability-policy changes so existing SDK sessions are invalidated.
-    // Prompt history, however, is a history of the four prompt sections and
-    // prompt mode only; recording unrelated identity versions here would show
-    // duplicate prompt revisions in the editor.
-    if (promptChanged) {
-      insertAgentProfilePromptVersionSnapshot({
-        profileId,
-        version: nextVersion,
-        name: nextName,
-        prompts: nextPrompts,
-        identityHash: nextHash,
-        changeSource: updates.changeSource ?? 'update',
-        restoredFromVersion: updates.restoredFromVersion,
-        createdAt: now,
-      });
-    }
-  })();
+  prepareCached(`UPDATE agent_profiles
+     SET name = ?, identity_prompt = ?, soul_prompt = ?, agents_prompt = ?, tools_prompt = ?,
+         prompt_mode = ?, include_claude_preset = ?, avatar_emoji = ?, avatar_color = ?, avatar_url = ?, model_config_id = ?,
+         model = ?, runtime_policy = ?, identity_hash = ?, version = ?, updated_at = ?
+     WHERE id = ? AND owner_user_id = ? AND status = 'active'`).run(
+    nextName,
+    nextPrompts.identity_prompt,
+    nextPrompts.soul_prompt,
+    nextPrompts.agents_prompt,
+    nextPrompts.tools_prompt,
+    nextPrompts.prompt_mode,
+    includeClaudePresetForMode(nextPrompts.prompt_mode) ? 1 : 0,
+    nextAvatarEmoji,
+    nextAvatarColor,
+    nextAvatarUrl,
+    nextModelConfigId,
+    nextModel,
+    serializeAgentProfileRuntimePolicy(nextRuntimePolicy),
+    nextHash,
+    nextVersion,
+    now,
+    profileId,
+    ownerUserId,
+  );
   return getAgentProfile(profileId);
+}
+
+/**
+ * Active Agents that run one of `models` of a configuration, so a model the
+ * configuration is about to drop can be refused while an Agent names it.
+ */
+export function listAgentProfilesUsingModels(
+  modelConfigId: string,
+  models: readonly string[],
+): Array<{ id: string; name: string }> {
+  if (models.length === 0) return [];
+  const rows = prepareCached(`SELECT id, name, model FROM agent_profiles
+       WHERE model_config_id = ? AND model IS NOT NULL AND status = 'active'
+       ORDER BY created_at, id`).all(modelConfigId) as Array<{
+    id: string;
+    name: string;
+    model: string;
+  }>;
+  return rows
+    .filter((row) => models.includes(row.model))
+    .map(({ id, name }) => ({ id, name }));
 }
 
 export function countAgentProfilesByModelConfigId(
@@ -10160,6 +7034,106 @@ export function archiveAgentProfile(
     "UPDATE agent_profiles SET status = 'archived', updated_at = ? WHERE id = ? AND owner_user_id = ?",
   ).run(new Date().toISOString(), profileId, ownerUserId);
   return 'ok';
+}
+
+class AgentProfileArchiveRollback extends Error {
+  constructor(
+    readonly result: Exclude<ReturnType<typeof archiveAgentProfile>, 'ok'>,
+  ) {
+    super(`Agent profile archive rolled back: ${result}`);
+  }
+}
+
+/**
+ * Move every listed Workspace to `targetProfileId`, then archive the profile,
+ * as one transaction: when the archive is refused (a channel mount or a
+ * Workspace that was not listed still names the profile) nothing moves.
+ */
+export function migrateAgentProfileWorkspacesAndArchive(
+  profileId: string,
+  ownerUserId: string,
+  targetProfileId: string,
+  groupFolders: readonly string[],
+): ReturnType<typeof archiveAgentProfile> {
+  try {
+    db.transaction(() => {
+      for (const folder of groupFolders) {
+        assignWorkspaceAgentProfile(folder, targetProfileId);
+      }
+      const result = archiveAgentProfile(profileId, ownerUserId);
+      if (result !== 'ok') throw new AgentProfileArchiveRollback(result);
+    })();
+    return 'ok';
+  } catch (err) {
+    if (err instanceof AgentProfileArchiveRollback) return err.result;
+    throw err;
+  }
+}
+
+/**
+ * Names compare after NFKC folding without invisible characters (zero-width
+ * spaces, soft hyphens, joiners), ignoring case and surrounding space.
+ */
+function agentProfileNameKey(name: string): string {
+  return name
+    .normalize('NFKC')
+    .replace(/\p{Default_Ignorable_Code_Point}/gu, '')
+    .trim()
+    .toLowerCase();
+}
+
+/** A name another active Agent of the same owner already uses. */
+export class AgentProfileNameTakenError extends Error {
+  constructor(
+    readonly requestedName: string,
+    readonly conflict: { id: string | null; name: string },
+  ) {
+    super(
+      `Agent name "${requestedName}" is already used by the Agent "${conflict.name}"; names compare case-insensitively after Unicode normalization and the built-in HappyClaw counts. Ask the user for a different name.`,
+    );
+    this.name = 'AgentProfileNameTakenError';
+  }
+}
+
+/** Every write that names an Agent goes through this, whatever its caller. */
+function assertAgentProfileNameAvailable(
+  ownerUserId: string,
+  name: string,
+  excludeProfileId?: string,
+): void {
+  const conflict = findAgentProfileNameConflict(
+    ownerUserId,
+    name,
+    excludeProfileId,
+  );
+  if (conflict) throw new AgentProfileNameTakenError(name, conflict);
+}
+
+/**
+ * The active profile of `ownerUserId` (the built-in HappyClaw included)
+ * whose name collides with `name`, other than `excludeProfileId`.
+ */
+export function findAgentProfileNameConflict(
+  ownerUserId: string,
+  name: string,
+  excludeProfileId?: string,
+): { id: string | null; name: string } | undefined {
+  const key = agentProfileNameKey(name);
+  const rows = prepareCached(
+    "SELECT id, name, is_default FROM agent_profiles WHERE owner_user_id = ? AND status = 'active'",
+  ).all(ownerUserId) as Array<{ id: string; name: string; is_default: number }>;
+  const builtIn = rows.find((row) => row.is_default === 1);
+  if (
+    key === agentProfileNameKey(DEFAULT_AGENT_PROFILE_NAME) &&
+    builtIn?.id !== excludeProfileId
+  ) {
+    return { id: builtIn?.id ?? null, name: DEFAULT_AGENT_PROFILE_NAME };
+  }
+  const conflict = rows.find(
+    (row) =>
+      row.id !== excludeProfileId && agentProfileNameKey(row.name) === key,
+  );
+  return conflict ? { id: conflict.id, name: conflict.name } : undefined;
 }
 
 /**
@@ -10241,7 +7215,7 @@ export function getWorkspaceAgentProfileBinding(
   groupFolder: string,
 ): WorkspaceAgentProfileBinding | undefined {
   const row =
-    prepareCached(`SELECT group_folder, agent_profile_id, interaction_mode, process_visibility, created_at, updated_at
+    prepareCached(`SELECT group_folder, agent_profile_id, interaction_mode, process_visibility, work_mode, created_at, updated_at
        FROM workspace_agent_profiles
        WHERE group_folder = ?`).get(groupFolder) as
       | {
@@ -10249,6 +7223,7 @@ export function getWorkspaceAgentProfileBinding(
           agent_profile_id: string;
           interaction_mode: unknown;
           process_visibility: unknown;
+          work_mode: unknown;
           created_at: string;
           updated_at: string;
         }
@@ -10262,6 +7237,7 @@ export function getWorkspaceAgentProfileBinding(
       row.group_folder,
     ),
     process_visibility: parseProcessVisibility(row.process_visibility),
+    work_mode: parseWorkMode(row.work_mode) ?? DEFAULT_WORK_MODE,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -10273,13 +7249,28 @@ export function getWorkspaceAgentProfileId(
   return getWorkspaceAgentProfileBinding(groupFolder)?.agent_profile_id;
 }
 
+/**
+ * The modes on a Workspace's Agent binding, with their defaults when it has
+ * none, from one read of the row.
+ */
+export function getWorkspaceModes(
+  groupFolder: string,
+): Pick<
+  WorkspaceAgentProfileBinding,
+  'interaction_mode' | 'process_visibility' | 'work_mode'
+> {
+  const binding = getWorkspaceAgentProfileBinding(groupFolder);
+  return {
+    interaction_mode: binding?.interaction_mode ?? 'assistant',
+    process_visibility: binding?.process_visibility ?? 'hidden',
+    work_mode: binding?.work_mode ?? DEFAULT_WORK_MODE,
+  };
+}
+
 export function getWorkspaceInteractionMode(
   groupFolder: string,
 ): InteractionMode {
-  return (
-    getWorkspaceAgentProfileBinding(groupFolder)?.interaction_mode ??
-    'assistant'
-  );
+  return getWorkspaceModes(groupFolder).interaction_mode;
 }
 
 export function setWorkspaceInteractionMode(
@@ -10300,9 +7291,7 @@ export function setWorkspaceInteractionMode(
 export function getWorkspaceProcessVisibility(
   groupFolder: string,
 ): ProcessVisibility {
-  return (
-    getWorkspaceAgentProfileBinding(groupFolder)?.process_visibility ?? 'hidden'
-  );
+  return getWorkspaceModes(groupFolder).process_visibility;
 }
 
 /**
@@ -10317,6 +7306,29 @@ export function setWorkspaceProcessVisibility(
        SET process_visibility = ?, updated_at = ?
        WHERE group_folder = ?`).run(
     processVisibility,
+    new Date().toISOString(),
+    groupFolder,
+  );
+  return result.changes > 0;
+}
+
+/** How the Workspace's sessions take on work; `single` without a binding. */
+export function getWorkspaceWorkMode(groupFolder: string): WorkMode {
+  return getWorkspaceModes(groupFolder).work_mode;
+}
+
+/**
+ * Takes effect when a session's runner next starts: the runner reads it for
+ * its tools and prompt, nothing already running changes.
+ */
+export function setWorkspaceWorkMode(
+  groupFolder: string,
+  workMode: WorkMode,
+): boolean {
+  const result = prepareCached(`UPDATE workspace_agent_profiles
+       SET work_mode = ?, updated_at = ?
+       WHERE group_folder = ?`).run(
+    workMode,
     new Date().toISOString(),
     groupFolder,
   );
@@ -10372,6 +7384,52 @@ export function peekAgentProfileForWorkspace(
   return readDefaultProfile(ownerUserId);
 }
 
+/** A user's main Agent (their default profile), without creating it. */
+export function peekDefaultAgentProfile(
+  userId: string,
+): AgentProfile | undefined {
+  const row = prepareCached(
+    "SELECT * FROM agent_profiles WHERE owner_user_id = ? AND is_default = 1 AND status = 'active' LIMIT 1",
+  ).get(userId) as Record<string, unknown> | undefined;
+  return row ? mapAgentProfileRow(row) : undefined;
+}
+
+/**
+ * The main Agent of the user who owns a workspace folder: the creator of its
+ * Web workspace, the home one first. Read-only.
+ */
+export function peekWorkspaceOwnerMainAgentProfile(
+  groupFolder: string,
+): AgentProfile | undefined {
+  const row = prepareCached(`SELECT created_by
+       FROM registered_groups
+       WHERE folder = ? AND jid LIKE 'web:%' AND created_by IS NOT NULL
+       ORDER BY is_home DESC, added_at ASC
+       LIMIT 1`).get(groupFolder) as { created_by: string } | undefined;
+  return row ? peekDefaultAgentProfile(row.created_by) : undefined;
+}
+
+/**
+ * The system main HappyClaw: the main Agent of the earliest-created admin. Every Agent that binds no connection, directly or through its
+ * owner's main Agent, falls back to its binding.
+ */
+export function peekSystemMainAgentProfile(): AgentProfile | undefined {
+  const adminId = getSystemMainAdminUserId();
+  return adminId ? peekDefaultAgentProfile(adminId) : undefined;
+}
+
+/**
+ * The earliest-created admin, whose main Agent is the system main. Status is
+ * not consulted, so disabling an admin does not move the system main.
+ */
+export function getSystemMainAdminUserId(): string | null {
+  const row = prepareCached(`SELECT id FROM users
+       WHERE role = 'admin'
+       ORDER BY created_at ASC, id ASC
+       LIMIT 1`).get() as { id: string } | undefined;
+  return row?.id ?? null;
+}
+
 export function getAgentProfileForWorkspace(
   groupFolder: string,
   ownerUserId?: string | null,
@@ -10408,7 +7466,8 @@ export function backfillAgentProfileDefaultsAndWorkspaceMappings(): void {
   // runners, so no process-local profile membership lock is necessary here.
   const tx = db.transaction(() => {
     const users = prepareCached(
-      "SELECT id FROM users WHERE status != 'deleted'",
+      // Guests never own an Agent Profile.
+      "SELECT id FROM users WHERE status != 'deleted' AND role != 'guest'",
     ).all() as Array<{ id: string }>;
     for (const user of users) {
       getOrCreateDefaultAgentProfile(user.id);
@@ -10450,9 +7509,20 @@ export function backfillAgentProfileDefaultsAndWorkspaceMappings(): void {
  * Returns the affected `group_folder` values so callers can also evict the
  * in-memory sessions cache and the row count for telemetry.
  */
+/** Which sessions of a provider a configuration change invalidates. */
+interface ProviderSessionCleanupOptions {
+  includeUnboundFolders?: string[];
+  /**
+   * Set when only the provider's default model changed: a session recorded
+   * on another of its models keeps running that model and stays; only one
+   * that ran the old default, or recorded no model, is dropped.
+   */
+  previousDefaultModel?: string;
+}
+
 function deleteSessionsByProviderIdInCurrentTransaction(
   providerId: string,
-  options?: { includeUnboundFolders?: string[] },
+  options?: ProviderSessionCleanupOptions,
 ): {
   deletedCount: number;
   affectedFolders: string[];
@@ -10469,6 +7539,26 @@ function deleteSessionsByProviderIdInCurrentTransaction(
     ? ` OR (provider_id IS NULL AND group_folder IN (${placeholders}))`
     : '';
   const params = [providerId, ...includeUnboundFolders];
+  if (options?.previousDefaultModel !== undefined) {
+    const doomed = `(provider_id = ?${unboundClause})
+         AND (model IS NULL OR model = '' OR model = ?)`;
+    const doomedParams = [...params, options.previousDefaultModel];
+    const folders = db
+      .prepare(`SELECT DISTINCT group_folder FROM sessions WHERE ${doomed}`)
+      .all(...doomedParams) as Array<{ group_folder: string }>;
+    db.prepare(
+      `DELETE FROM workspace_runtime_sessions
+       WHERE (group_folder, runtime_agent_id) IN (
+         SELECT group_folder, agent_id FROM sessions WHERE ${doomed})`,
+    ).run(...doomedParams);
+    const result = db
+      .prepare(`DELETE FROM sessions WHERE ${doomed}`)
+      .run(...doomedParams);
+    return {
+      deletedCount: result.changes,
+      affectedFolders: folders.map((row) => row.group_folder),
+    };
+  }
   const rows = db
     .prepare(
       `SELECT DISTINCT group_folder FROM sessions WHERE provider_id = ?${unboundClause}`,
@@ -10488,7 +7578,7 @@ function deleteSessionsByProviderIdInCurrentTransaction(
 
 export function deleteSessionsByProviderId(
   providerId: string,
-  options?: { includeUnboundFolders?: string[] },
+  options?: ProviderSessionCleanupOptions,
 ): {
   deletedCount: number;
   affectedFolders: string[];
@@ -10506,7 +7596,7 @@ export function deleteSessionsByProviderId(
  */
 export function deleteSessionsByProviderIdAroundCommit<T>(
   providerId: string,
-  options: { includeUnboundFolders?: string[] } | undefined,
+  options: ProviderSessionCleanupOptions | undefined,
   commit: () => T,
 ): {
   value: T;
@@ -10836,6 +7926,9 @@ function syncWorkspaceFromRegisteredGroup(
 
 function deleteWorkspaceMirror(jid: string, folder?: string): void {
   deleteWorkspaceMemoryData(jid);
+  prepareCached(
+    'DELETE FROM guest_workspace_grants WHERE workspace_jid = ?',
+  ).run(jid);
   prepareCached('DELETE FROM workspaces WHERE jid = ?').run(jid);
   prepareCached(
     'DELETE FROM workspace_runtime_sessions WHERE workspace_jid = ?',
@@ -11992,7 +9085,6 @@ export function hasContainerModeGroups(): boolean {
 export interface AdminHostOnlyMigrationResult {
   affectedGroups: Array<{ jid: string; folder: string }>;
   affectedFolders: string[];
-  migratedTaskIds: string[];
 }
 
 function forceRuntimesToHostForFolderQuery(
@@ -12008,21 +9100,8 @@ function forceRuntimesToHostForFolderQuery(
        ORDER BY jid`,
     )
     .all(...params) as Array<{ jid: string; folder: string }>;
-  const affectedTasks = db
-    .prepare(
-      `SELECT id, group_folder
-       FROM scheduled_tasks
-       WHERE group_folder IN (${folderQuery})
-         AND COALESCE(execution_mode, 'container') <> 'host'
-       ORDER BY id`,
-    )
-    .all(...params) as Array<{ id: string; group_folder: string }>;
-  const migratedTaskIds = affectedTasks.map((row) => row.id);
   const affectedFolders = Array.from(
-    new Set([
-      ...affectedGroups.map((group) => group.folder),
-      ...affectedTasks.map((task) => task.group_folder),
-    ]),
+    new Set(affectedGroups.map((group) => group.folder)),
   ).sort();
 
   db.prepare(
@@ -12032,18 +9111,7 @@ function forceRuntimesToHostForFolderQuery(
        AND COALESCE(execution_mode, 'container') <> 'host'`,
   ).run(...params);
 
-  if (migratedTaskIds.length > 0) {
-    db.prepare(
-      `UPDATE scheduled_tasks
-       SET execution_mode = 'host',
-           revision = revision + 1,
-           updated_at = ?
-       WHERE group_folder IN (${folderQuery})
-         AND COALESCE(execution_mode, 'container') <> 'host'`,
-    ).run(new Date().toISOString(), ...params);
-  }
-
-  return { affectedGroups, affectedFolders, migratedTaskIds };
+  return { affectedGroups, affectedFolders };
 }
 
 /**
@@ -12238,10 +9306,36 @@ function channelMountFromRegisteredGroup(
   return null;
 }
 
+let channelMountChangeListener: ((channelJid: string) => void) | null = null;
+
+/**
+ * Called after any change of a channel mount (bind, unbind, rebind, delete),
+ * once the change is committed. Team mode reconciles the group with it.
+ */
+export function setChannelMountChangeListener(
+  listener: ((channelJid: string) => void) | null,
+): void {
+  channelMountChangeListener = listener;
+}
+
+function notifyChannelMountChanged(channelJid: string): void {
+  const listener = channelMountChangeListener;
+  if (!listener) return;
+  // After the surrounding transaction has committed.
+  queueMicrotask(() => {
+    try {
+      listener(channelJid);
+    } catch (error) {
+      logger.warn({ err: error, channelJid }, 'Channel mount listener failed');
+    }
+  });
+}
+
 export function upsertChannelMount(
   mount: Omit<ChannelMount, 'created_at' | 'updated_at'> &
     Partial<Pick<ChannelMount, 'created_at' | 'updated_at'>>,
 ): ChannelMount {
+  notifyChannelMountChanged(mount.channel_jid);
   return db.transaction(() => {
     const now = new Date().toISOString();
     const existing = getChannelMount(mount.channel_jid);
@@ -12293,6 +9387,7 @@ export function upsertChannelMount(
 }
 
 export function deleteChannelMount(channelJid: string): void {
+  notifyChannelMountChanged(channelJid);
   if (!db) return;
   try {
     db.transaction(() => {
@@ -12572,7 +9667,7 @@ function ensureGroupDirExists(folder: string): void {
     return;
   }
   try {
-    fs.mkdirSync(path.join(GROUPS_DIR, folder, 'logs'), { recursive: true });
+    ensureWorkspaceDirs(folder);
   } catch (err) {
     logger.warn({ err, folder }, 'Failed to ensure group directory exists');
   }
@@ -12587,9 +9682,14 @@ function ensureGroupDirExists(folder: string): void {
  */
 export function ensureUserHomeGroup(
   userId: string,
-  role: 'admin' | 'member',
+  role: UserRole,
   username?: string,
 ): string {
+  if (role === 'guest') {
+    // Callers skip guests; refusing here keeps a missed call site from
+    // handing a read-only account its own executable workspace.
+    throw new Error('Guest accounts do not have a home workspace');
+  }
   const existing = getUserHomeGroup(userId);
   if (existing) {
     ensureGroupDirExists(existing.folder);
@@ -12619,6 +9719,13 @@ export function ensureUserHomeGroup(
   };
 
   setRegisteredGroup(jid, group);
+  // A new admin home is a Host workspace without a custom directory: it lives
+  // in the workspace root.
+  try {
+    assignWorkspaceRootDirIfNew(jid, group);
+  } catch (err) {
+    logger.warn({ err, folder }, 'Failed to create the workspace directory');
+  }
   ensureGroupDirExists(folder);
   assignWorkspaceAgentProfile(
     folder,
@@ -12679,9 +9786,8 @@ export function resetWorkspaceKnowledgeForRebuild(workspaceJid: string): void {
 
 export class WorkspaceRebuildPersistentStateError extends Error {
   constructor(
-    public readonly code: 'workspace_missing' | 'active_task_runs',
+    public readonly code: 'workspace_missing',
     message: string,
-    public readonly activeRunIds: string[] = [],
   ) {
     super(message);
     this.name = 'WorkspaceRebuildPersistentStateError';
@@ -12690,7 +9796,6 @@ export class WorkspaceRebuildPersistentStateError extends Error {
 
 export interface WorkspaceRebuildPersistentStateResult {
   deletedAgentIds: string[];
-  recycledTaskIds: string[];
 }
 
 /**
@@ -12717,61 +9822,6 @@ export function rebuildWorkspacePersistentState(input: {
             `Workspace changed while rebuilding: ${workspaceJid}`,
           );
         }
-      }
-
-      const activeRunIds = (
-        prepareCached(`SELECT tr.id
-             FROM task_runs tr
-             JOIN scheduled_tasks st ON st.id = tr.task_id
-             WHERE st.group_folder = ?
-               AND (
-                 tr.status IN ('queued','running','retry_wait')
-                 OR (
-                   tr.status = 'delivered'
-                   AND json_valid(tr.definition_snapshot)
-                   AND json_extract(
-                     tr.definition_snapshot,
-                     '$.context_mode'
-                   ) = 'group'
-                 )
-               )
-             ORDER BY tr.created_at, tr.id`).all(input.groupFolder) as Array<{
-          id: string;
-        }>
-      ).map((row) => row.id);
-      if (activeRunIds.length > 0) {
-        throw new WorkspaceRebuildPersistentStateError(
-          'active_task_runs',
-          'Scheduled task runs are still active during workspace rebuild',
-          activeRunIds,
-        );
-      }
-
-      const recycledTaskIds = (
-        prepareCached(`SELECT id FROM scheduled_tasks
-             WHERE group_folder = ? AND deleted_at IS NULL
-             ORDER BY id`).all(input.groupFolder) as Array<{ id: string }>
-      ).map((row) => row.id);
-      if (recycledTaskIds.length > 0) {
-        const now = new Date().toISOString();
-        prepareCached(`UPDATE task_run_logs
-           SET status = 'error',
-               error = COALESCE(error, 'Workspace rebuilt while task was running')
-           WHERE status = 'running'
-             AND task_id IN (
-               SELECT id FROM scheduled_tasks
-               WHERE group_folder = ? AND deleted_at IS NULL
-             )`).run(input.groupFolder);
-        prepareCached(`UPDATE scheduled_tasks
-           SET deleted_at = ?, status = 'paused', next_run = NULL,
-               running_until = NULL, runner_id = NULL,
-               workspace_jid = NULL, workspace_folder = NULL,
-               revision = revision + 1, updated_at = ?
-           WHERE group_folder = ? AND deleted_at IS NULL`).run(
-          now,
-          now,
-          input.groupFolder,
-        );
       }
 
       const agents = prepareCached(`SELECT id, chat_jid FROM agents
@@ -12858,7 +9908,7 @@ export function rebuildWorkspacePersistentState(input: {
       for (const siblingJid of siblingJids) {
         ensureChatExists(siblingJid);
       }
-      return { deletedAgentIds, recycledTaskIds };
+      return { deletedAgentIds };
     })
     .immediate();
 }
@@ -12866,7 +9916,7 @@ export function rebuildWorkspacePersistentState(input: {
 /**
  * Delete an IM group's registered_groups entry and all jid-scoped data
  * (messages, chat record, pinned references). Does NOT touch folder-scoped
- * data (sessions, scheduled_tasks) because IM groups typically
+ * data (sessions, automations) because IM groups typically
  * share their folder with the owner's home workspace.
  *
  * Used when an IM group is detected as dead (bot removed, group disbanded,
@@ -12914,9 +9964,6 @@ export function deleteImGroupRecord(jid: string): void {
     prepareCached('DELETE FROM subagent_checkpoints WHERE chat_jid = ?').run(
       jid,
     );
-    prepareCached(
-      'UPDATE scheduled_tasks SET workspace_jid = NULL, workspace_folder = NULL WHERE workspace_jid = ?',
-    ).run(jid);
   });
   tx();
 }
@@ -12981,16 +10028,10 @@ export function deleteGroupData(
     prepareCached(
       'DELETE FROM im_context_bindings WHERE workspace_jid = ?',
     ).run(jid);
-    // 1. 删除定时任务运行日志 + 定时任务
-    prepareCached(
-      'DELETE FROM task_runs WHERE task_id IN (SELECT id FROM scheduled_tasks WHERE group_folder = ?)',
-    ).run(folder);
-    prepareCached(
-      'DELETE FROM task_run_logs WHERE task_id IN (SELECT id FROM scheduled_tasks WHERE group_folder = ?)',
-    ).run(folder);
-    prepareCached('DELETE FROM scheduled_tasks WHERE group_folder = ?').run(
-      folder,
-    );
+    // 1. 删除工作区的自动化及其运行记录
+    clearFolderRuntimeState(folder, jid);
+    deleteWorkspaceAutomations(jid);
+    deleteWorkspaceWorkItems(jid);
     // 2. 删除 workspace -> AgentProfile 归属映射
     prepareCached(
       'DELETE FROM workspace_agent_profiles WHERE group_folder = ?',
@@ -13001,9 +10042,15 @@ export function deleteGroupData(
     prepareCached(
       'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
     ).run(folder);
+    // The directory itself is removed after the commit (removeFlowArtifacts),
+    // which the caller hands the recorded path it read before.
+    deleteRecordedWorkdir(folder);
     // 4. 删除注册信息
     prepareCached('DELETE FROM registered_groups WHERE jid = ?').run(jid);
     // 5. 删除会话与 workspace-owned agents
+    prepareCached(
+      'DELETE FROM user_pinned_sessions WHERE agent_id IN (SELECT id FROM agents WHERE group_folder = ? OR chat_jid = ?)',
+    ).run(folder, jid);
     prepareCached('DELETE FROM sessions WHERE group_folder = ?').run(folder);
     prepareCached(
       'DELETE FROM session_model_selections WHERE group_folder = ?',
@@ -13015,18 +10062,28 @@ export function deleteGroupData(
       'DELETE FROM subagent_checkpoints WHERE group_folder = ? OR chat_jid = ?',
     ).run(folder, jid);
     // 6. 删除聊天记录
+    const sessionChats = keyPrefixRange(`${jid}#agent:`);
     prepareCached('DELETE FROM messages WHERE chat_jid = ?').run(jid);
-    prepareCached('DELETE FROM messages WHERE chat_jid LIKE ?').run(
-      `${jid}#agent:%`,
-    );
+    prepareCached(
+      'DELETE FROM messages WHERE chat_jid >= @from AND chat_jid < @to',
+    ).run(sessionChats);
     deleteTurnTracesForChatTree(jid);
     prepareCached('DELETE FROM chats WHERE jid = ?').run(jid);
-    prepareCached('DELETE FROM chats WHERE jid LIKE ?').run(`${jid}#agent:%`);
-    // 7. 删除 pin 记录
+    prepareCached('DELETE FROM chats WHERE jid >= @from AND jid < @to').run(
+      sessionChats,
+    );
+    // 7. 删除 pin 记录与访客授权
     prepareCached('DELETE FROM user_pinned_groups WHERE jid = ?').run(jid);
-    // 8. 清除定时任务的工作区关联（任务本身不删，只断开绑定）
+    // The workspace's v88 mapping and its sessions' OOM counters
+    // (`oom_exits:<folder>#<id>`), which deleteAgent clears one session at a time.
+    prepareCached('DELETE FROM router_state WHERE key = ?').run(
+      `${LEGACY_MAIN_SESSION_KEY_PREFIX}${jid}`,
+    );
     prepareCached(
-      'UPDATE scheduled_tasks SET workspace_jid = NULL, workspace_folder = NULL WHERE workspace_jid = ?',
+      'DELETE FROM router_state WHERE key >= @from AND key < @to',
+    ).run(keyPrefixRange(`oom_exits:${folder}#`));
+    prepareCached(
+      'DELETE FROM guest_workspace_grants WHERE workspace_jid = ?',
     ).run(jid);
   });
   tx();
@@ -13057,6 +10114,32 @@ export function unpinGroup(userId: string, jid: string): void {
   ).run(userId, jid);
 }
 
+// --- User pinned sessions ---
+
+/** The sessions a user pinned, as agent id → pinned_at. */
+export function getUserPinnedSessions(userId: string): Record<string, string> {
+  const rows = prepareCached(
+    'SELECT agent_id, pinned_at FROM user_pinned_sessions WHERE user_id = ?',
+  ).all(userId) as Array<{ agent_id: string; pinned_at: string }>;
+  const result: Record<string, string> = {};
+  for (const row of rows) result[row.agent_id] = row.pinned_at;
+  return result;
+}
+
+export function pinSession(userId: string, agentId: string): string {
+  const pinned_at = new Date().toISOString();
+  prepareCached(
+    'INSERT OR REPLACE INTO user_pinned_sessions (user_id, agent_id, pinned_at) VALUES (?, ?, ?)',
+  ).run(userId, agentId, pinned_at);
+  return pinned_at;
+}
+
+export function unpinSession(userId: string, agentId: string): void {
+  prepareCached(
+    'DELETE FROM user_pinned_sessions WHERE user_id = ? AND agent_id = ?',
+  ).run(userId, agentId);
+}
+
 // --- Web API accessors ---
 
 /**
@@ -13080,7 +10163,7 @@ export function getMessagesPage(
       ? `
       SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
-             m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+             m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason, m.automation_run_id,
              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
              m.delivery_updated_at, seq.sequence AS ingest_sequence
       FROM message_ingest_sequences seq
@@ -13093,7 +10176,7 @@ export function getMessagesPage(
         ? `
       SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
-             m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+             m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason, m.automation_run_id,
              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
              m.delivery_updated_at, seq.sequence AS ingest_sequence
       FROM message_ingest_sequences seq
@@ -13105,7 +10188,7 @@ export function getMessagesPage(
         : `
       SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
              m.is_from_me, m.attachments, m.token_usage, m.channel_context,
-             m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+             m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason, m.automation_run_id,
              m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
              m.delivery_updated_at, seq.sequence AS ingest_sequence
       FROM message_ingest_sequences seq
@@ -13138,7 +10221,7 @@ export function getMessagesForTurn(
   const rows =
     prepareCached(`SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
               m.is_from_me, m.attachments, m.token_usage, m.channel_context,
-              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason, m.automation_run_id,
               m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
               m.delivery_updated_at, seq.sequence AS ingest_sequence
        FROM message_ingest_sequences seq
@@ -13148,6 +10231,20 @@ export function getMessagesForTurn(
       NewMessage & { is_from_me: number }
     >;
   return rows.map((row) => normalizeMessageRow(row));
+}
+
+/**
+ * Keep one message out of the history replayed into a fresh model session:
+ * a note written for the reader, not words the model said.
+ */
+export function excludeMessageFromHistoryRecovery(
+  chatJid: string,
+  messageId: string,
+): void {
+  if (!isDatabaseInitialized()) return;
+  prepareCached(
+    'UPDATE messages SET history_recovery_allowed = 0 WHERE chat_jid = ? AND id = ?',
+  ).run(chatJid, messageId);
 }
 
 /**
@@ -13166,7 +10263,7 @@ export function getConversationHistoryMessagesPage(
   const rows =
     prepareCached(`SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
               m.is_from_me, m.attachments, m.token_usage, m.channel_context,
-              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason, m.automation_run_id,
               m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
               m.delivery_updated_at, seq.sequence AS ingest_sequence
        FROM message_ingest_sequences seq
@@ -13200,7 +10297,7 @@ export function getMessagesAfter(
     stableSequence !== undefined
       ? `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
               m.is_from_me, m.attachments, m.token_usage, m.channel_context,
-              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason, m.automation_run_id,
               m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
               m.delivery_updated_at, seq.sequence AS ingest_sequence
        FROM message_ingest_sequences seq
@@ -13210,7 +10307,7 @@ export function getMessagesAfter(
        LIMIT ?`
       : `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
               m.is_from_me, m.attachments, m.token_usage, m.channel_context,
-              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason, m.automation_run_id,
               m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
               m.delivery_updated_at, seq.sequence AS ingest_sequence
        FROM message_ingest_sequences seq
@@ -13279,6 +10376,56 @@ export function getLatestMessagePreviewPerChat(
   return result;
 }
 
+/**
+ * The newest message of each chat a reader would show, in one read: not a
+ * system row, not blank, and not an input cancelled before it ran
+ * (isCancelledInput). Newest by ingest order, like getMessagesPage; the
+ * content is cut to `maxChars` in SQL.
+ */
+export function getLatestVisibleMessagePerChat(
+  chatJids: string[],
+  maxChars: number,
+): Map<string, { content: string; timestamp: string; is_from_me: boolean }> {
+  const result = new Map<
+    string,
+    { content: string; timestamp: string; is_from_me: boolean }
+  >();
+  if (chatJids.length === 0) return result;
+  const rows = prepareCached(
+    `SELECT j.value AS chat_jid,
+            substr(CAST(m.content AS TEXT), 1, ?) AS content,
+            m.timestamp AS timestamp,
+            m.is_from_me AS is_from_me
+     FROM json_each(?) j
+     JOIN messages m ON m.rowid = (
+       SELECT x.rowid
+       FROM message_ingest_sequences seq
+       JOIN messages x ON x.chat_jid = seq.chat_jid AND x.id = seq.message_id
+       WHERE seq.chat_jid = j.value
+         AND x.sender <> '__system__'
+         AND NOT (x.is_from_me = 0
+                  AND COALESCE(x.delivery_status, '') = 'cancelled')
+         AND trim(CAST(COALESCE(x.content, '') AS TEXT),
+                  ' ' || char(9, 10, 13)) <> ''
+       ORDER BY seq.sequence DESC
+       LIMIT 1
+     )`,
+  ).all(Math.max(1, Math.trunc(maxChars)), JSON.stringify(chatJids)) as Array<{
+    chat_jid: string;
+    content: unknown;
+    timestamp: string;
+    is_from_me: number;
+  }>;
+  for (const row of rows) {
+    result.set(row.chat_jid, {
+      content: toUtf8String(row.content),
+      timestamp: row.timestamp,
+      is_from_me: !!row.is_from_me,
+    });
+  }
+  return result;
+}
+
 export function getMessagesPageMulti(
   chatJids: string[],
   before?: string,
@@ -13300,7 +10447,7 @@ export function getMessagesPageMulti(
     stableSequence !== undefined
       ? `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
               m.is_from_me, m.attachments, m.token_usage, m.channel_context,
-              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason, m.automation_run_id,
               m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
               m.delivery_updated_at, seq.sequence AS ingest_sequence
        FROM message_ingest_sequences seq
@@ -13311,7 +10458,7 @@ export function getMessagesPageMulti(
       : before
         ? `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
                 m.is_from_me, m.attachments, m.token_usage, m.channel_context,
-                m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+                m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason, m.automation_run_id,
                 m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
                 m.delivery_updated_at, seq.sequence AS ingest_sequence
          FROM message_ingest_sequences seq
@@ -13321,7 +10468,7 @@ export function getMessagesPageMulti(
          LIMIT ?`
         : `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
               m.is_from_me, m.attachments, m.token_usage, m.channel_context,
-              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason, m.automation_run_id,
               m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
               m.delivery_updated_at, seq.sequence AS ingest_sequence
        FROM message_ingest_sequences seq
@@ -13367,7 +10514,7 @@ export function getMessagesAfterMulti(
     stableSequence !== undefined
       ? `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
               m.is_from_me, m.attachments, m.token_usage, m.channel_context,
-              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason, m.automation_run_id,
               m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
               m.delivery_updated_at, seq.sequence AS ingest_sequence
        FROM message_ingest_sequences seq
@@ -13377,7 +10524,7 @@ export function getMessagesAfterMulti(
        LIMIT ?`
       : `SELECT m.id, m.chat_jid, m.source_jid, m.sender, m.sender_name, m.content, m.timestamp,
               m.is_from_me, m.attachments, m.token_usage, m.channel_context,
-              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason,
+              m.turn_id, m.session_id, m.sdk_message_uuid, m.source_kind, m.finalization_reason, m.automation_run_id,
               m.delivery_mode, m.delivery_status, m.delivery_run_id, m.delivery_priority,
               m.delivery_updated_at, seq.sequence AS ingest_sequence
        FROM message_ingest_sequences seq
@@ -13392,19 +10539,6 @@ export function getMessagesAfterMulti(
   >;
 
   return rows.map((row) => normalizeMessageRow(row));
-}
-
-/**
- * Get task run logs for a specific task, ordered by most recent first.
- */
-export function getTaskRunLogs(taskId: string, limit = 20): TaskRunLog[] {
-  return prepareCached(`
-    SELECT id, task_id, run_at, duration_ms, status, result, error
-    FROM task_run_logs
-    WHERE task_id = ?
-    ORDER BY run_at DESC
-    LIMIT ?
-  `).all(taskId, limit) as TaskRunLog[];
 }
 
 /**
@@ -13423,7 +10557,9 @@ export function getGroupsByOwner(
 // ===================== Auth CRUD =====================
 
 function parseUserRole(value: unknown): UserRole {
-  return value === 'admin' ? 'admin' : 'member';
+  if (value === 'admin') return 'admin';
+  if (value === 'guest') return 'guest';
+  return 'member';
 }
 
 function parseUserStatus(value: unknown): UserStatus {
@@ -13433,6 +10569,8 @@ function parseUserStatus(value: unknown): UserStatus {
 }
 
 function parsePermissionsFromDb(raw: unknown, role: UserRole): Permission[] {
+  // Guests never hold a permission, whatever the stored column says.
+  if (role === 'guest') return [];
   if (typeof raw === 'string') {
     try {
       const parsed = normalizePermissions(JSON.parse(raw));
@@ -13484,6 +10622,10 @@ function mapUserRow(row: Record<string, unknown>): User {
     ai_avatar_url:
       typeof row.ai_avatar_url === 'string' ? row.ai_avatar_url : null,
     default_require_mention: !!row.default_require_mention,
+    guest_owner_id:
+      role === 'guest' && typeof row.guest_owner_id === 'string'
+        ? row.guest_owner_id
+        : null,
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
     last_login_at:
@@ -13511,6 +10653,7 @@ function toUserPublic(user: User, lastActiveAt: string | null): UserPublic {
     ai_avatar_color: user.ai_avatar_color,
     ai_avatar_url: user.ai_avatar_url,
     default_require_mention: user.default_require_mention,
+    guest_owner_id: user.guest_owner_id,
     created_at: user.created_at,
     last_login_at: user.last_login_at,
     last_active_at: lastActiveAt,
@@ -13535,6 +10678,8 @@ export interface CreateUserInput {
   notes?: string | null;
   last_login_at?: string | null;
   deleted_at?: string | null;
+  /** Required for and only accepted with role === 'guest'. */
+  guest_owner_id?: string | null;
 }
 
 function initializeBillingForUser(
@@ -13588,13 +10733,19 @@ function initializeBillingForUser(
 }
 
 export function createUser(user: CreateUserInput): void {
-  const permissions = normalizePermissions(
-    user.permissions ?? getDefaultPermissions(user.role),
-  );
+  const isGuest = user.role === 'guest';
+  if (isGuest !== !!user.guest_owner_id) {
+    throw new Error('guest_owner_id is required for, and only for, guests');
+  }
+  const permissions = isGuest
+    ? []
+    : normalizePermissions(
+        user.permissions ?? getDefaultPermissions(user.role),
+      );
   prepareCached(`INSERT INTO users (
       id, username, password_hash, display_name, role, status, permissions, must_change_password,
-      disable_reason, notes, created_at, updated_at, last_login_at, deleted_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      disable_reason, notes, created_at, updated_at, last_login_at, deleted_at, guest_owner_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
     user.id,
     user.username,
     user.password_hash,
@@ -13609,7 +10760,10 @@ export function createUser(user: CreateUserInput): void {
     user.updated_at,
     user.last_login_at ?? null,
     user.deleted_at ?? null,
+    isGuest ? user.guest_owner_id : null,
   );
+  // Guests cannot start a run, so they get no wallet, subscription or Agent.
+  if (isGuest) return;
   initializeBillingForUser(user.id, user.role, user.created_at);
   getOrCreateDefaultAgentProfile(user.id);
 }
@@ -13718,9 +10872,11 @@ export function listUsers(options: ListUsersOptions = {}): ListUsersResult {
   const rows = db
     .prepare(
       `
-      SELECT u.*, MAX(s.last_active_at) AS last_active_at
+      SELECT u.*, MAX(s.last_active_at) AS last_active_at,
+             go.username AS guest_owner_username
       FROM users u
       LEFT JOIN user_sessions s ON s.user_id = u.id
+      LEFT JOIN users go ON go.id = u.guest_owner_id
       ${whereClause}
       GROUP BY u.id
       ORDER BY
@@ -13740,7 +10896,14 @@ export function listUsers(options: ListUsersOptions = {}): ListUsersResult {
       const user = mapUserRow(row);
       const lastActiveAt =
         typeof row.last_active_at === 'string' ? row.last_active_at : null;
-      return toUserPublic(user, lastActiveAt);
+      const publicUser = toUserPublic(user, lastActiveAt);
+      if (user.role === 'guest') {
+        publicUser.guest_owner_username =
+          typeof row.guest_owner_username === 'string'
+            ? row.guest_owner_username
+            : null;
+      }
+      return publicUser;
     }),
     total: totalRow.count,
     page,
@@ -13919,6 +11082,7 @@ export function deleteUser(id: string): void {
   const now = new Date().toISOString();
   const tx = db.transaction((userId: string) => {
     prepareCached('DELETE FROM user_sessions WHERE user_id = ?').run(userId);
+    deleteWebPushSubscriptionsForUser(userId);
     prepareCached(`UPDATE users
        SET status = 'deleted', deleted_at = ?, disable_reason = COALESCE(disable_reason, 'deleted_by_admin'), updated_at = ?
        WHERE id = ?`).run(now, now, userId);
@@ -13930,6 +11094,159 @@ export function restoreUser(id: string): void {
   prepareCached(`UPDATE users
      SET status = 'disabled', deleted_at = NULL, disable_reason = NULL, updated_at = ?
      WHERE id = ?`).run(new Date().toISOString(), id);
+}
+
+// --- Guest accounts ---
+
+export interface GuestWorkspaceGrant {
+  guest_user_id: string;
+  workspace_jid: string;
+  owner_user_id: string;
+  created_at: string;
+}
+
+/** Non-deleted guests owned by `ownerId`, oldest first. */
+export function listGuestsByOwner(ownerId: string): User[] {
+  const rows = prepareCached(
+    `SELECT * FROM users
+     WHERE role = 'guest' AND guest_owner_id = ? AND status != 'deleted'
+     ORDER BY created_at ASC`,
+  ).all(ownerId) as Array<Record<string, unknown>>;
+  return rows.map(mapUserRow);
+}
+
+/** Ids of every guest (any status) owned by `ownerId`. */
+export function listGuestIdsByOwner(ownerId: string): string[] {
+  const rows = prepareCached(
+    "SELECT id FROM users WHERE role = 'guest' AND guest_owner_id = ?",
+  ).all(ownerId) as Array<{ id: string }>;
+  return rows.map((row) => row.id);
+}
+
+export function listGuestWorkspaceGrants(
+  guestUserId: string,
+): GuestWorkspaceGrant[] {
+  return prepareCached(
+    `SELECT guest_user_id, workspace_jid, owner_user_id, created_at
+     FROM guest_workspace_grants
+     WHERE guest_user_id = ?
+     ORDER BY created_at ASC, workspace_jid ASC`,
+  ).all(guestUserId) as GuestWorkspaceGrant[];
+}
+
+/** Replace a guest's grant set atomically. Callers validate the JIDs. */
+export function replaceGuestWorkspaceGrants(
+  guestUserId: string,
+  ownerUserId: string,
+  workspaceJids: readonly string[],
+): void {
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    prepareCached(
+      'DELETE FROM guest_workspace_grants WHERE guest_user_id = ?',
+    ).run(guestUserId);
+    const insert = prepareCached(
+      `INSERT OR IGNORE INTO guest_workspace_grants
+         (guest_user_id, workspace_jid, owner_user_id, created_at)
+       VALUES (?, ?, ?, ?)`,
+    );
+    for (const jid of workspaceJids) {
+      insert.run(guestUserId, jid, ownerUserId, now);
+    }
+  })();
+  // The only insert path: the next lookup reloads the set.
+  grantedWorkspaceJids = null;
+}
+
+/**
+ * Workspace JIDs with any grant row, whatever its state: a superset of the
+ * workspaces that have viewing guests, so a JID absent here needs no grant
+ * query. Rows are only added by replaceGuestWorkspaceGrants, which drops the
+ * set; deletions leave it a (still safe) superset until then.
+ */
+let grantedWorkspaceJids: Set<string> | null = null;
+
+export function workspaceHasGuestGrants(workspaceJid: string): boolean {
+  grantedWorkspaceJids ??= new Set(
+    (
+      prepareCached(
+        'SELECT DISTINCT workspace_jid FROM guest_workspace_grants',
+      ).all() as Array<{ workspace_jid: string }>
+    ).map((row) => row.workspace_jid),
+  );
+  return grantedWorkspaceJids.has(workspaceJid);
+}
+
+export function deleteGuestWorkspaceGrantsForGuest(guestUserId: string): void {
+  prepareCached(
+    'DELETE FROM guest_workspace_grants WHERE guest_user_id = ?',
+  ).run(guestUserId);
+}
+
+/**
+ * The only grant predicate: the grant row exists, the guest is an active
+ * guest of the grant's owner, the owner is active and not itself a guest, the
+ * workspace is still owned by that owner, and a Host workspace's owner is
+ * still an admin (Host workspaces require the admin role, CLAUDE.md §8).
+ */
+const ACTIVE_GUEST_GRANT_SQL = `FROM guest_workspace_grants g
+     JOIN users gu ON gu.id = g.guest_user_id
+     JOIN users o ON o.id = g.owner_user_id
+     JOIN registered_groups r
+       ON r.jid = g.workspace_jid AND r.created_by = g.owner_user_id
+     WHERE gu.role = 'guest' AND gu.status = 'active'
+       AND gu.guest_owner_id = g.owner_user_id
+       AND o.status = 'active' AND o.role != 'guest'
+       AND (r.execution_mode IS NOT 'host' OR o.role = 'admin')`;
+
+export function hasActiveGuestWorkspaceGrant(
+  guestUserId: string,
+  workspaceJid: string,
+  workspaceOwnerId: string,
+): boolean {
+  return !!prepareCached(
+    `SELECT 1 ${ACTIVE_GUEST_GRANT_SQL}
+       AND g.guest_user_id = ? AND g.workspace_jid = ? AND g.owner_user_id = ?
+     LIMIT 1`,
+  ).get(guestUserId, workspaceJid, workspaceOwnerId);
+}
+
+export function listActiveGuestIdsForWorkspace(
+  workspaceJid: string,
+  workspaceOwnerId: string,
+): string[] {
+  const rows = prepareCached(
+    `SELECT g.guest_user_id AS id ${ACTIVE_GUEST_GRANT_SQL}
+       AND g.workspace_jid = ? AND g.owner_user_id = ?`,
+  ).all(workspaceJid, workspaceOwnerId) as Array<{ id: string }>;
+  return rows.map((row) => row.id);
+}
+
+/** Workspace JIDs a guest may currently view. */
+export function listActiveGuestGrantJids(guestUserId: string): string[] {
+  const rows = prepareCached(
+    `SELECT g.workspace_jid AS jid ${ACTIVE_GUEST_GRANT_SQL}
+       AND g.guest_user_id = ?`,
+  ).all(guestUserId) as Array<{ jid: string }>;
+  return rows.map((row) => row.jid);
+}
+
+/** Purge a guest's grants, pins and sessions, then mark the row deleted. */
+export function deleteGuestUser(guestUserId: string): void {
+  db.transaction(() => {
+    deleteGuestWorkspaceGrantsForGuest(guestUserId);
+    if (tableExists('user_pinned_groups')) {
+      prepareCached('DELETE FROM user_pinned_groups WHERE user_id = ?').run(
+        guestUserId,
+      );
+    }
+    if (tableExists('user_pinned_sessions')) {
+      prepareCached('DELETE FROM user_pinned_sessions WHERE user_id = ?').run(
+        guestUserId,
+      );
+    }
+    deleteUser(guestUserId);
+  })();
 }
 
 // --- User Sessions ---
@@ -13969,6 +11286,10 @@ export function getSessionWithUser(
     display_name: String(row.display_name ?? ''),
     permissions: parsePermissionsFromDb(row.permissions, role),
     must_change_password: !!row.must_change_password,
+    guest_owner_id:
+      role === 'guest' && typeof row.guest_owner_id === 'string'
+        ? row.guest_owner_id
+        : null,
   };
 }
 
@@ -13984,6 +11305,23 @@ export function deleteUserSession(sessionId: string): void {
 
 export function deleteUserSessionsByUserId(userId: string): void {
   prepareCached('DELETE FROM user_sessions WHERE user_id = ?').run(userId);
+}
+
+/**
+ * End every session of `userId` and sign the device of `currentSessionId` in
+ * again as `next` (a password change made on it). That device keeps its Web
+ * Push subscription; the other devices lose theirs with their sessions.
+ */
+export function replaceUserSessions(
+  userId: string,
+  currentSessionId: string,
+  next: UserSession,
+): void {
+  db.transaction(() => {
+    moveWebPushSubscriptionsToSession(userId, currentSessionId, next.id);
+    deleteUserSessionsByUserId(userId);
+    createUserSession(next);
+  })();
 }
 
 export function updateSessionLastActive(sessionId: string): void {
@@ -14008,6 +11346,9 @@ export function deleteExpiredSessions(): number {
 // --- Invite Codes ---
 
 export function createInviteCode(invite: InviteCode): void {
+  if (invite.role === 'guest') {
+    throw new Error('Invite codes cannot create guest accounts');
+  }
   const permissions = normalizePermissions(invite.permissions);
   prepareCached(`INSERT INTO invite_codes (code, created_by, role, permission_template, permissions, max_uses, used_count, expires_at, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
@@ -14075,6 +11416,11 @@ export function registerUserWithInvite(input: {
 
       if (!inviteRow) return { ok: false, reason: 'invalid_or_expired_invite' };
       const inviteRole = parseUserRole(inviteRow.role);
+      // Guests are only created by their owner (POST /api/guests); an invite
+      // can never yield one, even if the row was written by hand.
+      if (inviteRole === 'guest') {
+        return { ok: false, reason: 'invalid_or_expired_invite' };
+      }
       const invitePermissions = parsePermissionsFromDb(
         inviteRow.permissions,
         inviteRole,
@@ -14324,8 +11670,8 @@ export function queryAuthAuditLogs(
 // ===================== Sub-Agent CRUD =====================
 
 export function createAgent(agent: SubAgent): void {
-  prepareCached(`INSERT INTO agents (id, group_folder, chat_jid, name, prompt, status, kind, created_by, created_at, completed_at, result_summary, spawned_from_jid, source_kind, thread_id, root_message_id, title_source, last_active_at, last_im_jid)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+  prepareCached(`INSERT INTO agents (id, group_folder, chat_jid, name, prompt, status, kind, created_by, created_at, completed_at, result_summary, spawned_from_jid, source_kind, thread_id, root_message_id, title_source, last_active_at, last_im_jid, automation_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
     agent.id,
     agent.group_folder,
     agent.chat_jid,
@@ -14344,7 +11690,16 @@ export function createAgent(agent: SubAgent): void {
     agent.title_source ?? null,
     agent.last_active_at ?? null,
     agent.last_im_jid ?? null,
+    agent.automation_id ?? null,
   );
+}
+
+/** The run sessions of an automation, archived ones included, newest first. */
+export function listAgentsByAutomationId(automationId: string): SubAgent[] {
+  const rows = prepareCached(
+    'SELECT * FROM agents WHERE automation_id = ? ORDER BY created_at DESC, id DESC',
+  ).all(automationId) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentRow);
 }
 
 /** Status of every session row, for retiring on-disk IPC namespaces. */
@@ -14649,6 +12004,27 @@ export function listActiveConversationAgents(): SubAgent[] {
 
 export function deleteAgent(id: string): void {
   db.transaction(() => {
+    const existing = getAgent(id);
+    if (existing) {
+      clearUsageLimitWait(`${existing.chat_jid}#agent:${id}`);
+    }
+    // The Session's scope under any chat, compared exactly: LIKE would read
+    // `_` and `%` in the id as wildcards and delete other Sessions' waits.
+    prepareCached(
+      'DELETE FROM usage_limit_waits WHERE substr(scope_key, -length(@suffix)) = @suffix',
+    ).run({ suffix: `#agent:${id}` });
+    clearAgentSessionHistoryReinjections(id);
+    prepareCached('DELETE FROM user_pinned_sessions WHERE agent_id = ?').run(
+      id,
+    );
+    // The session's v88 mapping and OOM counter (`oom_exits:<folder>#<id>`).
+    prepareCached(
+      'DELETE FROM router_state WHERE key >= @from AND key < @to AND value = @id',
+    ).run({ ...keyPrefixRange(LEGACY_MAIN_SESSION_KEY_PREFIX), id });
+    prepareCached(
+      `DELETE FROM router_state WHERE key >= @from AND key < @to
+         AND substr(key, -length(@suffix)) = @suffix`,
+    ).run({ ...keyPrefixRange('oom_exits:'), suffix: `#${id}` });
     // A product Session can own an SDK runtime resume row and channel mounts;
     // clear all three projections together so direct DB callers cannot leave
     // routable ghosts behind.
@@ -14696,7 +12072,10 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
             | 'native_thread'
             | 'feishu_thread'
             | 'auto_im'
-            | 'channel_direct')
+            | 'channel_direct'
+            | 'automation'
+            | 'team_router'
+            | 'work_item')
         : null,
     thread_id: typeof row.thread_id === 'string' ? row.thread_id : null,
     root_message_id:
@@ -14712,7 +12091,30 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
         : null,
     last_active_at:
       typeof row.last_active_at === 'string' ? row.last_active_at : null,
+    automation_id:
+      typeof row.automation_id === 'string' ? row.automation_id : null,
   };
+}
+
+/** The conversation sessions of several workspaces at once, by workspace JID. */
+export function listConversationAgentsByJids(
+  chatJids: string[],
+): Map<string, SubAgent[]> {
+  const result = new Map<string, SubAgent[]>();
+  if (chatJids.length === 0) return result;
+  const rows = prepareCached(
+    `SELECT * FROM agents
+     WHERE kind = 'conversation'
+       AND chat_jid IN (SELECT value FROM json_each(?))
+     ORDER BY created_at DESC`,
+  ).all(JSON.stringify(chatJids)) as Array<Record<string, unknown>>;
+  for (const row of rows) {
+    const agent = mapAgentRow(row);
+    const list = result.get(agent.chat_jid);
+    if (list) list.push(agent);
+    else result.set(agent.chat_jid, [agent]);
+  }
+  return result;
 }
 
 export function deleteMessagesForChatJid(chatJid: string): void {
@@ -14821,9 +12223,14 @@ export function getAgentBuilderInputMessage(
   is_from_me: number;
   source_kind: string | null;
   task_id: string | null;
+  automation_run_id: string | null;
+  sender_name: string | null;
+  attachments: string | null;
+  delivery_status: string | null;
 } | null {
   const row =
-    prepareCached(`SELECT id, chat_jid, content, sender, source_jid, is_from_me, source_kind, task_id
+    prepareCached(`SELECT id, chat_jid, content, sender, source_jid, is_from_me, source_kind, task_id, automation_run_id,
+              sender_name, attachments, delivery_status
        FROM messages WHERE id = ? AND chat_jid = ? LIMIT 1`).get(
       messageId,
       chatJid,
@@ -14837,6 +12244,10 @@ export function getAgentBuilderInputMessage(
           is_from_me: number;
           source_kind: string | null;
           task_id: string | null;
+          automation_run_id: string | null;
+          sender_name: string | null;
+          attachments: string | null;
+          delivery_status: string | null;
         }
       | undefined;
   return row
@@ -15797,7 +13208,9 @@ export function getAllUserBillingOverview(): Array<{
   balance_usd: number;
   current_month_cost: number;
 }> {
-  const month = new Date().toISOString().slice(0, 7);
+  // Joins monthly_usage on its local-calendar `month` key; a UTC month here
+  // would join the previous month's row for the first hours of a local month.
+  const month = toLocalMonthString();
   return prepareCached(`SELECT u.id as user_id, u.username, u.display_name, u.role,
               s.plan_id, p.name as plan_name,
               COALESCE(b.balance_usd, 0) as balance_usd,
@@ -15807,7 +13220,7 @@ export function getAllUserBillingOverview(): Array<{
        LEFT JOIN billing_plans p ON p.id = s.plan_id
        LEFT JOIN user_balances b ON b.user_id = u.id
        LEFT JOIN monthly_usage mu ON mu.user_id = u.id AND mu.month = ?
-       WHERE u.status != 'deleted'
+       WHERE u.status != 'deleted' AND u.role != 'guest'
        ORDER BY u.created_at ASC`).all(month) as Array<{
     user_id: string;
     username: string;
@@ -15826,7 +13239,9 @@ export function getRevenueStats(): {
   activeSubscriptions: number;
   currentMonthRevenue: number;
 } {
-  const month = new Date().toISOString().slice(0, 7);
+  // monthly_usage.month is a local calendar month (see incrementUsageBoth's
+  // caller), so summing "this month" must use the local month too.
+  const month = toLocalMonthString();
   const deposited = (
     prepareCached(
       'SELECT COALESCE(SUM(total_deposited_usd), 0) as total FROM user_balances',
@@ -16033,8 +13448,11 @@ export function getDashboardStats(): {
   monthCost: number;
   activeSubscriptions: number;
 } {
-  const today = new Date().toISOString().slice(0, 10);
-  const month = new Date().toISOString().slice(0, 7);
+  // daily_usage is keyed by the local calendar day (see incrementUsageBoth's
+  // caller, which passes `toLocalDateString(createdAt)`), so the read window
+  // must use the same local day rather than the UTC one.
+  const today = toLocalDateString();
+  const month = toLocalMonthString();
 
   const totalUsers = (
     prepareCached(
@@ -16190,12 +13608,18 @@ export function tryIncrementRedeemCodeUsage(
  */
 export function closeDatabase(): void {
   _stmts = null;
+  grantedWorkspaceJids = null;
   _newMsgStmtCache.clear();
   _sqlStmtCache.clear();
   _sqlStmtCacheDb = null;
   bindChannelReliabilityDatabase(null);
   bindWorkspaceMemoryDatabase(null);
   bindOwnerProfileDatabase(null);
+  initRuntimeStateStore(null);
+  initAutomationStore(null);
+  initWorkItemStore(null);
+  initWebPushStore(null);
+  initWorkspaceDirStore(null);
   if (db) {
     db.close();
   }

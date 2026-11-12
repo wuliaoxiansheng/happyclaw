@@ -25,12 +25,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
+import { ResponsiveMenu } from '@/components/common/ResponsiveMenu';
 import { Input } from '@/components/ui/input';
 import {
   Select,
@@ -47,6 +42,7 @@ import {
   type InviteCode,
   type PermissionTemplateKey,
 } from '../../stores/users';
+import { copyToClipboard as writeToClipboard } from '../../utils/clipboard';
 import {
   formatDateTime,
   getErrorMessage,
@@ -147,7 +143,7 @@ export function InviteCodesTab({
   };
 
   const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text).then(() => setNotice('已复制到剪贴板'));
+    writeToClipboard(text).then(() => setNotice('已复制到剪贴板'));
   };
 
   const handleDelete = async (invite: InviteCode) => {
@@ -223,28 +219,33 @@ export function InviteCodesTab({
       align: 'right',
       className: 'w-12',
       cell: (invite) => (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
+        <ResponsiveMenu
+          title="邀请码操作"
+          groups={[
+            [
+              {
+                label: '复制邀请码',
+                icon: Copy,
+                onSelect: () => copyToClipboard(invite.code),
+              },
+            ],
+            [
+              {
+                label: '删除邀请码',
+                icon: Trash2,
+                destructive: true,
+                onSelect: () => void handleDelete(invite),
+              },
+            ],
+          ]}
+          trigger={
             <IconButton
               label="邀请码操作"
               icon={<MoreHorizontal />}
               hideTooltip
             />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-36">
-            <DropdownMenuItem onSelect={() => copyToClipboard(invite.code)}>
-              <Copy />
-              复制邀请码
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              variant="destructive"
-              onSelect={() => void handleDelete(invite)}
-            >
-              <Trash2 />
-              删除邀请码
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
+          }
+        />
       ),
     },
   ];

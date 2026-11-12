@@ -40,6 +40,9 @@ const alignClass = {
   center: 'text-center',
 } as const;
 
+const PHONE_STICKY_FIRST_COLUMN =
+  'phone:[&_tr>*:first-child]:sticky phone:[&_tr>*:first-child]:left-0 phone:[&_tr>*:first-child]:z-1';
+
 /** Column-driven table on the shared table primitive. */
 export function DataTable<T>({
   columns,
@@ -63,6 +66,13 @@ export function DataTable<T>({
       className={cn(
         framed &&
           'overflow-hidden rounded-xl bg-surface-raised ring-1 ring-surface-border',
+        // A phone scrolls a wide table sideways in its one scroller (the
+        // table container) and keeps the first column, which names the row,
+        // pinned at the left edge.
+        PHONE_STICKY_FIRST_COLUMN,
+        framed
+          ? 'phone:[&_tr>*:first-child]:bg-surface-raised'
+          : 'phone:[&_tr>*:first-child]:bg-background',
         className,
       )}
     >

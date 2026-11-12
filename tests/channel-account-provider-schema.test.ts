@@ -74,6 +74,11 @@ describe('provider-specific channel credential contract', () => {
       { botToken: '123456:token', proxyUrl: 'http://proxy' },
       'bot_token',
     ],
+    [
+      'telegram',
+      { botToken: '123456:token', streamingMode: 'off' },
+      'bot_token',
+    ],
     ['qq', { appId: 'qq-a', appSecret: 'secret-q' }, 'credentials'],
     ['wechat', { bypassProxy: 'true' }, 'qr_session'],
     [
@@ -150,6 +155,7 @@ describe('provider-specific channel credential contract', () => {
       { clientId: 'a', clientSecret: 'b', streamingMode: 'free-text' },
     ],
     ['discord', { botToken: 'a', streamingMode: 'free-text' }],
+    ['telegram', { botToken: 'a', streamingMode: 'card' }],
     ['wechat', { bypassProxy: 'sometimes' }],
   ])(
     'rejects invalid enum-like option for %s',
@@ -159,6 +165,18 @@ describe('provider-specific channel credential contract', () => {
       expect(body.error).toMatch(/must be/);
     },
   );
+
+  test('Telegram streams by default and reports a switched-off account', async () => {
+    const streaming = await create('telegram', { botToken: '1:a' });
+    expect(streaming.body.account.options).toMatchObject({
+      streamingMode: 'edit',
+    });
+    const off = await create('telegram', {
+      botToken: '2:b',
+      streamingMode: 'off',
+    });
+    expect(off.body.account.options).toMatchObject({ streamingMode: 'off' });
+  });
 
   test('QR providers are draft accounts until protocol authorization finishes', async () => {
     const wechat = await create('wechat', {});

@@ -560,12 +560,6 @@ interface UsageState {
   setQuery: (query: UsageQuery) => void;
   loadStats: (query?: UsageQuery | number) => Promise<void>;
   refresh: () => Promise<void>;
-  setDays: (days: number) => void;
-  setSelectedUserId: (id: string | null) => void;
-  setSelectedModel: (model: string | null) => void;
-  setSelectedAgentId: (id: string | null) => void;
-  setSelectedGroupFolder: (folder: string | null) => void;
-  setSelectedSource: (source: string | null) => void;
   loadFilters: (query?: UsageQuery) => Promise<void>;
 }
 
@@ -749,13 +743,6 @@ export const useUsageStore = create<UsageState>((set, get) => ({
   refresh: async () => {
     await get().loadStats(queryFromState(get()));
   },
-
-  setDays: (days) => set({ days }),
-  setSelectedUserId: (id) => set({ selectedUserId: id }),
-  setSelectedModel: (model) => set({ selectedModel: model }),
-  setSelectedAgentId: (id) => set({ selectedAgentId: id }),
-  setSelectedGroupFolder: (folder) => set({ selectedGroupFolder: folder }),
-  setSelectedSource: (source) => set({ selectedSource: source }),
 
   loadFilters: async (providedQuery) => {
     const query = providedQuery || queryFromState(get());

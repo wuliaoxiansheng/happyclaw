@@ -46,10 +46,7 @@ import path from 'path';
 import { logger } from './logger.js';
 import { isValidNameSegment } from './plugin-manifest.js';
 import { getSnapshotPath, type CatalogPluginEntry } from './plugin-catalog.js';
-import {
-  getUserRuntimeRoot as getUserRuntimeRootFromUtils,
-  readUserPluginsV2,
-} from './plugin-utils.js';
+import { getUserRuntimeRoot, readUserPluginsV2 } from './plugin-utils.js';
 
 /**
  * Filename prefix for per-plugin runtime markers. Placed at snapshot-root
@@ -116,9 +113,7 @@ export interface MaterializeOptions {
 }
 
 /** runtime/ root for a user (caller mounts this whole dir into Docker). */
-export function getUserRuntimeRoot(userId: string): string {
-  return getUserRuntimeRootFromUtils(userId);
-}
+export { getUserRuntimeRoot };
 
 /** runtime/{userId}/snapshots/{snapshotId}/. */
 export function getUserSnapshotsDir(userId: string): string {

@@ -295,9 +295,114 @@ describe('resolveSessionLaunchOverrides', () => {
     );
     expect(mocks.logger.warn).not.toHaveBeenCalled();
   });
+
+  test('within another configuration, returns a model its list offers', () => {
+    setProviders(chatGpt('gpt'), {
+      ...thirdParty('glm'),
+      models: [
+        { id: 'glm-model' },
+        { id: 'glm-air' },
+        { id: 'glm-old', hidden: true },
+      ],
+    });
+    const glm = () =>
+      overrides.resolveSessionLaunchOverrides(
+        'grp',
+        null,
+        mocks.providers[1] as never,
+      );
+    db.setSessionModelSelection('grp', null, 'glm', 'member-1', {
+      model: 'glm-air',
+    });
+    expect(glm()).toEqual({ model: 'glm-air' });
+    // Left out of the picker, still the conversation's choice.
+    db.setSessionModelSelection('grp', null, 'glm', 'member-1', {
+      model: 'glm-old',
+    });
+    expect(glm()).toEqual({ model: 'glm-old' });
+    expect(mocks.logger.warn).not.toHaveBeenCalled();
+    // An effort goes with a model that takes it...
+    setProviders(chatGpt('gpt'), {
+      ...thirdParty('glm'),
+      models: [{ id: 'glm-model' }, { id: 'glm-air' }, { id: 'glm-5.3' }],
+    });
+    db.setSessionModelSelection('grp', null, 'glm', 'member-1', {
+      model: 'glm-5.3',
+      effort: 'high',
+    });
+    expect(glm()).toEqual({ model: 'glm-5.3', effort: 'high' });
+    // ...and is ignored, with a warning, on one that takes none.
+    db.setSessionModelSelection('grp', null, 'glm', 'member-1', {
+      model: 'glm-air',
+      effort: 'high',
+    });
+    expect(glm()).toEqual({ model: 'glm-air' });
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ providerId: 'glm', effort: 'high' }),
+      expect.any(String),
+    );
+  });
+
+  test('within another configuration, a model it dropped is ignored, quietly when predicting', () => {
+    db.setSessionModelSelection('grp', null, 'glm', 'member-1', {
+      model: 'glm-air',
+    });
+    const glm = mocks.providers[1] as never;
+    expect(
+      overrides.resolveSessionLaunchOverrides('grp', null, glm, {
+        warn: false,
+      }),
+    ).toEqual({});
+    expect(mocks.logger.warn).not.toHaveBeenCalled();
+    expect(overrides.resolveSessionLaunchOverrides('grp', null, glm)).toEqual(
+      {},
+    );
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ providerId: 'glm', model: 'glm-air' }),
+      expect.any(String),
+    );
+  });
 });
 
 describe('a pinned ChatGPT launch', () => {
+  test("an Agent's model is judged against the account catalog", () => {
+    const bound = runner.trySelectPoolProvider(
+      'grp',
+      null,
+      'gpt',
+      'gpt-6-astra',
+    );
+    providerPool.releaseSession('gpt');
+    expect(bound).toMatchObject({
+      profileId: 'gpt',
+      chosenModel: 'gpt-6-astra',
+      sessionModel: 'gpt-6-astra',
+      resolved: { config: { anthropicModel: 'gpt-6-astra' } },
+    });
+    expect(bound).not.toHaveProperty('sessionEffort');
+
+    // The account's own list rules out a model it does not have.
+    mocks.catalog = { models: CATALOG, source: 'live' };
+    const stale = runner.trySelectPoolProvider('grp', null, 'gpt', 'gpt-7-new');
+    providerPool.releaseSession('gpt');
+    expect(stale?.resolved.config.anthropicModel).toBe('gpt-6.1-sol');
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ providerId: 'gpt', model: 'gpt-7-new' }),
+      expect.any(String),
+    );
+  });
+
+  test('a model list never reaches a ChatGPT launch', () => {
+    setProviders(
+      { ...chatGpt('gpt'), models: [{ id: 'gpt-6.1-sol', effort: 'low' }] },
+      thirdParty('glm'),
+    );
+    db.setSessionModelSelection('grp', null, 'gpt', 'member-1');
+    const selected = runner.trySelectPoolProvider('grp', null);
+    providerPool.releaseSession('gpt');
+    expect(selected?.resolved.customEnv).toEqual({});
+  });
+
   test('runs the pinned model and hands the effort to the gateway lease', () => {
     db.setSessionModelSelection('grp', null, 'gpt', 'ops-1', {
       model: 'gpt-6-astra',
@@ -340,9 +445,11 @@ describe('a pinned ChatGPT launch', () => {
     const selected = runner.trySelectPoolProvider('grp', null);
     providerPool.releaseSession('glm');
     expect(selected).toMatchObject({ profileId: 'glm' });
-    expect(selected).not.toHaveProperty('sessionModel');
+    // Every configuration records the model its session runs on; only a
+    // ChatGPT one gets a gateway effort.
+    expect(selected).toMatchObject({ sessionModel: 'glm-model' });
     expect(selected).not.toHaveProperty('sessionEffort');
-    expect(db.getSessionModel('grp', null)).toBeNull();
+    expect(db.getSessionModel('grp', null)).toBe('glm-model');
   });
 
   test('records the model beside the provider binding', () => {
@@ -434,15 +541,6 @@ describe('changing the model starts a new session', () => {
     });
   });
 
-  test('is predicted when the pin is dropped but the pool keeps the binding', () => {
-    setProviders(chatGpt('gpt'), chatGpt('gpt-2'), thirdParty('glm'));
-    resumableSession('gpt', 'gpt-6-astra');
-    // No pin: the pool's sticky binding returns to the configuration's model.
-    expect(runner.willClearSessionOnProviderSwitch('grp', null)).toBe(true);
-    resumableSession('gpt', 'gpt-6.1-sol');
-    expect(runner.willClearSessionOnProviderSwitch('grp', null)).toBe(false);
-  });
-
   test('another configuration resets through the provider rule', () => {
     resumableSession('glm', null);
     db.setSessionModelSelection('grp', null, 'gpt', 'ops-1', {
@@ -472,13 +570,37 @@ describe('changing the model starts a new session', () => {
         chatJid: 'web:grp',
       },
       selected,
-      null,
     );
     expect(input.sessionId).toBeUndefined();
     // deleteSession wiped the row; the new session is bound and recorded again.
     expect(db.getSession('grp', null) || undefined).toBeUndefined();
     expect(db.getSessionProviderId('grp', null)).toBe('gpt');
     expect(db.getSessionModel('grp', null)).toBe('gpt-6-astra');
+  });
+
+  test('the reset rebinds the session the launch runs', () => {
+    const session = 'session-1';
+    db.setSession('grp', 'sdk-session-1', session);
+    db.setSessionProviderId('grp', session, 'gpt');
+    db.setSessionModel('grp', session, 'gpt-6.1-sol');
+    db.setSessionModelSelection('grp', session, 'gpt', 'ops-1', {
+      model: 'gpt-6-astra',
+    });
+    const selected = runner.trySelectPoolProvider('grp', session);
+    providerPool.releaseSession('gpt');
+    applyProviderSwitchToInput(
+      {
+        prompt: 'continue',
+        sessionId: 'sdk-session-1',
+        groupFolder: 'grp',
+        chatJid: `web:grp#agent:${session}`,
+        agentId: session,
+      },
+      selected,
+    );
+    expect(db.getSession('grp', session) || undefined).toBeUndefined();
+    expect(db.getSessionProviderId('grp', session)).toBe('gpt');
+    expect(db.getSessionModel('grp', session)).toBe('gpt-6-astra');
   });
 });
 

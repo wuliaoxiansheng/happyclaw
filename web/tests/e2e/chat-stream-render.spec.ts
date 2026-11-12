@@ -8,6 +8,8 @@ import { expect, test, type Page } from '@playwright/test';
 
 const HARNESS = '/tests/e2e/chat-render-harness.html';
 
+type WordSeen = { inserted: number[]; fading: boolean[]; frames: number[] };
+
 declare global {
   interface Window {
     renderHarness: {
@@ -15,6 +17,12 @@ declare global {
       emit: (event: Record<string, unknown>) => void;
       finish: (content: string) => void;
     };
+    /** The answer's word spans as `watchWords` saw them, by text. */
+    __words: Record<string, WordSeen>;
+    /** Each text the answer showed, and when (`recordAnswer`). */
+    __answer: { at: number; text: string }[];
+    /** Fading words of the first block when the second appeared. */
+    __fadingWhenClosed: number[];
   }
 }
 
@@ -73,11 +81,11 @@ test.describe('the step timeline', () => {
 
     // The oldest steps fold into one line that says what they were.
     await expect(
-      timeline.getByRole('button', { name: /较早 4 步 · 3 个工具/ }),
+      timeline.getByRole('button', { name: /较早 5 步 · 3 个工具/ }),
     ).toBeVisible();
-    // The latest ones are rows: finished reasoning, commentary, running tool,
-    // the sub-agent, and the reasoning being written.
-    await expect(timeline.getByText('比较方案')).toBeVisible();
+    // The latest five are rows: commentary, running tool, the sub-agent and the
+    // reasoning being written; the finished reasoning before them is folded.
+    await expect(timeline.getByText('比较方案')).toHaveCount(0);
     await expect(
       timeline.getByText('我先把渲染循环换成虚拟列表，再跑测试。'),
     ).toBeVisible();
@@ -110,7 +118,7 @@ test.describe('the step timeline', () => {
   test('opens a folded line to the steps it holds', async ({ page }) => {
     await open(page, 'scenario=streaming');
     const timeline = block(page).getByRole('list', { name: '处理步骤' });
-    const folded = timeline.getByRole('button', { name: /较早 4 步/ });
+    const folded = timeline.getByRole('button', { name: /较早 5 步/ });
     await expect(folded).toHaveAttribute('aria-expanded', 'false');
     await expect(timeline.getByText('已浏览 1 个文件 · 搜索 1 次')).toHaveCount(
       0,
@@ -135,6 +143,7 @@ test.describe('the step timeline', () => {
 
   test('has touch-sized buttons and nothing that sticks out sideways', async ({
     page,
+    hasTouch,
   }) => {
     await open(page, 'scenario=streaming');
     const card = block(page).locator('[data-hc-process-card]');
@@ -144,7 +153,7 @@ test.describe('the step timeline', () => {
     for (let i = 0; i < count; i += 1) {
       const box = await buttons.nth(i).boundingBox();
       // 40px is the touch target the coarse-pointer variants ask for.
-      expect(box!.height).toBeGreaterThanOrEqual(39);
+      if (hasTouch) expect(box!.height).toBeGreaterThanOrEqual(39);
     }
     await expectNoSidewaysOverflow(page);
   });
@@ -170,7 +179,7 @@ test.describe('the step timeline', () => {
     await expect(card).toBeVisible();
     // The process folds to one summary row; nothing spins.
     const summary = card.getByRole('button', {
-      name: /已处理 .* · 6 个工具 · 3 段思考 · 1 个失败/,
+      name: /^已工作 \d+s · \d+ 个工具 · 1 个失败$/,
     });
     await expect(summary).toBeVisible();
     await expect(summary).toHaveAttribute('aria-expanded', 'false');
@@ -248,8 +257,9 @@ test.describe('reasoning', () => {
     expect((await state()).top).toBeLessThan(8);
   });
 
-  test('scrolls in its own area without handing the scroll on to the chat', async ({
+  test('scrolls in its own area with a mouse; folds on a phone, all of it a tap away', async ({
     page,
+    isMobile,
   }) => {
     await open(page, 'scenario=live');
     await page.evaluate(() => {
@@ -262,8 +272,25 @@ test.describe('reasoning', () => {
     });
     const body = page.locator('[data-hc-thinking-body]');
     await expect(body).toBeVisible();
-    await expect(body).toHaveCSS('overscroll-behavior-y', 'contain');
-    await expect(body).toHaveCSS('overflow-y', 'auto');
+    if (!isMobile) {
+      await expect(body).toHaveCSS('overscroll-behavior-y', 'contain');
+      await expect(body).toHaveCSS('overflow-y', 'auto');
+      await expect(page.getByRole('button', { name: '查看全部' })).toHaveCount(
+        0,
+      );
+      return;
+    }
+    // No box in a box on a phone: a finger on it scrolls the chat.
+    await expect(body).toHaveCSS('overflow-y', 'hidden');
+    await expect(body).toHaveCSS('overscroll-behavior-y', 'auto');
+    await expect(body).toHaveAttribute('data-hc-clamped', 'cut');
+    const viewAll = page.getByRole('button', { name: '查看全部' });
+    expect((await viewAll.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    await viewAll.tap();
+    const sheet = page.getByRole('dialog', { name: '思考' });
+    await expect(sheet).toBeVisible();
+    await expect(sheet).toContainText('第 0 段。');
+    await expect(sheet).toContainText('第 29 段。');
   });
 });
 
@@ -306,10 +333,10 @@ test.describe('a proactive workspace', () => {
     page,
   }) => {
     await open(page, 'scenario=proactive&visibility=hidden');
-    await expect(block(page).getByText('正在处理…')).toBeVisible();
-    await expect(
-      block(page).getByRole('button', { name: '显示过程' }),
-    ).toBeVisible();
+    const bar = page.locator('[data-hc-run-status-bar]');
+    await expect(bar.locator('[data-hc-run-phase]')).toHaveText('处理中');
+    await expect(bar.getByRole('button', { name: '显示过程' })).toBeVisible();
+    await expect(bar).not.toContainText(/运行命令|搜索|Bash/);
     await expect(page.locator('[data-hc-process-panel]')).toHaveCount(0);
     const text = await block(page).innerText();
     for (const word of ['Bash', 'Grep', 'vitest', '检查移动端滚动性能']) {
@@ -383,12 +410,58 @@ test.describe('a proactive workspace', () => {
     await expectNoSidewaysOverflow(page);
   });
 
+  const PROGRESS = '收到，我先跑一遍侧栏的测试，再看滚动帧率，大概要一两分钟。';
+
+  for (const visibility of ['hidden', 'activity', 'full'] as const) {
+    test(`${visibility}: the progress the Agent sent, in the panel and the status bar`, async ({
+      page,
+    }) => {
+      await open(
+        page,
+        `scenario=proactive&visibility=${visibility}&progress=1`,
+      );
+      const panel = page.locator('[data-hc-process-panel]');
+      const steps = panel.getByRole('list', { name: '处理步骤' });
+      await expect(steps.getByText(PROGRESS)).toBeVisible();
+      const bar = page.locator('[data-hc-run-status-bar]');
+      await expect(bar.locator('[data-hc-run-progress]')).toHaveText(PROGRESS);
+      await expect(bar.locator('[data-hc-run-phase]')).toHaveText(
+        visibility === 'hidden' ? '处理中' : '运行命令',
+      );
+      if (visibility === 'hidden') {
+        // Nothing else of the process: no tool, no plan, no phase of the work.
+        const toggle = panel.getByRole('button', { name: /处理过程/ });
+        await expect(toggle).toContainText('正在处理');
+        await expect(toggle).not.toContainText(/运行命令|子 Agent|最近/);
+        const text = await panel.innerText();
+        for (const word of [
+          'Bash',
+          'Grep',
+          'vitest',
+          '检查移动端滚动性能',
+          '计划',
+        ]) {
+          expect(text).not.toContain(word);
+        }
+      }
+      // The reasoning title is `full`'s to show.
+      await expectNoModelText(
+        page,
+        visibility === 'full' ? ['确认订阅范围'] : [],
+      );
+      await expectNoSidewaysOverflow(page);
+    });
+  }
+
   test('"显示过程" opens the reply-mode settings with the visibility levels', async ({
     page,
   }) => {
     await open(page, 'scenario=proactive&visibility=hidden');
-    await block(page).getByRole('button', { name: '显示过程' }).click();
-    const dialog = page.getByRole('dialog', { name: '工作区回复模式' });
+    await page
+      .locator('[data-hc-run-status-bar]')
+      .getByRole('button', { name: '显示过程' })
+      .click();
+    const dialog = page.getByRole('dialog', { name: '工作区设置' });
     await expect(dialog).toBeVisible();
     const levels = dialog.getByRole('group', { name: '过程可见性' });
     await expect(levels.getByRole('radio')).toHaveCount(3);
@@ -413,9 +486,11 @@ test.describe('a finished reply that has its steps', () => {
     await reply.scrollIntoViewIfNeeded();
     const card = reply.locator('[data-hc-process-card]');
     await expect(card).toHaveAttribute('data-mode', 'settled');
-    const summary = card.getByRole('button', {
-      name: /已处理 .* · 6 个工具 · 3 段思考 · 1 个失败/,
-    });
+    // Folded, the line says that a call failed; opened, the counts say it.
+    const summary = card.getByRole('button', { name: /^已工作 \d+s/ });
+    await expect(summary).toHaveAccessibleName(
+      /^已工作 \d+s · \d+ 个工具 · 1 个失败$/,
+    );
     await expect(summary).toBeVisible();
     await expect(summary).toHaveAttribute('aria-expanded', 'false');
     // The two rows the card replaces are not there; the steps stay folded.
@@ -448,6 +523,7 @@ test.describe('a finished reply that has its steps', () => {
 
   test('has a summary row the touch target asks for, as high as the streaming card keeps', async ({
     page,
+    hasTouch,
   }) => {
     await open(page, 'scenario=history&steps=1');
     const summary = page
@@ -455,7 +531,8 @@ test.describe('a finished reply that has its steps', () => {
       .first();
     await summary.scrollIntoViewIfNeeded();
     const final = (await summary.boundingBox())!;
-    expect(final.height).toBeGreaterThanOrEqual(39);
+    // The touch target applies to coarse pointers only.
+    if (hasTouch) expect(final.height).toBeGreaterThanOrEqual(39);
 
     await open(page, 'scenario=settled');
     const frozen = (await page
@@ -587,6 +664,7 @@ test.describe('the reasoning and trace the server kept', () => {
 
   test('is one collapsed row that loads the settled card, open on the steps', async ({
     page,
+    hasTouch,
   }) => {
     const requests: string[] = [];
     await route(page, (r) => {
@@ -601,7 +679,7 @@ test.describe('the reasoning and trace the server kept', () => {
     // Nothing is asked for until the row is opened.
     expect(requests).toEqual([]);
     const rowBox = (await row.boundingBox())!;
-    expect(rowBox.height).toBeGreaterThanOrEqual(39);
+    if (hasTouch) expect(rowBox.height).toBeGreaterThanOrEqual(39);
 
     await row.click();
     const card = page.locator('[data-hc-process-card]');
@@ -613,7 +691,7 @@ test.describe('the reasoning and trace the server kept', () => {
     expect(summaryBox.width).toBeCloseTo(rowBox.width, 0);
     expect(summaryBox.x).toBeCloseTo(rowBox.x, 0);
     await expect(
-      card.getByRole('button', { name: /已处理 .* · 1 个工具 · 1 段思考/ }),
+      card.getByRole('button', { name: /^已工作 \d+s$/ }),
     ).toHaveAttribute('aria-expanded', 'true');
     const steps = card.getByRole('list', { name: '处理步骤' });
     await expect(steps.getByText('useChatStore in web/src')).toBeVisible();
@@ -622,7 +700,7 @@ test.describe('the reasoning and trace the server kept', () => {
     ).toBeVisible();
     await expect(page.getByRole('button', { name: '处理过程' })).toHaveCount(0);
     expect(requests).toEqual([
-      '/api/groups/web%3Arender-harness/turn-traces/turn-kept',
+      '/api/groups/web%3Arender-harness%23agent%3Arender-session/turn-traces/turn-kept',
     ]);
     // The reply itself did not move out from under the reader.
     await expect(page.getByText('改成窄 selector 即可。')).toBeVisible();
@@ -672,7 +750,7 @@ test.describe('the reasoning and trace the server kept', () => {
     await expect(loaded).toHaveAttribute('aria-expanded', 'true');
     await expect(page.getByText('useChatStore in web/src')).toBeVisible();
     expect(requests).toEqual([
-      '/api/groups/web%3Arender-harness/turn-traces/turn-kept',
+      '/api/groups/web%3Arender-harness%23agent%3Arender-session/turn-traces/turn-kept',
     ]);
     // The reply itself did not move out from under the reader.
     await expect(page.getByText('改成窄 selector 即可。')).toBeVisible();
@@ -755,21 +833,23 @@ test.describe('the reasoning and trace the server kept', () => {
     await page.getByRole('button', { name: '处理过程' }).click();
     const card = page.locator('[data-hc-process-card]');
     await expect(
-      card.getByRole('button', { name: /已处理 .* · 1 个工具/ }),
+      card.getByRole('button', { name: /^已工作 \d+s$/ }),
     ).toHaveAttribute('aria-expanded', 'true');
+    // The speech tool is not among the tools it says it used.
+    await expect(card.locator('[data-hc-work-counts]')).toHaveText(
+      '1 个工具 · 1 段思考',
+    );
     await expect(page.getByText('useChatStore in web/src')).toBeVisible();
     await expect(page.getByText(SAY)).toHaveCount(0);
     await expect(page.getByText('说点什么')).toHaveCount(0);
   });
 
-  for (const [visibility, row] of [
-    ['hidden', false],
-    ['activity', true],
-    ['full', true],
-  ] as const) {
-    test(`a proactive reply at the ${visibility} level offers ${
-      row ? 'its process' : 'nothing'
-    }`, async ({ page }) => {
+  // At hidden the server flags only a turn that sent progress, so a flagged
+  // reply offers its process at every level.
+  for (const visibility of ['hidden', 'activity', 'full'] as const) {
+    test(`a proactive reply at the ${visibility} level offers its process`, async ({
+      page,
+    }) => {
       await route(page, (r) => r.fulfill({ json: TURN_WITH_STEPS }));
       await open(
         page,
@@ -777,7 +857,7 @@ test.describe('the reasoning and trace the server kept', () => {
       );
       await expect(page.getByText('改成窄 selector 即可。')).toBeVisible();
       await expect(page.getByRole('button', { name: '处理过程' })).toHaveCount(
-        row ? 1 : 0,
+        1,
       );
       // The older rows are the classic layout's.
       await expect(page.getByRole('button', { name: '思考过程' })).toHaveCount(
@@ -789,17 +869,59 @@ test.describe('the reasoning and trace the server kept', () => {
     });
   }
 
+  for (const layout of ['timeline', 'classic'] as const) {
+    test(`a proactive reply at the hidden level opens to the progress alone (${layout})`, async ({
+      page,
+    }) => {
+      const progress = '先看订阅层级，稍后给结论。';
+      await route(page, (r) =>
+        r.fulfill({
+          json: {
+            ...TURN,
+            thinking: '',
+            thinking_duration_ms: null,
+            trace: [],
+            steps: [
+              {
+                id: 'note-p',
+                kind: 'text',
+                at: 1_000_000,
+                endedAt: 1_000_000,
+                status: 'done',
+                commentary: true,
+                progress: true,
+                text: progress,
+              },
+            ],
+          },
+        }),
+      );
+      await open(
+        page,
+        `scenario=lazy-trace&layout=${layout}&mode=proactive&visibility=hidden`,
+      );
+      const row = page.getByRole('button', { name: '处理过程' });
+      await expect(row).toHaveCount(1);
+      await expect(page.getByRole('button', { name: '执行详情' })).toHaveCount(
+        0,
+      );
+      await expect(page.getByText(progress)).toHaveCount(0);
+      await row.click();
+      const card = page.locator('[data-hc-process-card]');
+      await expect(card.getByText(progress)).toBeVisible();
+      await expect(card.locator('[data-hc-work-counts]')).toHaveText(
+        '1 条进展',
+      );
+      await expect(page.getByText('useChatStore in web/src')).toHaveCount(0);
+    });
+  }
+
   for (const [visibility, reasoning, trace] of [
-    ['hidden', false, false],
     ['activity', false, true],
     ['full', true, true],
   ] as const) {
     test(`a proactive reply in the classic layout at the ${visibility} level offers ${
-      !trace
-        ? 'nothing'
-        : reasoning
-          ? 'the trace and the reasoning'
-          : 'the trace only'
+      reasoning ? 'the trace and the reasoning' : 'the trace only'
     }`, async ({ page }) => {
       await route(page, (r) => r.fulfill({ json: TURN }));
       await open(
@@ -839,7 +961,7 @@ test.describe('on a wide screen', () => {
       card!.x + card!.width + 1,
     );
     // Rows are 28px tall with a mouse; the touch-sized variant does not apply.
-    const folded = timeline.getByRole('button', { name: /较早 4 步/ });
+    const folded = timeline.getByRole('button', { name: /较早 5 步/ });
     expect((await folded.boundingBox())!.height).toBeLessThan(32);
   });
 
@@ -966,5 +1088,337 @@ test.describe('on a wide screen', () => {
       .locator('[data-hc-process-panel]')
       .getByRole('button', { name: /处理过程/ });
     await expect(toggle).toContainText('最近：运行');
+  });
+});
+
+test.describe('the streamed answer', () => {
+  const ANSWER = '[data-hc-streaming-block] [data-markdown-root]';
+
+  const emitText = (page: Page, text: string) =>
+    page.evaluate(
+      (delta) =>
+        window.renderHarness.emit({ eventType: 'text_delta', text: delta }),
+      text,
+    );
+
+  /** Record each text the answer shows, and when. */
+  const recordAnswer = (page: Page) =>
+    page.evaluate((answer) => {
+      window.__answer = [];
+      let last = '';
+      new MutationObserver(() => {
+        const text = document.querySelector(answer)?.textContent ?? '';
+        if (text === last) return;
+        last = text;
+        window.__answer.push({ at: performance.now(), text });
+      }).observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+    }, ANSWER);
+
+  /**
+   * Watch each word span of the answer: its opacity when it entered the DOM,
+   * whether it was fading then, and its opacity on every frame after.
+   */
+  async function watchWords(page: Page) {
+    await page.evaluate((answer) => {
+      const words: Record<string, WordSeen> = {};
+      window.__words = words;
+      const seen = (span: HTMLElement) =>
+        (words[span.textContent!.trim()] ??= {
+          inserted: [],
+          fading: [],
+          frames: [],
+        });
+      const selector = `${answer} span`;
+      new MutationObserver((records) => {
+        for (const record of records) {
+          for (const node of record.addedNodes) {
+            if (!(node instanceof HTMLElement)) continue;
+            const spans = node.matches(selector)
+              ? [node]
+              : [...node.querySelectorAll<HTMLElement>('span')].filter((span) =>
+                  span.matches(selector),
+                );
+            for (const span of spans) {
+              const word = seen(span);
+              word.inserted.push(Number(getComputedStyle(span).opacity));
+              word.fading.push(span.getAnimations().length > 0);
+            }
+          }
+        }
+      }).observe(document.body, { childList: true, subtree: true });
+      const frame = () => {
+        for (const span of document.querySelectorAll<HTMLElement>(selector)) {
+          seen(span).frames.push(Number(getComputedStyle(span).opacity));
+        }
+        requestAnimationFrame(frame);
+      };
+      requestAnimationFrame(frame);
+    }, ANSWER);
+  }
+
+  const watched = (page: Page) => page.evaluate(() => window.__words);
+
+  /**
+   * Start the reply and let the page settle: mounting the live reply sets
+   * the composer and highlighter up in a long task, which must not fall
+   * between two renders a test times against a fade.
+   */
+  const startSettled = (page: Page) =>
+    page.evaluate(() => {
+      window.renderHarness.start();
+      return new Promise<void>((resolve) =>
+        requestIdleCallback(() => resolve(), { timeout: 2000 }),
+      );
+    });
+
+  /**
+   * Emit `text`, and `next` the moment the answer has a word span `shown`
+   * accepts: from inside the page, so no round trip to the test runner
+   * widens the gap while the words fade.
+   */
+  const emitThenOnShown = (
+    page: Page,
+    text: string,
+    next: string,
+    shown: string | null,
+  ) =>
+    page.evaluate(
+      ({ answer, text, next, shown }) =>
+        new Promise<void>((resolve) => {
+          const observer = new MutationObserver(() => {
+            const spans = document.querySelectorAll(`${answer} span`);
+            const ready = [...spans].some(
+              (span) => shown === null || span.textContent?.trim() === shown,
+            );
+            if (!ready) return;
+            observer.disconnect();
+            window.renderHarness.emit({ eventType: 'text_delta', text: next });
+            resolve();
+          });
+          observer.observe(document.body, { childList: true, subtree: true });
+          window.renderHarness.emit({ eventType: 'text_delta', text });
+        }),
+      { answer: ANSWER, text, next, shown },
+    );
+
+  /** A word never loses any opacity it showed: nothing fades in twice. */
+  function expectNeverFadesAgain(frames: number[], word: string) {
+    frames.forEach((opacity, i) => {
+      if (i > 0) {
+        expect(opacity, word).toBeGreaterThanOrEqual(frames[i - 1] - 0.01);
+      }
+    });
+  }
+
+  test('fades each new word in once, and a word shown never fades again', async ({
+    page,
+  }) => {
+    await open(page, 'scenario=live');
+    await watchWords(page);
+    await page.evaluate(() => window.renderHarness.start());
+    for (const delta of [
+      'Alpha bravo charlie. ',
+      'Delta echo ',
+      'foxtrot golf ',
+      'hotel india.',
+    ]) {
+      await emitText(page, delta);
+      await page.waitForTimeout(130);
+    }
+    const text = 'Alpha bravo charlie. Delta echo foxtrot golf hotel india.';
+    const answer = block(page).getByText(text);
+    await expect(answer).toBeVisible();
+    await page.waitForTimeout(400);
+    const words = await watched(page);
+    for (const word of ['Alpha', 'charlie.', 'Delta', 'golf', 'india.']) {
+      // It entered transparent and fading...
+      expect(words[word].fading[0], word).toBe(true);
+      expect(words[word].inserted[0], word).toBeLessThan(0.5);
+      // ...became opaque, and never lost any of it through the renders
+      // that followed.
+      expect(words[word].frames.at(-1), word).toBe(1);
+      expectNeverFadesAgain(words[word].frames, word);
+    }
+    // A copy of the words reads exactly as the text.
+    const copied = await answer.evaluate((paragraph) => {
+      getSelection()!.selectAllChildren(paragraph);
+      return getSelection()!.toString();
+    });
+    expect(copied).toBe(text);
+  });
+
+  test('a block re-read mid-fade resumes its words instead of restarting them', async ({
+    page,
+  }) => {
+    await open(page, 'scenario=live');
+    await watchWords(page);
+    await startSettled(page);
+    // The setext underline turns the paragraph into a heading (new elements),
+    // sent as soon as the last word is in, while it fades.
+    await emitThenOnShown(page, 'Heading words arrive', '\n===', 'arrive');
+    await expect(block(page).locator('h1')).toHaveText('Heading words arrive');
+    await page.waitForTimeout(400);
+    const words = await watched(page);
+    // The last word was still fading when the heading replaced it, and its
+    // new element picked the fade up where it was.
+    expect(words.arrive.fading).toEqual([true, true]);
+    expect(words.arrive.inserted[1]).toBeGreaterThan(0.05);
+    for (const word of ['Heading', 'words', 'arrive']) {
+      expect(words[word].frames.at(-1), word).toBe(1);
+      expectNeverFadesAgain(words[word].frames, word);
+    }
+  });
+
+  test('a paragraph that closes mid-fade finishes fading in', async ({
+    page,
+  }) => {
+    await open(page, 'scenario=live');
+    await watchWords(page);
+    // Enough words that they are still fading when the next block opens, as
+    // soon as they are in.
+    const first =
+      'One two three four five six seven eight nine ten eleven twelve.';
+    await page.evaluate((answer) => {
+      window.__fadingWhenClosed = [];
+      new MutationObserver(() => {
+        const roots = document.querySelectorAll(answer);
+        if (roots.length === 2 && window.__fadingWhenClosed.length === 0) {
+          window.__fadingWhenClosed.push(
+            roots[0].querySelectorAll('.hc-stream-word').length,
+          );
+        }
+      }).observe(document.body, { childList: true, subtree: true });
+    }, ANSWER);
+    await startSettled(page);
+    await emitThenOnShown(page, first, '\n\nSecond one', null);
+    // Once its words are in, the closed paragraph shows as final again.
+    const closed = page.locator(ANSWER).first();
+    await expect(page.locator(ANSWER)).toHaveCount(2);
+    await expect(closed.locator('span')).toHaveCount(0);
+    await expect(closed).toHaveText(first);
+    // When the second block appeared, the first was still fading in...
+    const [fading] = await page.evaluate(() => window.__fadingWhenClosed);
+    expect(fading).toBeGreaterThan(0);
+    // ...and none of its words (a burst fades in a few at a time) lost any
+    // of what they showed on the way.
+    const words = Object.entries(await watched(page)).filter(([word]) =>
+      first.includes(word),
+    );
+    expect(words.length).toBeGreaterThan(5);
+    for (const [word, { frames }] of words) {
+      expectNeverFadesAgain(frames, word);
+    }
+  });
+
+  test('a block after a paragraph break sent on its own fades in', async ({
+    page,
+  }) => {
+    await open(page, 'scenario=live');
+    await watchWords(page);
+    await page.evaluate(() => window.renderHarness.start());
+    await emitText(page, 'Opening words');
+    await expect(block(page).getByText('Opening words')).toBeVisible();
+    // A render that ends in the blank lines of the break.
+    await emitText(page, '\n\n');
+    await page.waitForTimeout(150);
+    await emitText(page, 'Following block');
+    await expect(block(page).getByText('Following block')).toBeVisible();
+    const words = await watched(page);
+    for (const word of ['Following', 'block']) {
+      expect(words[word].fading[0], word).toBe(true);
+    }
+  });
+
+  test('does not fade when less motion is asked for', async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await open(page, 'scenario=live');
+    await page.evaluate(() => window.renderHarness.start());
+    await emitText(page, '这是一段**普通**的回复，不带淡入。');
+    await expect(block(page).getByText(/^这是一段普通的回复/)).toBeVisible();
+    await expect(page.locator(`${ANSWER} span`)).toHaveCount(0);
+  });
+
+  test('never shows the asterisks or link syntax still being written', async ({
+    page,
+  }) => {
+    await open(page, 'scenario=live');
+    const reply =
+      '这是**重点内容**，然后是~~删除线~~，参见[文档](https://example.com/doc)。';
+    await recordAnswer(page);
+    // One character every 30ms: renders land mid-syntax.
+    await page.evaluate(async (text) => {
+      window.renderHarness.start();
+      for (const char of text) {
+        window.renderHarness.emit({ eventType: 'text_delta', text: char });
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+    }, reply);
+    const answer = page.locator(ANSWER).first();
+    await expect(answer.locator('strong')).toHaveText('重点内容');
+    await expect(answer.locator('del')).toHaveText('删除线');
+    await expect(answer.locator('a')).toHaveText('文档');
+    const shown = (await page.evaluate(() => window.__answer)).map(
+      ({ text }) => text,
+    );
+    expect(shown.length).toBeGreaterThan(5);
+    expect(shown.filter((text) => /\*\*|~~|\]\(|\(https/.test(text))).toEqual(
+      [],
+    );
+
+    // The final message is the plain rendering, with no word spans left.
+    await page.evaluate(
+      (content) => window.renderHarness.finish(content),
+      reply,
+    );
+    const final = page.locator('[data-message-id="live-final"]');
+    await expect(final.locator('strong')).toHaveText('重点内容');
+    await expect(final.locator('a')).toHaveAttribute(
+      'href',
+      'https://example.com/doc',
+    );
+    await expect(final.locator('[data-markdown-root] span')).toHaveCount(0);
+  });
+
+  test('renders less often while the reader types in the composer', async ({
+    page,
+  }) => {
+    await open(page, 'scenario=live');
+    await recordAnswer(page);
+    await page.evaluate(() => window.renderHarness.start());
+    /** Median milliseconds between renders of the answer as text streams. */
+    const cadence = async (typing: boolean) => {
+      const [from, to] = await page.evaluate(async (typing) => {
+        // The composer's Tiptap editor, as typing reaches it.
+        const composer = (
+          document.querySelector('[data-composer-editor]') as HTMLElement & {
+            editor: { commands: { insertContent: (text: string) => void } };
+          }
+        ).editor;
+        const from = performance.now();
+        for (let i = 0; i < 60; i += 1) {
+          window.renderHarness.emit({
+            eventType: 'text_delta',
+            text: `word${i} `,
+          });
+          if (typing) composer.commands.insertContent('a');
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        return [from, performance.now()];
+      }, typing);
+      const renders = (await page.evaluate(() => window.__answer))
+        .map(({ at }) => at)
+        .filter((at) => at >= from && at <= to);
+      const gaps = renders
+        .slice(1)
+        .map((at, i) => at - renders[i])
+        .sort((a, b) => a - b);
+      return gaps[Math.floor(gaps.length / 2)];
+    };
+    expect(await cadence(false)).toBeLessThan(180);
+    expect(await cadence(true)).toBeGreaterThanOrEqual(240);
   });
 });

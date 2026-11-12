@@ -22,14 +22,6 @@ describe('HappyClaw first-wake eligibility', () => {
     ).toBe(false);
     expect(
       isHappyClawBootstrapTurn({
-        turnId: 'scheduled-turn',
-        isHome: true,
-        isDefaultProfile: true,
-        isScheduledTask: true,
-      }),
-    ).toBe(false);
-    expect(
-      isHappyClawBootstrapTurn({
         turnId: 'custom-turn',
         isHome: true,
         isDefaultProfile: false,
@@ -46,45 +38,32 @@ describe('HappyClaw first-wake eligibility', () => {
 });
 
 describe('HappyClaw Owner Profile structural runtime eligibility', () => {
-  test('keeps capability across terminal warmup but denies unsafe runtime kinds', () => {
-    const warmup = {
+  test('any conversation session of Home has it; other runtime kinds do not', () => {
+    const session = {
       isHome: true,
       isDefaultProfile: true,
+      runtimeAgentKind: 'conversation' as const,
     };
-    expect(isHappyClawOwnerProfileRuntimeStructurallyEligible(warmup)).toBe(
+    expect(isHappyClawOwnerProfileRuntimeStructurallyEligible(session)).toBe(
       true,
     );
-    expect(
-      isHappyClawOwnerProfileRuntimeStructurallyEligible({
-        ...warmup,
-        runtimeAgentId: 'conversation-1',
-        runtimeAgentKind: 'conversation',
-      }),
-    ).toBe(true);
-    expect(
-      isHappyClawOwnerProfileRuntimeStructurallyEligible({
-        ...warmup,
-        isScheduledTask: true,
-      }),
-    ).toBe(false);
-    for (const runtimeAgentKind of ['task', 'spawn'] as const) {
+    for (const runtimeAgentKind of ['task', 'spawn', null] as const) {
       expect(
         isHappyClawOwnerProfileRuntimeStructurallyEligible({
-          ...warmup,
-          runtimeAgentId: `${runtimeAgentKind}-1`,
+          ...session,
           runtimeAgentKind,
         }),
       ).toBe(false);
     }
     expect(
       isHappyClawOwnerProfileRuntimeStructurallyEligible({
-        ...warmup,
+        ...session,
         isHome: false,
       }),
     ).toBe(false);
     expect(
       isHappyClawOwnerProfileRuntimeStructurallyEligible({
-        ...warmup,
+        ...session,
         isDefaultProfile: false,
       }),
     ).toBe(false);

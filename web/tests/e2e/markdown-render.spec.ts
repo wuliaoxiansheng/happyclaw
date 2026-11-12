@@ -13,15 +13,45 @@ async function openMarkdown(page: Page, query = '') {
   return sink;
 }
 
+type MarkdownHarnessWindow = Window & {
+  markdownHarness: {
+    kitchenSink: string;
+    setPartial(partialText: string): void;
+    finish(content?: string): void;
+  };
+};
+
 /** Append a settled assistant reply to the transcript. */
 async function appendReply(page: Page, content: string) {
   await page.evaluate((text) => {
-    (
-      window as unknown as {
-        markdownHarness: { finish(content: string): void };
-      }
-    ).markdownHarness.finish(text);
+    (window as MarkdownHarnessWindow).markdownHarness.finish(text);
   }, content);
+}
+
+/**
+ * The Markdown a message renders, as its elements (tag and classes) and
+ * text in document order; diagrams count as one element.
+ */
+function renderedShape(message: Locator) {
+  return message.evaluate((element) => {
+    const shape: string[] = [];
+    const walk = (node: Node) => {
+      for (const child of node.childNodes) {
+        if (child instanceof Element) {
+          shape.push(
+            `<${child.localName} ${child.getAttribute('class') ?? ''}>`,
+          );
+          if (child.localName !== 'svg') walk(child);
+        } else if (child.textContent?.trim()) {
+          shape.push(child.textContent);
+        }
+      }
+    };
+    for (const root of element.querySelectorAll('[data-markdown-root]')) {
+      walk(root);
+    }
+    return shape;
+  });
 }
 
 /** Whether the element or any ancestor is fixed-positioned. */
@@ -122,6 +152,43 @@ test.describe('chat Markdown rendering', () => {
       'href',
       /^\/api\/groups\/web%3Arender-harness\/files\/preview\//,
     );
+  });
+
+  test('a settled reply wraps without a lone last character; a streaming one does not re-break', async ({
+    page,
+  }) => {
+    const sink = await openMarkdown(page);
+    const wrap = (locator: Locator) =>
+      locator.evaluate((element) => getComputedStyle(element).textWrapStyle);
+    expect(await wrap(sink.locator('p').first())).toBe('pretty');
+    expect(await wrap(sink.locator('li').first())).toBe('pretty');
+    expect(await wrap(sink.locator('h1').first())).toBe('balance');
+
+    const reply =
+      '流式回复的第一段，已经写完了。\n\n## 小标题\n\n第二段还在一个字一个字地出来';
+    await page.evaluate((text) => {
+      (window as MarkdownHarnessWindow).markdownHarness.setPartial(text);
+    }, reply);
+    const streaming = page.locator('p', { hasText: '第二段还在' }).last();
+    await expect(streaming).toBeVisible();
+    expect(await wrap(streaming)).not.toBe('pretty');
+    // A block that closed keeps the plain wrap while the reply streams on,
+    // also once its words are in and it renders as final Markdown: wrapping
+    // it again would move the open block under it.
+    const closed = page.locator('p', { hasText: '流式回复的第一段' }).last();
+    await expect(closed.locator('.hc-stream-word')).toHaveCount(0);
+    expect(await wrap(closed)).not.toBe('pretty');
+    expect(
+      await wrap(page.locator('h2', { hasText: '小标题' }).last()),
+    ).not.toBe('balance');
+
+    // Once the reply is final, all of it wraps for looks.
+    await appendReply(page, `${reply}。`);
+    // The streaming copy is gone; only the final message has it.
+    await expect(page.locator('p', { hasText: '第二段还在' })).toHaveCount(1);
+    expect(
+      await wrap(page.locator('p', { hasText: '流式回复的第一段' }).last()),
+    ).toBe('pretty');
   });
 
   test('footnote references jump within the message', async ({
@@ -277,5 +344,54 @@ test.describe('chat Markdown rendering', () => {
     expect(page.url()).toBe(url);
     // The click opened the link, not the enlarged preview.
     await expect(page.getByRole('dialog')).toHaveCount(0);
+  });
+
+  test('a streamed reply settles into the rendering of the reply loaded whole', async ({
+    page,
+  }) => {
+    await openMarkdown(page);
+    const loaded = page.locator('[data-message-id="md-a1"]');
+    // Images that fail to load have settled into their placeholder.
+    await expect(loaded.getByText('工作区相对路径图片')).toBeVisible();
+    // Diagrams render once they scroll into view.
+    const pending = loaded.getByText('Mermaid 图表渲染中');
+    await expect
+      .poll(async () => {
+        await pending
+          .first()
+          .scrollIntoViewIfNeeded({ timeout: 500 })
+          .catch(() => {});
+        return pending.count();
+      })
+      .toBe(0);
+    const shape = await renderedShape(loaded);
+
+    await page.goto(`${HARNESS_PATH}?scenario=markdown-streaming`);
+    await page.waitForFunction(() => 'markdownHarness' in window);
+    const sink = await page.evaluate(
+      () => (window as MarkdownHarnessWindow).markdownHarness.kitchenSink,
+    );
+    let fading = 0;
+    for (let end = 300; end < sink.length + 300; end += 300) {
+      await page.evaluate(
+        (text) =>
+          (window as MarkdownHarnessWindow).markdownHarness.setPartial(text),
+        sink.slice(0, end),
+      );
+      await page.waitForTimeout(120);
+      fading += await page
+        .locator('[data-hc-streaming-block] .hc-stream-word')
+        .count();
+    }
+    // The open block's words faded in while it streamed...
+    expect(fading).toBeGreaterThan(0);
+    await page.evaluate(() =>
+      (window as MarkdownHarnessWindow).markdownHarness.finish(),
+    );
+    // ...and the final message carries nothing of it.
+    const final = page.locator('[data-message-id="md-final"]');
+    await expect(final.getByText('工作区相对路径图片')).toBeVisible();
+    await expect(page.locator('[data-markdown-pending]')).toHaveCount(0);
+    await expect.poll(() => renderedShape(final)).toEqual(shape);
   });
 });

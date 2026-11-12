@@ -21,7 +21,7 @@ export function stripAgentInternalTags(text: string): string {
 /**
  * True when the agent deliberately answered with nothing but non-empty
  * `<internal>`/`<process>` blocks — a complete, intentionally silent final
- * (e.g. a scheduled pipeline stage confirming "done" without notifying).
+ * (e.g. an automation run confirming "done" without notifying).
  */
 export function isInternalOnlyAgentOutput(
   text: string | null | undefined,
@@ -31,10 +31,6 @@ export function isInternalOnlyAgentOutput(
   // content. Empty or nested-empty blocks leave only whitespace.
   return text.replace(/<\/?(?:internal|process)>/g, '').trim() !== '';
 }
-
-/** Workspace notice for a scheduled run that ended silently on purpose. */
-export const SCHEDULED_TASK_SILENT_COMPLETION_NOTICE =
-  'Agent 已按任务要求以内部确认静默完成，没有面向用户的输出。';
 
 /**
  * Detect whether an agent output is system-maintenance noise that should
@@ -67,14 +63,18 @@ export function isSystemMaintenanceNoise(text: string): boolean {
 }
 
 /**
- * Strip virtual JID suffixes (#task:xxx, #agent:xxx) to get the base JID.
+ * Strip the virtual session suffix (#agent:xxx) to get the base JID.
  */
 export function stripVirtualJidSuffix(jid: string): string {
-  const taskSep = jid.indexOf('#task:');
-  if (taskSep >= 0) return jid.slice(0, taskSep);
   const agentSep = jid.indexOf('#agent:');
   if (agentSep >= 0) return jid.slice(0, agentSep);
   return jid;
+}
+
+/** The Runtime Session of a `{workspaceJid}#agent:{id}` route JID, else null. */
+export function agentIdOfJid(jid: string): string | null {
+  const agentSep = jid.indexOf('#agent:');
+  return agentSep >= 0 ? jid.slice(agentSep + '#agent:'.length) || null : null;
 }
 
 /**
@@ -103,7 +103,7 @@ export function escapeCsvField(value: unknown): string {
  * resolve THAT, then re-append the not-yet-existing tail — so a not-yet-created
  * leaf under a symlinked parent is still resolved correctly.
  */
-function realpathBestEffort(p: string): string {
+export function realpathBestEffort(p: string): string {
   let checkPath = path.resolve(p);
   const tail: string[] = [];
   while (checkPath !== path.dirname(checkPath)) {
@@ -222,18 +222,28 @@ export function isSecureRequest(c: any): boolean {
   return false;
 }
 
+/** A session's IPC root, the runner's /workspace/ipc. */
+export function sessionIpcDir(folder: string, agentId: string): string {
+  return path.join(DATA_DIR, 'ipc', folder, 'agents', agentId);
+}
+
+/**
+ * A session's Claude directory: ~/.claude in a container, CLAUDE_CONFIG_DIR
+ * on the host.
+ */
+export function sessionClaudeDir(folder: string, agentId: string): string {
+  return path.join(DATA_DIR, 'sessions', folder, 'agents', agentId, '.claude');
+}
+
 /** Create IPC + session directories for an agent. */
 export function ensureAgentDirectories(
   folder: string,
   agentId: string,
 ): string {
-  const agentIpcDir = path.join(DATA_DIR, 'ipc', folder, 'agents', agentId);
+  const agentIpcDir = sessionIpcDir(folder, agentId);
   fs.mkdirSync(path.join(agentIpcDir, 'input'), { recursive: true });
   fs.mkdirSync(path.join(agentIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(agentIpcDir, 'tasks'), { recursive: true });
-  fs.mkdirSync(
-    path.join(DATA_DIR, 'sessions', folder, 'agents', agentId, '.claude'),
-    { recursive: true },
-  );
+  fs.mkdirSync(sessionClaudeDir(folder, agentId), { recursive: true });
   return agentIpcDir;
 }

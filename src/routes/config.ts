@@ -6,8 +6,17 @@ import path from 'node:path';
 import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
 import QRCode from 'qrcode';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
+import {
+  listStorageSources,
+  listStorageSourceUsers,
+  planStorageSourceDelete,
+  planStorageSourceSave,
+  StorageSourceAdminError,
+  withStorageSourceWriteLock,
+} from '../storage-source-admin.js';
 import { DATA_DIR } from '../config.js';
+import { bindSystemMainIfUnbound } from '../model-binding-backfill.js';
 import {
   avatarUploadBodyLimit,
   AVATAR_MAX_FILE_BYTES,
@@ -16,7 +25,7 @@ import type { Variables } from '../web-context.js';
 import { getWebDeps } from '../web-context.js';
 import { canAccessGroup, canModifyGroup } from '../group-acl.js';
 import { recordLegacyUserImRoute } from '../legacy-route-telemetry.js';
-import { extractChatId, getChannelType } from '../im-channel.js';
+import { getChannelType } from '../im-channel.js';
 import {
   deleteRegisteredGroup,
   deleteChatHistory,
@@ -31,33 +40,30 @@ import {
   logAuthEvent,
   deleteWorkspaceSessions,
   deleteSessionsByProviderIdAroundCommit,
-  getSession,
   getRouterState,
   getRouterStateByPrefix,
   setRouterState,
   deleteRouterState,
   isDatabaseInitialized,
-  VALID_ACTIVATION_MODES,
   getDefaultChannelAccount,
   getLegacyChannelAccount,
-  getChannelAccount,
-  getGroupsByTargetAgent,
-  updateAgentLastImJid,
   clearSessionModelSelectionsForModelConfig,
   countAgentProfilesByModelConfigId,
   countSessionModelSelectionsForModelConfig,
+  listAgentProfilesUsingModels,
+  listSessionNamespacesForProviderId,
 } from '../db.js';
+import { parseChannelAddress } from '../channel-address.js';
+import { conversationBindingPolicyError } from '../channel-conversation-kind.js';
 import {
-  channelConversationJid,
-  parseChannelAddress,
-} from '../channel-address.js';
-import { isMentionActivationMode } from '../feishu-conversation-policy.js';
-import { normalizeLegacyOwnerMention } from '../im-audience-policy.js';
-import {
-  conversationBindingPolicyError,
-  resolveChannelConversationKind,
-  type ChannelConversationKind,
-} from '../channel-conversation-kind.js';
+  FEISHU_P2P_MENTION_ACTIVATION_ERROR,
+  feishuP2pRejectsMentionActivation,
+  fetchLiveChatInfo,
+  getConversationKind,
+  hasConsistentChannelAccount,
+  parseBindingResponsePolicy,
+  refreshAgentLastImJid,
+} from '../channel-binding-helpers.js';
 import {
   adminRoleMiddleware,
   authMiddleware,
@@ -76,30 +82,29 @@ import {
   AppearanceConfigSchema,
   HostIntegrationSettingsSchema,
   SystemSettingsSchema,
+  StorageSourceSaveSchema,
   UnifiedProviderCreateSchema,
   UnifiedProviderPatchSchema,
   UnifiedProviderSecretsSchema,
   ProviderConnectivityTestSchema,
-  BalancingConfigSchema,
+  ProviderDiscoverModelsSchema,
+  type ProviderConnectivityTestInput,
 } from '../schemas.js';
 import {
   getClaudeProviderConfig,
   toPublicClaudeProviderConfig,
   appendClaudeConfigAudit,
   getProviders,
-  getEnabledProviders,
-  getDefaultModelConfigId,
-  getUsableDefaultProvider,
-  setDefaultModelConfig,
-  DEFAULT_MODEL_DISABLE_ERROR,
-  getBalancingConfig,
-  saveBalancingConfig,
+  getProviderById,
+  getGlobalProvider,
   createProvider,
+  nextProviderModelList,
+  providerModels,
+  recordProviderTest,
   updateProvider,
   updateProviderSecrets,
-  setProviderEnabled,
   duplicateProvider,
-  providerHasCredentials,
+  reservedConnectionEnvError,
   validateProviderCustomEnv,
   deleteProvider,
   providerToConfig,
@@ -142,6 +147,7 @@ import type {
   ClaudeOAuthAccountInfo,
   ClaudeOAuthCredentials,
   CachedOAuthUsage,
+  ProviderAuthMode,
   UnifiedProvider,
 } from '../runtime-config.js';
 import {
@@ -149,6 +155,7 @@ import {
   buildClaudeCodeExchangeBody,
   ClaudeCredentialInputError,
   CLAUDE_CODE_USER_AGENT,
+  CLAUDE_OAUTH_BETA,
   CLAUDE_OAUTH_PROFILE_URL,
   CLAUDE_OAUTH_TOKEN_URL,
   CLAUDE_OAUTH_USAGE_URL,
@@ -199,20 +206,50 @@ import {
   resolveCodexDefaultEffort,
 } from '../codex-gateway/model-catalog.js';
 import {
+  codexProviderCatalogFailure,
   ensureCodexProviderCatalog,
   getResolvedCodexCatalog,
+  listCodexModelsForProvider,
   maybeRefreshCodexCatalog,
+  refreshCodexProviderCatalog,
   type ProviderCodexCatalog,
 } from '../codex-gateway/model-catalog-sync.js';
 import {
   hasOAuthUsageSignals,
   parseOAuthUsageResponse,
 } from '../runtime-config.js';
-import type { AudienceMode, AuthUser, RegisteredGroup } from '../types.js';
+import type { AuthUser, RegisteredGroup } from '../types.js';
 import { logger } from '../logger.js';
 import brandAssetRoutes from './brand-assets.js';
-import { testFeishuCredentials } from '../feishu-connectivity.js';
-import { testProviderConnectivity } from '../provider-connectivity.js';
+import { testFeishuAppCredentials } from '../channel-account-connectivity.js';
+import {
+  ANTHROPIC_API_ORIGIN,
+  checkClaudeAccount,
+  CLAUDE_SUBSCRIPTION_MODELS,
+  connectionTestResult,
+  discoverAnthropicModels,
+  discoverEndpointModels,
+  redact,
+  testAnthropicApiKey,
+  testProviderConnectivity,
+  testThirdPartyConnection,
+  type ConnectionTestResult,
+  type ModelDiscoveryResult,
+} from '../provider-connectivity.js';
+import {
+  classifyProviderError,
+  CONNECTION_ENV_PREFILL,
+  findPresetsByBaseUrl,
+  getModelPreset,
+  modelsUrlFor,
+  normalizeProviderBaseUrl,
+  presetModelEntry,
+  splitOneMillionSuffix,
+  type ModelPreset,
+  type ProviderErrorCode,
+  type ProviderModelEntry,
+} from '../model-providers.js';
+import { isCodexGatewayBaseUrl } from '../codex-gateway/resolve-gateway-url.js';
 import {
   buildSessionMountUpdate,
   buildDetachedWorkspaceUpdate,
@@ -221,9 +258,10 @@ import {
   hasRemainingThreadMapMount,
   hasSessionMountConflict,
   hasWorkspaceMountConflict,
+  isBindableSession,
   isNativeContextContainer,
+  SESSION_NOT_BINDABLE,
   unbindChannelMount,
-  type NativeContextMetadata,
 } from '../channel-mount-service.js';
 import { checkImChannelLimit, isBillingEnabled } from '../billing.js';
 import { providerPool } from '../provider-pool.js';
@@ -231,13 +269,12 @@ import { getProviderQuotaObservation } from '../provider-quota-observation.js';
 import { updateProviderSessionCredentials } from '../provider-session-credentials.js';
 import { getClientIp } from '../utils.js';
 import {
-  getWorkspaceRuntimeJids,
+  collectWorkspaceRuntimeJids,
   quiesceWorkspaceRunnersAroundCommit,
   resolveEffectiveAgentProfile,
   withAgentProfileLocks,
   WorkspaceRuntimeQuiesceError,
 } from '../agent-profile-runtime.js';
-import { notifyTaskSchedulerChanged } from '../task-scheduler.js';
 import {
   SYSTEM_CAPABILITY_LOCK_KEY,
   withCapabilityScopeLocks,
@@ -249,6 +286,25 @@ import {
   markAdminHostOnlyCleanupPending,
   restorePendingAdminHostOnlyRuntimeSafetyBlocks,
 } from '../admin-host-only-runtime.js';
+import {
+  DEPLOYMENT_MODE_ENV,
+  getDeploymentModeResolution,
+  isSingleUserHost,
+  resolveDeploymentMode,
+} from '../deployment-mode.js';
+import {
+  getWorkspaceRootResolution,
+  rootForNewWorkspaces,
+  validateWorkspaceRootSetting,
+  WORKSPACE_ROOT_PROBLEM_MESSAGES,
+} from '../workspace-root.js';
+import {
+  listOtherActiveUsers,
+  SingleUserHostConflictError,
+  singleUserHostRefusal,
+  type OtherActiveUser,
+} from '../single-user-host-guard.js';
+import { getWorkspaceRootOccupancy } from '../workspace-dir.js';
 const configRoutes = new Hono<{ Variables: Variables }>();
 
 configRoutes.use('/user-im/*', async (c, next) => {
@@ -331,6 +387,11 @@ interface ApplyOptions {
   sessionInvalidation?: {
     modelChanged: boolean;
     baseUrlChanged: boolean;
+    /**
+     * Set when the default model's change is the only reason: sessions on
+     * another model of the provider keep running it and are kept.
+     */
+    previousDefaultModel?: string;
   };
 }
 
@@ -448,12 +509,11 @@ function restorePendingProviderRuntimeSafetyBlocks(): void {
   for (const providerId of pendingProviderIds) {
     if (providerId && configuredProviderIds.has(providerId)) continue;
     if (providerId) {
-      const cleanup = deleteSessionsByProviderIdAroundCommit(
+      deleteSessionsByProviderIdAroundCommit(
         providerId,
         undefined,
         () => undefined,
       );
-      syncProviderSessionCaches(cleanup.affectedFolders);
     }
     deleteRouterState(providerInvalidationStateKey(providerId));
     volatilePendingProviderSessionInvalidations.delete(providerId);
@@ -464,12 +524,9 @@ function restorePendingProviderRuntimeSafetyBlocks(): void {
     );
   }
   if (pendingProviderIds.size === 0) return;
-  const runtimeJids = Array.from(
-    new Set(
-      getClaudeRuntimeTargets().flatMap((target) =>
-        getWorkspaceRuntimeJids(deps, target.folder, target.primaryJid),
-      ),
-    ),
+  const runtimeJids = collectWorkspaceRuntimeJids(
+    deps,
+    getClaudeRuntimeTargets(),
   );
   deps.queue.blockGroupsForRuntimeSafety(
     runtimeJids,
@@ -588,35 +645,51 @@ function getSafeLegacyUnboundFolders(
 function getProviderSessionCleanupOptions(
   providerId: string,
   invalidation?: ApplyOptions['sessionInvalidation'],
-): { includeUnboundFolders: string[] } {
+): { includeUnboundFolders: string[]; previousDefaultModel?: string } {
   return {
     includeUnboundFolders: getSafeLegacyUnboundFolders(
       providerId,
       invalidation,
     ),
+    ...(invalidation?.previousDefaultModel !== undefined
+      ? { previousDefaultModel: invalidation.previousDefaultModel }
+      : {}),
   };
 }
 
-function syncProviderSessionCaches(affectedFolders: string[]): void {
-  if (!deps) return;
-  for (const folder of affectedFolders) {
-    const remainingMainSession = getSession(folder);
-    if (remainingMainSession !== undefined) {
-      deps.sessions[folder] = remainingMainSession;
-    } else {
-      delete deps.sessions[folder];
-    }
-  }
+/** The models a connection offers once an edit is saved. */
+function providerModelsAfterEdit(
+  previous: UnifiedProvider,
+  patch: {
+    anthropicBaseUrl?: string;
+    anthropicModel?: string;
+    models?: ProviderModelEntry[];
+  },
+): ProviderModelEntry[] {
+  const anthropicModel =
+    patch.anthropicModel !== undefined
+      ? patch.anthropicModel.trim()
+      : previous.anthropicModel;
+  return providerModels({
+    anthropicBaseUrl: patch.anthropicBaseUrl ?? previous.anthropicBaseUrl,
+    anthropicModel: splitOneMillionSuffix(anthropicModel).model,
+    models: nextProviderModelList(previous, {
+      anthropicModel,
+      models: patch.models,
+    }),
+  });
 }
 
 /**
- * Whether runners may be using this provider. The automatic pool only picks
- * enabled ones, but an Agent binding or a conversation's model pick can run
- * any saved configuration — those need the same runtime cleanup on a change.
+ * Whether runners may be using this provider: a stored session ran on it, an
+ * Agent binds it (directly or as the main Agent others follow), a
+ * conversation picked it, or it is the connection host-side calls and unbound
+ * launches fall back to.
  */
 function providerMayHaveRunners(provider: UnifiedProvider): boolean {
   return (
-    provider.enabled ||
+    getGlobalProvider()?.id === provider.id ||
+    listSessionNamespacesForProviderId(provider.id).length > 0 ||
     countAgentProfilesByModelConfigId(provider.id) > 0 ||
     countSessionModelSelectionsForModelConfig(provider.id) > 0
   );
@@ -632,7 +705,6 @@ function commitProviderConfigWithSessionInvalidation<T>(
     getProviderSessionCleanupOptions(providerId, invalidation),
     commit,
   );
-  syncProviderSessionCaches(result.affectedFolders);
   return { value: result.value, clearedSessionsCount: result.deletedCount };
 }
 
@@ -654,13 +726,7 @@ function getClaudeRuntimeTargets(): Array<{
 
 function getKnownClaudeRuntimeJids(): string[] {
   if (!deps) return [];
-  return Array.from(
-    new Set(
-      getClaudeRuntimeTargets().flatMap((target) =>
-        getWorkspaceRuntimeJids(deps, target.folder, target.primaryJid),
-      ),
-    ),
-  );
+  return collectWorkspaceRuntimeJids(deps, getClaudeRuntimeTargets());
 }
 
 async function mutateClaudeConfigForAllGroups<T>(
@@ -1125,7 +1191,7 @@ async function fetchOAuthUsage(
         {
           headers: {
             Authorization: `Bearer ${oauthCredentials.accessToken}`,
-            'anthropic-beta': 'oauth-2025-04-20',
+            'anthropic-beta': CLAUDE_OAUTH_BETA,
             'Content-Type': 'application/json',
           },
         },
@@ -1399,116 +1465,17 @@ configRoutes.get('/claude', authMiddleware, systemConfigMiddleware, (c) => {
   }
 });
 
-// ─── GET /claude/providers — 列出所有供应商 + 健康 + 负载均衡配置 ─────
+// ─── GET /claude/providers — 列出所有模型连接 ─────
 configRoutes.get(
   '/claude/providers',
   authMiddleware,
   systemConfigMiddleware,
   (c) => {
     try {
-      const providers = getProviders();
-      const balancing = getBalancingConfig();
-      const enabledProviders = getEnabledProviders();
-
-      // Refresh pool state for health info
-      providerPool.refreshFromConfig(enabledProviders, balancing);
-      const healthStatuses = providerPool.getHealthStatuses();
-
-      return c.json({
-        providers: providers.map((p) => ({
-          ...toPublicProvider(p),
-          health: healthStatuses.find((h) => h.profileId === p.id) || null,
-        })),
-        balancing,
-        enabledCount: enabledProviders.length,
-        // The default that actually applies: one that lost its credential
-        // pins nothing, so the page must not present it as the default.
-        defaultModelConfigId: getUsableDefaultProvider()?.id ?? null,
-      });
+      return c.json({ providers: getProviders().map(toPublicProvider) });
     } catch (err) {
       logger.error({ err }, 'Failed to list providers');
       return c.json({ error: 'Failed to list providers' }, 500);
-    }
-  },
-);
-
-// ─── PUT /claude/default — 设置或取消默认模型配置 ─────
-// providerId=null 取消默认，回到已启用配置的自动轮换。
-configRoutes.put(
-  '/claude/default',
-  authMiddleware,
-  systemConfigMiddleware,
-  async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const raw = (body as { modelConfigId?: unknown }).modelConfigId;
-    if (raw !== null && (typeof raw !== 'string' || !raw.trim())) {
-      return c.json(
-        { error: 'modelConfigId must be a non-empty string or null' },
-        400,
-      );
-    }
-    const modelConfigId = raw === null ? null : (raw as string).trim();
-    const actor = (c.get('user') as AuthUser).username;
-
-    try {
-      return await withClaudeConfigMutationLock(async () => {
-        const previousId = getDefaultModelConfigId();
-        const target = modelConfigId
-          ? getProviders().find((provider) => provider.id === modelConfigId)
-          : null;
-        // Refuse before any runner is stopped.
-        if (modelConfigId) {
-          if (!target) throw new Error('未找到指定模型配置');
-          if (!providerHasCredentials(target)) {
-            throw new Error(
-              '该模型配置还没有可用的凭据，请先填写密钥或完成授权',
-            );
-          }
-        }
-        if (previousId === modelConfigId && (!target || target.enabled)) {
-          return c.json({
-            defaultModelConfigId: previousId,
-            provider: target ? toPublicProvider(target) : null,
-            applied: {
-              success: true,
-              stoppedCount: 0,
-              failedCount: 0,
-              persisted: true,
-            },
-          });
-        }
-        const mutation = await mutateClaudeConfigForAllGroups(
-          actor,
-          {
-            trigger: 'default_model_update',
-            previousModelConfigId: previousId,
-            modelConfigId,
-          },
-          () => {
-            const provider = setDefaultModelConfig(modelConfigId);
-            appendClaudeConfigAuditBestEffort(
-              actor,
-              modelConfigId ? 'set_default_model' : 'clear_default_model',
-              modelConfigId ? [`id:${modelConfigId}`] : [],
-            );
-            return provider;
-          },
-        );
-        const provider = mutation.value ?? null;
-        const payload = {
-          defaultModelConfigId: getUsableDefaultProvider()?.id ?? null,
-          provider: provider ? toPublicProvider(provider) : null,
-          applied: mutation.applied,
-        };
-        return mutation.applied.success
-          ? c.json(payload)
-          : c.json({ error: mutation.applied.error, ...payload }, 503);
-      });
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Failed to set default model';
-      logger.warn({ err, modelConfigId }, 'Failed to set default model');
-      return c.json({ error: message }, 400);
     }
   },
 );
@@ -1528,25 +1495,31 @@ configRoutes.post(
       );
     }
 
+    const reserved = reservedConnectionEnvError(validation.data.customEnv);
+    if (reserved) return c.json(reserved, 400);
     const envError = validateProviderCustomEnv(validation.data.customEnv ?? {});
     if (envError) return c.json({ error: envError }, 400);
-    if (validation.data.enabled) {
-      const draft = validation.data;
-      const hasCredential = !!(
-        draft.anthropicAuthToken?.trim() ||
-        draft.anthropicApiKey?.trim() ||
-        (draft.type === 'official' &&
-          (draft.claudeCodeOauthToken?.trim() ||
-            draft.claudeOAuthCredentials ||
-            draft.claudeCredentialInput?.trim()))
-      );
-      if (!hasCredential) {
-        return c.json({ error: '启用的模型配置必须带有可用的凭据' }, 400);
-      }
+    // A connection without a credential could neither be tested nor run.
+    const draft = validation.data;
+    const hasCredential = !!(
+      draft.anthropicAuthToken?.trim() ||
+      draft.anthropicApiKey?.trim() ||
+      (draft.type === 'official' &&
+        (draft.claudeCodeOauthToken?.trim() ||
+          draft.claudeOAuthCredentials ||
+          draft.claudeCredentialInput?.trim()))
+    );
+    if (!hasCredential) {
+      return c.json({ error: '新建模型配置需要凭据' }, 400);
     }
 
     const actor = (c.get('user') as AuthUser).username;
-    const { claudeCredentialInput, ...createInput } = validation.data;
+    const {
+      claudeCredentialInput,
+      enabled: _enabled,
+      weight: _weight,
+      ...createInput
+    } = validation.data;
     let pasted: ReturnType<typeof claudeCredentialInputFields>;
     try {
       pasted = claudeCredentialInputFields(
@@ -1562,12 +1535,22 @@ configRoutes.post(
     }
 
     try {
-      const provider = createProvider({ ...createInput, ...pasted });
+      const provider = createProvider({
+        ...createInput,
+        ...pasted,
+        // A preset connection may leave its address to the preset.
+        anthropicBaseUrl:
+          createInput.anthropicBaseUrl?.trim() ||
+          (createInput.type === 'third_party'
+            ? getModelPreset(createInput.presetId)?.baseUrl
+            : undefined),
+      });
       appendClaudeConfigAudit(actor, 'create_provider', [
         `id:${provider.id}`,
         `type:${provider.type}`,
         `name:${provider.name}`,
       ]);
+      bindSystemMainIfUnbound(provider.id);
       return c.json(toPublicProvider(provider), 201);
     } catch (err) {
       const message =
@@ -1594,13 +1577,19 @@ configRoutes.patch(
       );
     }
     if (validation.data.customEnv) {
+      const reserved = reservedConnectionEnvError(validation.data.customEnv);
+      if (reserved) return c.json(reserved, 400);
       const envError = validateProviderCustomEnv(validation.data.customEnv);
       if (envError) return c.json({ error: envError }, 400);
     }
 
     const actor = (c.get('user') as AuthUser).username;
-    const { anthropicAuthToken, clearAnthropicAuthToken, ...providerPatch } =
-      validation.data;
+    const {
+      anthropicAuthToken,
+      clearAnthropicAuthToken,
+      weight: _weight,
+      ...providerPatch
+    } = validation.data;
     const tokenChange =
       anthropicAuthToken !== undefined
         ? { anthropicAuthToken }
@@ -1618,13 +1607,6 @@ configRoutes.patch(
         if (tokenChange && previous.codexOAuthCredentials) {
           throw new Error('ChatGPT 订阅配置的网关凭据由系统管理');
         }
-        if (
-          clearAnthropicAuthToken &&
-          previous.enabled &&
-          !previous.anthropicApiKey
-        ) {
-          throw new Error('该配置正在启用，请先停用再清空密钥');
-        }
         const changedFields = Object.keys(validation.data).map(
           (k) => `${k}:updated`,
         );
@@ -1632,9 +1614,12 @@ configRoutes.patch(
           validation.data.anthropicBaseUrl !== undefined &&
           validation.data.anthropicBaseUrl !== previous.anthropicBaseUrl
         );
+        // `[1m]` from an older client only sets the model's window, which
+        // is not a model change.
         const modelChanged = !!(
           validation.data.anthropicModel !== undefined &&
-          validation.data.anthropicModel !== previous.anthropicModel
+          splitOneMillionSuffix(validation.data.anthropicModel).model !==
+            previous.anthropicModel
         );
         const customEnvChanged = !!(
           validation.data.customEnv !== undefined &&
@@ -1650,17 +1635,49 @@ configRoutes.patch(
             ? anthropicAuthToken.trim() !== previous.anthropicAuthToken
             : !!previous.anthropicAuthToken)
         );
-        const authModeChanged = !!(
+        // Null clears the style: a change only when there was one.
+        const authModeChanged =
           providerPatch.anthropicAuthMode !== undefined &&
-          providerPatch.anthropicAuthMode !== previous.anthropicAuthMode
-        );
+          (providerPatch.anthropicAuthMode ?? undefined) !==
+            previous.anthropicAuthMode;
         const protocolFieldChanged =
           baseUrlChanged ||
           modelChanged ||
           customEnvChanged ||
           tokenChanged ||
           authModeChanged;
+        const nextModels = providerModelsAfterEdit(previous, providerPatch);
+        const removedModels = providerModels(previous)
+          .map((entry) => entry.id)
+          .filter((model) => !nextModels.some((entry) => entry.id === model));
+        const agentsUsingRemoved = listAgentProfilesUsingModels(
+          id,
+          removedModels,
+        );
+        if (agentsUsingRemoved.length > 0) {
+          return c.json(
+            {
+              error: `${agentsUsingRemoved.map((agent) => agent.name).join('、')} 正在使用要移除的模型，请先为这些智能体改选模型`,
+              code: 'MODEL_IN_USE',
+              agents: agentsUsingRemoved,
+            },
+            409,
+          );
+        }
         const pendingInvalidation = getPendingProviderSessionInvalidation(id);
+        const sessionsInvalidated =
+          baseUrlChanged ||
+          modelChanged ||
+          customEnvChanged ||
+          tokenChanged ||
+          authModeChanged;
+        const onlyDefaultModelChanged =
+          modelChanged &&
+          !baseUrlChanged &&
+          !customEnvChanged &&
+          !tokenChanged &&
+          !authModeChanged &&
+          !pendingInvalidation;
         const sessionInvalidation = {
           modelChanged:
             modelChanged || pendingInvalidation?.modelChanged === true,
@@ -1668,9 +1685,12 @@ configRoutes.patch(
             baseUrlChanged ||
             tokenChanged ||
             pendingInvalidation?.baseUrlChanged === true,
+          ...(onlyDefaultModelChanged
+            ? { previousDefaultModel: previous.anthropicModel }
+            : {}),
         };
         const shouldClearSessions =
-          !!pendingInvalidation || protocolFieldChanged;
+          !!pendingInvalidation || sessionsInvalidated;
         const metadata = {
           trigger: 'provider_update',
           providerId: id,
@@ -1695,8 +1715,19 @@ configRoutes.patch(
           return updated;
         };
 
+        // Only what a running runner was launched with stops it: the endpoint,
+        // the key and its header style, the env, the connection's model, or a
+        // model a session may be running. A name, a model's window or
+        // efforts, the roles, an added model or the preset reach the next
+        // launch by themselves.
+        const runnerEnvironmentChanged =
+          protocolFieldChanged || removedModels.length > 0;
+
         let mutation: ClaudeMutationResult<ReturnType<typeof updateProvider>>;
-        if (providerMayHaveRunners(previous)) {
+        if (
+          providerMayHaveRunners(previous) &&
+          (runnerEnvironmentChanged || !!pendingInvalidation)
+        ) {
           mutation = await mutateClaudeConfigForAllGroups(
             actor,
             metadata,
@@ -1739,6 +1770,13 @@ configRoutes.patch(
                 : {}),
             },
           };
+          // The WebFetch policy is fixed at launch too, but needs no stop:
+          // this connection's runners exit after their current query.
+          if (
+            updated.webFetchPreflightPolicy !== previous.webFetchPreflightPolicy
+          ) {
+            deps?.queue?.drainProviderRunnersForCredentialRefresh?.(id);
+          }
         }
 
         if (!mutation.applied.success) {
@@ -1891,12 +1929,9 @@ configRoutes.delete(
           modelChanged: true,
           baseUrlChanged: true,
         };
-        // Deleting the default returns unselected conversations to the
-        // automatic pool; the operator is told, and the audit says so.
-        const wasDefault = !!previous && getDefaultModelConfigId() === id;
         const mutation = await mutateClaudeConfigForAllGroups(
           actor,
-          { trigger: 'provider_delete', providerId: id, wasDefault },
+          { trigger: 'provider_delete', providerId: id },
           () => {
             if (previous) {
               deleteProvider(id);
@@ -1904,7 +1939,6 @@ configRoutes.delete(
               invalidateProviderUsageCache(id);
               appendClaudeConfigAuditBestEffort(actor, 'delete_provider', [
                 `id:${id}`,
-                ...(wasDefault ? ['default_cleared'] : []),
               ]);
             }
             return { id };
@@ -1936,79 +1970,12 @@ configRoutes.delete(
             503,
           );
         }
-        return c.json({
-          ok: true,
-          applied: mutation.applied,
-          defaultCleared: wasDefault,
-        });
+        return c.json({ ok: true, applied: mutation.applied });
       });
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Failed to delete provider';
       logger.warn({ err }, 'Failed to delete provider');
-      return c.json({ error: message }, 400);
-    }
-  },
-);
-
-// ─── POST /claude/providers/:id/toggle — 切换 enabled ─────
-configRoutes.post(
-  '/claude/providers/:id/toggle',
-  authMiddleware,
-  systemConfigMiddleware,
-  async (c) => {
-    const { id } = c.req.param();
-    const actor = (c.get('user') as AuthUser).username;
-    const body = await c.req.json().catch(() => ({}));
-    if (typeof body.enabled !== 'boolean') {
-      return c.json({ error: 'enabled must be a boolean' }, 400);
-    }
-
-    try {
-      return await withClaudeConfigMutationLock(async () => {
-        // Refuse before any runner is stopped: enabling a credential-less
-        // provider would only route turns into authentication failures.
-        const target = getProviders().find((provider) => provider.id === id);
-        if (!target) throw new Error('未找到指定供应商');
-        if (body.enabled && !providerHasCredentials(target)) {
-          throw new Error('该模型配置还没有可用的凭据，请先填写密钥或完成授权');
-        }
-        if (!body.enabled && getDefaultModelConfigId() === id) {
-          throw new Error(DEFAULT_MODEL_DISABLE_ERROR);
-        }
-        const mutation = await mutateClaudeConfigForAllGroups(
-          actor,
-          { trigger: 'provider_toggle', providerId: id },
-          () => {
-            const updated = setProviderEnabled(id, body.enabled);
-            appendClaudeConfigAuditBestEffort(actor, 'toggle_provider', [
-              `id:${id}`,
-              `enabled:${updated.enabled}`,
-            ]);
-            return updated;
-          },
-        );
-        if (!mutation.applied.success) {
-          return c.json(
-            {
-              error: mutation.applied.error,
-              applied: mutation.applied,
-              ...(mutation.value
-                ? { provider: toPublicProvider(mutation.value) }
-                : {}),
-            },
-            503,
-          );
-        }
-        return c.json({
-          provider: toPublicProvider(mutation.value!),
-          applied: mutation.applied,
-        });
-      });
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Failed to toggle provider';
-      logger.warn({ err }, 'Failed to toggle provider');
       return c.json({ error: message }, 400);
     }
   },
@@ -2040,72 +2007,506 @@ configRoutes.post(
   },
 );
 
-// ─── POST /claude/providers/test — 测试第三方端点连通性 ─────
+// ─── 模型连接的测试与模型列表 ─────
 const CONNECTIVITY_TEST_WINDOW_MS = 60_000;
 const CONNECTIVITY_TEST_LIMIT = 10;
 const connectivityTestHits = new Map<string, number[]>();
 
+/** Spend one of an admin's upstream checks (tests and model lists) per minute. */
+function takeConnectivityCheck(userId: string): boolean {
+  const now = Date.now();
+  const recent = (connectivityTestHits.get(userId) ?? []).filter(
+    (at) => now - at < CONNECTIVITY_TEST_WINDOW_MS,
+  );
+  if (recent.length >= CONNECTIVITY_TEST_LIMIT) return false;
+  recent.push(now);
+  connectivityTestHits.set(userId, recent);
+  return true;
+}
+
+/** The upstream a test or a model list reaches, and what it sends there. */
+type CheckedConnection =
+  | { kind: 'chatgpt'; stored: UnifiedProvider }
+  | {
+      kind: 'third_party';
+      baseUrl: string;
+      token: string;
+      /** The style tried first: the explicit one, else the runtime's. */
+      authMode: ProviderAuthMode;
+      explicitAuthMode: boolean;
+      preset: ModelPreset | null;
+      model: string;
+      /** The background (haiku-tier) model, probed besides `model`. */
+      smallFastModel: string;
+      customEnv: Record<string, string>;
+    }
+  | {
+      kind: 'api_key';
+      credential: string;
+      authMode: ProviderAuthMode;
+      model: string;
+    }
+  | {
+      kind: 'account';
+      /** Set for a saved grant, which may be renewed before the check. */
+      providerId: string | null;
+      oauth: ClaudeOAuthCredentials | null;
+      token: string;
+    };
+
+/**
+ * Read the connection a request describes: a draft, or a saved connection
+ * whose blank fields fall back to what is stored.
+ */
+function resolveCheckedConnection(
+  draft: ProviderConnectivityTestInput,
+):
+  | { connection: CheckedConnection; stored: UnifiedProvider | undefined }
+  | { error: string; status: 400 | 404 } {
+  const stored = draft.providerId
+    ? (getProviderById(draft.providerId) ?? undefined)
+    : undefined;
+  if (draft.providerId && !stored) {
+    return { error: '未找到指定供应商', status: 404 };
+  }
+  if (stored?.codexOAuthCredentials) {
+    return { connection: { kind: 'chatgpt', stored }, stored };
+  }
+  const type = stored?.type ?? draft.type ?? 'third_party';
+  const model = draft.anthropicModel ?? stored?.anthropicModel;
+
+  if (type === 'third_party') {
+    const named = getModelPreset(draft.presetId ?? stored?.presetId);
+    const baseUrl =
+      draft.anthropicBaseUrl?.trim() ||
+      stored?.anthropicBaseUrl ||
+      named?.baseUrl ||
+      '';
+    // A preset only speaks for its own endpoint.
+    const preset =
+      named &&
+      normalizeProviderBaseUrl(baseUrl) ===
+        normalizeProviderBaseUrl(named.baseUrl)
+        ? named
+        : null;
+    const draftToken = draft.anthropicAuthToken?.trim();
+    const token =
+      draftToken || stored?.anthropicAuthToken || stored?.anthropicApiKey || '';
+    if (!baseUrl) return { error: '请填写 API 端点', status: 400 };
+    if (isCodexGatewayBaseUrl(baseUrl)) {
+      return { error: 'ChatGPT 订阅请先完成登录', status: 400 };
+    }
+    if (!token) return { error: '请填写 API 密钥', status: 400 };
+    // A key the runtime sends as ANTHROPIC_API_KEY has no other style.
+    const apiKeyOnly =
+      !draftToken && !stored?.anthropicAuthToken && !!stored?.anthropicApiKey;
+    const explicit =
+      draft.anthropicAuthMode ??
+      (apiKeyOnly ? 'x-api-key' : stored?.anthropicAuthMode);
+    return {
+      stored,
+      connection: {
+        kind: 'third_party',
+        baseUrl,
+        token,
+        // A saved connection without a style is probed with the header its
+        // runtime infers (bare token → x-api-key, `Bearer …` → Authorization);
+        // a new one with Bearer, which every preset takes.
+        authMode:
+          explicit ??
+          (stored && !/^Bearer\s/i.test(token) ? 'x-api-key' : 'bearer'),
+        explicitAuthMode: !!explicit,
+        preset,
+        model:
+          model ??
+          (preset?.models[0] ? presetModelEntry(preset.models[0]).id : ''),
+        smallFastModel:
+          ('roles' in draft ? draft.roles?.smallFast : undefined) ??
+          stored?.roles?.smallFast ??
+          '',
+        customEnv: draft.customEnv ?? stored?.customEnv ?? {},
+      },
+    };
+  }
+
+  let pasted: ReturnType<typeof claudeCredentialInputFields>;
+  try {
+    pasted = claudeCredentialInputFields(
+      draft.claudeCredentialInput,
+      'official',
+      draft,
+    );
+  } catch (err) {
+    if (err instanceof ClaudeCredentialInputError) {
+      return { error: err.message, status: 400 };
+    }
+    throw err;
+  }
+  // A credential in the request replaces the saved one as a whole.
+  const draftCredential: Partial<
+    Pick<
+      UnifiedProvider,
+      | 'anthropicApiKey'
+      | 'anthropicAuthToken'
+      | 'claudeOAuthCredentials'
+      | 'claudeCodeOauthToken'
+    >
+  > = {
+    anthropicApiKey: draft.anthropicApiKey?.trim(),
+    anthropicAuthToken: draft.anthropicAuthToken?.trim(),
+    ...pasted,
+  };
+  const fromDraft = Object.values(draftCredential).some(Boolean);
+  const credential = fromDraft ? draftCredential : (stored ?? draftCredential);
+  const { claudeOAuthCredentials: oauth, claudeCodeOauthToken: setupToken } =
+    credential;
+  const apiKey = credential.anthropicApiKey || credential.anthropicAuthToken;
+  let connection: CheckedConnection | null = null;
+  if (oauth || setupToken) {
+    connection = {
+      kind: 'account',
+      providerId: fromDraft || !oauth ? null : stored!.id,
+      oauth: oauth ?? null,
+      token: oauth?.accessToken ?? setupToken!,
+    };
+  } else if (apiKey) {
+    connection = {
+      kind: 'api_key',
+      credential: apiKey,
+      // Claude Code sends ANTHROPIC_API_KEY as x-api-key and an auth token
+      // as Authorization, unless the connection chose otherwise.
+      authMode: credential.anthropicApiKey
+        ? 'x-api-key'
+        : (draft.anthropicAuthMode ?? stored?.anthropicAuthMode ?? 'bearer'),
+      model: model ?? '',
+    };
+  }
+  return connection
+    ? { connection, stored }
+    : { error: '请填写凭据', status: 400 };
+}
+
+/** Whether a request tests something other than the saved connection. */
+function draftChangesConnection(
+  draft: ProviderConnectivityTestInput,
+  stored: UnifiedProvider,
+): boolean {
+  const differs = (value: string | undefined, current: string) =>
+    !!value?.trim() && value.trim() !== current;
+  return (
+    differs(draft.anthropicBaseUrl, stored.anthropicBaseUrl) ||
+    differs(draft.anthropicAuthToken, stored.anthropicAuthToken) ||
+    differs(draft.anthropicApiKey, stored.anthropicApiKey) ||
+    draft.claudeCredentialInput !== undefined ||
+    (draft.anthropicAuthMode !== undefined &&
+      draft.anthropicAuthMode !== stored.anthropicAuthMode) ||
+    (draft.customEnv !== undefined &&
+      JSON.stringify(draft.customEnv) !== JSON.stringify(stored.customEnv)) ||
+    (draft.roles?.smallFast !== undefined &&
+      draft.roles.smallFast !== (stored.roles?.smallFast ?? ''))
+  );
+}
+
+/** Where a check goes, for logs: never a path, a query or a key. */
+function connectionOrigin(connection: CheckedConnection): string {
+  switch (connection.kind) {
+    case 'third_party':
+      try {
+        return new URL(connection.baseUrl).origin;
+      } catch {
+        return 'invalid';
+      }
+    case 'api_key':
+    case 'account':
+      return ANTHROPIC_API_ORIGIN;
+    case 'chatgpt':
+      return 'chatgpt';
+  }
+}
+
+/** A failed check that never reached the upstream. */
+function unreachedTest(
+  code: ProviderErrorCode,
+  message: string,
+): ConnectionTestResult {
+  return connectionTestResult(
+    {
+      ok: false,
+      probes: [
+        { model: '', ok: false, status: null, latencyMs: 0, message, code },
+      ],
+    },
+    { model: null },
+  );
+}
+
+/**
+ * Claude subscription: a saved grant due for renewal is renewed first, as a
+ * runner launch would; a pasted one is never renewed here, because renewing
+ * rotates the refresh token the admin is about to save.
+ */
+async function checkSubscriptionAccount(
+  connection: Extract<CheckedConnection, { kind: 'account' }>,
+): Promise<ConnectionTestResult> {
+  let token = connection.token;
+  if (connection.oauth && connection.providerId) {
+    const current = getProviderById(connection.providerId);
+    if (current?.claudeOAuthLastRefreshError) {
+      return unreachedTest(
+        'AUTH_INVALID',
+        current.claudeOAuthLastRefreshError.message,
+      );
+    }
+    if (isClaudeOAuthRefreshDue(connection.providerId, connection.oauth)) {
+      const outcome = await refreshClaudeProviderOAuth(connection.providerId);
+      if (
+        outcome.status === 'needs_relogin' ||
+        (outcome.status === 'failed' && outcome.terminal)
+      ) {
+        return unreachedTest('AUTH_INVALID', 'Claude 登录已失效，请重新登录');
+      }
+      const renewed = getProviderById(
+        connection.providerId,
+      )?.claudeOAuthCredentials;
+      // A renewal that failed for now (network, 5xx, backoff) says nothing
+      // about the login; an expired token would only be refused for age.
+      if (!renewed || renewed.expiresAt <= Date.now()) {
+        return unreachedTest('UPSTREAM_ERROR', '续期失败，稍后再试');
+      }
+      token = renewed.accessToken;
+    }
+  } else if (connection.oauth && connection.oauth.expiresAt <= Date.now()) {
+    return unreachedTest(
+      'UNKNOWN',
+      '访问令牌已过期，保存后会自动续期；现在无法验证',
+    );
+  }
+  return checkClaudeAccount(token);
+}
+
+/** ChatGPT subscription: fetch the account's live model catalog. */
+async function checkChatGptAccount(
+  provider: UnifiedProvider,
+): Promise<ConnectionTestResult> {
+  const startedAt = Date.now();
+  const ok = await refreshCodexProviderCatalog(provider.id);
+  const latencyMs = Date.now() - startedAt;
+  if (ok) {
+    return connectionTestResult(
+      { ok: true, probes: [{ model: '', ok: true, status: 200, latencyMs }] },
+      { model: null },
+    );
+  }
+  const failure = codexProviderCatalogFailure(provider.id);
+  const reauth =
+    getProviderById(provider.id)?.codexOAuthLastRefreshError?.kind ===
+    'reauth_required';
+  return connectionTestResult(
+    {
+      ok: false,
+      probes: [
+        {
+          model: '',
+          ok: false,
+          status: failure?.status ?? null,
+          latencyMs,
+          message: redact(failure?.message ?? 'ChatGPT 模型目录获取失败', []),
+          code: reauth
+            ? 'AUTH_INVALID'
+            : failure?.status
+              ? classifyProviderError({ status: failure.status }).code
+              : 'UNKNOWN',
+        },
+      ],
+    },
+    { model: null },
+  );
+}
+
+function testConnection(
+  connection: CheckedConnection,
+): Promise<ConnectionTestResult> {
+  switch (connection.kind) {
+    case 'third_party':
+      return testThirdPartyConnection(
+        {
+          baseUrl: connection.baseUrl,
+          token: connection.token,
+          authMode: connection.authMode,
+          explicitAuthMode: connection.explicitAuthMode,
+          model: connection.model,
+          haikuModel: connection.smallFastModel,
+          customHeaders: connection.customEnv.ANTHROPIC_CUSTOM_HEADERS,
+        },
+        testProviderConnectivity,
+      );
+    case 'api_key':
+      return testAnthropicApiKey(connection);
+    case 'account':
+      return checkSubscriptionAccount(connection);
+    case 'chatgpt':
+      return checkChatGptAccount(connection.stored);
+  }
+}
+
+async function discoverModels(
+  connection: CheckedConnection,
+): Promise<ModelDiscoveryResult> {
+  switch (connection.kind) {
+    case 'third_party': {
+      // A custom address that is exactly one vendor's lists models where
+      // that vendor does.
+      const matches = findPresetsByBaseUrl(connection.baseUrl);
+      const url = modelsUrlFor(
+        connection.baseUrl,
+        connection.preset ?? (matches.length === 1 ? matches[0] : null),
+      );
+      if (!url) {
+        return {
+          ok: false,
+          code: 'ENDPOINT_NOT_FOUND',
+          status: null,
+          message: '地址无效',
+        };
+      }
+      return discoverEndpointModels({
+        url,
+        credential: connection.token,
+        authMode: connection.authMode,
+        explicitAuthMode: connection.explicitAuthMode,
+        customHeaders: connection.customEnv.ANTHROPIC_CUSTOM_HEADERS,
+      });
+    }
+    case 'api_key':
+      return discoverAnthropicModels(connection);
+    case 'account':
+      return {
+        ok: true,
+        models: [...CLAUDE_SUBSCRIPTION_MODELS],
+        source: 'builtin',
+      };
+    case 'chatgpt': {
+      await ensureCodexProviderCatalog(connection.stored.id);
+      return {
+        ok: true,
+        source: 'catalog',
+        models: listCodexModelsForProvider(connection.stored).models.map(
+          (entry) => ({
+            id: entry.value,
+            ...(entry.label && entry.label !== entry.value
+              ? { name: entry.label }
+              : {}),
+          }),
+        ),
+      };
+    }
+  }
+}
+
+// ─── POST /claude/providers/discover-models — 获取模型连接的模型列表 ─────
+configRoutes.post(
+  '/claude/providers/discover-models',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const user = c.get('user') as AuthUser;
+    if (!takeConnectivityCheck(user.id)) {
+      return c.json({ error: '测试过于频繁，请稍后再试' }, 429);
+    }
+    const body = await c.req.json().catch(() => ({}));
+    const validation = ProviderDiscoverModelsSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json({ error: 'Invalid request body' }, 400);
+    }
+    // A saved connection lists models with its own env.
+    const { customEnv, ...draft } = validation.data;
+    const resolved = resolveCheckedConnection(
+      draft.providerId ? draft : { ...draft, customEnv },
+    );
+    if ('error' in resolved) {
+      return c.json({ error: resolved.error }, resolved.status);
+    }
+    const result = await discoverModels(resolved.connection);
+    logger.info(
+      {
+        providerId: validation.data.providerId ?? null,
+        kind: resolved.connection.kind,
+        origin: connectionOrigin(resolved.connection),
+        ok: result.ok,
+        ...(result.ok
+          ? { count: result.models.length }
+          : { code: result.code, status: result.status }),
+      },
+      'Provider model discovery finished',
+    );
+    return c.json(result);
+  },
+);
+
+// ─── POST /claude/providers/test — 测试模型连接 ─────
+// 带 providerId 且测的就是已保存的连接时，结果存为该连接的 lastTest；
+// 没有认证方式的连接同时记下端点接受的那一种。不停 Runner，不清会话。
 configRoutes.post(
   '/claude/providers/test',
   authMiddleware,
   systemConfigMiddleware,
   async (c) => {
     const user = c.get('user') as AuthUser;
-    const now = Date.now();
-    const recent = (connectivityTestHits.get(user.id) ?? []).filter(
-      (at) => now - at < CONNECTIVITY_TEST_WINDOW_MS,
-    );
-    if (recent.length >= CONNECTIVITY_TEST_LIMIT) {
+    if (!takeConnectivityCheck(user.id)) {
       return c.json({ error: '测试过于频繁，请稍后再试' }, 429);
     }
-    recent.push(now);
-    connectivityTestHits.set(user.id, recent);
-
     const body = await c.req.json().catch(() => ({}));
     const validation = ProviderConnectivityTestSchema.safeParse(body);
     if (!validation.success) {
       return c.json({ error: 'Invalid request body' }, 400);
     }
     const draft = validation.data;
-    const stored = draft.providerId
-      ? getProviders().find((provider) => provider.id === draft.providerId)
-      : undefined;
-    if (draft.providerId && !stored) {
-      return c.json({ error: '未找到指定供应商' }, 404);
+    const resolved = resolveCheckedConnection(draft);
+    if ('error' in resolved) {
+      return c.json({ error: resolved.error }, resolved.status);
     }
-    if (
-      stored &&
-      (stored.type !== 'third_party' || stored.codexOAuthCredentials)
-    ) {
-      return c.json({ error: '只有第三方兼容接口支持测试连接' }, 400);
+    const { connection, stored } = resolved;
+    const result = await testConnection(connection);
+
+    if (stored && !draftChangesConnection(draft, stored)) {
+      const foundAuthMode =
+        connection.kind === 'third_party' && !connection.explicitAuthMode
+          ? result.authMode
+          : undefined;
+      const recorded = recordProviderTest(
+        stored.id,
+        stored,
+        result.record,
+        foundAuthMode,
+      );
+      if (recorded) {
+        appendClaudeConfigAuditBestEffort(user.username, 'test_provider', [
+          `id:${stored.id}`,
+          `ok:${result.ok}`,
+          ...(result.code ? [`code:${result.code}`] : []),
+          ...(foundAuthMode ? [`anthropicAuthMode:${foundAuthMode}`] : []),
+        ]);
+        // A saved connection whose inferred header was refused now sends the
+        // one that worked; runners still sending the old one retire after
+        // their current query.
+        if (
+          connection.kind === 'third_party' &&
+          foundAuthMode &&
+          foundAuthMode !== connection.authMode
+        ) {
+          getWebDeps()?.queue.drainProviderRunnersForCredentialRefresh(
+            stored.id,
+          );
+        }
+      }
     }
-
-    const baseUrl =
-      draft.anthropicBaseUrl?.trim() || stored?.anthropicBaseUrl || '';
-    const token =
-      draft.anthropicAuthToken?.trim() || stored?.anthropicAuthToken || '';
-    if (!baseUrl) return c.json({ error: '请填写 API 端点' }, 400);
-    if (!token) return c.json({ error: '请填写 API 密钥' }, 400);
-    const customEnv = draft.customEnv ?? stored?.customEnv ?? {};
-    const model = draft.anthropicModel ?? stored?.anthropicModel ?? '';
-
-    const result = await testProviderConnectivity({
-      baseUrl,
-      token,
-      // A legacy provider has no mode; probe with the header its runtime
-      // infers (bare token → x-api-key, `Bearer …` → Authorization).
-      authMode:
-        draft.anthropicAuthMode ??
-        stored?.anthropicAuthMode ??
-        (stored && !/^Bearer\s/i.test(token) ? 'x-api-key' : 'bearer'),
-      model,
-      haikuModel: customEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL,
-      customHeaders: customEnv.ANTHROPIC_CUSTOM_HEADERS,
-    });
     logger.info(
       {
         providerId: draft.providerId ?? null,
+        kind: connection.kind,
+        origin: connectionOrigin(connection),
         ok: result.ok,
+        code: result.code,
         statuses: result.probes.map((probe) => probe.status),
       },
       'Provider connectivity test finished',
@@ -2114,29 +2515,25 @@ configRoutes.post(
   },
 );
 
-// ─── POST /claude/providers/:id/reset-health — 重置健康状态 ─────
-configRoutes.post(
-  '/claude/providers/:id/reset-health',
+// ─── GET /claude/providers/:id/impact — 修改协议字段会停掉多少 Runner ─────
+// activeRunners：正在使用这个连接的 Runner；stoppedRunners：修改端点、密钥、
+// 连接模型等协议字段时实际会停掉的 Runner（当前实现会停掉全部工作区的 Runner，
+// 连接既没被绑定或选用、也不是全局兜底连接时则一个都不停）。
+configRoutes.get(
+  '/claude/providers/:id/impact',
   authMiddleware,
   systemConfigMiddleware,
   (c) => {
     const { id } = c.req.param();
-    providerPool.resetHealth(id);
-    return c.json({ ok: true });
-  },
-);
-
-// ─── GET /claude/providers/health — 健康状态轮询 ─────
-configRoutes.get(
-  '/claude/providers/health',
-  authMiddleware,
-  systemConfigMiddleware,
-  (c) => {
-    // Refresh pool state
-    const enabledProviders = getEnabledProviders();
-    const balancing = getBalancingConfig();
-    providerPool.refreshFromConfig(enabledProviders, balancing);
-    return c.json({ statuses: providerPool.getHealthStatuses() });
+    const provider = getProviderById(id);
+    if (!provider) return c.json({ error: '未找到指定供应商' }, 404);
+    const status = getWebDeps()?.queue.getStatus();
+    const live = status?.groups.filter((group) => group.active) ?? [];
+    return c.json({
+      activeRunners: live.filter((group) => group.selectedProviderId === id)
+        .length,
+      stoppedRunners: providerMayHaveRunners(provider) ? live.length : 0,
+    });
   },
 );
 
@@ -2165,37 +2562,6 @@ configRoutes.get(
       const msg = err instanceof Error ? err.message : 'Unknown error';
       logger.warn({ err, providerId: id }, 'Failed to fetch OAuth usage');
       return c.json({ error: msg }, 400);
-    }
-  },
-);
-
-// ─── PUT /claude/balancing — 更新负载均衡参数 ─────
-configRoutes.put(
-  '/claude/balancing',
-  authMiddleware,
-  systemConfigMiddleware,
-  async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const validation = BalancingConfigSchema.safeParse(body);
-    if (!validation.success) {
-      return c.json(
-        { error: 'Invalid request body', details: validation.error.format() },
-        400,
-      );
-    }
-
-    const actor = (c.get('user') as AuthUser).username;
-
-    try {
-      const saved = saveBalancingConfig(validation.data);
-      appendClaudeConfigAudit(actor, 'update_balancing', [
-        ...Object.keys(validation.data),
-      ]);
-      return c.json(saved);
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Failed to update balancing';
-      return c.json({ error: message }, 400);
     }
   },
 );
@@ -2457,12 +2823,12 @@ configRoutes.post(
             : '官方 Claude (OAuth)',
           type: 'official',
           ...secrets,
-          enabled: true,
         });
         appendClaudeConfigAuditBestEffort(user.username, 'oauth_login', [
           `providerId:${provider.id}`,
           credentialField,
         ]);
+        bindSystemMainIfUnbound(provider.id);
         return c.json(toPublicProvider(provider));
       });
     } catch (err) {
@@ -2645,14 +3011,16 @@ configRoutes.post(
             // Internal identifier only; runners receive per-launch tokens.
             anthropicAuthToken: randomBytes(32).toString('hex'),
             anthropicModel: defaults.anthropicModel,
-            customEnv: defaults.customEnv,
+            // The runtime defaults a third-party endpoint used to get
+            // implicitly; the add wizard offers the same to the others.
+            customEnv: { ...CONNECTION_ENV_PREFILL, ...defaults.customEnv },
             codexOAuthCredentials: codexCredentials,
-            enabled: true,
           });
           appendClaudeConfigAuditBestEffort(actor, 'codex_oauth_login', [
             `providerId:${provider.id}`,
             'codexOAuthCredentials:set',
           ]);
+          bindSystemMainIfUnbound(provider.id);
           return c.json(toPublicProvider(provider));
         }
 
@@ -2770,7 +3138,7 @@ configRoutes.post(
   },
 );
 
-// ─── PUT /claude/custom-env — 更新当前启用供应商的自定义环境变量 ─────
+// ─── PUT /claude/custom-env — 兼容：更新全局兜底连接的自定义环境变量 ─────
 configRoutes.put(
   '/claude/custom-env',
   authMiddleware,
@@ -2785,14 +3153,14 @@ configRoutes.put(
       );
     }
 
-    try {
-      // Find first enabled provider and update its customEnv
-      const enabled = getEnabledProviders();
-      if (enabled.length === 0) {
-        return c.json({ error: '没有启用的供应商' }, 400);
-      }
+    const reserved = reservedConnectionEnvError(validation.data.customEnv);
+    if (reserved) return c.json(reserved, 400);
 
-      const updated = updateProvider(enabled[0].id, {
+    try {
+      const target = getGlobalProvider();
+      if (!target) return c.json({ error: '还没有模型连接' }, 400);
+
+      const updated = updateProvider(target.id, {
         customEnv: validation.data.customEnv,
       });
       return c.json({ customEnv: updated.customEnv });
@@ -2824,11 +3192,6 @@ function resolveProxyInfo(
   };
 }
 
-/** Persist a RegisteredGroup update and sync to the in-memory cache. */
-function applyBindingUpdate(imJid: string, updated: RegisteredGroup): void {
-  commitChannelMountUpdate(imJid, updated);
-}
-
 function applyRegisteredGroupUpdate(
   jid: string,
   updated: RegisteredGroup,
@@ -2839,87 +3202,6 @@ function applyRegisteredGroupUpdate(
     const groups = webDeps.getRegisteredGroups();
     if (groups[jid]) groups[jid] = updated;
   }
-}
-
-function hasConsistentChannelAccount(
-  userId: string,
-  imJid: string,
-  group: RegisteredGroup,
-): boolean {
-  const encodedAccountId = parseChannelAddress(imJid)?.channelAccountId ?? null;
-  const storedAccountId = group.channel_account_id ?? null;
-  if (encodedAccountId !== storedAccountId) {
-    if (!encodedAccountId && storedAccountId) {
-      const account = getChannelAccount(storedAccountId);
-      return (
-        account?.is_legacy_default === true && account.owner_user_id === userId
-      );
-    }
-    return false;
-  }
-  if (!storedAccountId) return true;
-  return getChannelAccount(storedAccountId)?.owner_user_id === userId;
-}
-
-function refreshAgentLastImJid(agentId: string): void {
-  const agent = getAgent(agentId);
-  if (!agent) return;
-  const remaining = getGroupsByTargetAgent(agentId);
-  const current = agent.last_im_jid
-    ? channelConversationJid(agent.last_im_jid)
-    : null;
-  if (current && remaining.some(({ jid }) => jid === current)) return;
-  remaining.sort((a, b) => {
-    const dateDiff =
-      Date.parse(b.group.added_at) - Date.parse(a.group.added_at);
-    if (Number.isFinite(dateDiff) && dateDiff !== 0) return dateDiff;
-    return a.jid.localeCompare(b.jid);
-  });
-  updateAgentLastImJid(agentId, remaining[0]?.jid ?? null);
-}
-
-type ChannelChatInfo = NativeContextMetadata & {
-  avatar?: string;
-  name?: string;
-  user_count?: string;
-};
-
-function getConversationKind(
-  imJid: string,
-  group: Pick<
-    RegisteredGroup,
-    'feishu_chat_mode' | 'feishu_group_message_type' | 'native_context_type'
-  >,
-  chatInfo?: ChannelChatInfo | null,
-): ChannelConversationKind {
-  return resolveChannelConversationKind(imJid, {
-    feishu_chat_mode: group.feishu_chat_mode,
-    feishu_group_message_type: group.feishu_group_message_type,
-    native_context_type:
-      chatInfo?.native_context_type ?? group.native_context_type,
-    chat_mode: chatInfo?.chat_mode,
-    group_message_type: chatInfo?.group_message_type,
-    thread_capable: chatInfo?.thread_capable,
-  });
-}
-
-// Only fetches live chat metadata — does NOT compute threadCapable. That
-// decision must be (re-)computed by the caller against a freshly re-read
-// imGroup taken AFTER this await, never against the pre-await snapshot —
-// see the identical helper's doc comment in routes/agents.ts for why.
-async function fetchLiveChatInfo(
-  userId: string,
-  imJid: string,
-): Promise<{ chatInfo?: ChannelChatInfo | null }> {
-  const channelType = getChannelType(imJid);
-  if (!channelType) return {};
-  const webDeps = getWebDeps();
-  const chatInfo = webDeps?.getChannelChatInfo
-    ? ((await webDeps.getChannelChatInfo(imJid)) as ChannelChatInfo | null)
-    : channelType === 'feishu' && webDeps?.getFeishuChatInfo
-      ? await webDeps.getFeishuChatInfo(userId, extractChatId(imJid))
-      : null;
-  return { chatInfo };
 }
 
 function resolveWorkspaceForBinding(
@@ -3373,6 +3655,7 @@ function toSystemSettingsResponse(
     maxLoginAttempts: settings.maxLoginAttempts,
     loginLockoutMinutes: settings.loginLockoutMinutes,
     fallbackModel: settings.fallbackModel,
+    allowMemberGuests: settings.allowMemberGuests,
   };
 }
 
@@ -3454,16 +3737,51 @@ configRoutes.put(
 
 // ─── Host integration settings (admin role only) ───────────────────
 
-function toHostIntegrationResponse(
+/** The stored host-integration settings, as configured. */
+function toStoredHostIntegration(
   settings: ReturnType<typeof getSystemSettings>,
 ) {
   return {
     externalClaudeDir: settings.externalClaudeDir,
     pluginAutoScan: settings.pluginAutoScan,
     adminHostOnlyMode: settings.adminHostOnlyMode,
+    workspaceRoot: settings.workspaceRoot,
+    deploymentMode: settings.deploymentMode,
     mainAgentContextSource: settings.mainAgentContextSource,
     mainAgentAutoCompactWindow: settings.mainAgentAutoCompactWindow,
     mainAgentAutoCompactPercentage: settings.mainAgentAutoCompactPercentage,
+  };
+}
+
+/** Stored values plus how the workspace root and deployment mode resolve. */
+function otherActiveUsersConflict(c: Context, users: OtherActiveUser[]) {
+  return c.json(
+    {
+      error: '单人宿主机模式只允许一个用户；请先停用其他账号。',
+      code: 'SINGLE_USER_HOST_OTHER_USERS',
+      users,
+    },
+    409,
+  );
+}
+
+function toHostIntegrationResponse(
+  settings: ReturnType<typeof getSystemSettings>,
+) {
+  // The same occupancy the server uses to pick the root (index.ts).
+  const root = getWorkspaceRootResolution(getWorkspaceRootOccupancy());
+  const mode = getDeploymentModeResolution();
+  return {
+    ...toStoredHostIntegration(settings),
+    // Where new Host workspaces go; null when no root is usable and they
+    // stay in data/groups/<folder>.
+    workspaceRootEffective: rootForNewWorkspaces(root),
+    workspaceRootSource: root.source,
+    workspaceRootFallbackReason: root.fallbackReason,
+    workspaceRootFallbackWarning: root.fallbackWarning,
+    deploymentMode: mode.mode,
+    deploymentModeConfigured: settings.deploymentMode,
+    deploymentModeSource: mode.source,
   };
 }
 
@@ -3504,9 +3822,46 @@ configRoutes.put(
         );
       }
     }
+    // The directory itself is created when the first workspace needs it.
+    const rootProblem =
+      validation.data.workspaceRoot !== undefined
+        ? validateWorkspaceRootSetting(
+            validation.data.workspaceRoot,
+            getWorkspaceRootOccupancy(),
+          )
+        : null;
+    if (rootProblem) {
+      return c.json(
+        {
+          error: WORKSPACE_ROOT_PROBLEM_MESSAGES[rootProblem],
+          code: 'WORKSPACE_ROOT_INVALID',
+          reason: rootProblem,
+        },
+        400,
+      );
+    }
 
     return withCapabilityScopeLocks([SYSTEM_CAPABILITY_LOCK_KEY], async () => {
-      const before = toHostIntegrationResponse(getSystemSettings());
+      const before = toStoredHostIntegration(getSystemSettings());
+      const singleUserHostBefore = isSingleUserHost();
+      const singleUserHostAfter =
+        resolveDeploymentMode({
+          configured: validation.data.deploymentMode ?? before.deploymentMode,
+          env: process.env[DEPLOYMENT_MODE_ENV],
+        }).mode === 'single_user_host';
+      const enablingSingleUserHost =
+        !singleUserHostBefore && singleUserHostAfter;
+      const actorId = (c.get('user') as AuthUser).id;
+      if (enablingSingleUserHost) {
+        const others = listOtherActiveUsers(actorId);
+        if (others.length > 0) return otherActiveUsersConflict(c, others);
+      }
+      // Single-user host mode makes admin host-only effective without
+      // touching the stored switch, so it migrates the same way enabling it.
+      const hostOnlyBefore = before.adminHostOnlyMode || singleUserHostBefore;
+      const hostOnlyAfter =
+        (validation.data.adminHostOnlyMode ?? before.adminHostOnlyMode) ||
+        singleUserHostAfter;
       const mainContextSourceChanged =
         validation.data.mainAgentContextSource !== undefined &&
         validation.data.mainAgentContextSource !==
@@ -3516,19 +3871,16 @@ configRoutes.put(
         validation.data.externalClaudeDir !== before.externalClaudeDir;
       const hostContextChanged =
         mainContextSourceChanged || externalClaudeDirChanged;
-      const adminHostOnlyModeChanged =
-        validation.data.adminHostOnlyMode !== undefined &&
-        validation.data.adminHostOnlyMode !== before.adminHostOnlyMode;
-      const enablingAdminHostOnlyMode =
-        adminHostOnlyModeChanged && validation.data.adminHostOnlyMode === true;
+      // Effective host-only turning on: the stored switch, or single-user
+      // host mode. Already on (stored true, then single-user host), there is
+      // nothing to migrate and no runner or session to reset.
+      const enablingAdminHostOnlyMode = !hostOnlyBefore && hostOnlyAfter;
       const pendingRuntimeCleanupFolders =
         getPendingAdminHostOnlyCleanupFolders();
       const repairingRuntimeCleanup = pendingRuntimeCleanupFolders.length > 0;
       const enforcingAdminHostOnlyMode =
         enablingAdminHostOnlyMode ||
-        (repairingRuntimeCleanup &&
-          before.adminHostOnlyMode &&
-          validation.data.adminHostOnlyMode !== false);
+        (repairingRuntimeCleanup && hostOnlyBefore && hostOnlyAfter);
       const defaultCompactChanged =
         (validation.data.mainAgentAutoCompactWindow !== undefined &&
           validation.data.mainAgentAutoCompactWindow !==
@@ -3632,6 +3984,13 @@ configRoutes.put(
         | ReturnType<typeof forceActiveAdminRuntimesToHost>
         | undefined;
       const commit = () => {
+        // An account may have been added while runners were quiescing.
+        // Checked before the first write, so nothing has changed yet when
+        // it fails (the stopped runners restart on demand).
+        if (enablingSingleUserHost) {
+          const others = listOtherActiveUsers(actorId);
+          if (others.length > 0) throw new SingleUserHostConflictError(others);
+        }
         if (enforcingAdminHostOnlyMode) {
           hostOnlyMigration = forceActiveAdminRuntimesToHost();
           if (deps) {
@@ -3644,14 +4003,7 @@ configRoutes.put(
         }
         for (const folder of sessionResetFolders)
           deleteWorkspaceSessions(folder);
-        if (deps?.sessions) {
-          for (const folder of sessionResetFolders)
-            delete deps.sessions[folder];
-        }
         const value = saveSystemSettings(validation.data);
-        if (hostOnlyMigration?.migratedTaskIds.length) {
-          notifyTaskSchedulerChanged();
-        }
         return value;
       };
       let saved: ReturnType<typeof saveSystemSettings>;
@@ -3694,6 +4046,9 @@ configRoutes.put(
             ADMIN_HOST_ONLY_RUNTIME_SAFETY_SOURCE,
           );
         } catch (err) {
+          if (err instanceof SingleUserHostConflictError) {
+            return otherActiveUsersConflict(c, err.users);
+          }
           if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
           return c.json(
             {
@@ -3707,12 +4062,17 @@ configRoutes.put(
           );
         }
       } else {
-        saved = commit();
+        try {
+          saved = commit();
+        } catch (err) {
+          if (!(err instanceof SingleUserHostConflictError)) throw err;
+          return otherActiveUsersConflict(c, err.users);
+        }
       }
       const response = toHostIntegrationResponse(saved);
       const changedFields = changedSettingFields(
         before,
-        response,
+        toStoredHostIntegration(saved),
         validation.data,
       );
       const actor = c.get('user') as AuthUser;
@@ -3731,8 +4091,6 @@ configRoutes.put(
               ? {
                   host_only_migrated_groups:
                     hostOnlyMigration.affectedGroups.length,
-                  host_only_migrated_tasks:
-                    hostOnlyMigration.migratedTaskIds.length,
                 }
               : {}),
           },
@@ -3741,6 +4099,299 @@ configRoutes.put(
 
       return c.json(response);
     });
+  },
+);
+
+// ─── Storage sources (admin only) ───────────────────────────────────
+// NFS exports and SMB shares workspaces can mount. Sources added here live
+// under data/config/ and are merged with the mount allowlist's own, which
+// stay read-only; an SMB password is write-only and kept in a 0600 file.
+
+const STORAGE_SOURCE_ID_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+/**
+ * Sources whose change persisted while a runner using them could not be
+ * stopped, with the runtimes blocked since. They stay blocked until the same
+ * request is retried.
+ */
+const storageSourceCleanupPending = new Map<string, string[]>();
+
+function storageSourceSafetySource(id: string): string {
+  return `storage_source:${id}`;
+}
+
+class StorageSourceRuntimeError extends Error {
+  constructor(readonly persisted: boolean) {
+    super('storage source runtime cleanup failed');
+  }
+}
+
+/**
+ * Commits a storage source change with every runner that mounts the source
+ * stopped (CLAUDE.md §8): Docker fixes a mount when the container is created,
+ * so a warm runner would keep the old share, credentials or write access.
+ */
+async function commitStorageSourceChange<T>(
+  id: string,
+  quiesce: boolean,
+  reason: string,
+  commit: () => T,
+): Promise<T> {
+  const needsQuiesce = quiesce || storageSourceCleanupPending.has(id);
+  const targets = needsQuiesce
+    ? listStorageSourceUsers(id).map(({ jid, folder }) => ({
+        folder,
+        primaryJid: jid,
+      }))
+    : [];
+  const safetySource = storageSourceSafetySource(id);
+  const releaseBlocked = (runtimeJids: string[]) => {
+    const blocked = storageSourceCleanupPending.get(id) ?? [];
+    storageSourceCleanupPending.delete(id);
+    const jids = [...new Set([...blocked, ...runtimeJids])];
+    if (deps && jids.length > 0) {
+      deps.queue.unblockGroupsForRuntimeSafety?.(jids, safetySource);
+    }
+  };
+  if (!deps || targets.length === 0) {
+    const value = commit();
+    releaseBlocked([]);
+    return value;
+  }
+  try {
+    const result = await quiesceWorkspaceRunnersAroundCommit(
+      deps,
+      targets,
+      {
+        reason,
+        onPostCommitFailure: (runtimeJids) => {
+          storageSourceCleanupPending.set(id, [
+            ...new Set([
+              ...(storageSourceCleanupPending.get(id) ?? []),
+              ...runtimeJids,
+            ]),
+          ]);
+          deps.queue.blockGroupsForRuntimeSafety?.(
+            runtimeJids,
+            `${reason}: runtime cleanup failed after commit`,
+            safetySource,
+          );
+        },
+      },
+      commit,
+    );
+    releaseBlocked(result.runtimeJids);
+    return result.value;
+  } catch (err) {
+    if (err instanceof WorkspaceRuntimeQuiesceError) {
+      throw new StorageSourceRuntimeError(err.persisted);
+    }
+    throw err;
+  }
+}
+
+function storageSourceRuntimeErrorResponse(
+  c: Context<{ Variables: Variables }>,
+  err: StorageSourceRuntimeError,
+) {
+  return c.json(
+    {
+      error: err.persisted
+        ? '改动已生效，但没能停下使用该存储源的工作区；重试同一请求即可完成清理'
+        : '没能停下使用该存储源的工作区，存储源未修改',
+      persisted: err.persisted,
+      retryable: true,
+    },
+    503,
+  );
+}
+
+function storageSourceAdminErrorResponse(
+  c: Context<{ Variables: Variables }>,
+  err: StorageSourceAdminError,
+) {
+  return c.json(
+    {
+      error: err.message,
+      ...(err.code ? { code: err.code } : {}),
+      ...err.details,
+    },
+    err.status,
+  );
+}
+
+function logStorageSourceAudit(
+  c: Context<{ Variables: Variables }>,
+  eventType: 'storage_source_saved' | 'storage_source_deleted',
+  details: Record<string, unknown>,
+): void {
+  const actor = c.get('user') as AuthUser;
+  logAuthEvent({
+    event_type: eventType,
+    username: actor.username,
+    actor_username: actor.username,
+    ip_address: getClientIp(c),
+    user_agent: c.req.header('user-agent') ?? null,
+    // The server and share are deployment details; record only the shape.
+    details,
+  });
+}
+
+configRoutes.get(
+  '/storage-sources',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => {
+    try {
+      return c.json(listStorageSources());
+    } catch (err) {
+      logger.error({ err }, 'Failed to list storage sources');
+      return c.json({ error: 'Failed to list storage sources' }, 500);
+    }
+  },
+);
+
+// Storage sources are Docker volumes, and single-user host mode runs no
+// Docker: a source saved there would never be mounted.
+function storageSourceWriteRefusal(c: Context) {
+  if (!isSingleUserHost()) return null;
+  return singleUserHostRefusal(
+    c,
+    '单人宿主机模式不使用 Docker，存储源不会生效。',
+  );
+}
+
+async function saveStorageSourceRoute(
+  c: Context<{ Variables: Variables }>,
+  creating: boolean,
+) {
+  const refusal = storageSourceWriteRefusal(c);
+  if (refusal) return refusal;
+  const id = c.req.param('id') ?? '';
+  if (!STORAGE_SOURCE_ID_RE.test(id)) {
+    return c.json(
+      { error: '标识只能用小写字母、数字和连字符，最长 63 个字符' },
+      400,
+    );
+  }
+  const body = await c.req.json().catch(() => ({}));
+  const validation = StorageSourceSaveSchema.safeParse(body);
+  if (!validation.success) {
+    return c.json(
+      { error: 'Invalid request body', details: validation.error.format() },
+      400,
+    );
+  }
+  const { force, ...input } = validation.data;
+  let audit: Record<string, unknown> | undefined;
+  try {
+    const source = await withStorageSourceWriteLock(async () => {
+      const plan = planStorageSourceSave(id, input, creating);
+      if (plan.revokedReadWriteUsers > 0 && !force) {
+        throw new StorageSourceAdminError(
+          `有 ${plan.revokedReadWriteUsers} 个工作区以读写方式挂载了 ${id}，关闭读写后它们将无法启动`,
+          409,
+          'STORAGE_SOURCE_READ_WRITE_IN_USE',
+          { readWriteUsedBy: plan.revokedReadWriteUsers },
+        );
+      }
+      return commitStorageSourceChange(
+        id,
+        plan.changesMounts,
+        `Storage source ${id} updated`,
+        () => {
+          const view = plan.commit();
+          audit = {
+            source_id: id,
+            type: view.type,
+            created: creating,
+            password_changed:
+              plan.passwordAction === 'set' ||
+              plan.passwordAction === 'removed',
+          };
+          return view;
+        },
+      );
+    });
+    return c.json({ source }, creating ? 201 : 200);
+  } catch (err) {
+    if (err instanceof StorageSourceRuntimeError) {
+      return storageSourceRuntimeErrorResponse(c, err);
+    }
+    if (err instanceof StorageSourceAdminError) {
+      return storageSourceAdminErrorResponse(c, err);
+    }
+    logger.error({ err, sourceId: id }, 'Failed to save storage source');
+    return c.json({ error: 'Failed to save storage source' }, 500);
+  } finally {
+    // Recorded whenever the change persisted, including a 503 after it.
+    if (audit) logStorageSourceAudit(c, 'storage_source_saved', audit);
+  }
+}
+
+configRoutes.post(
+  '/storage-sources/:id',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => saveStorageSourceRoute(c, true),
+);
+
+configRoutes.put(
+  '/storage-sources/:id',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => saveStorageSourceRoute(c, false),
+);
+
+configRoutes.delete(
+  '/storage-sources/:id',
+  authMiddleware,
+  adminRoleMiddleware,
+  async (c) => {
+    const refusal = storageSourceWriteRefusal(c);
+    if (refusal) return refusal;
+    const id = c.req.param('id');
+    let audit: Record<string, unknown> | undefined;
+    try {
+      await withStorageSourceWriteLock(async () => {
+        let plan: ReturnType<typeof planStorageSourceDelete> | undefined;
+        try {
+          plan = planStorageSourceDelete(id);
+        } catch (err) {
+          // A retry after a 503 finds the source gone: finish stopping the
+          // runners that still use it instead of answering 404.
+          if (
+            !(err instanceof StorageSourceAdminError) ||
+            err.status !== 404 ||
+            !storageSourceCleanupPending.has(id)
+          ) {
+            throw err;
+          }
+        }
+        await commitStorageSourceChange(
+          id,
+          true,
+          `Storage source ${id} deleted`,
+          () => {
+            if (!plan) return;
+            plan.commit();
+            audit = { source_id: id, type: plan.source.type };
+          },
+        );
+      });
+    } catch (err) {
+      if (err instanceof StorageSourceRuntimeError) {
+        return storageSourceRuntimeErrorResponse(c, err);
+      }
+      if (err instanceof StorageSourceAdminError) {
+        return storageSourceAdminErrorResponse(c, err);
+      }
+      logger.error({ err, sourceId: id }, 'Failed to delete storage source');
+      return c.json({ error: 'Failed to delete storage source' }, 500);
+    } finally {
+      if (audit) logStorageSourceAudit(c, 'storage_source_deleted', audit);
+    }
+    return c.json({ success: true });
   },
 );
 
@@ -3949,9 +4600,10 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
     next.appSecret &&
     credentialsChanged
   ) {
-    const test = await testFeishuCredentials(
+    const test = await testFeishuAppCredentials(
       next.appId as string,
       next.appSecret as string,
+      current?.domain,
     );
     if (!test.ok) {
       logger.warn(
@@ -3984,6 +4636,8 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
       enabled: next.enabled as boolean | undefined,
       autoIsolateContext: next.autoIsolateContext as boolean | undefined,
       ownerOpenId: next.ownerOpenId as string | undefined,
+      // The legacy form has no brand field; a Lark account stays on Lark.
+      domain: current?.domain,
     });
     appendImConfigAudit(
       user.username,
@@ -5480,43 +6134,21 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         ? body.target_agent_id.trim()
         : '';
 
-  // Parse once for named sessions, main/workspace binds, and policy-only updates.
-  const rawActivationMode = body.activation_mode;
-  let activationMode =
-    typeof rawActivationMode === 'string' &&
-    VALID_ACTIVATION_MODES.has(rawActivationMode)
-      ? (rawActivationMode as
-          | (typeof rawActivationMode & 'auto')
-          | 'always'
-          | 'when_mentioned'
-          | 'owner_mentioned'
-          | 'disabled')
-      : undefined;
-  let audienceMode: AudienceMode | undefined =
-    body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
-      ? body.audience_mode
-      : undefined;
-  if (channelType === 'feishu') {
-    const normalized = normalizeLegacyOwnerMention({
-      activationMode,
-      audienceMode,
-    });
-    activationMode = normalized.activationMode;
-    audienceMode = normalized.audienceMode;
-  }
+  // Parse once for session binds, topic workspace binds, and policy-only updates.
+  const { activationMode, audienceMode } = parseBindingResponsePolicy(
+    imJid,
+    body,
+  );
 
   // Bind to workspace session. Stored in target_agent_id for backward compatibility.
-  if (targetSessionId && targetSessionId !== 'main') {
+  if (targetSessionId) {
     const sessionId = targetSessionId;
     const agent = getAgent(sessionId);
     if (!agent) {
       return c.json({ error: 'Session not found' }, 404);
     }
-    if (agent.kind !== 'conversation') {
-      return c.json(
-        { error: 'Only workspace sessions can bind IM groups' },
-        400,
-      );
+    if (!isBindableSession(agent)) {
+      return c.json(SESSION_NOT_BINDABLE, 400);
     }
     if (!agent.chat_jid.startsWith('web:')) {
       return c.json(
@@ -5563,6 +6195,9 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     ) {
       return c.json({ error: 'Session not found' }, 404);
     }
+    if (!isBindableSession(freshAgent)) {
+      return c.json(SESSION_NOT_BINDABLE, 400);
+    }
     const freshOwnerGroup = getRegisteredGroup(freshAgent.chat_jid);
     if (
       !freshOwnerGroup ||
@@ -5600,14 +6235,13 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
 
     if (
-      getChannelType(imJid) === 'feishu' &&
-      (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
-      isMentionActivationMode(activationMode)
+      feishuP2pRejectsMentionActivation(
+        imJid,
+        chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
+        activationMode,
+      )
     ) {
-      return c.json(
-        { error: 'Feishu private chats do not support mention activation' },
-        400,
-      );
+      return c.json({ error: FEISHU_P2P_MENTION_ACTIVATION_ERROR }, 400);
     }
 
     const updated: RegisteredGroup = buildSessionMountUpdate(
@@ -5619,7 +6253,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         audienceMode,
       },
     );
-    applyBindingUpdate(imJid, updated);
+    commitChannelMountUpdate(imJid, updated);
     if (freshImGroup.binding_mode === 'thread_map') {
       detachThreadMapWorkspaceIfLast(freshImGroup.target_main_jid, imJid);
     }
@@ -5636,7 +6270,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       ? body.owner_im_id.trim()
       : undefined;
 
-  // Bind to workspace main conversation
+  // Bind a native topic group to a workspace (each topic its own session)
   if (typeof body.target_main_jid === 'string' && body.target_main_jid.trim()) {
     const targetMainJid = body.target_main_jid.trim();
     if (!targetMainJid.startsWith('web:')) {
@@ -5674,27 +6308,20 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
     const bindingPolicyError = conversationBindingPolicyError(
       getConversationKind(imJid, freshImGroup, chatInfo),
-      targetSessionId === 'main' ? 'session' : 'workspace',
+      'workspace',
     );
     if (bindingPolicyError) {
       return c.json({ error: bindingPolicyError }, 400);
     }
     if (
-      getChannelType(imJid) === 'feishu' &&
-      (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
-      isMentionActivationMode(activationMode)
+      feishuP2pRejectsMentionActivation(
+        imJid,
+        chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
+        activationMode,
+      )
     ) {
-      return c.json(
-        { error: 'Feishu private chats do not support mention activation' },
-        400,
-      );
+      return c.json({ error: FEISHU_P2P_MENTION_ACTIVATION_ERROR }, 400);
     }
-    // Compute against freshImGroup, not the pre-await snapshot — see
-    // fetchLiveChatInfo's doc comment.
-    const threadCapable = isNativeContextContainer(imJid, freshImGroup, {
-      ...(chatInfo ?? {}),
-      activation_mode: activationMode ?? freshImGroup.activation_mode,
-    });
     const force = body.force === true;
     const replyPolicy = 'source_only' as const;
     const legacyMainJid = `web:${freshTargetGroup.folder}`;
@@ -5707,17 +6334,12 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
     const updated: RegisteredGroup = {
-      ...buildWorkspaceMountUpdate(
-        freshImGroup,
-        targetMainJid,
-        threadCapable ? 'thread_map' : 'single_session',
-        {
-          replyPolicy,
-          ...(activationMode !== undefined ? { activationMode } : {}),
-          ...(audienceMode !== undefined ? { audienceMode } : {}),
-          ...(ownerImId !== undefined ? { ownerImId } : {}),
-        },
-      ),
+      ...buildWorkspaceMountUpdate(freshImGroup, targetMainJid, 'thread_map', {
+        replyPolicy,
+        ...(activationMode !== undefined ? { activationMode } : {}),
+        ...(audienceMode !== undefined ? { audienceMode } : {}),
+        ...(ownerImId !== undefined ? { ownerImId } : {}),
+      }),
       feishu_chat_mode: chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
       feishu_group_message_type:
         chatInfo?.group_message_type ?? freshImGroup.feishu_group_message_type,
@@ -5725,19 +6347,19 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         ? { owner_claim_source: 'configured' as const }
         : {}),
     };
-    applyBindingUpdate(imJid, updated);
+    commitChannelMountUpdate(imJid, updated);
     if (freshImGroup.binding_mode === 'thread_map') {
       detachThreadMapWorkspaceIfLast(
         freshImGroup.target_main_jid,
         imJid,
         targetMainJid,
-        threadCapable ? 'thread_map' : 'single_session',
+        'thread_map',
       );
     }
-    if (threadCapable) markNativeContextWorkspace(targetMainJid);
+    markNativeContextWorkspace(targetMainJid);
     logger.info(
-      { imJid, targetMainJid, threadCapable, userId: user.id },
-      'IM group bound to workspace (bindings page)',
+      { imJid, targetMainJid, userId: user.id },
+      'IM topic group bound to workspace (bindings page)',
     );
     return c.json({ success: true });
   }
@@ -5749,14 +6371,13 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     ownerImId !== undefined
   ) {
     if (
-      getChannelType(imJid) === 'feishu' &&
-      imGroup.feishu_chat_mode === 'p2p' &&
-      isMentionActivationMode(activationMode)
+      feishuP2pRejectsMentionActivation(
+        imJid,
+        imGroup.feishu_chat_mode,
+        activationMode,
+      )
     ) {
-      return c.json(
-        { error: 'Feishu private chats do not support mention activation' },
-        400,
-      );
+      return c.json({ error: FEISHU_P2P_MENTION_ACTIVATION_ERROR }, 400);
     }
     const candidate: RegisteredGroup = {
       ...imGroup,
@@ -5781,11 +6402,17 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         400,
       );
     }
+    if (candidate.target_main_jid && !threadCapable) {
+      return c.json(
+        { error: 'Workspace bindings only accept native topic groups' },
+        400,
+      );
+    }
     const updated = candidate.target_main_jid
       ? buildWorkspaceMountUpdate(
           candidate,
           candidate.target_main_jid,
-          threadCapable ? 'thread_map' : 'single_session',
+          'thread_map',
           {
             activationMode: candidate.activation_mode,
             audienceMode: candidate.audience_mode,
@@ -5793,11 +6420,8 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
           },
         )
       : candidate;
-    applyBindingUpdate(imJid, updated);
-    if (imGroup.binding_mode === 'thread_map' && !threadCapable) {
-      detachThreadMapWorkspaceIfLast(imGroup.target_main_jid, imJid);
-    }
-    if (threadCapable && updated.target_main_jid) {
+    commitChannelMountUpdate(imJid, updated);
+    if (updated.target_main_jid) {
       markNativeContextWorkspace(updated.target_main_jid);
     }
     logger.info(
@@ -5856,7 +6480,7 @@ configRoutes.post(
       sender_allowlist: undefined,
       audience_mode: 'everyone',
     };
-    applyBindingUpdate(imJid, updated);
+    commitChannelMountUpdate(imJid, updated);
 
     logger.info(
       { imJid, userId: user.id },

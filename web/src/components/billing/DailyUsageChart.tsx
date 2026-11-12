@@ -21,11 +21,16 @@ export default function DailyUsageChart() {
   const chartData = Array.from({ length: CHART_DAYS }, (_, i) => {
     const d = new Date(today);
     d.setDate(d.getDate() - (CHART_DAYS - 1 - i));
-    const dateStr = d.toISOString().slice(0, 10);
+    // The ledger rows are keyed by local calendar day, so match them with the
+    // local day too: toISOString() would shift the whole chart by one day
+    // between local midnight and UTC midnight.
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const dateStr = `${d.getFullYear()}-${month}-${day}`;
     const found = dailyUsage.find((u) => u.date === dateStr);
     return {
       date: dateStr,
-      label: `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`,
+      label: `${month}-${day}`,
       cost: found?.total_cost_usd ?? 0,
       inputTokens: found?.total_input_tokens ?? 0,
       outputTokens: found?.total_output_tokens ?? 0,

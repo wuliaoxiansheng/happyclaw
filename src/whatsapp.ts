@@ -34,7 +34,6 @@ import { ProxyAgent } from 'proxy-agent';
 import { readFile } from 'node:fs/promises';
 import { logger } from './logger.js';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
-import { notifyNewImMessage } from './message-notifier.js';
 import { markdownToPlainText, splitTextChunks } from './im-utils.js';
 import { saveDownloadedFile, FileTooLargeError } from './im-downloader.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
@@ -43,6 +42,20 @@ import {
   resolveAdmittedChannelRoute,
 } from './channel-admission.js';
 import { canonicalizeWhatsAppProviderConversationJid } from './whatsapp-jid.js';
+import {
+  groupSenderAdmission,
+  type ChannelCommandMention,
+  type GroupAudienceConnectOpts,
+  type GroupSenderAdmission,
+} from './im-group-audience.js';
+import {
+  existingControlTarget,
+  parseConnectorRuntimeControl,
+  projectChannelInbound,
+  runSessionBreak,
+  STEER_TARGET_MISSING_REPLY,
+  type ChannelFollowUpConnectOpts,
+} from './im-connector-follow-up.js';
 import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
 import {
   ChannelInboundLifecycle,
@@ -96,7 +109,9 @@ export interface WhatsAppConnectionState {
   meName?: string;
 }
 
-export interface WhatsAppConnectOpts {
+/** Group audience senders are `jidNormalizedUser` participant JIDs. */
+export interface WhatsAppConnectOpts
+  extends ChannelFollowUpConnectOpts, GroupAudienceConnectOpts {
   onReady?: () => void;
   onNewChat: (jid: string, name: string) => void;
   isChatAuthorized?: (jid: string) => boolean;
@@ -110,9 +125,14 @@ export interface WhatsAppConnectOpts {
     chatJid: string,
     command: string,
     senderImId?: string,
+    mentions?: ChannelCommandMention[],
   ) => Promise<string | null>;
   resolveGroupFolder?: (jid: string) => string | undefined;
   resolveEffectiveChatJid?: (
+    chatJid: string,
+  ) => { effectiveJid: string; agentId: string | null } | null;
+  /** The route a chat already has; never creates one. */
+  lookupEffectiveChatJid?: (
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
@@ -125,8 +145,6 @@ export interface WhatsAppConnectOpts {
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   /** owner_mentioned mode: bot @mentioned but sender not group owner → drop */
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
-  /** Sender allowlist: false → drop before any further processing */
-  isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   /** WhatsApp 专属：连接状态变化回调（QR 出现、connected、断线等） */
   onConnectionUpdate?: (state: WhatsAppConnectionState) => void;
   normalizeIncomingJid?: (jid: string) => string | null;
@@ -651,13 +669,18 @@ export function createWhatsAppConnection(
     msg: WAMessage,
     content: proto.IMessage,
     groupFolder: string | undefined,
+    /** The admitted route; a session route picks that session's worktree. */
+    routeJid: string,
     lease: ChannelInboundLease,
     activeSock: WASocket,
+    /** Replaces the provider caption, e.g. by the guidance of `/steer`. */
+    captionOverride?: string,
   ): Promise<{ content: string; attachmentsJson?: string } | null> {
     inboundLifecycle.assertCurrent(lease);
     const detected = detectMedia(content);
     if (!detected) return null;
     const { kind, label, node, defaultExt } = detected;
+    const caption = captionOverride ?? node.caption;
 
     // Baileys unwraps its known FutureProofMessage variants internally, but
     // rc13 does not yet recognize proto-74 lottieStickerMessage. Keep the
@@ -686,11 +709,11 @@ export function createWhatsAppConnection(
         { err, kind, msgId: msg.key?.id },
         'WhatsApp media download failed',
       );
-      const cap = node.caption ? `: ${node.caption}` : '';
+      const cap = caption ? `: ${caption}` : '';
       return { content: `[${label} 下载失败${cap}]` };
     }
 
-    const captionLine = node.caption ? `\n${node.caption}` : '';
+    const captionLine = caption ? `\n${caption}` : '';
 
     if (!groupFolder) {
       // No workspace mapping for this chat — skip disk save, just signal what arrived
@@ -709,6 +732,7 @@ export function createWhatsAppConnection(
         'whatsapp',
         fileName,
         buffer,
+        routeJid,
       );
       inboundLifecycle.assertCurrent(lease);
     } catch (err) {
@@ -848,20 +872,22 @@ export function createWhatsAppConnection(
         return;
       }
 
-      // ── Group gates: sender allowlist → mention required → owner check ──
+      // ── Group gates: response audience → mention required → owner check ──
+      const isBotMentioned = isGroup && isMentioningBot(inner, activeSock.user);
+      let audience: GroupSenderAdmission = 'admitted';
       if (isGroup) {
-        if (
-          opts.isSenderAllowedInGroup &&
-          !opts.isSenderAllowedInGroup(chatJid, senderImId)
-        ) {
-          logger.debug(
-            { chatJid, senderImId },
-            'WhatsApp dropped: sender not allowlisted',
-          );
-          return;
-        }
+        const addressedText =
+          isBotMentioned && text
+            ? stripLeadingWhatsAppBotMention(text, inner, activeSock.user)
+            : text;
+        audience = groupSenderAdmission(
+          opts,
+          chatJid,
+          senderImId,
+          addressedText ?? '',
+        );
+        if (audience === 'rejected') return;
 
-        const isBotMentioned = isMentioningBot(inner, activeSock.user);
         if (
           opts.shouldProcessGroupMessage &&
           !isBotMentioned &&
@@ -884,21 +910,69 @@ export function createWhatsAppConnection(
           );
           return;
         }
-        if (isBotMentioned && text) {
-          text = stripLeadingWhatsAppBotMention(text, inner, activeSock.user);
-        }
+        text = addressedText;
       }
+
+      // A group message must carry the bot in mentionedJid; a 1:1 chat is
+      // addressed to the bot by construction.
+      const runtimeControl = parseConnectorRuntimeControl({
+        commandText: text?.trim() ?? '',
+        eligible: !isGroup || isBotMentioned,
+        hasAttachments: detectMedia(inner) !== null,
+      });
+      // A runtime control acts on the Session the chat already has.
+      const lookup = opts.lookupEffectiveChatJid;
+      const controlTarget = () =>
+        existingControlTarget(
+          chatJid,
+          !!opts?.resolveEffectiveChatJid,
+          lookup && (() => lookup(chatJid)),
+        );
+      if (runtimeControl?.kind === 'break') {
+        const reply = await runSessionBreak(opts.onSessionBreak, {
+          sourceJid: chatJid,
+          targetJid: controlTarget(),
+          senderImId,
+          chatType: isGroup ? 'group' : 'p2p',
+        });
+        inboundLifecycle.assertCurrent(lease);
+        try {
+          await activeSock.sendMessage(remoteJid, { text: reply });
+        } catch (err) {
+          logger.warn({ err, chatJid }, 'WhatsApp /break reply send failed');
+        }
+        return;
+      }
+      const steerText =
+        runtimeControl?.kind === 'steer' ? runtimeControl.text : undefined;
+      if (steerText !== undefined && !controlTarget()) {
+        inboundLifecycle.assertCurrent(lease);
+        try {
+          await activeSock.sendMessage(remoteJid, {
+            text: STEER_TARGET_MISSING_REPLY,
+          });
+        } catch (err) {
+          logger.warn({ err, chatJid }, 'WhatsApp /steer reply send failed');
+        }
+        return;
+      }
+      if (steerText !== undefined) text = steerText;
 
       // Control commands may repair/change a binding. Consume them before
       // route validation; media must not be downloaded for a stale route.
       const commandText = text?.trim() ?? '';
       const slashMatch = commandText.match(/^\/(\S+)(?:\s+(.*))?$/s);
-      if (slashMatch && opts.onCommand) {
+      if (slashMatch && opts.onCommand && steerText === undefined) {
         const cmdBody = (
           slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
         ).trim();
         try {
-          const reply = await opts.onCommand(chatJid, cmdBody, senderImId);
+          const reply = await opts.onCommand(
+            chatJid,
+            cmdBody,
+            senderImId,
+            isGroup ? whatsAppCommandMentions(inner, activeSock.user) : [],
+          );
           if (reply !== null && reply !== undefined) {
             if (sock) {
               try {
@@ -919,6 +993,8 @@ export function createWhatsAppConnection(
           );
         }
       }
+      // Admitted only as `/owner_mention`, and not consumed as it.
+      if (audience === 'bootstrap') return;
 
       const resolvedRoute = resolveAdmittedChannelRoute(
         chatJid,
@@ -948,8 +1024,10 @@ export function createWhatsAppConnection(
         msg,
         inner,
         opts.resolveGroupFolder?.(chatJid),
+        targetJid,
         lease,
         activeSock,
+        steerText,
       );
       inboundLifecycle.assertCurrent(lease);
       if (media) {
@@ -986,9 +1064,8 @@ export function createWhatsAppConnection(
         false,
         { attachments: attachmentsJson, sourceJid: chatJid },
       );
-
-      opts.onMessagePersisted?.(
-        targetJid,
+      const followUp = projectChannelInbound(
+        opts,
         {
           id,
           chat_jid: targetJid,
@@ -1000,10 +1077,24 @@ export function createWhatsAppConnection(
           attachments: attachmentsJson,
           is_from_me: false,
         },
-        routing?.agentId ?? undefined,
+        {
+          agentId: routing?.agentId ?? undefined,
+          requestedMode: steerText === undefined ? undefined : 'steer',
+        },
       );
-      notifyNewImMessage();
-
+      if (!followUp.shouldStartTurn) {
+        // Released by the host when the active run ends.
+        logger.info(
+          {
+            chatJid,
+            targetJid,
+            msgId: key.id,
+            disposition: followUp.disposition,
+          },
+          'WhatsApp message queued behind the active run',
+        );
+        return;
+      }
       if (routing?.agentId) {
         opts.onAgentMessage?.(chatJid, routing.agentId);
         logger.info(
@@ -1613,16 +1704,7 @@ export function isWhatsAppSelfParticipant(
  * (e.g. `15551234567:42@s.whatsapp.net`). Compare every known self identity
  * after normalizing device suffixes and hosted aliases.
  */
-export function isMentioningBot(
-  content: proto.IMessage,
-  self: WhatsAppSelfRef,
-): boolean {
-  // Fail closed: 当 self 暂时不可用（reconnect 间隙、auth 状态未就绪），
-  // 从前的 fail-open 让 require_mention 模式短暂被绕过——攻击者可在 socket
-  // 启动毫秒级窗口中把所有群消息都被处理。一致性优先：没法确认时按"未被
-  // mention"处理，主消息处理流会丢弃。和 feishu 实现的语义对齐。
-  const identities = new Set(collectWhatsAppSelfJids(self));
-  if (identities.size === 0) return false;
+function mentionedJids(content: proto.IMessage): string[] {
   const ctx =
     content.extendedTextMessage?.contextInfo ||
     content.imageMessage?.contextInfo ||
@@ -1633,9 +1715,41 @@ export function isMentioningBot(
     content.stickerMessage?.contextInfo ||
     content.eventMessage?.contextInfo ||
     content.groupInviteMessage?.contextInfo;
-  const mentioned = ctx?.mentionedJid;
-  if (!mentioned || mentioned.length === 0) return false;
-  return mentioned.some((m) => identities.has(canonicalizeWhatsAppUserJid(m)));
+  return ctx?.mentionedJid ?? [];
+}
+
+export function isMentioningBot(
+  content: proto.IMessage,
+  self: WhatsAppSelfRef,
+): boolean {
+  // Fail closed: 当 self 暂时不可用（reconnect 间隙、auth 状态未就绪），
+  // 从前的 fail-open 让 require_mention 模式短暂被绕过——攻击者可在 socket
+  // 启动毫秒级窗口中把所有群消息都被处理。一致性优先：没法确认时按"未被
+  // mention"处理，主消息处理流会丢弃。和 feishu 实现的语义对齐。
+  const identities = new Set(collectWhatsAppSelfJids(self));
+  if (identities.size === 0) return false;
+  return mentionedJids(content).some((m) =>
+    identities.has(canonicalizeWhatsAppUserJid(m)),
+  );
+}
+
+/**
+ * Members a WhatsApp group command names, for `/allow` and `/disallow`,
+ * normalized exactly like group senders (`jidNormalizedUser`). The bot's own
+ * identities are never named.
+ */
+export function whatsAppCommandMentions(
+  content: proto.IMessage,
+  self: WhatsAppSelfRef,
+): ChannelCommandMention[] {
+  const selfIds = new Set(collectWhatsAppSelfJids(self));
+  const ids = new Set<string>();
+  for (const jid of mentionedJids(content)) {
+    if (selfIds.has(canonicalizeWhatsAppUserJid(jid))) continue;
+    const id = jidNormalizedUser(jid);
+    if (id) ids.add(id);
+  }
+  return [...ids].map((imId) => ({ imId }));
 }
 
 /** Remove a leading WhatsApp display token only when trusted message metadata

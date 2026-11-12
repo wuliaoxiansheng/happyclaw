@@ -1,6 +1,10 @@
 import type { ChannelAccount } from './types.js';
 import type { ChannelAccountSecret } from './channel-account-secrets.js';
-import { testFeishuCredentials } from './feishu-connectivity.js';
+import {
+  testFeishuCredentials,
+  type FeishuConnectivityResult,
+} from './feishu-connectivity.js';
+import { normalizeFeishuBrand } from './feishu-domain.js';
 import { fetch as undiciFetch, ProxyAgent } from 'undici';
 import {
   configuredWeChatHttpProxy,
@@ -14,14 +18,26 @@ export interface ChannelAccountCredentialTestResult {
   error?: string;
 }
 
+/** Test Feishu credentials against the host of the stored `domain` brand. */
+export function testFeishuAppCredentials(
+  appId: string,
+  appSecret: string,
+  domain: string | undefined,
+): Promise<FeishuConnectivityResult> {
+  return testFeishuCredentials(appId, appSecret, {
+    brand: normalizeFeishuBrand(domain),
+  });
+}
+
 export async function testChannelAccountCredentials(
   account: ChannelAccount,
   secret: ChannelAccountSecret,
 ): Promise<ChannelAccountCredentialTestResult> {
   if (account.provider === 'feishu') {
-    const result = await testFeishuCredentials(
+    const result = await testFeishuAppCredentials(
       secret.appId || '',
       secret.appSecret || '',
+      secret.domain,
     );
     return result.ok
       ? { success: true }

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { extractErrorMessage } from '../utils/error';
 import {
   mcpServerEndpoint,
   normalizeMcpServers,
@@ -104,7 +105,7 @@ export const useMcpServersStore = create<McpServersState>((set, get) => ({
     } catch (err) {
       set({
         loading: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
   },
@@ -115,7 +116,7 @@ export const useMcpServersStore = create<McpServersState>((set, get) => ({
       set({ error: null });
       await get().loadServers();
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
       throw err;
     }
   },
@@ -139,7 +140,7 @@ export const useMcpServersStore = create<McpServersState>((set, get) => ({
       set({ error: null });
       await get().loadServers();
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
       throw err;
     }
   },
@@ -164,7 +165,7 @@ export const useMcpServersStore = create<McpServersState>((set, get) => ({
       set({ error: null });
       await get().loadServers();
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
       throw err;
     }
   },

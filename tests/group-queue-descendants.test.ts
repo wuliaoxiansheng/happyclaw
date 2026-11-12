@@ -40,19 +40,12 @@ function seedResolver(
       const folder = jidToFolder[baseJid] || baseJid;
       return `${folder}#${agentId}`;
     }
-    const taskSep = groupJid.indexOf('#task:');
-    if (taskSep >= 0) {
-      const baseJid = groupJid.slice(0, taskSep);
-      const taskId = groupJid.slice(taskSep + '#task:'.length);
-      const folder = jidToFolder[baseJid] || baseJid;
-      return `${folder}#task:${taskId}`;
-    }
     return jidToFolder[groupJid] || groupJid;
   });
 }
 
 describe('GroupQueue.listDescendantJids', () => {
-  test('returns active sub-agent and task virtual JIDs in the same folder', () => {
+  test('returns active sub-agent and session virtual JIDs in the same folder', () => {
     const q = new GroupQueue();
     seedResolver(q, {
       'web:main': 'main',
@@ -63,13 +56,13 @@ describe('GroupQueue.listDescendantJids', () => {
       'web:main', // main session, NOT a descendant
       'web:main#agent:a1', // sub-agent spawned from web:main
       'feishu:F1#agent:a2', // sub-agent spawned from IM sibling, same folder
-      'web:main#task:t1', // scheduled task
+      'web:main#agent:run1', // automation run session
       'web:other#agent:a3', // different folder — must NOT match
     ]);
 
     const out = q.listDescendantJids('web:main').sort();
     expect(out).toEqual(
-      ['web:main#agent:a1', 'feishu:F1#agent:a2', 'web:main#task:t1'].sort(),
+      ['web:main#agent:a1', 'feishu:F1#agent:a2', 'web:main#agent:run1'].sort(),
     );
   });
 
@@ -93,13 +86,13 @@ describe('GroupQueue.listDescendantJids', () => {
     expect(q.listDescendantJids('web:main')).toEqual(['web:main#agent:a1']);
   });
 
-  test('includes a descendant present ONLY in waitingGroups (message-only, no pendingTasks)', () => {
+  test('includes a descendant present ONLY in waitingGroups (no pendingTasks)', () => {
     const q = new GroupQueue();
     seedResolver(q, { 'web:main': 'main' });
-    // A capacity-blocked message-check descendant: enqueueMessageCheck adds it to
-    // waitingGroups + sets pendingMessages, but pendingTasks stays empty. This
-    // exercises the waitingGroups predicate branch independently of pendingTasks,
-    // so a future regression that drops that branch is caught here.
+    // A lane drainGroup parked in waitingGroups (no slot yet) while its
+    // pendingTasks is empty. This exercises the waitingGroups predicate branch
+    // independently of pendingTasks, so a future regression that drops that
+    // branch is caught here.
     seed(q, 'web:main#agent:a1', { active: false, pendingTasks: [] });
     (q as unknown as { waitingGroups: Set<string> }).waitingGroups.add(
       'web:main#agent:a1',
@@ -129,12 +122,12 @@ describe('GroupQueue.listDescendantJids', () => {
   test('stopGroup invokes queued task drop callback before discarding it', async () => {
     const q = new GroupQueue();
     let dropped = 0;
-    const jid = 'web:main#task:queued';
+    const jid = 'web:main#agent:queued';
     seed(q, jid, {
       active: false,
       pendingTasks: [
         {
-          id: 'scheduled-task',
+          id: 'queued-task',
           groupJid: jid,
           fn: async () => {},
           onDropped: () => {

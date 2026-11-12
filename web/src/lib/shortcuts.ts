@@ -12,8 +12,6 @@ export const SHORTCUTS = {
   save: 'mod+s',
 } as const;
 
-export type ShortcutName = keyof typeof SHORTCUTS;
-
 const MODIFIERS = ['mod', 'ctrl', 'alt', 'shift'] as const;
 type Modifier = (typeof MODIFIERS)[number];
 

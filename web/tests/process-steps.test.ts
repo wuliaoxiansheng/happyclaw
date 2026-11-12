@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  LIVE_TIMELINE_ROWS,
   SETTLED_TIMELINE_ROWS,
   buildProcessView,
   cleanToolSummary,
   describeGroup,
-  describeSettled,
+  describeWork,
+  describeWorkCounts,
   formatSpanZh,
   groupProcessSteps,
   hasListedSteps,
@@ -13,7 +15,6 @@ import {
   processSpanMs,
   stepDurationMs,
   summarizeGroup,
-  summarizeSettled,
   summarizedSteps,
   toolCategory,
   toolOutput,
@@ -240,108 +241,119 @@ describe('formatSpanZh', () => {
   });
 });
 
-describe('summarizeSettled', () => {
+describe('describeWork', () => {
   const thinking = (id: string, at: number, endedAt: number) =>
     step({ id, kind: 'thinking', at, endedAt, durationMs: endedAt - at });
 
-  it('reads a run of 59.6 seconds as a minute, not as sixty seconds', () => {
+  it('says how long the process took, as the timer beside it would', () => {
     expect(
-      summarizeSettled([
-        thinking('t1', 0, 3000),
-        tool('a', 'Bash', { at: 3000, endedAt: 59_600 }),
-      ]),
-    ).toBe('已处理 1 分 · 1 个工具 · 1 段思考');
-    expect(summarizeSettled([thinking('t1', 0, 59_999)])).toBe('已思考 1 分');
-  });
-
-  it('says what the run did, how long it took, and what it used', () => {
-    expect(
-      summarizeSettled([
+      describeWork([
         thinking('t1', 0, 3000),
         tool('a', 'Read', { at: 3000, endedAt: 4000 }),
         thinking('t2', 4000, 6000),
         tool('b', 'Bash', { at: 6000, endedAt: 14_000 }),
       ]),
-    ).toBe('已处理 14 秒 · 2 个工具 · 2 段思考');
-  });
-
-  it('is the reasoning alone when there was no tool', () => {
-    expect(summarizeSettled([thinking('t1', 0, 12_000)])).toBe('已思考 12 秒');
-    expect(summarizeSettled([thinking('t1', 0, 300)])).toBe('已思考');
-  });
-
-  it('is the tools alone when there was no reasoning', () => {
+    ).toBe('已工作 14s');
     expect(
-      summarizeSettled([
-        tool('a', 'Read', { at: 0, endedAt: 500 }),
-        tool('b', 'Bash', { at: 500, endedAt: 9000 }),
+      describeWork([
+        thinking('t1', 0, 3000),
+        tool('a', 'Bash', { at: 3000, endedAt: 65_400 }),
       ]),
-    ).toBe('已使用 2 个工具');
+    ).toBe('已工作 1m 05s');
   });
 
-  it('counts a sub-agent as a tool and the failures at the end', () => {
-    expect(
-      summarizeSettled([
-        thinking('t1', 0, 2000),
-        step({
-          id: 'task-1',
-          kind: 'task',
-          taskId: 'task-1',
-          at: 2000,
-          endedAt: 9000,
-        }),
-        tool('b', 'Bash', { at: 9000, endedAt: 10_000, status: 'error' }),
-      ]),
-    ).toBe('已处理 10 秒 · 2 个工具 · 1 段思考 · 1 个失败');
+  it('reads a run under a second as a second, never as nothing', () => {
+    expect(describeWork([thinking('t1', 0, 300)])).toBe('已工作 1s');
   });
 
   it('takes the total it was given when the steps carry no times', () => {
     expect(
-      summarizeSettled(
+      describeWork(
         [
           step({ id: 't1', kind: 'thinking', status: 'done' }),
           tool('a', 'Read', { at: 1000 }),
         ],
         20_000,
       ),
-    ).toBe('已处理 20 秒 · 1 个工具 · 1 段思考');
+    ).toBe('已工作 20s');
+    expect(describeWork([tool('a', 'Read', { at: 1000 })])).toBe('已工作');
   });
 
-  it('leaves the answer and a question for the reader out of the count', () => {
+  it('leaves the answer and a question for the reader out of the time', () => {
     expect(
-      summarizeSettled([
-        tool('a', 'Read', { at: 0, endedAt: 500 }),
-        tool('q', 'AskUserQuestion', { at: 500, endedAt: 600 }),
+      describeWork([
+        tool('a', 'Read', { at: 0, endedAt: 2000 }),
+        tool('q', 'AskUserQuestion', { at: 2000, endedAt: 9000 }),
         step({
           id: 'text-1',
           kind: 'text',
-          at: 700,
-          endedAt: 800,
+          at: 9000,
+          endedAt: 30_000,
           text: '好了',
         }),
       ]),
-    ).toBe('已使用 1 个工具');
+    ).toBe('已工作 2s');
+  });
+});
+
+describe('describeWorkCounts', () => {
+  it('counts what the process used, a sub-agent as a tool, and the failures', () => {
+    expect(
+      describeWorkCounts([
+        step({ id: 't1', kind: 'thinking' }),
+        step({ id: 'task-1', kind: 'task', taskId: 'task-1' }),
+        tool('b', 'Bash', { status: 'error' }),
+      ]),
+    ).toBe('2 个工具 · 1 段思考 · 1 个失败');
   });
 
-  it('has a line for notes alone, and for nothing it can name', () => {
+  it('is the reasoning or the tools alone when there was only one', () => {
+    expect(describeWorkCounts([step({ id: 't1', kind: 'thinking' })])).toBe(
+      '1 段思考',
+    );
+    expect(describeWorkCounts([tool('a', 'Read'), tool('b', 'Bash')])).toBe(
+      '2 个工具',
+    );
+  });
+
+  it('counts the notes only when there is nothing else, and says nothing for nothing', () => {
     expect(
-      describeSettled({
-        tools: 0,
-        tasks: 0,
-        thinking: 0,
-        commentary: 2,
-        failed: 0,
-      }),
+      describeWorkCounts([
+        step({ id: 'n1', kind: 'text', text: '先看看' }),
+        step({ id: 'n2', kind: 'text', text: '再看看' }),
+        tool('a', 'Read'),
+      ]),
+    ).toBe('1 个工具');
+    expect(
+      describeWorkCounts([
+        step({ id: 'n1', kind: 'text', text: '先看看' }),
+        step({ id: 'n2', kind: 'text', text: '再看看' }),
+        tool('q', 'AskUserQuestion'),
+      ]),
     ).toBe('2 条过程说明');
+    expect(describeWorkCounts([])).toBe('');
+  });
+
+  it('calls the progress the Agent sent progress', () => {
     expect(
-      describeSettled({
-        tools: 0,
-        tasks: 0,
-        thinking: 0,
-        commentary: 0,
-        failed: 0,
-      }),
-    ).toBe('已处理');
+      describeWorkCounts([
+        step({
+          id: 'p1',
+          kind: 'text',
+          commentary: true,
+          progress: true,
+          text: '在查',
+        }),
+        step({ id: 'n1', kind: 'text', commentary: true, text: '先看看' }),
+        tool('q', 'AskUserQuestion'),
+      ]),
+    ).toBe('1 条进展 · 1 条过程说明');
+  });
+
+  it('says there were earlier steps it did not count', () => {
+    expect(describeWorkCounts([tool('a', 'Bash')], 3)).toBe(
+      '1 个工具 · 另有较早 3 步',
+    );
   });
 });
 
@@ -362,6 +374,21 @@ describe('what the card lists', () => {
   it('drops the commentary unless it is asked for', () => {
     expect(visibleSteps(steps, true)).toHaveLength(4);
     expect(visibleSteps(steps, false).map((s) => s.id)).toEqual(['a', 'b']);
+  });
+
+  it('keeps the progress the Agent sent either way', () => {
+    const progress = step({
+      id: 'p',
+      kind: 'text',
+      commentary: true,
+      progress: true,
+      text: '在查',
+    });
+    expect(visibleSteps([...steps, progress], false).map((s) => s.id)).toEqual([
+      'a',
+      'b',
+      'p',
+    ]);
   });
 
   it('has something to show when the timeline would list a step', () => {
@@ -464,9 +491,11 @@ describe('buildProcessView', () => {
     expect(itemSteps(view.rows).map((s) => s.id)).toEqual(['a', 'c']);
   });
 
-  it('folds a live list past six rows and a settled one past thirty', () => {
+  it('folds past six rows, a card at work past five (cindy) and a settled one past thirty', () => {
     const steps = commands(11);
     expect(buildProcessView(steps).folded).toHaveLength(5);
+    expect(buildProcessView(steps, LIVE_TIMELINE_ROWS).folded).toHaveLength(6);
+    expect(LIVE_TIMELINE_ROWS).toBe(5);
     expect(buildProcessView(steps, SETTLED_TIMELINE_ROWS).folded).toEqual([]);
     expect(SETTLED_TIMELINE_ROWS).toBe(30);
     expect(
@@ -482,25 +511,6 @@ describe('a list of nothing but a question', () => {
     expect(hasListedSteps([question])).toBe(false);
     expect(summarizedSteps([question])).toEqual([]);
     expect(hasListedSteps([question, tool('a', 'Read')])).toBe(true);
-  });
-});
-
-describe('the summary of a run that dropped steps', () => {
-  it('says there were earlier steps it did not count', () => {
-    const steps = [
-      step({ id: 't1', kind: 'thinking', at: 0, endedAt: 3000 }),
-      tool('a', 'Bash', { at: 3000, endedAt: 9000 }),
-    ];
-    expect(summarizeSettled(steps, undefined, 12)).toBe(
-      '已处理 9 秒 · 1 个工具 · 1 段思考 · 另有较早 12 步',
-    );
-    expect(summarizeSettled([tool('a', 'Bash')], undefined, 3)).toBe(
-      '已使用 1 个工具 · 另有较早 3 步',
-    );
-    expect(
-      summarizeSettled([tool('a', 'Bash', { status: 'error' })], undefined, 3),
-    ).toBe('已使用 1 个工具 · 1 个失败 · 另有较早 3 步');
-    expect(summarizeSettled([tool('a', 'Bash')])).toBe('已使用 1 个工具');
   });
 });
 

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 
+import { splitOneMillionSuffix } from './model-providers.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 
 const MAX_SNAPSHOTS = 500;
@@ -191,6 +192,37 @@ export function getRunContextSnapshot(
   agentId?: string,
 ): RunContextSnapshot | null {
   return snapshots.get(snapshotKey(chatJid, agentId)) ?? null;
+}
+
+/**
+ * The context window Claude Code last reported running `model` with for one
+ * conversation (any of its chats), or null when no run in this process said.
+ * Compared by model without the `[1m]` suffix, which Claude Code strips.
+ */
+export function latestSdkContextWindow(
+  chatJids: readonly string[],
+  agentId: string | null,
+  models: readonly string[],
+): number | null {
+  const wanted = new Set(models.map(baseModelId).filter(Boolean));
+  let window: number | null = null;
+  for (const snapshot of snapshots.values()) {
+    if (
+      snapshot.sdkContext &&
+      snapshot.sdkContext.maxTokens > 0 &&
+      snapshot.agentId === agentId &&
+      chatJids.includes(snapshot.chatJid) &&
+      wanted.has(baseModelId(snapshot.sdkContext.model))
+    ) {
+      // Insertion order is recency: a newer snapshot is re-inserted last.
+      window = snapshot.sdkContext.maxTokens;
+    }
+  }
+  return window;
+}
+
+function baseModelId(model: string): string {
+  return splitOneMillionSuffix(model).model.toLowerCase();
 }
 
 /**

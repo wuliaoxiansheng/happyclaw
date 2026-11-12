@@ -20,20 +20,28 @@ vi.mock('../src/runtime-config.js', () => ({
     maxConcurrentHostProcesses: 10,
   }),
 }));
-vi.mock('../src/db.js', () => ({ getTaskById: () => undefined }));
+vi.mock('../src/db.js', () => ({}));
 
 const { GroupQueue } = await import('../src/group-queue.js');
 type Receipt = import('../src/group-queue.js').IpcDeliveryReceipt;
 
-const JID = 'web:ipc-receipts';
+const AGENT_ID = 'session';
+const JID = `web:ipc-receipts#agent:${AGENT_ID}`;
 const FOLDER = 'ipc-receipts';
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 let queue: InstanceType<typeof GroupQueue>;
 let releaseRun: (() => void) | undefined;
+/** The lane's conversation task; a test may replace it before starting. */
+let runTurn: () => Promise<boolean>;
+let taskSeq = 0;
+
+function enqueueTurn(jid = JID): void {
+  queue.enqueueTask(jid, `turn-${++taskSeq}`, () => runTurn());
+}
 
 function inputDir(): string {
-  return path.join(DATA_DIR, 'ipc', FOLDER, 'input');
+  return path.join(DATA_DIR, 'ipc', FOLDER, 'agents', AGENT_ID, 'input');
 }
 
 function readPayloads(): Array<{ receipt?: Receipt; queryRunId?: string }> {
@@ -53,7 +61,7 @@ async function startRunner(
     interactionMode?: 'assistant' | 'proactive';
   } = {},
 ): Promise<void> {
-  queue.enqueueMessageCheck(JID);
+  enqueueTurn();
   await tick();
   queue.registerProcess(
     JID,
@@ -67,6 +75,7 @@ async function startRunner(
     {
       containerName: options.containerName ?? null,
       groupFolder: FOLDER,
+      agentId: AGENT_ID,
       feishuCliAccountId: options.feishuCliAccountId,
       interactionMode: options.interactionMode,
     },
@@ -79,7 +88,7 @@ function cursor(id: string): { timestamp: string; id: string } {
 
 function inject(id: string, coveredIds: string[] = [id]): Receipt {
   expect(
-    queue.sendMessage(JID, id, undefined, undefined, JID, undefined, {
+    queue.sendMessage(JID, id, undefined, undefined, JID, {
       chatJid: JID,
       coveredCursors: coveredIds.map(cursor),
       cursor: cursor(id),
@@ -93,15 +102,15 @@ beforeEach(() => {
   fs.rmSync(DATA_DIR, { recursive: true, force: true });
   queue = new GroupQueue();
   queue.setIpcDeliveryCommitEligibilityChecker(() => true);
-  queue.setProcessMessagesFn(
-    () =>
-      new Promise<boolean>((resolve) => {
-        releaseRun = () => resolve(true);
-      }),
-  );
+  runTurn = () =>
+    new Promise<boolean>((resolve) => {
+      releaseRun = () => resolve(true);
+    });
 });
 
 afterEach(async () => {
+  // A test may pin Date.now; restore it even when its expectations failed.
+  vi.restoreAllMocks();
   releaseRun?.();
   await tick();
   await tick();
@@ -109,22 +118,6 @@ afterEach(async () => {
 });
 
 describe('GroupQueue IPC delivery receipts', () => {
-  test('closes the runner boot window when an incompatible suffix is already queued', async () => {
-    queue.enqueueMessageCheck(JID);
-    await tick();
-    // Simulates processGroupMessages splitting the durable input prefix before
-    // onProcess has registered the child/input directory.
-    queue.enqueueMessageCheck(JID);
-    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(false);
-
-    queue.registerProcess(JID, { killed: false, kill: () => true } as never, {
-      containerName: null,
-      groupFolder: FOLDER,
-      interactionMode: 'assistant',
-    });
-    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(true);
-  });
-
   test('drains a warm runner before injecting another interaction contract', async () => {
     await startRunner({ interactionMode: 'assistant' });
 
@@ -136,7 +129,6 @@ describe('GroupQueue IPC delivery receipts', () => {
         undefined,
         undefined,
         JID,
-        'task-proactive',
         undefined,
         undefined,
         undefined,
@@ -145,6 +137,32 @@ describe('GroupQueue IPC delivery receipts', () => {
     ).toBe('no_active');
     expect(readPayloads()).toEqual([]);
     expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(true);
+  });
+
+  test('a runner retired after its query takes no new turn', async () => {
+    await startRunner({ interactionMode: 'proactive' });
+    expect(queue.retireRunnerAfterQuery(JID)).toBe(true);
+    expect(queue.sendMessage(JID, 'approved', undefined, undefined, JID)).toBe(
+      'no_active',
+    );
+  });
+
+  test('retiring keeps a stronger close and the clean-up already registered', async () => {
+    await startRunner({ interactionMode: 'proactive' });
+    const state = (
+      queue as unknown as {
+        getGroup(jid: string): {
+          closing: string | null;
+          afterRunnerExit: (() => void) | null;
+        };
+      }
+    ).getGroup(JID);
+    const cleanUp = vi.fn();
+    state.closing = 'reclaim';
+    state.afterRunnerExit = cleanUp;
+    expect(queue.retireRunnerAfterQuery(JID)).toBe(true);
+    expect(state.closing).toBe('reclaim');
+    expect(state.afterRunnerExit).toBe(cleanUp);
   });
 
   test('accepts a warm scheduled prompt with the runner frozen mode', async () => {
@@ -158,7 +176,6 @@ describe('GroupQueue IPC delivery receipts', () => {
         undefined,
         undefined,
         JID,
-        'task-proactive',
         undefined,
         undefined,
         undefined,
@@ -182,7 +199,6 @@ describe('GroupQueue IPC delivery receipts', () => {
         undefined,
         undefined,
         JID,
-        undefined,
         undefined,
         {
           schemaVersion: 1,
@@ -210,7 +226,6 @@ describe('GroupQueue IPC delivery receipts', () => {
         undefined,
         JID,
         undefined,
-        undefined,
         {
           schemaVersion: 1,
           provider: 'feishu',
@@ -220,6 +235,98 @@ describe('GroupQueue IPC delivery receipts', () => {
       ),
     ).toBe('sent');
     expect(readPayloads()).toHaveLength(1);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(false);
+  });
+
+  test.each(['telegram', 'qq', 'dingtalk', 'discord', 'whatsapp', 'wecom'])(
+    'keeps a warm Bot-bound container for a %s turn',
+    async (provider) => {
+      await startRunner({
+        containerName: 'happyclaw-bot-a',
+        feishuCliAccountId: 'account-a',
+      });
+
+      expect(
+        queue.sendMessage(
+          JID,
+          `queued ${provider} input`,
+          undefined,
+          undefined,
+          `${provider}:chat-1`,
+          undefined,
+          {
+            schemaVersion: 1,
+            provider,
+            channelAccountId: `${provider}-account`,
+            sourceJid: `${provider}:chat-1`,
+            chat: { id: 'chat-1', type: 'group' },
+            message: { id: 'm-1' },
+          },
+        ),
+      ).toBe('sent');
+      expect(readPayloads()).toHaveLength(1);
+      expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(false);
+    },
+  );
+
+  test('one warm host runner takes Feishu, Web and Telegram inputs in turn', async () => {
+    // The Runner therefore cannot pick one channel's format guidance for its
+    // system prompt; each input carries its own (turn-notes.ts).
+    await startRunner({ feishuCliAccountId: 'account-a' });
+    // All three inputs land in one millisecond, the case that reorders them.
+    vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 9, 28));
+    const context = (provider: string) => ({
+      schemaVersion: 1 as const,
+      provider,
+      channelAccountId: `${provider}-account`,
+      sourceJid: `${provider}:chat-1`,
+      chat: { id: 'chat-1', type: 'group' },
+      message: { id: `${provider}-1` },
+    });
+    const send = (
+      text: string,
+      sourceJid: string,
+      channelContext?: ReturnType<typeof context>,
+      requirements?: { feishuCliAccountId: string | null },
+    ) =>
+      queue.sendMessage(
+        JID,
+        text,
+        undefined,
+        undefined,
+        sourceJid,
+        undefined,
+        channelContext,
+        undefined,
+        requirements,
+      );
+
+    expect(send('from feishu', 'feishu:chat-1', context('feishu'))).toBe(
+      'sent',
+    );
+    expect(
+      send('from the web', JID, undefined, { feishuCliAccountId: null }),
+    ).toBe('sent');
+    expect(send('from telegram', 'telegram:chat-1', context('telegram'))).toBe(
+      'sent',
+    );
+    // IPC files are named `${Date.now()}-${random}`, so files written in the
+    // same millisecond list in random order: match each input by its text.
+    expect(
+      Object.fromEntries(
+        readPayloads().map((payload) => {
+          const { text, channelContext } = payload as {
+            text: string;
+            channelContext?: { provider: string };
+          };
+          return [text, channelContext?.provider ?? 'web'];
+        }),
+      ),
+    ).toEqual({
+      'from feishu': 'feishu',
+      'from the web': 'web',
+      'from telegram': 'telegram',
+    });
     expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(false);
   });
 
@@ -241,7 +348,6 @@ describe('GroupQueue IPC delivery receipts', () => {
         undefined,
         undefined,
         JID,
-        undefined,
         undefined,
         undefined,
         undefined,
@@ -275,7 +381,6 @@ describe('GroupQueue IPC delivery receipts', () => {
         undefined,
         undefined,
         JID,
-        undefined,
         undefined,
         {
           schemaVersion: 1,
@@ -451,7 +556,7 @@ describe('GroupQueue IPC delivery receipts', () => {
     ];
 
     expect(
-      queue.sendMessage(JID, 'mixed', undefined, undefined, JID, undefined, {
+      queue.sendMessage(JID, 'mixed', undefined, undefined, JID, {
         chatJid: JID,
         coveredCursors,
         cursor: coveredCursors[1],
@@ -471,7 +576,7 @@ describe('GroupQueue IPC delivery receipts', () => {
     await startRunner();
 
     expect(
-      queue.sendMessage(JID, 'invalid', undefined, undefined, JID, undefined, {
+      queue.sendMessage(JID, 'invalid', undefined, undefined, JID, {
         chatJid: JID,
         coveredCursors: [cursor('m2')],
         cursor: cursor('m1'),
@@ -486,14 +591,14 @@ describe('GroupQueue IPC delivery receipts', () => {
     const second = { ...cursor('m2'), sequence: 11 };
 
     expect(
-      queue.sendMessage(JID, 'invalid', undefined, undefined, JID, undefined, {
+      queue.sendMessage(JID, 'invalid', undefined, undefined, JID, {
         chatJid: JID,
         coveredCursors: [first, second],
         cursor: { ...second, sequence: 99 },
       }),
     ).toBe('no_active');
     expect(
-      queue.sendMessage(JID, 'mixed', undefined, undefined, JID, undefined, {
+      queue.sendMessage(JID, 'mixed', undefined, undefined, JID, {
         chatJid: JID,
         coveredCursors: [first, cursor('m2')],
         cursor: cursor('m2'),
@@ -516,7 +621,6 @@ describe('GroupQueue IPC delivery receipts', () => {
         undefined,
         injected,
         JID,
-        undefined,
         {
           chatJid: JID,
           coveredCursors: [cursor('m1')],
@@ -551,7 +655,6 @@ describe('GroupQueue IPC delivery receipts', () => {
           expect(readPayloads()).toHaveLength(1);
         },
         JID,
-        'scheduled-task',
         {
           chatJid: JID,
           coveredCursors: [cursor('scheduled-prompt')],
@@ -584,7 +687,6 @@ describe('GroupQueue IPC delivery receipts', () => {
         undefined,
         undefined,
         JID,
-        undefined,
         {
           chatJid: JID,
           coveredCursors: [cursor('m1')],
@@ -612,7 +714,6 @@ describe('GroupQueue IPC delivery receipts', () => {
           throw new Error('projection callback failed');
         },
         JID,
-        undefined,
         {
           chatJid: JID,
           coveredCursors: [cursor('m1')],
@@ -637,7 +738,6 @@ describe('GroupQueue IPC delivery receipts', () => {
         undefined,
         undefined,
         JID,
-        undefined,
         {
           chatJid: JID,
           coveredCursors: [cursor('m1')],
@@ -767,7 +867,7 @@ describe('GroupQueue IPC delivery receipts', () => {
     const durableReplay: Receipt[] = [];
     const recoveryCalls: string[][] = [];
 
-    queue.setProcessMessagesFn(async () => {
+    runTurn = async () => {
       attempts++;
       if (attempts === 1) {
         return new Promise<boolean>((resolve) => {
@@ -779,7 +879,8 @@ describe('GroupQueue IPC delivery receipts', () => {
       const replay = durableReplay.shift();
       if (replay) replies++;
       return true;
-    });
+    };
+    queue.setLaneStarter((jid) => enqueueTurn(jid));
     queue.setOnUnacknowledgedIpcDeliveries((_jid, receipts) => {
       recoveryCalls.push(receipts.map((receipt) => receipt.cursor.id));
       durableReplay.push(...receipts);

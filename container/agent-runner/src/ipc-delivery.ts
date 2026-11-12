@@ -13,7 +13,6 @@ export interface IpcInputMessage {
   images?: Array<{ data: string; mimeType?: string }>;
   /** Exact GroupQueue query attempt that admitted this IPC input. */
   queryRunId?: string;
-  taskId?: string;
   sourceJid?: string;
   channelContext?: ChannelTurnContext;
   receipt?: IpcDeliveryReceipt;
@@ -48,28 +47,6 @@ export function ipcReceiptInputIdentity(receipt: IpcDeliveryReceipt): string {
         : `l:${cursor.timestamp}\0${cursor.id}`,
     )
     .join('\u0001')}`;
-}
-
-const SCHEDULED_GROUP_PROMPT_ID_PREFIX = 'scheduled-task-prompt:';
-
-/** Recover the exact group-mode task occurrence from its durable input batch. */
-export function scheduledGroupRunIdFromIpcMessages(
-  messages: readonly IpcInputMessage[],
-  taskId: string | null | undefined,
-): string | null {
-  if (!taskId) return null;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i];
-    if (message?.taskId !== taskId || !message.receipt) continue;
-    const cursors = message.receipt.coveredCursors ?? [message.receipt.cursor];
-    for (let j = cursors.length - 1; j >= 0; j--) {
-      const id = cursors[j]?.id;
-      if (!id?.startsWith(SCHEDULED_GROUP_PROMPT_ID_PREFIX)) continue;
-      const runId = id.slice(SCHEDULED_GROUP_PROMPT_ID_PREFIX.length);
-      if (runId && /^[a-zA-Z0-9-]+$/.test(runId)) return runId;
-    }
-  }
-  return null;
 }
 
 /**
@@ -459,7 +436,6 @@ export function serializeIpcInputMessage(message: IpcInputMessage): object {
     text: message.text,
     images: message.images,
     queryRunId: message.queryRunId,
-    taskId: message.taskId,
     sourceJid: message.sourceJid,
     channelContext: message.channelContext,
     receipt: message.receipt,

@@ -1,10 +1,5 @@
 import type { HappyClawOwnerProfileTurnResult } from './mcp-tools.js';
 
-export interface HappyClawOwnerProfileTurnContext {
-  result: HappyClawOwnerProfileTurnResult | null;
-  block: string;
-}
-
 function jsonForPrompt(value: unknown): string {
   return JSON.stringify(value).replace(/[<>&]/g, (char) => {
     if (char === '<') return '\\u003c';
@@ -41,12 +36,14 @@ export function renderHappyClawOwnerProfileBlock(
   return [header, data, guidance, '</workspace_owner_profile>'].join('\n');
 }
 
-export async function loadHappyClawOwnerProfileTurnContext(
-  fetchProjection: () => Promise<HappyClawOwnerProfileTurnResult | null>,
-): Promise<HappyClawOwnerProfileTurnContext> {
-  const result = await fetchProjection();
-  return {
-    result,
-    block: renderHappyClawOwnerProfileBlock(result),
-  };
-}
+/**
+ * Sent in place of a block once a turn has none (a non-owner sender, or no
+ * projection), when an earlier turn's block is still in the conversation: a
+ * block holds until the next one, so it has to be withdrawn explicitly. It
+ * says nothing about the owner or their onboarding.
+ */
+export const HAPPYCLAW_OWNER_PROFILE_WITHDRAWN_BLOCK = [
+  '<workspace_owner_profile trust="host_authoritative" onboarding_status="unavailable">',
+  'The owner profile is unavailable for the current input: do not run onboarding, and do not use, reveal or guess the preferred address.',
+  '</workspace_owner_profile>',
+].join('\n');

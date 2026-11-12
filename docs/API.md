@@ -22,19 +22,24 @@
 | `/api/groups`                      | `src/routes/agents.ts`           | Runtime Session 与渠道绑定    |
 | `/api/groups`                      | `src/routes/turn-traces.ts`      | 回合的思考摘要与执行轨迹      |
 | `/api/groups`                      | `src/routes/workspace-config.ts` | 项目 Skills/MCP               |
+| `/api/groups`                      | `src/routes/git-review.ts`       | 代码改动与会话 worktree       |
 | `/api/workspaces`                  | `src/routes/workspaces.ts`       | Agent-first 工作区投影        |
 | `/api/agent-profiles`              | `src/routes/agent-profiles.ts`   | 产品级 Agent                  |
 | `/api/channel-accounts`            | `src/routes/channel-accounts.ts` | 多渠道账号                    |
 | `/api/config`                      | `src/routes/config.ts`           | Provider、系统与兼容渠道配置  |
 | `/api/config`                      | `src/routes/brand-assets.ts`     | 品牌资源上传、删除与公开读取  |
-| `/api/tasks`                       | `src/routes/tasks.ts`            | 定时任务和运行                |
+| `/api/automations`                 | `src/routes/automations.ts`      | 自动化和运行记录              |
+| `/api`                             | `src/routes/work-items.ts`       | 团队模式与多任务模式：工作项  |
+| `/api/tasks`                       | `src/routes/tasks.ts`            | 已废弃，一律 410              |
 | `/api/memory`                      | `src/routes/memory.ts`           | Workspace Memory v2           |
 | `/api/skills`                      | `src/routes/skills.ts`           | 用户 Skills                   |
 | `/api/mcp-servers`                 | `src/routes/mcp-servers.ts`      | 用户/系统 MCP                 |
 | `/api/plugins`                     | `src/routes/plugins.ts`          | Plugin Catalog 与用户启用状态 |
+| `/api/push`                        | `src/routes/push.ts`             | Web Push 订阅与测试           |
 | `/api/usage`                       | `src/routes/usage.ts`            | Token 用量                    |
 | `/api/billing`                     | `src/routes/billing.ts`          | 订阅、余额和计费管理          |
 | `/api/admin`                       | `src/routes/admin.ts`            | 用户、邀请和审计              |
+| `/api/guests`                      | `src/routes/guests.ts`           | 只读访客账号与工作区授权      |
 | `/api/bug-report`                  | `src/routes/bug-report.ts`       | 脱敏问题报告                  |
 | `/api/browse`                      | `src/routes/browse.ts`           | Host 目录选择                 |
 | `/api`                             | `src/routes/monitor.ts`          | 健康、状态和 Docker 构建      |
@@ -44,17 +49,21 @@
 
 Public：
 
-- `GET /api/auth/status`
-- `POST /api/auth/setup`，仅用户表为空时可用
+- `GET /api/auth/status`：`{ initialized, deploymentMode, deploymentModeSource }`，
+  `deploymentModeSource` 为 `settings|env|default`；初始化向导据此预选环境变量给出的方式，
+  不改选就不提交
+- `POST /api/auth/setup`，仅用户表为空时可用；可带
+  `deployment_mode: "multi_user" | "single_user_host"`，在创建管理员的 Home 工作区之前保存。
+  只写入这一项，其他系统设置仍按环境变量生效；不带时什么也不存
 - `POST /api/auth/login`
-- `GET /api/auth/register/status`
-- `POST /api/auth/register`
+- `GET /api/auth/register/status`：单人宿主机模式下恒为关闭
+- `POST /api/auth/register`：单人宿主机模式下 403
 - `GET /api/auth/avatars/:filename`
 
 登录后：
 
 - `POST /api/auth/logout`
-- `GET /api/auth/me`
+- `GET /api/auth/me`：顶层带 `deploymentMode`（生效值）
 - `PUT /api/auth/profile`
 - `PUT /api/auth/password`
 - `GET /api/auth/sessions`
@@ -77,19 +86,57 @@ Public：
 让两个名称都过期，并删除该请求在两个名称下携带、且属于同一用户的全部会话；
 其他设备的会话不受影响。
 
+## 访客账号
+
+active 的 admin 可以为自己创建只读访客（`role=guest`），并授权其查看自己拥有的部分
+`web:*` 工作区（含 Home）；member 只有在系统设置 `allowMemberGuests` 开启时可以
+创建。所有路由只作用于调用者自己的访客；其他用户的访客和不属于调用者的工作区 JID
+一律按不存在处理。访客自身调用这些路由返回 403。
+
+- `GET /api/guests`：`{ guests, grantable_workspaces, can_create, max_guests }`。
+  每个访客含 `id`、`username`、`display_name`、`status`（`active`/`disabled`）、
+  `created_at`、`last_login_at` 和已授权的 `workspaces[{ jid, name, is_home }]`；
+  `grantable_workspaces` 是调用者自己的工作区；`can_create` 表示调用者现在能否新建。
+- `POST /api/guests`：`{ username, password, display_name?, workspace_jids[] }`，
+  用户名/密码规则与普通账号相同；成功 201 `{ guest }`，工作区无效 400，
+  member 未开放 403，已有 `max_guests`（20）个未删除的访客或用户名已存在 409。
+- `PATCH /api/guests/:id`：`display_name`、`status`、`workspace_jids`（整体替换）、
+  `password` 任选；授权变更对下一次请求立即生效，状态或密码变更同时注销访客的会话。
+  被管理员通过用户管理禁用的访客（列表里 `disabled_by_admin: true`）返回 403，
+  owner 只能删除它。
+- `DELETE /api/guests/:id`：标记删除并清除授权、置顶和会话。
+
+`allowMemberGuests` 关闭后，member 仍可列出、编辑和删除自己的访客，但这些访客无法
+登录、请求或接收广播。
+
+访客能看什么、能调用哪些路由见 [ACL 权限矩阵](ACL-MATRIX.md) 的“访客”一节。
+管理员用户管理（`/api/admin/users`）能列出、禁用、删除和重置访客（列表带
+`guest_owner_username`，支持 `role=guest` 过滤），但不能创建访客或改变访客角色；
+邀请码和注册永远不会产生访客。
+
 ## 工作区、消息和运行控制
 
-- `GET|POST /api/groups`
+- `GET|POST /api/groups`；`custom_cwd` 可以与同一用户的其他宿主机工作区相同。`GET` 另带
+  `workspace_root`：没有自定义目录的新宿主机工作区建在它下面的同名子目录；只返回给 admin，
+  其他角色为 `null`。工作区根目录和备用目录都不可用时也为 `null`，新工作区放在
+  `data/groups/{folder}`
 - `PATCH|DELETE /api/groups/:jid`
 - `PATCH /api/groups/:jid/agent-profile`
 - `POST /api/groups/:jid/stop`
 - `POST /api/groups/:jid/interrupt`
 - `POST /api/groups/:jid/reset-session`
 - `GET|PUT /api/groups/:jid/model-selection`，聊天输入框的会话级模型与推理档位选择
+- `GET /api/groups/:jid/context-usage`，会话当前的上下文占用（输入框旁的圆环）
 - `POST /api/groups/:jid/clear-history`，重建工作区内容：永久清除聊天、
-  Runtime Session、子对话、工作目录及 Workspace Memory（含版本历史和
-  Home Owner Profile），关联定时任务停止并移入回收站；保留工作区外壳、
-  `data/extra/` 和任务运行历史
+  Runtime Session、工作区目录（工作区根目录下记录的目录，否则 `data/groups/{folder}`）、
+  会话 worktree 目录及 Workspace Memory（含版本历史和 Home Owner Profile）；自动化保留，
+  重建期间暂停，排队或运行中的运行记为已终止，绑定已删会话的自动化保持暂停；保留工作区外壳、
+  `data/extra/`、自动化运行历史、worktree 分支和宿主机模式的自定义工作目录
+- `DELETE /api/groups/:jid` 和 `clear-history` 删除或移走有记录的工作区目录之前先做安全检查
+  （目录必须正是记录的根目录下的同名子目录、自身不是链接、不与安装目录重叠、不包含其他工作区
+  的目录或自定义目录；根目录被移走后用链接接回原位、真实位置仍带 `.happyclaw-workspace-root`
+  标记时按真实位置检查）。不通过时返回 409 `{ error, code: "WORKSPACE_DIR_UNSAFE", reason }`，
+  不删除任何文件
 - `POST /api/groups/:jid/reset-owner`，admin break-glass
 - `GET /api/groups/:jid/messages`
 - `GET /api/groups/:jid/turn-traces/:turnId`，已结算回合的思考摘要、执行轨迹与有序步骤
@@ -101,43 +148,102 @@ Public：
 - `GET /api/follow-ups`
 - `POST /api/follow-ups/:messageId/action`
 
-`model-selection` 以 `agentId`（GET 查询参数、PUT 请求体）区分 Runtime Session，
-缺省表示主会话。GET 返回当前选择、默认值的解析来源和全部已保存模型配置（不含凭据）；
-`default.source` 取值 `agent`（智能体绑定）、`workspace_env`（工作区自带 Provider
-环境变量）、`default`（`PUT /api/config/claude/default` 设置的全局默认）、`single`
-（唯一启用的配置）、`pool`（已启用配置间自动轮换）、`none`，顺序与运行时解析一致；
-PUT 的 `modelConfigId` 为 `null` 时恢复默认。会话选择优先于智能体绑定的模型配置，
-可以选择未启用的配置；切换后该会话的暖 Runner 在当前轮次结束后退出，下一条消息
-使用新配置。
+当一次运行可用的全部连接都撞了用量上限、且上游给出了重置时刻时，输入不会失败：
+该会话（lane）待处理的输入被放回 durable 队列（`delivery_status: 'queued'`，照常可
+编辑、排序、取消），在重置时刻后 60 秒加 0–30 秒抖动自动继续。同一会话最多连续等待
+3 次、单次不超过 7 天，超出则按原方式失败；新消息、`send_now`（`promote`）立即结束
+等待并与排队输入合批，`/break`、取消最后一条排队输入、停止、`/clear`、`/fresh`、删除
+工作区或会话取消等待。来源是 IM 的输入在开始等待时收到一条说明（同一输入只发一次）。
+自动化的输入与其他输入一样留在队列里等待，运行保持 `queued`。
 
-ChatGPT 订阅配置（`kind: "codex"`）还可以在配置内选择具体模型与推理档位。GET 为
-这类选项增加 `codex`：`defaultModel`（配置自己的模型）、`defaultEffort`（不选档位时
-实际使用的档位，Agent 显式档位优先，其次是配置档位，按模型目录钳制）、`source`
-（`live` 为该账号自己的目录，其余为兜底目录）、`needsReauth`，以及
-`models[]`（`value`、`label`、`efforts`、`defaultEffort`）。`models` 来自该账号的
-实时目录并按套餐过滤，同步读取、后台刷新，不等待网络；`efforts` 按 low 到 ultra
-排序，只含当前用户可以选择的档位。响应顶层另有 `selectedModel`、`selectedEffort`：
-已存的选择若不再被目录或当前用户权限支持，按未选择返回，与 Runner 启动时的处理
-一致。其他类型的选项形状不变，旧客户端不受影响。
+`model-selection` 以 `agentId`（GET 查询参数、PUT 请求体）指定 Runtime Session，必填，
+缺失时 400 `{ "code": "session_required" }`；`context-usage`、`messages`、`reset-session`
+同样必须带会话。GET 返回当前选择、默认值的解析来源和全部已保存模型配置（不含凭据）；
+`default.source` 按与运行时相同的函数解析，取值 `agent`（智能体自己的绑定）、
+`workspace_env`（工作区自带 Provider 环境变量）、`owner_main`（工作区所有者的主智能体）、
+`system_main`（系统主 HappyClaw：最早创建的 admin 的主智能体）、`none`；未设置的一步
+跳过，已设置但连接已删除或没有凭据时 `default.connectionMissing` 为 true，本轮失败并提示
+重新选择（不改用别的连接）；`none` 时同样失败，提示为主 HappyClaw 选择模型。`default.model` 是不选择时实际运行的模型（不带 `[1m]`；
+`workspace_env`、`none` 与直通中转为 `null`），`default.effort` 是不选择时运行的推理
+等级（该模型不支持档位时为 `null`）。
+PUT 的 `modelConfigId` 为 `null` 时恢复默认。会话选择的（配置, 模型）优先于智能体
+绑定；切换后该会话的暖 Runner 在当前轮次结束后退出，下一条消息使用新选择。
+
+每个配置都可以在配置内选择具体模型。选项带 `usable`（有凭据才可选）；ChatGPT 订阅以外
+的选项带 `models[]`：`id`、`efforts`（可选档位，空数组表示不能选）、`defaultEffort`
+（不选档位时运行的档位：智能体显式档位且该模型支持时用它，否则模型默认档位，没有则
+`null`）、`contextWindow`（未知为 `null`）、`effortsSource`（`declared` 连接里声明、
+`registry` 能力表、`family` 同系列推断、`none`）。全部模型都会列出。直通中转没有默认
+模型时 `model` 为空字符串。
+
+ChatGPT 订阅配置（`kind: "codex"`）不带 `models`，而是带 `codex`，并且还能选择推理
+档位：`defaultModel`（配置自己的模型）、`defaultEffort`（不选档位时实际使用的档位，
+Agent 显式档位优先，其次是配置档位，按模型目录钳制）、`source`（`live` 为该账号自己
+的目录，其余为兜底目录）、`needsReauth`，以及
+`models[]`（`value`、`label`、`efforts`、`defaultEffort`）。`codex.models` 来自该账号
+的实时目录并按套餐过滤，同步读取、后台刷新，不等待网络；`efforts` 按 low 到 ultra
+排序，只含当前用户可以选择的档位。
+
+响应顶层另有 `selectedModel` 与 `selectedEffort`（所有类型）：已存的模型若已不在配置
+的模型列表（ChatGPT 为账号目录）中，或档位不被所运行的模型（ChatGPT 为目录或当前用户
+权限）支持，按未选择返回，与 Runner 启动时的处理一致。
 
 PUT 可以携带 `model`、`effort`，请求整体替换该会话的选择：只写 `modelConfigId`
-会清掉之前的模型和档位，换配置也不会继承旧配置的模型。`model` 必须在该账号当前
-目录内，`effort` 必须在（所选或配置自己的）模型的 `efforts` 内，且 `model` 与
-`effort` 只能用于 ChatGPT 订阅配置，并要同时给出 `modelConfigId`；否则返回 400 与
-`code`：`MODEL_UNAVAILABLE`、`EFFORT_UNSUPPORTED`、`EFFORT_RESTRICTED`、
-`MODEL_SELECTION_UNSUPPORTED`、`MODEL_CONFIG_REQUIRED`。高于 `max` 的档位（目前是
+会清掉之前的模型和档位，换配置也不会继承旧配置的模型。`model` 最长 200 个字符，
+必须在所选配置的模型列表内，ChatGPT 订阅则必须在该账号当前目录内；`effort` 必须在
+（所选或配置默认的）模型的 `efforts` 内，否则 ChatGPT 以外返回 `EFFORT_NOT_SUPPORTED`；
+两者都要同时给出 `modelConfigId`。否则返回 400 与 `code`：
+`MODEL_NOT_IN_CONNECTION`、`EFFORT_NOT_SUPPORTED`、`MODEL_UNAVAILABLE`、
+`EFFORT_UNSUPPORTED`、`EFFORT_RESTRICTED`、`MODEL_CONFIG_REQUIRED`。推理等级按会话
+档位 → 智能体显式档位 → 模型默认档位解析，只取所运行模型支持的档位，不支持档位的
+模型不写 `CLAUDE_CODE_EFFORT_LEVEL`；没有默认 `max`。会话档位写入
+`CLAUDE_CODE_EFFORT_LEVEL`（Claude Code 让它优先于 Runner 为智能体传的 SDK `effort`），
+不改动交给 Runner 的智能体配置。ChatGPT 以外只改档位时退出暖 Runner（下一条消息
+重启），但保留 SDK 会话。高于 `max` 的档位（目前是
 `ultra`）只允许具备 `manage_system_config` 的用户选择，GET 不列出，PUT 返回
 `EFFORT_RESTRICTED`，Runner 启动时若选择者已失去该权限则回到默认档；放宽只需改
 `CODEX_SESSION_EFFORT_CEILING`。响应附带 `drained`（被退出的暖 Runner 数）与
 `liveUpdated`（被就地改档的存活网关授权数）。
 
-换配置或换模型会让下一条消息在新的底层会话上开始，并带上最近的对话记录（加密推理只对
-签发它的模型有效）；只改档位不会，存活 Runner 的下一个上游请求就使用新档位。
-选择的 (配置, 模型, 档位) 都没变时不退出任何 Runner。
+`context-usage` 以 `agentId` 查询参数区分 Runtime Session，访问检查同
+`model-selection` 的 GET，返回
+`{ usedTokens, contextWindow, percentage, model, updatedAt }`，没运行过、刚清除
+（`/clear`、`/fresh`、重置会话）或刚压缩上下文时全部为 `null`。数据在宿主侧从会话
+当前 SDK 会话的 transcript 读取：`usedTokens` 是最后一次主线程请求的 input + cache
+read + cache creation（不含子代理请求），`model` 是该请求的上游模型，`updatedAt` 是
+那次回复写入的时间；`contextWindow` 依次取 Claude Code 本进程上报的窗口（同一模型）、
+模型条目的上下文长度（声明、能力表或同系列推断）、官方连接下模型自己的窗口，
+其余为 200K；用量超过该窗口时改用模型窗口，仍超过则
+`percentage` 记为 100。`percentage` 保留一位小数。
+每个回合完成后，以及会话被清除时，工作区的 Web 会话收到 WebSocket 消息
+`{ type: 'context_usage', chatJid, agentId?, usedTokens, contextWindow, percentage, model, updatedAt }`。
+
+Runner 启动时，选中的模型取代配置的默认模型成为 `ANTHROPIC_MODEL`。第三方端点的模型
+环境由 `buildConnectionModelEnv` 按本轮模型生成：上下文长度大于 200K 时模型名加 `[1m]`
+（Claude Code 的开关，请求前剥掉，只把上下文上限抬到 1M），小于 1M 且不等于 200K 时
+写 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 压回实际长度，未知时两者都不写；opus/sonnet/haiku
+档与 `CLAUDE_CODE_SUBAGENT_MODEL` 取连接的 `roles`，未设置时跟随本轮模型。官方连接只在
+模型条目声明了大于 200K 的上下文时加 `[1m]`（可能按长上下文计费）。已选模型被移出列表
+后，按配置默认模型运行并记录告警，不让本轮失败。
+
+换配置或换模型（包括取消选择回到默认模型）会让下一条消息在新的底层会话上开始，并带
+上最近的对话记录：每种配置都记录会话运行的模型，一个底层会话只在一个模型上运行；
+记录这一信息之前就存在的会话视为运行在配置默认模型上。只改档位或只改上下文长度不会
+重置，存活 Runner 的下一个上游请求就使用新档位。
+选择的（配置, 模型, 档位）都没变时不退出任何 Runner，按名字选中配置的默认模型也不算
+变化；已经在所选配置上运行的暖 Runner 只在不涉及模型时保留，即新旧选择都没有指定
+模型，且之前未选择时也没有运行智能体绑定的模型。
 
 `POST /api/messages` 可以携带 Web 附件和 Runtime Session 标识。`/clear` 与
 `/fresh` 会进入与 `reset-session` 相同的 owner 级破坏性检查。`/fresh` 会开启
 新的 SDK 窗口并写入零摘要交接说明，不删除库中的旧历史，也不关闭 auto-compact。
+
+Web 客户端每次发送带一个 `clientMessageId`（UUID）；超时或网关错误后重发同一内容时
+沿用它。服务端按 `(用户, chatJid, clientMessageId)` 去重 24 小时：同一 id 且内容、
+附件、目标会话和 `followUpBehavior` 都相同的重复请求返回第一次的结果并带
+`deduplicated: true`，不再入库、入队或计费；同一 id 内容不同返回 409。消息落库后
+处理失败时返回 500 并带 `stored: true` 与 `messageId`。新消息的 WS 广播带上
+`client_message_id`，客户端据此确认送达。不带 id 的请求行为不变。
 
 `GET /api/groups/:jid/messages` 返回的图片附件是降采样缩略图，并带
 `hasOriginal` 标记；原图由
@@ -153,6 +259,16 @@ Workspace↔AgentProfile 绑定行上，因此：仅 `web:` 前缀工作区可�
 它与 `execution_mode` 共享同一道 quiesce 边界，暖 Runner 只能观察到旧契约或新
 契约；停机失败返回 503 并带 `persisted` 标记。
 
+`work_mode`（`single` 或 `multi`）是工作区的工作方式，存放在同一条绑定行上。
+`GET /api/groups` 的每个 `web:` 工作区和 `GET /api/workspaces/:jid` 都带它（没有绑定行
+时为 `single`）；`POST /api/groups` 可在创建时指定，缺省 `single`；`PATCH /api/groups/:jid`
+同样接受它，响应回显当前值。权限与 `interaction_mode` 相同（仅 `web:` 前缀工作区、仅
+owner，没有绑定行时 409 `WORKSPACE_AGENT_PROFILE_MISSING`）。切换不经过 quiesce，不中断
+正在运行的回合，也不重置 SDK 会话：该工作区的每个暖 Runner 在本轮结束后退役，空闲的
+立即关闭，下一轮由新的 Runner 按新值决定工具和提示词。`multi` 下，普通会话可以把大任务
+派给 Worker 会话（见「团队模式与多任务模式」）。切回 `single` 后不再派新任务，已派出的
+任务照常完成并回报，派出它们的会话在还有未结束的任务时保留跟进和停止的工具。
+
 `process_visibility`（`hidden`、`activity` 或 `full`）决定主动模式工作区的 Web
 能看到一个回合的多少过程，存放在同一条绑定行上。`GET /api/groups` 的每个 `web:`
 工作区都带解析后的有效值（没有绑定行时为 `hidden`）；`POST /api/groups` 可在创建时
@@ -162,11 +278,11 @@ Workspace↔AgentProfile 绑定行上，因此：仅 `web:` 前缀工作区可�
 不经过 quiesce、不重启运行时，正在运行的回合从下一个事件起按新值投影。Assistant
 模式的工作区始终展示完整过程，该字段可以设置但没有效果。三个级别对 Web 的投影：
 
-| 级别       | 广播给 Web 的 Runner 事件                                                                                                                       |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `hidden`   | 仅运行生命周期 `status`（`requesting`、`idle`、`interrupted`），即转圈                                                                          |
-| `activity` | 再加工具、子 Agent 任务、todo、hook、权限拒绝、上下文压缩和其余阶段状态，以及不含文本的 `thinking_start`/`thinking_end`；不含任何模型产出的文字 |
-| `full`     | `activity` 加上主 Agent 与子 Agent 的 `thinking_delta`（推理摘要），以及主 Agent 调用工具前写下的过程说明 `commentary`                          |
+| 级别       | 广播给 Web 的 Runner 事件                                                                                                                               |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `hidden`   | 仅运行生命周期 `status`（`requesting`、`idle`、`interrupted`），即转圈，以及进展（见下）                                                                |
+| `activity` | 再加工具、子 Agent 任务、todo、hook、权限拒绝、上下文压缩和其余阶段状态，以及不含文本的 `thinking_start`/`thinking_end`；进展以外不含任何模型产出的文字 |
+| `full`     | `activity` 加上主 Agent 与子 Agent 的 `thinking_delta`（推理摘要），以及主 Agent 调用工具前写下的过程说明 `commentary`                                  |
 
 `commentary` 由宿主合成，Runner 不会发这个事件：主 Agent 的文字先被扣住，只有紧接着
 调用了工具才作为一条完整的 `commentary`（先于该次调用，带该调用的 `queryRunId`）放行；
@@ -176,15 +292,30 @@ Workspace↔AgentProfile 绑定行上，因此：仅 `web:` 前缀工作区可�
 消息开头读起的文字才会被扣住，所以中途调高级别时，正在写的那句话的后半截不放行。
 它只广播给 Web，不进入 IM 渠道，也不写入 `turn_traces`；重连快照不含它。
 
+进展是主动模式 Agent 用 `send_message(delivery_role=progress)` 发给用户的话，按本轮输入
+的来源渠道（绑定回合时记录）分流。IM 回合的进展是一条独立消息，与 `final` 一样经 Turn
+Outbox 发出并写入消息；IM 回合的回复路由已不可用（输入被撤回、地址缺少渠道账号）时直接
+失败，告诉 Agent 没有送达，不改投 Web。来源未知（没有 `inputTurnId` 或回合已解绑）时按
+独立消息投递。Web 回合的进展不成为消息，而是一条带 `progress: true` 的 `commentary`，只由
+宿主合成（Runner 事件上的 `progress` 标记会被去掉），在每个级别都广播，并作为 `progress`
+步骤写入 `turn_traces`，最终回复送达后由 Web 折叠进该回复的处理过程。重连快照
+`stream_snapshot.snapshot.progress` 按顺序带上本轮已发的进展（`{ at, text }`），中途加入的
+标签页据此在每个级别重建进展步骤。Web 回合发过进展却没有回复就最终结束（被停止、被引导
+转向、出错终止，或因缺少 `final` 被拒绝结单且不再重试）时，宿主写一条简短的结束说明
+（`interrupt_partial`）作为本轮回复，进展随本轮轨迹挂在它上面。会重试的失败不写说明，
+进展留给下一次尝试：重试发出 `final` 就挂在 `final` 上，否则由最终那一条结束说明带上所有
+尝试的进展。
+
 任何级别都不会发送 `text_delta`（含子 Agent 文本）、`usage`、`memory_recall`、
 `prompt_suggestion`、`raw_sdk_event`、`notification` 和未知事件类型；`tool_result`
-只保留 `toolUseId` 与布尔值 `toolIsError`（调用是否失败），工具的 `toolInput`、
+只保留 `toolUseId` 与布尔值 `toolIsError`（调用是否失败；工作区记忆写入工具的回执
+另外保留结果文本，按 `toolUseId` 对应到该调用的 `tool_use_start` 识别），工具的 `toolInput`、
 `toolResultFacts`（见下）、子 Agent 的提示词与 Workflow 的预览文本都会被剥离。过程事件永远不会进入 IM 渠道的流式卡片。`context_audit` 从不发给 Web，但
 在所有模式下都会记录到宿主的运行上下文快照。`activity` 及以上还会广播子 Agent 任务的
 `agent_status`，使 Task 标签与任务事件一致。
 
 回合结算时，宿主把该回合的思考摘要、思考耗时、执行轨迹和有序步骤写入 `turn_traces`
-（Assistant 模式总是写；主动模式仅当 `process_visibility` 不是 `hidden` 时写，且
+（Assistant 模式总是写；主动模式在 `hidden` 级只写进展步骤，没有进展就不写，
 `activity` 级不保存思考文本，步骤里的思考也不带文本与标题；思考文本最多 64KB，保留
 尾部并以 `…` 开头标记被截断，轨迹最多 200 条，步骤最多 100 条）。`GET /api/groups/:jid/messages` 返回的消息带 `has_trace: true`
 表示它是所属回合最后一条 agent 消息且该回合有轨迹，WebSocket `new_message` 在写入
@@ -311,17 +442,238 @@ HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
 `GET /api/browse/directories?purpose=mount` 浏览服务器目录；未配置有效 allowlist
 时该入口 fail-closed。
 
+位于宿主机 NFS 挂载之下的目录默认仍按普通绑定挂进容器。allowlist 的根目录设置
+`nfsDirectMount: true` 后，该根下位于 NFS 上的目录改由 Docker 直接挂同一个导出
+子目录（`local` 卷驱动）。宿主机重挂 NFS（NAS 重启、断网恢复）因此不会让运行中的
+容器拿到失效的挂载；Docker Desktop 与 OrbStack 的 VM 没有挂载传播，绑定的旧挂载会
+一直报 `EBADF`。授权不变：仍按宿主机路径校验 allowlist，开关取匹配到的最具体的根；
+根下不在 NFS 上的目录照常绑定。
+
+```json
+{
+  "allowedRoots": [
+    { "path": "/Volumes/nas", "allowReadWrite": true, "nfsDirectMount": true }
+  ]
+}
+```
+
+- 协议跟随宿主机挂载：NFSv4 仍用 v4（含次版本）和宿主机挂载的原路径（包括 v4
+  伪根下的路径），NFSv3 仍用 v3，选项为 `proto=tcp,hard`。macOS 的版本取自
+  `nfsstat -m`，Linux 取自挂载表。
+- 只有 NFSv3 且守护进程用不了 NLM 时才加 `nolock`：Docker Desktop 与 OrbStack 的
+  VM 不跑 rpc.statd，v3 加锁会报 `ENOLCK`，加 `nolock` 后锁只在容器内生效；Linux
+  上守护进程与宿主机共用内核的 lockd 和 rpc.statd，跟随宿主机挂载是否 `nolock`。
+  NFSv4 的锁在协议内完成，不加 `nolock`。
+- 无法按宿主机挂载重建时容器启动失败并说明原因，不会悄悄退回绑定：宿主机挂载用了
+  Kerberos（`sec=krb5*`）、版本不是 3 或 4.x、读不到挂载表或版本。把该根的
+  `nfsDirectMount` 去掉即恢复绑定。
+- 挂载由守护进程完成，需要：守护进程能直接连到 NAS（NFS 端口，v3 还需要 rpcbind
+  与 mountd）；rootless Docker 不能挂 NFS，不要开启；导出要求特权源端口（Linux
+  knfsd 默认的 `secure`、群晖默认设置）时，经用户态 NAT 出网的 Docker Desktop 与
+  OrbStack 可能被拒。NAS 看到的 uid 是容器内进程的 uid：Linux 上与服务用户一致，
+  Docker Desktop 与 OrbStack 下是容器内 `node` 的 1000，而不是 Mac 用户的 uid，
+  NAS 没有 `all_squash` 一类映射时请先确认文件权限。
+
+网络存储也可以作为存储源直接挂载。管理员在 allowlist 的 `storageSources` 中声明
+服务器与凭据，工作区只按 `id` 选择来源、来源内的子目录和是否只读：
+
+```json
+{
+  "storageSources": [
+    {
+      "id": "nas-nfs",
+      "type": "nfs",
+      "server": "nas.lan",
+      "exportPath": "/volume1/shared",
+      "nfsVersion": "3",
+      "allowReadWrite": true
+    },
+    {
+      "id": "nas-smb",
+      "type": "cifs",
+      "server": "nas.lan",
+      "share": "team",
+      "username": "happyclaw-agent",
+      "passwordFile": "config/secrets/nas-smb",
+      "smbVersion": "3.0",
+      "allowReadWrite": false
+    }
+  ]
+}
+```
+
+```json
+{
+  "additional_mounts": [
+    {
+      "source": "nas-nfs",
+      "sub_path": "projects/alpha",
+      "container_path": "alpha",
+      "readonly": false
+    }
+  ]
+}
+```
+
+- `type` 为 `nfs` 或 `cifs`（SMB）。挂载由 Docker 守护进程的内核完成，容器不需要
+  额外权限；子目录不存在时容器启动失败。`sub_path` 和宿主机目录一样不能命中
+  `blockedPatterns`（`.ssh`、`credentials` 等）。
+- SMB 密码只放在 `passwordFile`（绝对路径或相对项目根，必须是服务用户所有的 600
+  普通文件，单行、不含逗号；示例里的密码目录已被 `.gitignore` 忽略），不进
+  allowlist、数据库、docker 命令行或日志：
+  启动时经 Docker Engine API 的请求体建一个命名卷
+  （`happyclaw-storage-<id>-<摘要>-<凭据版本>`，标签 `io.happyclaw.storage-source`），
+  容器按名字挂载。凭据版本是用服务端密钥（`WEB_SESSION_SECRET`）对密码做 HMAC 后取
+  的 8 位十六进制：改密码后新启动的容器用新卷，仍在运行的容器继续用旧卷，旧卷不会被
+  删除。Docker 自己会把卷参数（含密码）存在守护进程的数据目录里，
+  `docker volume inspect` 也能看到，所以请给 HappyClaw 用一个只有所需权限的专用
+  SMB 账号。只支持本机 unix socket 的 Docker 上下文；每次启动都按当前 Docker 上下文
+  建卷，与随后的 `docker run` 落在同一个守护进程。同名卷的参数不对（例如卷缺失时
+  `docker run` 自动建出的空本地卷）时，空闲则重建，在用则启动失败，不会把它当成共享
+  挂进容器。
+- 不再使用的 SMB 卷（改密码、改来源或删除工作区之后）目前不会自动回收，参数里仍有
+  旧密码。可以用 `docker volume ls --filter label=io.happyclaw.storage-source`
+  列出，确认没有容器在用后 `docker volume rm` 删除。
+- NFS 使用 AUTH_SYS 认证，NAS 只按来源 IP 和请求里自报的 uid 判断权限。容器出网与
+  守护进程主机共用同一个 IP，容器里的 Agent 可以自己连上导出，绕过 `sub_path` 和
+  只读限制。NAS 上只导出工作区可以看到的内容：按子目录单独导出，只读的就只读导出，
+  并设置 `all_squash`。宿主机目录的 `nfsDirectMount` 同样如此。
+- 没有 Unix 扩展的 SMB 共享没有可映射的属主，挂载按 `file_mode=0777,dir_mode=0777`
+  对容器内所有用户开放，实际权限由 SMB 账号在服务器上的权限决定。
+- 管理员也可以在 Web「设置 → 存储源」里添加存储源（见
+  `/api/config/storage-sources`），新建 Container 工作区时在挂载编辑器里选择。Web 添加的
+  存储源存在 `data/config/storage-sources.json`，密码在 `data/config/secrets/`，都在
+  `data/` 下，不进 Git 工作树、随 `make backup` 备份；服务从不改写
+  `config/mount-allowlist.json`。运行时把两份列表合并：allowlist 文件里的来源排在前面，
+  同一个 `id` 以 allowlist 文件为准，Web 那份被忽略并记一条告警；下次经 Web 保存或
+  删除任意存储源时，这份旧条目从 `storage-sources.json` 删除，连同它在
+  `data/config/secrets/` 下的密码文件（allowlist 文件里的来源正用着这个文件时保留）。
+  没有 allowlist 文件时 Web 添加的存储源照样可用，此时不授权任何宿主机目录，
+  `nonMainReadOnly` 按 `true`。allowlist 文件无法解析时全部挂载 fail-closed；
+  `storage-sources.json` 无法解析时只有其中的来源不能挂载。
+- 读写同时受来源的 `allowReadWrite` 与 `nonMainReadOnly` 约束；每次容器启动前都会
+  按当前 allowlist 重新校验，来源被删除后旧工作区无法启动；关闭 `allowReadWrite` 后，
+  以读写方式挂载它的工作区同样无法启动（不会自动降为只读）。
+
 ## 文件
 
 - `GET|POST /api/groups/:jid/files`
 - `POST /api/groups/:jid/files/open-directory`
 - `GET /api/groups/:jid/files/download/:path`
 - `GET /api/groups/:jid/files/preview/:path`
+- `GET|HEAD /api/groups/:jid/files/office-preview/:path`
 - `GET|PUT /api/groups/:jid/files/content/:path`
 - `DELETE /api/groups/:jid/files/:path`
 - `POST /api/groups/:jid/directories`
 
 路径必须位于目标工作区允许范围内；系统目录、路径穿越和不安全符号链接会被拒绝。
+
+文件根与该会话运行时的工作目录一致：宿主机模式的自定义目录、否则
+`data/groups/{folder}`。以上接口都接受查询参数 `agentId`（Runtime Session ID）；缺省时以
+工作区目录为根，会话有独立 worktree 时以 worktree 为根。`agentId` 不属于该工作区时
+返回 404。
+
+读取接口（列表、`download`、`preview`、`office-preview`、`content`）对 owner 和持有有效
+授权的访客开放，访客看不到隐藏路径（返回 404），见 `docs/ACL-MATRIX.md`；写入接口只对
+owner 开放。`:path` 是工作区相对路径的 base64url。`preview` 带 `ETag` 与
+`Last-Modified`，`Cache-Control: private, no-cache`，`If-None-Match` 命中时回 304。
+
+`office-preview` 把 doc/docx/xls/xlsx/ppt/pptx/odt/ods/odp 转成 PDF 返回
+（`Content-Type: application/pdf`，`Content-Security-Policy: default-src 'none'; sandbox`）。
+转换结果按源文件内容的 sha256 缓存在 `data/cache/office-preview/`；`ETag` 是这个哈希
+（强 ETag），`Cache-Control: private, no-cache`，`If-None-Match` 命中时直接回 304，不做
+转换。`HEAD` 同样执行转换并返回状态与头，不带正文，前端用它预检后再让 iframe 加载同一
+地址。没有配置转换器时直接回 501，不打开文件（缓存里已有的 PDF 也不再提供）。文件在
+校验后立即打开（末级不跟随符号链接、不阻塞），之后的哈希与转换只读这个描述符，同一份
+内容的请求各自拿到由自己的字节转换出的 PDF。同时最多 2 个转换、8 个排队。转换器与上限由
+`OFFICE_PREVIEW_*` 环境变量配置，见 `DEPLOYMENT.md`。错误返回 `{"error", "code"}`：
+
+| 状态 | `code`             | 含义                                                                                                                               |
+| ---- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 400  | `UNSUPPORTED_TYPE` | 不是上面列出的扩展名（目录也是 400，但没有 `code`）                                                                                |
+| 403  | 无                 | 宿主机工作区，调用者既不是 admin 也没有访客授权                                                                                    |
+| 404  | 无                 | 文件不存在、对访客隐藏、工作区不可见或 `agentId` 不属于它；末级是符号链接、不是普通文件（如 FIFO），或打开时已不是校验过的那个文件 |
+| 413  | `FILE_TOO_LARGE`   | 源文件超过 `OFFICE_PREVIEW_MAX_MB`，或转换结果超过它的 4 倍                                                                        |
+| 501  | `NOT_CONFIGURED`   | 没有配置转换器，或 Stirling 的密钥文件读不到                                                                                       |
+| 502  | `CONVERT_FAILED`   | 转换器出错、不可用或没有返回 PDF                                                                                                   |
+| 503  | `BUSY`             | 转换名额与排队都已满，稍后重试                                                                                                     |
+| 504  | `TIMEOUT`          | 超过 `OFFICE_PREVIEW_TIMEOUT_MS`                                                                                                   |
+
+## 代码改动与会话 worktree
+
+- `GET /api/groups/:jid/git/status?agentId=&scope=working|branch`
+- `GET /api/groups/:jid/git/diff?agentId=&path=&orig_path=&scope=working|branch`
+- `GET /api/groups/:jid/git/worktree-support`
+
+访问检查与文件接口相同：看不到的工作区返回 404，宿主机工作区需要宿主机执行权限
+（403）。git 只对宿主机模式的工作区执行，命令使用参数数组、有超时与输出上限。宿主机上的
+只读 git 调用（这里的 status、diff，删除 worktree 前的改动检查，`/fresh` 的工作区快照）
+一律关闭 fsmonitor、hooks、textconv、外部 diff 和仓库配置的 filter（clean、smudge、
+process），也不取可选锁：Docker 工作区的 `.git/config` 由容器内的 Agent 控制，读取时不
+执行其中配置的任何命令。只有用户发起的 `worktree add` 保持 git 默认行为（运行仓库自己的
+hook）。HappyClaw 本身不访问网络，但 LFS 或 partial clone 仓库在 `worktree add` 和 diff
+时可能按需访问远端。
+
+`git/status` 读取会话的 worktree，或工作目录所在的仓库（`data/groups/{folder}` 只认它
+自己的仓库），返回 200：
+
+```json
+{
+  "state": "ok",
+  "root": "/srv/repo",
+  "worktree": null,
+  "branch": "main",
+  "head": "3f2c…",
+  "upstream": "origin/main",
+  "ahead": 1,
+  "behind": 0,
+  "files": [
+    {
+      "path": "src/app.ts",
+      "status": "modified",
+      "index_status": ".",
+      "worktree_status": "M",
+      "additions": 12,
+      "deletions": 3,
+      "binary": false
+    },
+    {
+      "path": "new.txt",
+      "orig_path": "old.txt",
+      "status": "renamed",
+      "index_status": "R",
+      "worktree_status": ".",
+      "additions": 0,
+      "deletions": 0,
+      "binary": false
+    }
+  ],
+  "total_files": 2,
+  "truncated": false
+}
+```
+
+`status` 取值 `modified`、`added`、`deleted`、`renamed`、`copied`、`type_changed`、
+`untracked`、`conflicted`；`scope` 默认为 `working`（相对 HEAD 的暂存与未暂存合计），
+会话拥有独立 worktree 时支持 `scope=branch`（相对审阅基底展示已提交与未提交改动，
+并额外返回该基底 `baseCommit` 与领先它的提交数 `baseAhead`）。审阅基底是 worktree 的 `base_commit`
+与 HEAD 和默认分支（本地及 `origin`，当前所在分支除外）各 tip 的 merge-base 中最新的一个，
+会话分支合入或变基到更新的默认分支后，上游提交不算作会话的改动。未跟踪文件按
+行数计入新增，二进制或过大时为 `null`。最多返回 1000 个文件，原始输出上限 2 MB，超出时
+`truncated: true`。无法读取时同样返回 200：`{"state": "unavailable", "reason":
+"container_mode" | "worktree_broken", "message": "…"}`、`{"state": "not_git_repo",
+"message": "工作目录不是 git 仓库"}` 或 `{"state": "error", "error": "…"}`，都带
+`worktree`。
+
+`git/diff` 返回单个文件相对 HEAD（或 `scope=branch` 下相对审阅基底）的 unified diff，未跟踪文件与 `/dev/null` 比较：
+`{"state": "ok", "path": "src/app.ts", "diff": "diff --git …", "binary": false,
+"truncated": false, "untracked": false}`。输出上限 512 KB（`truncated: true`）；二进制
+文件 `binary: true`。`path`、`orig_path`（重命名的原路径）必须是仓库内的相对路径：
+绝对路径、`..`、NUL 和经符号链接逃出仓库的路径返回 400。
+
+`git/worktree-support` 返回 `{"available": true}`，或
+`{"available": false, "reason": "container_mode" | "directory_missing" |
+"not_git_repo" | "repo_has_no_commits", "message": "…"}`。
 
 ## Runtime Session 与渠道绑定
 
@@ -346,18 +698,75 @@ HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
 - `PUT /api/groups/:jid/im-binding`
 - `DELETE /api/groups/:jid/im-binding/:imJid`
 
+工作区没有主会话：列表只返回真实会话，每行带当前用户的置顶时间 `pinned_at`（未置顶为
+`null`），按「置顶的在前，再按最近活跃」排序（`shared/session-order.ts`）。
+
+- `PATCH /api/groups/:jid/sessions/:sessionId` 接受 `{ "pinned": true | false }`，返回
+  `{ "success": true, "pinned_at": … }`；置顶按用户记录，访客不能置顶。
+- `DELETE` 可删除任何会话，包括原生话题会话。会话绑定了私聊/普通群、原生话题或自动化时
+  先返回 409 `{ "code": "session_has_bindings", "linked_im_groups": [{jid, name}],
+"thread_bindings": [{jid, name, context_id}], "automations": [{id, name}] }`（三个数组
+  总是存在）；带 `confirm_bindings=true` 重发才删除。可选 `rebind_to=<同工作区另一会话 id>`
+  在同一事务里先把私聊/普通群绑定改到该会话；非法时 400 `invalid_rebind_target`。原生话题
+  绑定随会话删除，该话题下一条消息新建会话；绑定该会话的自动化暂停。有 worktree 时另走
+  worktree 的 409 确认。
+- `GET /api/groups/:jid/agents` 的 spawn 行带 `spawned_from_jid`（发起它的会话地址）。
+
 约束：
 
 - `POST /api/groups/:jid/sessions`（及 `/agents`）只接受工作区 `web:*` JID；IM 聊天
   JID 返回 400，IM 聊天应绑定到 Session 而不是在其下创建 Session。
+- 请求体可带 `worktree: true`：宿主机模式、工作目录是有提交的 git 仓库时，宿主在
+  `data/worktrees/{folder}/{sessionId}` 以当前 HEAD 新建分支 `happyclaw/<短 ID>` 的
+  worktree，该会话此后每次运行都以它为工作目录（工作区在仓库子目录时进入同一子目录）。
+  不满足条件返回 400 `{"code": "WORKTREE_UNAVAILABLE", "reason": …}`，不创建会话；
+  git 失败返回 500 `WORKTREE_CREATE_FAILED`。响应与 `GET` 列表的会话带
+  `worktree: {"branch", "base_commit", "status": "active" | "broken", "broken_reason"}`
+  或 `null`。worktree 丢失或损坏时该会话运行失败并说明原因，不会回退到主仓库。
+  仓库根目录的 `.worktreeinclude` 列出要复制进新 worktree 的被忽略文件（如 `.env`）：只复制
+  既匹配它、又被仓库的忽略规则（`.gitignore`、`info/exclude`、`core.excludesFile`）忽略的
+  未跟踪文件。该文件超过 64 KB 或匹配列表超过 256 KB（此时一个都不复制）、超过 100 个文件
+  或超过单文件 10 MB / 合计 50 MB 时少复制的部分会记 warn 日志，创建响应的
+  `worktree.include_incomplete` 为
+  `{"reason": "include_file_too_large" | "list_truncated" | "file_limit" | "size_limit", "copied_files", "skipped_files"}`
+  （`skipped_files` 是最多 5 个未复制的路径，前两种原因下为空），完整复制时为 `null`（`GET`
+  列表不带该字段）。Web 在新建会话后据此弹出不阻塞的提示。
+- 删除带 worktree 的会话会移除 worktree 目录、保留分支。可能丢失内容时返回 409
+  `{"code": "WORKTREE_DIRTY", "error", "dirty_worktrees": [{"session_id", "branch", "changed_files", "unreadable", "submodules", "embedded_repos", "detached_commits", "operation_in_progress", "hidden_changes"}]}`，
+  `error` 逐条写明原因：
+  - `changed_files`：未提交改动（含未跟踪文件）；嵌入的仓库或子模块指向的提交有变化也计入。
+  - `unreadable`：目录还在但状态读不出（`.git` 丢失、找不到管理目录、git 失败，或嵌套仓库
+    扫描超过 50 万个条目 / 10 秒），按有改动处理。
+  - `submodules`：初始化过子模块（本地提交存放在 worktree 的管理目录，会随之删除）。
+  - `embedded_repos`：worktree 内任意位置（包括被 `.gitignore`、`info/exclude` 或全局
+    excludesFile 忽略的目录）有另一个仓库的 `.git`：目录、符号链接，或指向本 worktree
+    管理目录 `modules/` 以外的 `.git` 文件；其中的提交和改动只存在 worktree 里。
+  - `detached_commits`：HEAD 不在分支上，且 HEAD 提交不能从任何分支或标签到达（在
+    detached HEAD 上提交、rebase 停在 edit 等），删除后这些提交不可达。
+  - `operation_in_progress`：`"rebase"` | `"merge"` | `"cherry-pick"` | `"revert"` |
+    `"bisect"` 进行中时为对应值，否则为 `null`。
+  - `hidden_changes`：有 assume-unchanged 的文件，或磁盘上存在的 skip-worktree 文件，
+    它们的改动不会出现在状态里（稀疏检出中不在磁盘上的文件不算）。
+
+  检查只读索引、管理目录和文件系统（遍历不跟随符号链接），不会在嵌入的仓库中启动 git；
+  其他被 `.gitignore` 忽略的文件不计入改动。带 `?force_worktree=true` 确认后才移除。git
+  无法移除 worktree 时只删除它自己的管理目录（`gitdir` 指向该 worktree），不会清理同一
+  仓库的其他 worktree。worktree 被标为 `broken` 后，目录恢复时（下次运行或列出会话时重新
+  检查）回到 `active`。删除工作区和 `clear-history` 同理（409 相同），确认参数为
+  `?force_worktrees=true&confirmed_worktrees=<session_id>,…`，列出调用方在 409 里看到并确认
+  的会话；停止 runner 之后会再检查一次，出现列表之外的可能丢失内容的 worktree 时再次返回
+  409（列出全部这类 worktree），只带 `force_worktrees=true` 不确认任何 worktree。工作区有
+  worktree 会话时 `PATCH` 不能切换到 Docker 执行（409 `WORKTREE_SESSIONS_EXIST`）。最后一个
+  worktree 移除后，空的 `data/worktrees/{folder}` 一并删除；启动时删除没有任何 worktree
+  记录的空目录，有内容的目录不动。
+
 - 工作区绑定只接受原生话题群（飞书话题群或 Telegram Forum）。
-- Runtime Session 绑定接受私聊和普通群，`sessionId=main` 表示该 Workspace 的主会话。
+- Runtime Session 绑定接受私聊和普通群，必须指定具体会话；`sessionId=main` 不再有特殊含义（404）。
 - 话题群使用 `thread_map`，每个原生话题映射独立 Session；普通群的 @ 策略不改变绑定层级。
 - `DELETE` 绑定会真正解除路由，不恢复默认工作区或自动创建会话。
 - 每条输入的回复回到实际来源渠道；Web 输入不会自动镜像到已绑定 IM。
-- 绑定管理 `PUT /api/config/user-im/bindings/:imJid` 使用
-  `{target_session_id: "main", target_main_jid: "web:..."}` 选择主会话；
-  仅指定 `target_main_jid` 表示话题群的 Workspace 绑定。
+- 绑定管理 `PUT /api/config/user-im/bindings/:imJid` 用 `target_session_id` 选择会话；
+  仅指定 `target_main_jid` 表示话题群的 Workspace 绑定（只接受原生话题群）。
 - 请求必须携带或解析出正确的 `channel_account_id`，不能跨机器人账号绑定。
 
 ## Agent Profiles
@@ -368,12 +777,77 @@ HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
 - `POST|DELETE /api/agent-profiles/:id/avatar`
 - `POST /api/agent-profiles/:id/refine-prompt`
 - `GET /api/agent-profiles/:id/workspaces`
-- `GET /api/agent-profiles/:id/prompt-versions`
-- `POST /api/agent-profiles/:id/prompt-versions/:version/restore`
 - `POST /api/agent-profiles/:id/effective-capabilities`
+- `POST /api/agent-profiles/:id/duplicate`
+- `POST /api/agent-profiles/:id/migrate-and-delete`
+- `GET /api/agent-profiles/:id/export`
+- `POST /api/agent-profiles/import`
 
 `effective-capabilities` 返回 PromptPlan、Skill/MCP Manifest、上下文预算和最近一次
-脱敏运行快照，用于对比“配置预期”与“SDK 实际加载”。
+脱敏运行快照，用于对比“配置预期”与“SDK 实际加载”；`model_resolution`
+（`source`、`model_config_id`、`model_config_name`、`model`、`effort`、`connection_missing`）
+说明运行实际用的连接与模型。请求体可带未保存的 `model_config_id`、`model`，与未保存
+的 `runtime_policy` 一样按它们计算；绑定的连接已删除时 `connection_missing` 为 true。
+`source` 按固定顺序取 `session`（会话手选；智能体预览不针对具体会话，不取这一步）、`agent`（智能体绑定）、`workspace_env`、`owner_main`（所有者的主智能体）、
+`system_main`（系统主 HappyClaw）或 `none`。`GET /api/agent-profiles` 另返回
+`model_configs[]`（每个连接 `{ id, name, type, model, usable, models }`，`models` 形状同
+`model-selection`）和 `inherited_model`（`owner_main`、`system_main` 各为
+`{ model_config_id, model, effort }` 或 `null`；`system_main_profile_id` 只在调用者拥有
+系统主 HappyClaw 时给出，否则为 `null`），供表单显示「跟随主智能体」。保存绑定或档位时
+档位必须是所绑定模型支持的。
+
+`GET /:id/workspaces` 的每个工作区带 `active_conversations`：该工作区运行时中正在
+执行或有排队输入的个数，即一次会重启 Runner 的保存会中断的对话数；只在等待输入的
+暖 Runner 不计入。
+
+名称在同一用户的 active 智能体（含内置 HappyClaw）之间唯一，按 NFKC 折叠后不区分
+大小写比较；创建、导入和改名冲突返回 409 与 `code: AGENT_NAME_TAKEN`，已有的重名
+不受影响。四段 Prompt 每段最多 20000 个字符；超限返回 400 与
+`code: PROMPT_TOO_LONG`、`field`（如 `soul_prompt`）和 `max`，名称不合法（含零宽
+空格、软连字符等不可见字符）返回 `code: INVALID_NAME`；比较名称时也会去掉这类字符。
+唯一性在数据库层的创建与改名里检查，Agent Builder 准备和发布草稿同样受约束。
+
+`runtime_policy.mcp.ids` 的引用可带 `system:`/`user:` 前缀，前缀不计入 id 的 128 字符
+上限。
+
+每个 profile 的 `runtime_policy.skills.host` 都是显式值（schema v84 起），宿主机
+Skills 不再随有效上下文来源隐式继承。
+
+`duplicate` 新建「<名称> 副本」（重名时为「副本 2」「副本 3」…），复制四段 Prompt、
+`prompt_mode`、`runtime_policy`、模型绑定、头像 Emoji/背景色与上传的头像文件（复制为
+新文件），不复制工作区和渠道挂载；内置 HappyClaw 返回 400。校验与创建相同；非
+admin 复制时去掉宿主机上下文与宿主机 Skills，响应 `stripped` 列出
+`host_context`/`host_skills`。
+
+`migrate-and-delete` 接受 `{target_agent_profile_id}`，在两个智能体的锁和工作区
+Runner 停止期间，用一个事务把该智能体的全部工作区迁到目标并归档它：归档被拒绝
+（例如仍有渠道挂载）时整体回滚并返回 409，提交前停不下 Runner 返回 503
+`persisted: false`；成功返回 `{success, migrated_workspaces, invalidated_runtime_jids}`。
+
+`export` 返回 `{format: "happyclaw-agent", version: 1, exported_at, agent}`，`agent`
+含名称、头像 Emoji/背景色、四段 Prompt、`prompt_mode` 与 `runtime_policy`；Skills 用
+目录名、MCP 用 `system:`/`user:` 前缀名引用，不含模型配置、上传头像、宿主机路径或
+凭据。`import` 接受 `{data, name?, drop_missing?, confirm_host_grants?}`：格式或
+版本不对返回 400
+（`INVALID_AGENT_EXPORT`、`UNSUPPORTED_AGENT_EXPORT_VERSION`）；引用了本账号没有的
+Skills/MCP 时返回 409 `AGENT_IMPORT_MISSING_REFERENCES` 与 `missing`，带
+`drop_missing: true` 重发会去掉这些引用后创建（去掉后为空的“所选”改为不使用）；非
+admin 导入时去掉宿主机上下文与宿主机 Skills；admin 导入会授予它们的文件时返回 409
+`AGENT_IMPORT_HOST_GRANTS` 与 `grants`，确认后带 `confirm_host_grants: true` 重发。
+成功返回 201
+`{profile, stripped, dropped}`。
+
+`GET /api/agent-profiles` 的每个 profile 带 `model_config_id` 与 `model`（该配置内
+的模型，`null` 表示配置的默认模型）；`model_configs[]` 的每项带 `models[]`（`id`、
+`hidden`），即可以绑定的模型，隐藏模型也在其中，ChatGPT 订阅配置为账号目录中的模型
+（均不隐藏）。创建与 PATCH 接受 `model`（最长 200 个字符，`null` 清除）：它需要一个
+模型配置（请求中的 `model_config_id`，PATCH 时也可以是已有的配置），并且必须在该
+配置的列表（ChatGPT 为目录）中，否则返回 400 与 `code: MODEL_NOT_IN_CONNECTION`。
+更换或清除 `model_config_id` 会清除 `model`，除非同一请求指定了新模型。改模型与改
+配置一样提升 profile 版本并停止相关工作区的 Runner，下一条消息在新的底层会话上开始
+并带上最近的对话记录。运行时，只有智能体的绑定决定了所用配置时才使用它的模型；会话
+自己选择了配置时（即使是同一配置且未选模型）运行会话的选择。配置不再提供该模型时，
+按配置默认模型运行并记录告警。
 
 `POST /api/agent-profiles` 只创建隔离的 AgentProfile。它不会隐式创建 Workspace、
 Session 或 Memory，也不会绑定/复制 Home Workspace。用户必须在创建 Workspace 时
@@ -438,6 +912,12 @@ owner 明确拒绝首次设置时可提交
 
 读操作要求访问工作区，写操作要求工作区 owner。
 
+项目能力以工作区的项目根为准，运行时、能力预览和这些接口一致：宿主机模式的自定义目录
+（会话有独立 worktree 时为 worktree），否则 `data/groups/{folder}`。宿主机自定义目录
+工作区因此会加载该目录 `.mcp.json` 和 `.claude/settings.json`、`.claude/settings.local.json`
+中声明的 MCP，以及从该目录向上到 git 根的 `.claude/skills`；它们属于项目上下文层
+（CLAUDE.md §5），与系统、用户 MCP 叠加。
+
 `workspace-config/skills/install` 的 `package` 规则与 `POST /api/skills/install`
 相同：URL 形式只接受 github.com 仓库或 tree 链接，其他主机返回 400。
 
@@ -455,6 +935,25 @@ owner 明确拒绝首次设置时可提交
 - `DELETE /api/channel-accounts/:id/paired-chats/:jid`
 - `POST /api/channel-accounts/:id/disconnect`
 - `POST /api/channel-accounts/:id/logout`
+- `POST /api/channel-accounts/feishu/registrations`
+- `GET|DELETE /api/channel-accounts/feishu/registrations/:registrationId`
+
+飞书账号凭证可带 `domain`（`feishu` 或 `lark`，缺省 `feishu`），连接、测试连接和
+开发者后台链接都按它选择飞书或 Lark 的域名；公开账号在 `options.domain` 返回品牌。
+`ownerOpenId` 只能由服务端写入。
+
+`feishu/registrations` 扫码一键创建飞书/Lark 应用（OAuth device-code 注册，
+PersonalAgent 应用）。`POST` 请求体 `{ name?, brand? }`，向飞书申请注册码，返回 201
+`{ registration }`，其中包含 `qr_data_url`（只在这次响应中返回）、`verification_url`、
+`user_code`、`expires_at`、`interval`；上游失败返回 502，同一用户进行中的注册超过 3 个
+返回 429 `too_many_registrations`。服务端按飞书给出的间隔在后台轮询（`slow_down` 时
+加长，租户为 Lark 时切到 Lark 域名），`GET` 只读内存状态，不会触发对飞书的请求。
+`status` 取值 `pending`、`creating`、`success`、`expired`、`denied`、`error`；
+成功时用与 `POST /api/channel-accounts` 相同的创建路径建号并连接，返回 `account_id`、
+`account` 和 `event_console_url`（该应用的事件订阅页：PersonalAgent 应用默认只订阅
+`im.message.receive_v1`）。App Secret 与 device code 从不返回或写入日志。`DELETE`
+取消并删除注册，正在建号时返回 409 `registration_completing`。注册只存在于进程内存，
+按用户隔离（他人 404），过期上限 15 分钟，结束后保留 10 分钟。
 
 账号严格按 `owner_user_id` 隔离。同一 Provider 可以有多个账号。兼容字段
 `default_workspace_jid` 不能替代渠道会话的显式绑定；连接、发现和配对不自动选择 Session。
@@ -462,35 +961,94 @@ owner 明确拒绝首次设置时可提交
 
 ## Provider 与系统配置
 
-Provider：
+Provider（模型连接：一份凭据和一个端点，提供一组模型）：
 
 - `GET /api/config/claude`
-- `GET|POST /api/config/claude/providers`；创建请求可用
-  `claudeCredentialInput` 提交官方凭据原文（`.credentials.json` 内容或
-  setup-token），由服务端解析，格式无效时返回 400；官方 Provider 同一时刻只保留
-  OAuth、setup-token、API Key 中的一种
+- `GET|POST /api/config/claude/providers`；设置页只添加和维护连接，没有全局默认、
+  启用开关和自动池，选哪个模型属于智能体和会话。公开 Provider 带 `models`
+  （`{ id, contextWindow?, efforts?, defaultEffort? }[]`：`id` 是上游原名，从不带
+  `[1m]`；连接自己的模型 `anthropicModel` 总在其中；ChatGPT 订阅为 `[]`，模型取自
+  其目录）、`roles`（`{ subagent?, smallFast?, opus?, sonnet? }`，各自是本连接的一个
+  模型，未设置时跟随本轮模型）、`presetId`（起步的厂商预设，只在地址仍是该预设的地址
+  时保留，否则为 `null`）和 `lastTest`（最近一次测试
+  `{ ok, code, status, model, latencyMs, at }`，未测过为 `null`；端点、认证方式、
+  凭据、`ANTHROPIC_CUSTOM_HEADERS` 或轻量后台模型变更后清空）。
+  创建请求可带 `models`、`roles`（指向不在列表里的模型时丢弃）、`presetId`（未知预设
+  400），`models` 不含 `anthropicModel` 时把它加在最前，超过 100 个模型返回 400；模型名
+  不能含空白，带 `[1m]` 的旧写法按 1M 上下文读入。`customEnv` 只注入非空值，新连接由
+  Web 预填 `API_TIMEOUT_MS`、`CLAUDE_CODE_NO_FLICKER`、`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`；
+  含 `CONNECTION_MODEL_ENV_KEYS` 里的键（模型、各档、子代理、压缩窗口、推理等级）返回
+  400 `{ error, code: 'RESERVED_ENV_KEY' }`。旧连接的这些键在读取时一次性迁移为
+  `roles`、上下文长度和默认档位。`enabled`、`weight` 被忽略。
+  每种类型创建时都必须带凭据，否则 400 `{ error: '新建模型配置需要凭据' }`。
+  可用 `claudeCredentialInput` 提交官方
+  凭据原文（`.credentials.json` 内容或 setup-token），由服务端解析，格式无效时
+  返回 400；官方 Provider 同一时刻只保留 OAuth、setup-token、API Key 中的一种
+- `webFetchPreflightPolicy: 'check' | 'skip'`（所有连接类型，与其他连接字段一样由
+  `manage_system_config` 在创建和 PATCH 时设置；公开 Provider 总是返回，未设置时为
+  `check`）：WebFetch 抓取前是否向 Anthropic
+  查询域名。`skip` 让使用该连接的会话跳过这次查询；`check` 不做设置，由 Claude Code
+  自己的设置决定（默认查询）。没有选中连接的启动（工作区自带 Provider 环境变量）同
+  `check`。值变化后，使用该连接的 Runner 在本轮结束后退出，下一条消息由新 Runner
+  按新值处理，SDK 会话保留；与端点等字段一起修改时按下述规则停 Runner。
 - `PATCH|DELETE /api/config/claude/providers/:id`，第三方 Provider 的 PATCH
   可同时携带 `anthropicAuthToken` / `clearAnthropicAuthToken`，与其他字段在同一
   请求内提交；删除 ChatGPT 订阅型 Provider 后在后台尽力吊销其 refresh token，
-  吊销结果不影响响应
+  吊销结果不影响响应。PATCH 的 `models` 是完整的新列表（未列出的即移除），
+  `presetId: null` 清除预设，`anthropicAuthMode: null` 清除认证方式、回到按令牌
+  推断（测试时也重新尝试两种方式）；改名称、预设、模型的上下文长度或档位、`roles`
+  或新增模型时不停 Runner、不清会话，在下次启动 Runner 时生效；端点、凭据、认证方式（含清除）、环境变量、默认模型变更或移除模型时停
+  Runner；改 `anthropicModel` 仍按协议字段处理，未带
+  `models` 时旧默认模型保留在列表中（列表已满 100 个时返回 400）；只改默认模型时
+  只清除跑在旧默认模型上或没有记录模型的会话，选了该连接其他模型的会话保留，只改
+  上下文长度不清会话。移除仍被智能体使用的模型返回 409
+  `{ error, code: 'MODEL_IN_USE', agents: [{ id, name }] }`；会话里选了被移除模型的
+  在下次运行时回到连接的默认模型
 - `PUT /api/config/claude/providers/:id/secrets`，同样接受
   `claudeCredentialInput`；凭据变更只排空该 Provider 的 Runner
-- `POST /api/config/claude/providers/:id/toggle`，没有可用凭据的 Provider
-  不能启用；全局默认的 Provider 不能禁用
-- `PUT /api/config/claude/default`，请求体 `{ modelConfigId: string | null }`：
-  设置全局默认模型配置，`null` 取消并回到已启用配置间的自动轮换。没有会话选择、
-  智能体绑定和工作区环境变量的运行都使用它，不再参与负载均衡；未启用的配置在
-  设为默认时同时启用，没有可用凭据的配置返回 400；删除默认配置会清除默认，
-  响应带 `defaultCleared: true`；默认配置被清除凭据时默认同时清除（之后补回凭据
-  也不会自动恢复）。`GET /api/config/claude/providers` 返回
-  `defaultModelConfigId`（无默认为 `null`）
 - `POST /api/config/claude/providers/:id/duplicate`，服务端连同加密密钥复制为
   停用的新 Provider；OAuth 授权的 Provider 拒绝复制
-- `POST /api/config/claude/providers/test`，按草稿字段（可选 `providerId`
-  回退到已保存的端点与密钥）向第三方端点发送一次最小 `/v1/messages` 请求，
-  返回每个模型的状态码、耗时和脱敏错误摘要，不回传密钥；按用户限流
-- `POST /api/config/claude/providers/:id/reset-health`
-- `GET /api/config/claude/providers/health`
+- `POST /api/config/claude/providers/test`，测试任意类型的连接。请求体为
+  `providerId`（未填字段回退到已保存的连接与凭据）或草稿：`type`、`presetId`、
+  `anthropicBaseUrl`、`anthropicAuthToken`、`anthropicAuthMode`、`anthropicApiKey`、
+  `claudeCredentialInput`、`anthropicModel`、`customEnv`，均可选（缺省 `type` 视为
+  `third_party`；预设草稿可不带地址，按预设地址与其第一个模型测试；
+  `claudeCredentialInput` 只用于测试，从不保存）。第三方端点发一次最小
+  `/v1/messages`（另测不同的 Haiku 映射），未指定认证方式时 Bearer 被 401/403
+  拒绝会改用 `x-api-key` 再试一次；官方 API Key 在默认模型是具体的 `claude-*`
+  模型时发一次最小消息，否则读 `GET /v1/models`（不计费）；Claude 订阅
+  （OAuth、setup-token）只做不计费的账号检查，已保存的授权到期时先续期，粘贴的
+  已过期授权不续期、返回 `UNKNOWN`；ChatGPT 订阅拉取一次实时模型目录。响应为
+  `{ ok, probes, code, authMode?, record }`，每个 probe 为
+  `{ model, ok, status, latencyMs, message?, hint?, code? }`：`code` 为
+  `ProviderErrorCode`（通过为 `null`）；`authMode` 只在那次请求证明凭据被接受时
+  返回（2xx，或只会在认证通过后出现的 `MODEL_NOT_FOUND`、`CONTEXT_TOO_LONG`、
+  `WIRE_INCOMPATIBLE`），换用另一种方式后超时、限流或报其他错时沿用第一次的结果、
+  不返回 `authMode`；订阅的账号检查只有 403 明确指出缺少 scope 时才算通过；`record` 即 `ProviderTestRecord`，账号
+  检查的 `model` 为 `null`、其 probe 的 `model` 为空串。`message` 是脱敏且不超过
+  300 字的上游摘录，密钥（含 JSON 转义形式）与自定义请求头的值都会被替换；日志只记
+  上游 origin。带 `providerId` 且测试的
+  正是已保存的连接（草稿未改端点、凭据、认证方式或环境变量）时，`record` 存为该
+  连接的 `lastTest`（审计 `test_provider`，不停 Runner、不清会话）；没有认证方式
+  的旧连接同时记下端点接受的方式，与原先推断的不同时只排空该连接的 Runner。
+  与 `discover-models` 共用每用户每分钟 10 次的限额，超出返回 429
+- `POST /api/config/claude/providers/discover-models`，获取连接的模型列表，
+  请求体同上（不含 `anthropicModel`；`customEnv` 只用于草稿，其
+  `ANTHROPIC_CUSTOM_HEADERS` 随请求发送，已保存的连接用自己的环境变量）。第三方端点读
+  `modelsUrlFor(地址, 预设)`（自定义地址恰好匹配一个预设时用该预设的列表地址），
+  认证方式回退同测试；官方 API Key 读 `https://api.anthropic.com/v1/models`；
+  Claude 订阅不发请求，返回内置别名；ChatGPT 订阅返回其模型目录。成功为
+  `{ ok: true, models, source, authMode? }`，`models` 为
+  `{ id, name?, contextWindow?, efforts?, defaultEffort? }[]`（档位取自上游声明的
+  `supported_reasoning_levels`、`supported_efforts` 等字段，`minimal`/`ultra` 丢弃），`source` 为 `endpoint`、`builtin` 或
+  `catalog`；失败仍为 200
+  `{ ok: false, code, status, message }`：列表地址 404 为 `ENDPOINT_NOT_FOUND`，
+  返回内容不是模型列表为 `UNKNOWN`
+- `GET /api/config/claude/providers/:id/impact`，返回
+  `{ activeRunners, stoppedRunners }`：正在使用该连接的 Runner 数，以及修改其
+  协议字段（端点、密钥、认证方式、默认模型、环境变量）时实际会停掉的 Runner 数
+  （连接是系统主 HappyClaw 的连接、有会话记录、被智能体绑定或被会话选用时为全部存活
+  Runner，否则为 0）
 - `GET /api/config/claude/providers/:id/usage`，读不到用量时以 `status`
   区分 `unsupported`（setup-token、仅推理权限或非 OAuth 凭据，见
   `unsupportedReason`）与 `needs_relogin`（刷新授权被拒）；ChatGPT 订阅型
@@ -500,7 +1058,6 @@ Provider：
   `limitId`、`limitName`、`primary`/`secondary` 窗口（`usedPercent` 0–100、
   `windowMinutes`、`resetsAt` epoch 秒）和 `credits`（`hasCredits`、
   `unlimited`、`balance`），服务重启后为空
-- `PUT /api/config/claude/balancing`
 - `POST /api/config/claude/apply`
 - `POST /api/config/claude/oauth/start`，可选 `targetProviderId`（必须是已有的
   官方 Provider）与 `profile`（`full` 默认，或 `setup_token`）；流程绑定发起用户
@@ -555,7 +1112,38 @@ minimalClientVersion?, availableInPlans?, serviceTiers }`（字段取自官方
 - `GET|PUT /api/config/system`
 - `GET|PUT /api/config/host-integration`，仅 admin；包含
   `adminHostOnlyMode`。从 `false` 切到 `true` 时会停稳管理员工作区运行器，并把
-  active admin 拥有的工作区和定时任务持久迁移为 Host；普通成员数据不变
+  active admin 拥有的工作区持久迁移为 Host；普通成员数据不变
+  - `workspaceRoot`（存储值，`''` 表示未设置）以及只读的 `workspaceRootEffective`、
+    `workspaceRootSource`（`settings|env|default`）、`workspaceRootFallbackReason`、
+    `workspaceRootFallbackWarning`。`workspaceRootEffective` 是新工作区实际使用的根目录；
+    备用目录也不可用（`workspaceRootFallbackWarning` 非空）时为 `null`，新工作区放在
+    `data/groups/{folder}`。保存不合格的值返回 400
+    `{ error, code: "WORKSPACE_ROOT_INVALID", reason }`；目录在第一个工作区需要时才创建
+  - `deploymentMode`（生效值）、`deploymentModeConfigured`（存储值）、`deploymentModeSource`。
+    PUT 的 `deploymentMode` 接受 `'' | multi_user | single_user_host`；还有其他启用中的账号时
+    切到单人宿主机返回 409 `{ code: "SINGLE_USER_HOST_OTHER_USERS", users: [{ id, username, role }] }`，
+    成功时执行与开启 `adminHostOnlyMode` 相同的 Host 迁移（已存的 `adminHostOnlyMode` 为
+    `true` 时没有要迁移的工作区，不停运行器、不清会话）；切回多人只保存这一项，存储的
+    `adminHostOnlyMode`、注册和计费设置原样生效，不迁回 Docker
+- `GET /api/config/storage-sources`、`POST|PUT|DELETE /api/config/storage-sources/:id`，
+  仅 admin；列出合并后的全部存储源，写入只针对 `data/config/storage-sources.json`
+  （POST 新建、PUT 替换），写入前用运行时同一个解析器校验合并后的整份列表，不通过时
+  文件不变。`config/mount-allowlist.json` 声明的来源 `origin` 为 `allowlist`，对它的
+  POST/PUT/DELETE 返回 409（`code: STORAGE_SOURCE_READ_ONLY`），只能在服务器上改该文件；
+  Web 添加的为 `web`。allowlist 文件无法解析时列表为空并带 `allowlistError`，写入返回
+  409；`storage-sources.json` 无法解析时带 `managedError`。返回值还带 `hasPassword`、
+  `usedBy`（挂载它的工作区数）与 `readWriteUsedBy`（其中以读写方式挂载的），从不返回
+  密码或 `passwordFile`。SMB 密码只写：请求里的 `password` 省略表示保留、空串表示清除，
+  写入 `data/config/secrets/storage-<id>`（600，目录 700）；NFS 请求里的 `password`
+  被忽略。PUT 把 `allowReadWrite` 从 `true` 改为 `false` 且有工作区以读写方式挂载它时
+  返回 409（`code: STORAGE_SOURCE_READ_WRITE_IN_USE`、`readWriteUsedBy`），请求体带
+  `force: true` 才执行。DELETE，以及改动服务器、导出路径、共享、版本、凭据或收回读写的
+  PUT，会先停下挂载该来源的工作区的运行器再写入（只改 `description` 或打开读写不停）；
+  停不下来时返回 503，带 `persisted` 与 `retryable`，`persisted: true` 表示改动已经生效、
+  这些工作区暂停接活，重试同一请求（DELETE 也一样）完成清理后恢复。审计记
+  `storage_source_saved` / `storage_source_deleted`，只含 id、类型和是否实际写入或删除了
+  密码，不含服务器与共享。单人宿主机模式不使用 Docker，三个写接口都返回 409
+  `{ code: "SINGLE_USER_HOST" }`，设置页也不显示存储源
 - `GET /api/config/external-resources`
 - `GET /api/config/external-resources/rule`
 - `GET|PUT /api/config/registration`
@@ -572,29 +1160,89 @@ Legacy 渠道 facade 位于 `/api/config/user-im/*`，涵盖飞书、Telegram、
 
 系统级 `/api/config/feishu` 和 `/api/config/telegram` 也只保留兼容用途。
 
-## 定时任务
+## 自动化
 
-- `GET|POST /api/tasks`
-- `PATCH|DELETE /api/tasks/:id`
-- `POST /api/tasks/:id/restore`
-- `POST /api/tasks/:id/runs`
-- `GET /api/tasks/:id/runs`
-- `GET /api/tasks/runs/:runId`
-- `POST /api/tasks/runs/:runId/cancel`
-- `POST /api/tasks/:id/run`，旧立即运行入口
-- `GET /api/tasks/:id/logs`，旧日志入口
-- `POST /api/tasks/ai`
-- `POST /api/tasks/parse`
+- `GET|POST /api/automations`（`?workspace=<jid>` 过滤）
+- `GET|PATCH|DELETE /api/automations/:id`（DELETE 带 `?sessions=keep|archive|delete`）
+- `POST /api/automations/:id/pause`、`/resume`
+- `POST /api/automations/:id/run`，立即运行（202）
+- `GET /api/automations/:id/runs?limit=50`
+- `POST /api/automations/:id/runs/:runId/cancel`
+- `POST /api/automations/:id/runs/read`
+- `GET /api/automations/for-session?jid=<sessionJid>`，绑定到该会话的自动化
 
-写入使用 revision 或 idempotency key 防止并发覆盖和重复运行。运行状态与通知状态
-分开持久化；通知失败不会重新执行任务主体。
+只返回当前用户创建的自动化，其他人的一律 404，没有管理员旁路；宿主机工作区要求
+管理员。PATCH 必须带 `expectedRevision`，过期返回 409。草稿校验、Cron 语法和权限
+由 `src/automation-service.ts` 统一处理，REST 与 Agent 工具返回同样的中文错误。
+状态变化通过 WS `automation_changed` / `automation_run_updated` 只推给所有者。
 
-任务定义不设置每用户数量配额。`prompt` 与 `script_command` 有长度上限，AI 输入
-和解析结果、REST 与 MCP `schedule_task` / `update_task` 使用同一组上限，超出即
-拒绝。
+旧的 `/api/tasks*` 全部返回 410，提示改用 `/api/automations`。
 
-PATCH 修改 `chat_jid` 时会同时更新任务的具体 `delivery_route_jid`。已经物化的 Run
-在 `definition_snapshot` 中冻结原投递路由，不会因后续任务编辑而切换目标。
+## 团队模式与多任务模式
+
+- `GET /api/workspaces/:jid/team-mounts` → `{ mounts }`，工作区的群绑定及其团队设置，
+  `eligible=false` 时带 `ineligibleReason`
+- `PUT /api/workspaces/:jid/team-mounts/:channelJid`，body `{ settings }`（不含
+  `version`，由服务端递增）→ `{ mount }`；规则最多 20 条，说明最长 2000 字
+- `GET /api/workspaces/:jid/work-items?status=open|ended&limit=` → `{ items }`
+- `GET /api/workspaces/:jid/work-decisions?kind=&limit=` → `{ decisions }`
+- `GET /api/work-items?needs=me` → `{ items }`，当前用户各工作区里等人处理的工作项
+- `GET /api/work-items/:id` → `{ item, events, subscriptions }`
+- `POST /api/work-items/:id/stop`、`/approve` → `{ item }`
+
+只服务工作区主人，没有管理员旁路，Host 工作区要求管理员，访客 403；权限见
+`docs/ACL-MATRIX.md` §4.7。校验和状态机在 `src/work-item-service.ts`，它的
+`WorkItemError` 按自带状态码返回 `{ error }`。工作项变化通过 WS `work_item_updated`
+只推给主人。
+
+工作项有两种来源（`origin`）：`team` 来自团队模式的群，`delegated` 是多任务工作区里
+某个会话用 `work_delegate` 派出的后台任务。两种工作项共用同一个工作区编号 `#seq`，
+也走同一组路由。`WorkItemView` 带 `origin`、`originAgentId`（派出它的会话）、
+`originInputId`（派出时那一轮回答的输入）和 `originSessionName`（派出它的会话名，会话
+已删除时为 `null`）。派发型工作项的 `channelJid` 是派出会话的 lane，`channelName`
+为 `null`。对派发型工作项调用 `POST /api/work-items/:id/stop` 时，工作项结束为
+`stopped`，Worker 停下，派出它的会话收到一条 `state="stopped"` 的 `work_report` 输入；
+`/approve` 不适用，派发型工作项一开始就可修改，调用返回 409。派出会话的 `/break` 或
+Web 停止不会取消队列里尚未处理的派发回报；Worker 一轮结束却没有交回结果（或运行彻底
+失败、计费被拒）时，工作项结束为 `failed`，派出会话收到 `state="failed"` 的回报。
+
+## Web Push
+
+系统通知：Web 来源的回复完成或运行出错时，如果主人没有正在看该会话的可见页面，服务端
+向其浏览器订阅推送。只服务当前登录用户本人的订阅，访客 403，全部响应
+`Cache-Control: private, no-store`。
+
+- `GET /api/push/vapid-public-key` → `{ publicKey }`；密钥不可用时 503
+- `GET /api/push/status` → `{ available, subscription_count, subscriptions }`，每项
+  `{ id, user_agent, created_at, last_success_at }`，不返回 endpoint 与密钥
+- `POST /api/push/subscribe`，body 为浏览器 `PushSubscription` 的
+  `{ endpoint, keys: { p256dh, auth } }` → `{ success }`；endpoint 必须是 https、不带端口
+  和账号，主机只能是 `fcm.googleapis.com`、`web.push.apple.com`、
+  `*.push.services.mozilla.com`、`*.notify.windows.com`，且只含 `[a-z0-9.-]`，WHATWG URL
+  与 web-push 使用的 `url.parse` 解析出的主机必须相同，否则 400；只保存规范化后的
+  `new URL(endpoint).href`。订阅记在提交它的登录会话上，同一用户重复提交是更新（并改记到
+  当前会话）；endpoint 已属于其他用户时不改归属：删除那条记录并返回
+  409 `{ code: 'push_subscription_conflict' }`，浏览器须退订，本用户重新开启才会得到新订阅。
+  每个用户最多保留最近登记的 20 个（按最后一次登记时间淘汰）
+- `POST /api/push/unsubscribe`，body `{ endpoint }` → `{ success }`，幂等，只能删除本人的
+- `POST /api/push/test` → `{ success, ...summary }`，只向本人的订阅发一条测试通知；每个
+  用户每分钟最多 3 次，超出 429（带 `Retry-After`）
+
+订阅随登记它的登录会话结束而删除：退出登录、吊销会话、改密或管理员重置密码、禁用或删除
+用户、会话过期（`user_sessions` 上的触发器）。本人改密（含管理员重置自己的密码）时，发起的
+这台设备换到新会话并保留订阅，其他设备的订阅随旧会话删除。Web 退出登录前先注销并退订本浏览器的订阅；
+浏览器另记本机由哪个用户开启，换了账号的浏览器不会把旧订阅登记给新用户，而是退订，设置页
+显示未开启。
+
+VAPID 密钥首次使用时生成在 `data/config/web-push-vapid.json`（权限 600），不进入
+数据库；订阅存于 `web_push_subscriptions`。推送服务返回 404/410 的订阅会被删除。联系
+地址可用环境变量 `WEB_PUSH_SUBJECT` 设置。单次投递由 `src/web-push-transport.ts` 发出：
+总时长不超过 10 秒，响应体超过 16 KiB 即断开，走与其他出站请求相同的 `HTTPS_PROXY` /
+`NO_PROXY`。判定与发送在 `src/web-push.ts`，调用点在 `src/index.ts` 的
+`webTurnPushNotice`：只对 Web 来源的输入、最终回复或运行错误推送；IM 来源、自动化运行、
+团队模式会话和 Worker 不推送。会被推送的回复在 WebSocket `new_message` 里带
+`web_push: true`（不入库、不出现在历史接口）；已订阅推送的页面只对这类回复不再弹页面通知，
+其他回复与后台任务完成仍照常弹出。
 
 ## Skills、MCP 和 Plugins
 
@@ -738,6 +1386,40 @@ POST、PATCH 和 DELETE 均返回
 `{ storeRevision, item, replayed }`；GET item 返回相同 wrapper，但不含
 `replayed`。`replayed` 表示服务端按相同 idempotency key 返回了已有写入结果。
 
+`canonicalKey` 规范化后（忽略大小写、全半角和空格/`_`/`-`）已被另一条 active 条目
+使用时（Agent 提议还包括另一条 proposed 条目），创建或改 key 返回 409：
+
+```json
+{
+  "error": "memory_duplicate",
+  "message": "An active memory already uses this canonical key: ...",
+  "existing": {
+    "id": "wmi_...",
+    "kind": "fact",
+    "title": "部署流程",
+    "status": "active",
+    "revision": 3
+  }
+}
+```
+
+### 待确认的记忆
+
+群聊成员的轮次和自动化运行写入的记忆以 `status: "proposed"` 保存，不参与召回、目录和
+搜索；`GET .../items?status=proposed` 列出它们。owner 的回答：
+
+- `POST /api/memory/workspaces/:workspaceJid/items/:itemId/confirm`
+- `POST /api/memory/workspaces/:workspaceJid/items/:itemId/reject`
+
+请求体 `{ expectedRevision, idempotencyKey?, reason?, provenance? }`（`reason` 只用于
+reject），返回 `{ storeRevision, item, replayed }`。confirm 把条目改为 active，
+reject 写入 tombstone；审计事件分别记为 `confirm`、`reject`。带相同
+`idempotencyKey` 重发返回已有结果（`replayed: true`）。owner 用 PATCH 编辑一条提议
+也会把它变为 active；创建和 PATCH 都不接受 `status: "proposed"`（400）。条目已不是
+proposed 时
+返回 409 `not_proposed`，revision 过期返回 409 `revision_conflict`，确认时同一
+canonical key 已有 active 条目返回 409 `memory_duplicate`。
+
 并发编辑使用 compare-and-set。`expectedRevision` 过期时返回：
 
 ```json
@@ -770,6 +1452,13 @@ Web 和 Runtime 不再把它们当作第二个可写真相源。
 - `GET /api/usage/records`
 - `GET /api/usage/export.csv`
 - `GET /api/usage/users`
+- `GET /api/usage/cache`：与 `/stats` 相同的筛选参数，返回提示缓存命中率
+  `{ window, semantics: 'anthropic', summary, daily[], models[], connections[] }`；
+  每行含 `inputTokens`、`cacheCreationTokens`、`cacheReadTokens` 和
+  `hitRate = cacheRead ÷ (input + cacheCreation + cacheRead)`（无提示 Token 时为
+  `null`）。`daily[].date`、`models[].model`、`connections[]` 的 `connectionId`
+  （未记录连接时为 `null`）与 `name`（连接已删除时为 `null`）。按 Anthropic 用量语义
+  计算（input 不含缓存）；网关把缓存计入 input 时命中率偏低
 
 计费用户侧：
 
@@ -805,13 +1494,20 @@ Web 和 Runtime 不再把它们当作第二个可写真相源。
 监控：
 
 - `GET /api/health`，Public
-- `GET /api/status`
+- `GET /api/build`，Public：返回当前部署的前端构建标识 `{ id, builtAt }`（读自
+  前端构建产物中的 build.json，由 `web/vite.config.ts` 写入，每次请求按文件 mtime
+  刷新，无需重启后端）；构建产物缺失或损坏时两个字段为 `null`。`id` 是构建产物
+  的内容哈希，同一份前端源码重新构建时不变，不含版本号或提交。已打开的页面在
+  WS 连接/重连、回到前台和每 30 分钟比较一次，`id` 不同且服务端 `builtAt` 更新
+  时提示刷新
+- `GET /api/status`：带 `deploymentMode`；单人宿主机模式下不做任何 Docker 探测，Docker 相关
+  字段为 `null`
 - `GET /api/status/groups`：只返回队列运行状态，供聊天页恢复运行态；可见范围与
   `/api/status` 相同，不做 Docker 与版本探测
 - `POST /api/status/groups/:folder/switch-provider`
 - `GET /api/status/channel-outbox/uncertain`
 - `POST /api/status/channel-outbox/:id/resolve`
-- `POST /api/docker/pull`
+- `POST /api/docker/pull`：单人宿主机模式下 409 `SINGLE_USER_HOST`
 
 Agent 镜像只由 `main` 分支的 GitHub Actions 构建并发布。该接口仅在运行主机上执行
 `docker pull` 更新已发布镜像，不在用户机器上编译镜像。
@@ -829,7 +1525,8 @@ Agent 镜像只由 `main` 分支的 GitHub Actions 构建并发布。该接口�
 
 目录浏览：
 
-- `GET|POST /api/browse/directories`
+- `GET|POST /api/browse/directories`；目标在工作区根目录（当前的或有工作区记录的旧根目录）
+  里面时返回 403 `{ error, code: "WORKSPACE_ROOT_FORBIDDEN" }`
 
 ## WebSocket
 
@@ -842,6 +1539,8 @@ Agent 镜像只由 `main` 分支的 GitHub Actions 构建并发布。该接口�
 - `terminal_input`
 - `terminal_resize`
 - `terminal_stop`
+- `presence`，`{ visible, chatJid, agentId }`：页面是否可见、正在看哪个会话；可见时约每 25 秒
+  重发，服务端 60 秒内未收到即视为不在看。用于决定是否发系统通知，访客连接忽略
 
 服务端主要事件：
 
@@ -851,7 +1550,11 @@ Agent 镜像只由 `main` 分支的 GitHub Actions 构建并发布。该接口�
 - `status_update`
 - `stream_event`
 - `stream_snapshot`，连接建立时推送进行中回合的快照（含推理文本尾部、推理计时、
-  活动工具、子 Agent 状态和轨迹）
+  活动工具、子 Agent 状态、轨迹，以及主动模式 Web 回合已发的进展 `progress`）
+- `active_run_snapshot`，连接建立时推送；`usageLimitWaits[]`
+  （`{ chatJid, agentId?, resumeAt, waitCount }`）列出正在等待用量重置的会话
+- `usage_limit_wait`，`{ chatJid, agentId?, resumeAt, waitCount? }`：会话开始等待
+  用量重置；`resumeAt: null` 表示等待结束
 - `agent_status`
 - `terminal_output`
 - `terminal_started`

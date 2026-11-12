@@ -199,6 +199,8 @@ describe('Codex provider state in the public provider shape', () => {
   });
 });
 
+const SESSION = 'session-1';
+
 describe('container launch substitution', () => {
   test('the env file carries a runner token, never the stored identifier', () => {
     const provider = createCodexProvider();
@@ -214,16 +216,12 @@ describe('container launch substitution', () => {
         added_at: new Date().toISOString(),
       } as never,
       false,
+      SESSION,
       false,
-      undefined,
-      undefined,
       undefined,
       runtimeConfig.resolveProviderById(provider.id),
       undefined,
       undefined,
-      undefined,
-      undefined,
-      false,
       {
         envLines: ['HTTP_PROXY=http://proxy.example:8080'],
         addHostGateway: false,
@@ -231,7 +229,7 @@ describe('container launch substitution', () => {
       lease,
     );
     const envFile = fs.readFileSync(
-      path.join(getContainerRuntimeEnvDir('codex-ws'), 'env'),
+      path.join(getContainerRuntimeEnvDir('codex-ws', SESSION), 'env'),
       'utf8',
     );
     expect(envFile).not.toContain('stored-gateway-identifier');
@@ -256,7 +254,7 @@ describe('container launch substitution', () => {
     const lease = new CodexGatewayRunnerLease({
       kind: 'container',
       groupFolder: 'codex-pick',
-      sessionAgentId: null,
+      agentId: SESSION,
       sessionEffort: 'ultra',
     });
     fs.mkdirSync(path.join(root, 'groups', 'codex-pick'), { recursive: true });
@@ -267,9 +265,8 @@ describe('container launch substitution', () => {
         added_at: new Date().toISOString(),
       } as never,
       false,
+      SESSION,
       false,
-      undefined,
-      undefined,
       undefined,
       // What trySelectPoolProvider hands over for a pinned model.
       {
@@ -278,14 +275,11 @@ describe('container launch substitution', () => {
       },
       undefined,
       undefined,
-      undefined,
-      undefined,
-      false,
       { envLines: [], addHostGateway: false },
       lease,
     );
     const envFile = fs.readFileSync(
-      path.join(getContainerRuntimeEnvDir('codex-pick'), 'env'),
+      path.join(getContainerRuntimeEnvDir('codex-pick', SESSION), 'env'),
       'utf8',
     );
     const value = (key: string) =>

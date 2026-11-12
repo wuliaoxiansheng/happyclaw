@@ -1219,17 +1219,24 @@ export function cancelStaleRetryWaitChannelTurns(input: {
   updatedBefore: string;
   reason: string;
   now?: Date | string;
+  /** Inputs known to run again later (a usage-limit wait); never closed. */
+  keepCorrelationIds?: readonly string[];
 }): number {
   const now = isoNow(input.now);
+  const keep = [...new Set(input.keepCorrelationIds ?? [])];
+  const keepClause =
+    keep.length > 0
+      ? ` AND correlation_id NOT IN (${keep.map(() => '?').join(',')})`
+      : '';
   return requireDatabase()
     .prepare(
       `UPDATE turn_runs
        SET status = 'cancelled', completed_at = ?, updated_at = ?, error = ?,
            lease_owner = NULL, lease_expires_at = NULL,
            revision = revision + 1
-       WHERE status = 'retry_wait' AND updated_at < ?`,
+       WHERE status = 'retry_wait' AND updated_at < ?${keepClause}`,
     )
-    .run(now, now, input.reason, input.updatedBefore).changes;
+    .run(now, now, input.reason, input.updatedBefore, ...keep).changes;
 }
 
 /**
@@ -2673,26 +2680,6 @@ export function claimStreamingCardRecovery(
            OR (status = 'recovering' AND updated_at <= ?))`,
     )
     .run(now, id, expectedRevision, staleBefore);
-  return changed.changes === 1 ? getStreamingCardRecord(id) : undefined;
-}
-
-/** Release a failed recovery claim so an account-ready pass can retry now. */
-export function releaseStreamingCardRecovery(
-  id: string,
-  expectedRevision: number,
-  error: string,
-  nowInput?: Date | string,
-): StreamingCardRecord | undefined {
-  const connection = requireDatabase();
-  const now = isoNow(nowInput);
-  const changed = connection
-    .prepare(
-      `UPDATE streaming_cards
-       SET status = 'streaming', error = ?, revision = revision + 1,
-           updated_at = ?
-       WHERE id = ? AND revision = ? AND status = 'recovering'`,
-    )
-    .run(error, now, id, expectedRevision);
   return changed.changes === 1 ? getStreamingCardRecord(id) : undefined;
 }
 

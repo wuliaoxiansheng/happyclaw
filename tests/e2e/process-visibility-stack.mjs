@@ -14,9 +14,10 @@
 // proactive workspace never streams answer text, `hidden` shows only the run
 // lifecycle, `activity` strips tool output and reasoning, `full` adds the
 // reasoning and the narration written before a tool call, never the text that
-// ends a turn), what a reconnecting client is handed mid-run, what is stored for
-// a settled turn and who may read it, and that a client that was handed the
-// proactive reply mid-turn is told when its trace is stored.
+// ends a turn; every level shows the progress a proactive Agent sent), what a
+// reconnecting client is handed mid-run, what is stored for a settled turn and
+// who may read it, and that a client that was handed the proactive reply
+// mid-turn is told when its trace is stored.
 //
 // Usage:
 //   npm run build:all
@@ -49,7 +50,10 @@ const THINK2 =
 const NARRATION = `Let me run the demo command first (${NONCE}).`;
 const ANSWER = `DEMO_DONE_${NONCE}`;
 const PROACTIVE_TEXT = `DEMO_PROACTIVE_${NONCE}`;
+const PROGRESS_TEXT = `DEMO_PROGRESS_${NONCE}`;
 const SENTINEL = '<!--HAPPYCLAW_PROACTIVE_FINAL_DELIVERED-->';
+const CLOSING_THOUGHT =
+  '**Nothing more**\n\nThe reply is sent; the turn can end.';
 const MODEL = 'stub-model';
 
 const results = [];
@@ -162,6 +166,11 @@ function startStub() {
     // fails, Read), to see what the Runner reads out of their results.
     script: 'demo',
     factsFile: '',
+    // A proactive turn's last request, after it spoke: a real model takes a
+    // moment (and may reason) to decide it is done.
+    closingDelayMs: 0,
+    // A proactive turn that ends after its work without sending its final.
+    skipFinal: false,
     calls: 0,
     agentRequests: 0,
   };
@@ -190,8 +199,22 @@ function startStub() {
         blocks = [{ type: 'text', text: 'ok' }]; // background / housekeeping call
       } else {
         state.agentRequests += 1;
-        const round = roundOf(body.messages || []);
-        if (round === 0 && state.script === 'facts') {
+        // A proactive demo turn first acknowledges with a progress statement,
+        // then goes on as the other scripts do, one round later.
+        const acknowledges =
+          state.mode === 'proactive' && state.script === 'demo';
+        const round = roundOf(body.messages || []) - (acknowledges ? 1 : 0);
+        if (round === -1) {
+          blocks = [
+            {
+              type: 'tool_use',
+              id: `toolu_progress_${n}`,
+              name: 'mcp__happyclaw__send_message',
+              input: { text: PROGRESS_TEXT, delivery_role: 'progress' },
+            },
+          ];
+          stop = 'tool_use';
+        } else if (round === 0 && state.script === 'facts') {
           blocks = [
             {
               type: 'tool_use',
@@ -233,6 +256,8 @@ function startStub() {
             { type: 'thinking', text: THINK2 },
             { type: 'text', text: ANSWER },
           ];
+        } else if (round === 1 && state.skipFinal) {
+          blocks = [{ type: 'text', text: SENTINEL }];
         } else if (round === 1) {
           blocks = [
             { type: 'thinking', text: THINK2 },
@@ -244,6 +269,12 @@ function startStub() {
             },
           ];
           stop = 'tool_use';
+        } else if (state.closingDelayMs > 0) {
+          await sleep(state.closingDelayMs);
+          blocks = [
+            { type: 'thinking', text: CLOSING_THOUGHT },
+            { type: 'text', text: SENTINEL },
+          ];
         } else {
           blocks = [{ type: 'text', text: SENTINEL }];
         }
@@ -289,6 +320,8 @@ const home = path.join(scratch, 'home');
 fs.mkdirSync(path.join(scratch, 'data'), { recursive: true });
 fs.mkdirSync(home, { recursive: true });
 fs.symlinkSync(path.join(REPO, 'container'), path.join(scratch, 'container'));
+// The server serves ./web/dist: the browser scenario opens the real Web.
+fs.symlinkSync(path.join(REPO, 'web'), path.join(scratch, 'web'));
 
 const stub = await startStub();
 const FACTS_TEXT = `alpha-${NONCE}\nbeta\ngamma\n`;
@@ -402,6 +435,51 @@ async function waitUntil(pred, timeoutMs, label) {
   throw new Error(`timed out waiting for ${label}`);
 }
 
+/** Open a session in a workspace; every Web input names one. */
+async function openSession(cookie, jid, name) {
+  const r = await http_('POST', `/api/groups/${enc(jid)}/sessions`, {
+    cookie,
+    body: { name },
+  });
+  if (r.status >= 300 || !r.json?.session?.id)
+    throw new Error(`session: HTTP ${r.status} ${JSON.stringify(r.json)}`);
+  const sessionId = r.json.session.id;
+  return { jid, sessionId, sessionJid: `${jid}#agent:${sessionId}` };
+}
+
+/**
+ * A session's events: run lifecycle and snapshots under its JID, everything
+ * else under the workspace JID with its agentId.
+ */
+const ofSession =
+  ({ jid, sessionId }) =>
+  (e) =>
+    e.chatJid === `${jid}#agent:${sessionId}` ||
+    (e.chatJid === jid && e.agentId === sessionId);
+
+function sendTo(ws, { jid, sessionId }, content) {
+  ws.send(
+    JSON.stringify({
+      type: 'send_message',
+      chatJid: jid,
+      agentId: sessionId,
+      content,
+    }),
+  );
+}
+
+/** Its stored history, newest page. */
+const historyOf = (cookie, { jid, sessionId }) =>
+  http_('GET', `/api/groups/${enc(jid)}/messages?agentId=${enc(sessionId)}`, {
+    cookie,
+  });
+
+/** One settled turn of it; a trace is stored under the session's chat. */
+const traceOf = (cookie, { sessionJid }, turnId) =>
+  http_('GET', `/api/groups/${enc(sessionJid)}/turn-traces/${enc(turnId)}`, {
+    cookie,
+  });
+
 // ── scenarios ─────────────────────────────────────────────────────────────
 const UNSAFE_TYPES = new Set([
   'text_delta',
@@ -410,6 +488,16 @@ const UNSAFE_TYPES = new Set([
   'prompt_suggestion',
   'raw_sdk_event',
 ]);
+/**
+ * A frame the Runner wrote for the turn (the host's own `idle` names the
+ * input instead): the model's request, its reasoning and its tools.
+ */
+const isRunnerFrame = (e) =>
+  !!e.turnId &&
+  (e.eventType.startsWith('thinking_') ||
+    e.eventType.startsWith('tool_') ||
+    (e.eventType === 'status' && e.statusText === 'requesting'));
+
 const typeCounts = (events) => {
   const counts = {};
   for (const e of events) {
@@ -455,16 +543,11 @@ async function runScenario(ctx, { label, interaction, visibility, expect }) {
     );
   }
 
+  const session = await openSession(ctx.cookie, jid, label);
   const conn = openWs(ctx.cookie);
   await conn.ready;
-  const mine = (e) => e.chatJid === jid;
-  conn.ws.send(
-    JSON.stringify({
-      type: 'send_message',
-      chatJid: jid,
-      content: 'run the demo',
-    }),
-  );
+  const mine = ofSession(session);
+  sendTo(conn.ws, session, 'run the demo');
 
   // Mid-run reconnect: a second client joins while the Bash tool is running.
   const conn2 = openWs(ctx.cookie);
@@ -473,16 +556,26 @@ async function runScenario(ctx, { label, interaction, visibility, expect }) {
     ? waitUntil(
         () =>
           conn.events.some(
-            (e) => mine(e) && e.event?.eventType === 'tool_use_start',
+            (e) =>
+              mine(e) &&
+              e.event?.eventType === 'tool_use_start' &&
+              e.event?.toolName === 'Bash',
           ),
         90_000,
-        'tool_use_start on WS1',
+        'the Bash tool_use_start on WS1',
       )
     : waitUntil(
-        () => conn.events.some((e) => mine(e) && e.type === 'run_started'),
+        () =>
+          conn.events.some(
+            (e) =>
+              mine(e) &&
+              (interaction === 'proactive'
+                ? e.event?.eventType === 'commentary' && e.event?.progress
+                : e.type === 'run_started'),
+          ),
         90_000,
-        'run_started on WS1',
-      ).then(() => sleep(1800));
+        'the run (and a proactive turn its progress) on WS1',
+      ).then(() => sleep(interaction === 'proactive' ? 300 : 1800));
   await toolSeen;
   if (expect.toolVisible) await sleep(400);
   // A reconnecting client is sent the in-flight state once its socket opens, so
@@ -503,6 +596,33 @@ async function runScenario(ctx, { label, interaction, visibility, expect }) {
   const live = conn.events.filter(mine);
   const counts = typeCounts(live);
   console.log(`   web-visible stream events: ${JSON.stringify(counts)}`);
+
+  // 0. The context ring follows the turn, and GET reads the same numbers.
+  const usageNotices = live.filter((e) => e.type === 'context_usage');
+  const lastUsage = usageNotices.at(-1);
+  check(
+    label,
+    'the context ring is told how full the context is after the turn',
+    !!lastUsage &&
+      lastUsage.usedTokens > 0 &&
+      lastUsage.contextWindow > 0 &&
+      typeof lastUsage.percentage === 'number' &&
+      typeof lastUsage.model === 'string',
+    JSON.stringify(usageNotices),
+  );
+  const usageRead = await http_(
+    'GET',
+    `/api/groups/${enc(jid)}/context-usage?agentId=${enc(session.sessionId)}`,
+    { cookie: ctx.cookie },
+  );
+  check(
+    label,
+    'GET context-usage reads what the ring was told',
+    usageRead.status === 200 &&
+      usageRead.json?.usedTokens === lastUsage?.usedTokens &&
+      usageRead.json?.contextWindow === lastUsage?.contextWindow,
+    `HTTP ${usageRead.status} ${JSON.stringify(usageRead.json)}`,
+  );
 
   // 1. What the Web may see live.
   const streamEvents = live
@@ -527,14 +647,48 @@ async function runScenario(ctx, { label, interaction, visibility, expect }) {
   if (expect.onlyLifecycleStatus) {
     const odd = streamEvents.filter(
       (e) =>
-        e.eventType !== 'status' ||
-        !['requesting', 'idle', 'interrupted'].includes(e.statusText),
+        !(e.eventType === 'commentary' && e.progress === true) &&
+        (e.eventType !== 'status' ||
+          !['requesting', 'idle', 'interrupted'].includes(e.statusText)),
     );
     check(
       label,
-      'only requesting/idle/interrupted status reaches the Web',
+      'only requesting/idle/interrupted status and the progress the Agent sent reach the Web',
       odd.length === 0,
       JSON.stringify(odd.slice(0, 2)),
+    );
+  }
+  if (interaction === 'proactive') {
+    const sent = streamEvents.filter(
+      (e) => e.eventType === 'commentary' && e.progress === true,
+    );
+    check(
+      label,
+      'the progress the Agent sent reaches the Web once, whole, at this level',
+      sent.length === 1 && sent[0].text === PROGRESS_TEXT,
+      JSON.stringify(sent),
+    );
+    // The card it lands on is the one the turn's own frames build.
+    const runnerTurnIds = new Set(
+      streamEvents.filter(isRunnerFrame).map((e) => e.turnId),
+    );
+    check(
+      label,
+      "and carries the turn id of the Runner's own frames",
+      sent.length === 1 &&
+        runnerTurnIds.size === 1 &&
+        runnerTurnIds.has(sent[0].turnId),
+      `${sent[0]?.turnId} vs ${JSON.stringify([...runnerTurnIds])}`,
+    );
+    check(
+      label,
+      'and is no chat message: the Web turn keeps it in its process',
+      !live.some(
+        (e) =>
+          e.type === 'new_message' &&
+          e.message?.content?.includes(PROGRESS_TEXT),
+      ),
+      '',
     );
   }
   if (expect.thinkingText) {
@@ -549,7 +703,9 @@ async function runScenario(ctx, { label, interaction, visibility, expect }) {
       JSON.stringify(joined.slice(0, 80)),
     );
   }
-  const notes = streamEvents.filter((e) => e.eventType === 'commentary');
+  const notes = streamEvents.filter(
+    (e) => e.eventType === 'commentary' && !e.progress,
+  );
   if (expect.narration) {
     const joined = notes.map((e) => e.text).join('\n');
     check(
@@ -621,7 +777,30 @@ async function runScenario(ctx, { label, interaction, visibility, expect }) {
 
   // 2. Reconnect snapshot.
   const snap = snapshotMsg?.snapshot;
-  if (expect.snapshot === 'none') {
+  if (interaction === 'proactive') {
+    check(
+      label,
+      'a reconnecting client is handed the progress the Agent sent, at this level',
+      !!snap &&
+        Array.isArray(snap.progress) &&
+        snap.progress.length === 1 &&
+        snap.progress[0].text === PROGRESS_TEXT &&
+        typeof snap.progress[0].at === 'number',
+      JSON.stringify(snap?.progress),
+    );
+  }
+  if (expect.snapshot === 'progress-only') {
+    check(
+      label,
+      'and nothing else of the process',
+      !!snap &&
+        (snap.activeTools || []).length === 0 &&
+        !snap.thinkingText &&
+        !snap.partialText &&
+        (snap.traceEvents || []).length === 0,
+      JSON.stringify(snap)?.slice(0, 200),
+    );
+  } else if (expect.snapshot === 'none') {
     check(
       label,
       'no in-flight snapshot is sent to a reconnecting client',
@@ -677,9 +856,7 @@ async function runScenario(ctx, { label, interaction, visibility, expect }) {
   }
 
   // 3. Persisted history + trace.
-  const history = await http_('GET', `/api/groups/${enc(jid)}/messages`, {
-    cookie: ctx.cookie,
-  });
+  const history = await historyOf(ctx.cookie, session);
   const agentMessages = (history.json.messages || []).filter(
     (m) => m.is_from_me,
   );
@@ -695,12 +872,30 @@ async function runScenario(ctx, { label, interaction, visibility, expect }) {
     !!finalMsg,
     `agent messages: ${JSON.stringify(agentMessages.map((m) => m.content?.slice(0, 40)))}`,
   );
+  if (interaction === 'proactive') {
+    check(
+      label,
+      'the progress was stored as no message of its own',
+      !agentMessages.some((m) => m.content?.includes(PROGRESS_TEXT)),
+      JSON.stringify(agentMessages.map((m) => m.content?.slice(0, 40))),
+    );
+  }
+  // Every frame of the turn names the input it answers, the reply's turn_id:
+  // what lets the Web settle the live card in place while the run closes.
+  const frames = live.filter((e) => e.type === 'stream_event');
+  check(
+    label,
+    'every stream frame names the input the reply answers',
+    frames.length > 0 &&
+      frames.every((e) => e.event?.inputTurnId === finalMsg?.turn_id),
+    `${JSON.stringify([...new Set(frames.map((e) => e.event?.inputTurnId))])} reply=${finalMsg?.turn_id}`,
+  );
   const flagged = agentMessages.filter((m) => m.has_trace === true);
   // A proactive reply is announced mid-turn, before its trace exists: the
   // client is told afterwards which message carries it. An assistant reply
   // carries `has_trace` itself.
   const traceNotices = live.filter(
-    (e) => e.type === 'message_trace' && e.chatJid === jid,
+    (e) => e.type === 'message_trace' && mine(e),
   );
   if (interaction === 'proactive' && expect.trace !== 'none') {
     check(
@@ -740,11 +935,7 @@ async function runScenario(ctx, { label, interaction, visibility, expect }) {
       `flagged ${flagged.length}`,
     );
     if (finalMsg?.turn_id) {
-      const r = await http_(
-        'GET',
-        `/api/groups/${enc(jid)}/turn-traces/${enc(finalMsg.turn_id)}`,
-        { cookie: ctx.cookie },
-      );
+      const r = await traceOf(ctx.cookie, session, finalMsg.turn_id);
       check(
         label,
         'turn-traces is 404 while the process is hidden',
@@ -761,18 +952,29 @@ async function runScenario(ctx, { label, interaction, visibility, expect }) {
     );
     const turnId = (flagged[flagged.length - 1] || finalMsg)?.turn_id;
     storedTurnId = turnId;
-    const r = await http_(
-      'GET',
-      `/api/groups/${enc(jid)}/turn-traces/${enc(turnId)}`,
-      { cookie: ctx.cookie },
-    );
+    const r = await traceOf(ctx.cookie, session, turnId);
     check(
       label,
       'GET turn-traces answers 200',
       r.status === 200,
       `HTTP ${r.status} ${JSON.stringify(r.json)?.slice(0, 160)}`,
     );
-    if (r.status === 200) {
+    if (r.status === 200 && expect.trace === 'progress-only') {
+      const t = r.json;
+      check(
+        label,
+        'the stored turn holds the progress alone: no reasoning, timing or trace rows',
+        t.thinking === '' &&
+          t.thinking_duration_ms === null &&
+          Array.isArray(t.trace) &&
+          t.trace.length === 0 &&
+          t.steps.length === 1 &&
+          t.steps[0].kind === 'text' &&
+          t.steps[0].progress === true &&
+          t.steps[0].text === PROGRESS_TEXT,
+        JSON.stringify(t).slice(0, 400),
+      );
+    } else if (r.status === 200) {
       const t = r.json;
       if (expect.trace === 'with-thinking') {
         const i1 = t.thinking.indexOf('Planning the demo');
@@ -844,7 +1046,7 @@ async function runScenario(ctx, { label, interaction, visibility, expect }) {
   }
 
   for (const c of [conn, conn2, conn3]) c.ws.close();
-  return { jid, counts, turnId: storedTurnId };
+  return { jid, session, counts, turnId: storedTurnId };
 }
 
 /** Every leaf of a value: facts must hold numbers and booleans only. */
@@ -878,20 +1080,18 @@ async function runFactsScenario(ctx, { label, interaction, visibility }) {
     throw new Error(
       `create workspace: HTTP ${created.status} ${JSON.stringify(created.json).slice(0, 300)}`,
     );
-  const jid = created.json.jid;
+  const session = await openSession(ctx.cookie, created.json.jid, label);
+  const mine = ofSession(session);
   const conn = openWs(ctx.cookie);
   await conn.ready;
-  conn.ws.send(
-    JSON.stringify({ type: 'send_message', chatJid: jid, content: 'look' }),
-  );
+  sendTo(conn.ws, session, 'look');
   await waitUntil(
-    () =>
-      conn.events.some((e) => e.chatJid === jid && e.type === 'run_finished'),
+    () => conn.events.some((e) => mine(e) && e.type === 'run_finished'),
     150_000,
     'run_finished',
   );
   await sleep(1500);
-  const live = conn.events.filter((e) => e.chatJid === jid);
+  const live = conn.events.filter(mine);
   const streamEvents = live
     .filter((e) => e.type === 'stream_event')
     .map((e) => e.event);
@@ -932,18 +1132,12 @@ async function runFactsScenario(ctx, { label, interaction, visibility }) {
     JSON.stringify([summaryOf('Read'), summaryOf('Glob'), summaryOf('Bash')]),
   );
 
-  const history = await http_('GET', `/api/groups/${enc(jid)}/messages`, {
-    cookie: ctx.cookie,
-  });
+  const history = await historyOf(ctx.cookie, session);
   const flagged = (history.json.messages || []).filter(
     (m) => m.is_from_me && m.has_trace === true,
   );
   const turnId = flagged[flagged.length - 1]?.turn_id;
-  const trace = await http_(
-    'GET',
-    `/api/groups/${enc(jid)}/turn-traces/${enc(turnId)}`,
-    { cookie: ctx.cookie },
-  );
+  const trace = await traceOf(ctx.cookie, session, turnId);
   check(
     label,
     'the stored turn is readable',
@@ -1131,10 +1325,13 @@ function checkStoredSteps(label, interaction, expect, t) {
       JSON.stringify(texts),
     );
   } else {
+    const texts = steps.filter((s) => s.kind === 'text');
     check(
       label,
-      'a proactive turn has no text step, its speech tool is no step and no tool output is kept',
-      !steps.some((s) => s.kind === 'text') &&
+      'a proactive turn keeps only the progress it sent as text, its speech tool is no step and no tool output is kept',
+      texts.length === 1 &&
+        texts[0].progress === true &&
+        texts[0].text === PROGRESS_TEXT &&
         !raw.includes(NARRATION) &&
         !raw.includes(PROACTIVE_TEXT) &&
         !raw.includes('send_message') &&
@@ -1228,7 +1425,7 @@ async function main() {
       visibility: 'hidden',
       expect: {
         toolVisible: false,
-        always: ['status'],
+        always: ['status', 'commentary'],
         never: [
           'text_delta',
           'thinking_delta',
@@ -1240,11 +1437,10 @@ async function main() {
           'tool_progress',
           'usage',
           'task_start',
-          'commentary',
         ],
         onlyLifecycleStatus: true,
-        snapshot: 'none',
-        trace: 'none',
+        snapshot: 'progress-only',
+        trace: 'progress-only',
       },
     },
     {
@@ -1253,8 +1449,13 @@ async function main() {
       visibility: 'activity',
       expect: {
         toolVisible: true,
-        always: ['tool_use_start', 'thinking_start', 'thinking_end'],
-        never: ['text_delta', 'thinking_delta', 'usage', 'commentary'],
+        always: [
+          'tool_use_start',
+          'thinking_start',
+          'thinking_end',
+          'commentary',
+        ],
+        never: ['text_delta', 'thinking_delta', 'usage'],
         stripped: true,
         thinkingTiming: true,
         snapshot: 'activity',
@@ -1292,7 +1493,7 @@ async function main() {
     '\n== steps-level (full -> activity -> hidden -> full, stored turn)',
   );
   const fullRun = outcomes[3];
-  const stepsUrl = `/api/groups/${enc(fullRun.jid)}/turn-traces/${enc(fullRun.turnId)}`;
+  const stepsUrl = `/api/groups/${enc(fullRun.session.sessionJid)}/turn-traces/${enc(fullRun.turnId)}`;
   const setLevel = (process_visibility) =>
     http_('PATCH', `/api/groups/${enc(fullRun.jid)}`, {
       cookie,
@@ -1338,10 +1539,25 @@ async function main() {
   const atHidden = await http_('GET', stepsUrl, { cookie });
   check(
     'steps-level',
-    'at hidden the turn is a 404 that carries no step',
-    atHidden.status === 404 &&
-      !JSON.stringify(atHidden.json).includes('thinking'),
-    `HTTP ${atHidden.status} ${JSON.stringify(atHidden.json)?.slice(0, 120)}`,
+    'at hidden the turn shows the progress the Agent sent, and no other step',
+    atHidden.status === 200 &&
+      atHidden.json.steps.length === 1 &&
+      atHidden.json.steps[0].text === PROGRESS_TEXT &&
+      atHidden.json.thinking === '' &&
+      atHidden.json.trace.length === 0 &&
+      !JSON.stringify(atHidden.json).includes('Planning the demo'),
+    `HTTP ${atHidden.status} ${JSON.stringify(atHidden.json)?.slice(0, 200)}`,
+  );
+  const listedAtHidden = await historyOf(cookie, fullRun.session);
+  check(
+    'steps-level',
+    'and its reply is still listed as carrying a trace',
+    (listedAtHidden.json.messages || []).some(
+      (m) => m.turn_id === fullRun.turnId && m.has_trace === true,
+    ),
+    JSON.stringify(
+      (listedAtHidden.json.messages || []).map((m) => [m.turn_id, m.has_trace]),
+    ),
   );
   check(
     'steps-level',
@@ -1385,23 +1601,15 @@ async function main() {
   const conn = openWs(cookie);
   await conn.ready;
   stub.setMode('proactive');
-  conn.ws.send(
-    JSON.stringify({
-      type: 'send_message',
-      chatJid: switched.jid,
-      content: 'run the demo again',
-    }),
-  );
+  const switchedOwn = ofSession(switched.session);
+  sendTo(conn.ws, switched.session, 'run the demo again');
   await waitUntil(
-    () =>
-      conn.events.some(
-        (e) => e.chatJid === switched.jid && e.type === 'run_finished',
-      ),
+    () => conn.events.some((e) => switchedOwn(e) && e.type === 'run_finished'),
     150_000,
     'run_finished after the switch',
   );
   const after = conn.events
-    .filter((e) => e.chatJid === switched.jid && e.type === 'stream_event')
+    .filter((e) => switchedOwn(e) && e.type === 'stream_event')
     .map((e) => e.event);
   check(
     'proactive-switch',
@@ -1415,7 +1623,27 @@ async function main() {
     !after.some((e) => e.eventType === 'text_delta'),
     '',
   );
+  // A second turn on a warm Runner: its frames carry the Runner's own turn
+  // id, not the input's. The progress must carry the same, or the Web would
+  // start a new card for it and wipe the one it belongs to.
+  const switchedProgress = after.filter(
+    (e) => e.eventType === 'commentary' && e.progress === true,
+  );
+  const switchedTurnIds = new Set(
+    after.filter(isRunnerFrame).map((e) => e.turnId),
+  );
+  check(
+    'proactive-switch',
+    "the warm turn's progress lands on its own card",
+    switchedProgress.length === 1 &&
+      switchedTurnIds.size === 1 &&
+      switchedTurnIds.has(switchedProgress[0].turnId),
+    `${JSON.stringify(switchedProgress.map((e) => [e.turnId, e.inputTurnId]))} vs ${JSON.stringify([...switchedTurnIds])}`,
+  );
   conn.ws.close();
+
+  await proactiveStopKeepsProgress(ctx);
+  await proactiveNoFinalKeepsProgress(ctx);
 
   await runFactsScenario(ctx, {
     label: 'tool-facts-assistant',
@@ -1431,7 +1659,7 @@ async function main() {
   console.log('\n== access control');
   const anon = await http_(
     'GET',
-    `/api/groups/${enc(switched.jid)}/turn-traces/whatever`,
+    `/api/groups/${enc(switched.session.sessionJid)}/turn-traces/whatever`,
   );
   check(
     'acl',
@@ -1459,6 +1687,355 @@ async function main() {
     anonPatch.status === 401,
     `HTTP ${anonPatch.status}`,
   );
+
+  await proactiveReplyInTheBrowser(ctx, 'full');
+  await proactiveReplyInTheBrowser(ctx, 'hidden');
+}
+
+/**
+ * A proactive Web turn stopped after it sent progress, at `hidden`: the
+ * progress stays with the turn, on a closing note that carries its trace, and
+ * a later read of the history still finds it.
+ */
+async function proactiveStopKeepsProgress(ctx) {
+  const label = 'stop-keeps-progress';
+  console.log(`\n== ${label}`);
+  stub.setMode('proactive');
+  const created = await http_('POST', '/api/groups', {
+    cookie: ctx.cookie,
+    body: {
+      name: `${label}-${NONCE}`,
+      execution_mode: 'host',
+      agent_profile_id: ctx.profileId,
+      interaction_mode: 'proactive',
+      process_visibility: 'hidden',
+    },
+  });
+  if (created.status >= 300)
+    throw new Error(`create workspace: HTTP ${created.status}`);
+  const session = await openSession(ctx.cookie, created.json.jid, label);
+  const conn = openWs(ctx.cookie);
+  await conn.ready;
+  const mine = ofSession(session);
+  sendTo(conn.ws, session, 'start');
+  await waitUntil(
+    () =>
+      conn.events.some(
+        (e) =>
+          mine(e) &&
+          e.event?.eventType === 'commentary' &&
+          e.event?.progress === true,
+      ),
+    90_000,
+    'the progress on the Web',
+  );
+  const stop = await http_(
+    'POST',
+    `/api/groups/${enc(session.sessionJid)}/interrupt`,
+    { cookie: ctx.cookie },
+  );
+  check(
+    label,
+    'the turn is stopped',
+    stop.status === 200,
+    `HTTP ${stop.status}`,
+  );
+  await waitUntil(
+    () =>
+      conn.events.some(
+        (e) =>
+          mine(e) &&
+          e.type === 'new_message' &&
+          e.message?.source_kind === 'interrupt_partial',
+      ),
+    60_000,
+    'the closing note',
+  );
+  const note = conn.events.find(
+    (e) =>
+      mine(e) &&
+      e.type === 'new_message' &&
+      e.message?.source_kind === 'interrupt_partial',
+  ).message;
+  check(
+    label,
+    'a closing note becomes the reply and carries the trace',
+    note.content === '已停止。' && note.has_trace === true && !!note.turn_id,
+    JSON.stringify(note).slice(0, 300),
+  );
+  const history = await historyOf(ctx.cookie, session);
+  const stored = (history.json.messages || []).find((m) => m.id === note.id);
+  check(
+    label,
+    'the history still flags it',
+    stored?.has_trace === true,
+    JSON.stringify(stored)?.slice(0, 200),
+  );
+  const trace = await traceOf(ctx.cookie, session, note.turn_id);
+  check(
+    label,
+    'and its trace holds the progress, alone at hidden',
+    trace.status === 200 &&
+      trace.json.steps.length === 1 &&
+      trace.json.steps[0].progress === true &&
+      trace.json.steps[0].text === PROGRESS_TEXT,
+    `HTTP ${trace.status} ${JSON.stringify(trace.json)?.slice(0, 200)}`,
+  );
+  conn.ws.close();
+}
+
+/**
+ * A proactive Web turn that sent progress and then ended without its final:
+ * the host refuses to settle it. The refusal will be retried, so it writes no
+ * closing note: the progress waits for the attempt that ends the turn for good
+ * (tests/proactive-progress-web.test.ts drives the attempts that follow).
+ */
+async function proactiveNoFinalKeepsProgress(ctx) {
+  const label = 'no-final-progress';
+  console.log(`\n== ${label}`);
+  stub.setMode('proactive');
+  stub.state.skipFinal = true;
+  try {
+    const created = await http_('POST', '/api/groups', {
+      cookie: ctx.cookie,
+      body: {
+        name: `${label}-${NONCE}`,
+        execution_mode: 'host',
+        agent_profile_id: ctx.profileId,
+        interaction_mode: 'proactive',
+        process_visibility: 'activity',
+      },
+    });
+    if (created.status >= 300)
+      throw new Error(`create workspace: HTTP ${created.status}`);
+    const session = await openSession(ctx.cookie, created.json.jid, label);
+    const conn = openWs(ctx.cookie);
+    await conn.ready;
+    const mine = ofSession(session);
+    sendTo(conn.ws, session, 'go');
+    await waitUntil(
+      () => conn.events.some((e) => mine(e) && e.type === 'run_finished'),
+      120_000,
+      'the refused turn to finish its run',
+    );
+    await sleep(3000);
+    const notes = conn.events.filter(
+      (e) =>
+        mine(e) &&
+        e.type === 'new_message' &&
+        e.message?.source_kind === 'interrupt_partial',
+    );
+    check(
+      label,
+      'a refusal that will be retried writes no closing note',
+      conn.events.some(
+        (e) =>
+          mine(e) &&
+          e.event?.eventType === 'commentary' &&
+          e.event?.progress === true,
+      ) && notes.length === 0,
+      JSON.stringify(notes.map((e) => e.message?.content)),
+    );
+    const history = await historyOf(ctx.cookie, session);
+    check(
+      label,
+      'and the history holds none either',
+      !(history.json.messages || []).some(
+        (m) => m.source_kind === 'interrupt_partial',
+      ),
+      JSON.stringify((history.json.messages || []).map((m) => m.source_kind)),
+    );
+    conn.ws.close();
+  } finally {
+    stub.state.skipFinal = false;
+  }
+}
+
+/**
+ * A proactive turn's reply in the real Web: once the utterance is in the list,
+ * its process panel and spinner are gone, while the run (still asking the model
+ * whether it is done) can be stopped. The progress the Agent sent shows while
+ * the turn works, in the panel and the status bar, folds away with the reply,
+ * and is there again under it, also after a reload. Screenshots go to
+ * HC_E2E_SHOTS if set.
+ */
+async function proactiveReplyInTheBrowser(ctx, visibility) {
+  const label = `proactive-reply-browser-${visibility}`;
+  console.log(`\n== ${label}`);
+  stub.setMode('proactive');
+  // Shorter than the wait before a quiet turn shows its spinner again (3s).
+  stub.state.closingDelayMs = 1500;
+  const created = await http_('POST', '/api/groups', {
+    cookie: ctx.cookie,
+    body: {
+      name: `${label}-${NONCE}`,
+      execution_mode: 'host',
+      agent_profile_id: ctx.profileId,
+      interaction_mode: 'proactive',
+      process_visibility: visibility,
+    },
+  });
+  if (created.status >= 300)
+    throw new Error(`create workspace: HTTP ${created.status}`);
+  const folder = created.json.group.folder;
+  const session = await openSession(ctx.cookie, created.json.jid, label);
+  const { chromium } = createRequire(path.join(REPO, 'web', 'package.json'))(
+    '@playwright/test',
+  );
+  const browser = await chromium.launch();
+  const shots = process.env.HC_E2E_SHOTS;
+  try {
+    const context = await browser.newContext({
+      baseURL: base,
+      viewport: { width: 1280, height: 860 },
+    });
+    await context.addCookies(
+      ctx.cookie.split('; ').map((pair) => {
+        const at = pair.indexOf('=');
+        return {
+          name: pair.slice(0, at),
+          value: pair.slice(at + 1),
+          url: base,
+        };
+      }),
+    );
+    const page = await context.newPage();
+    // `?agent=` names the session the chat opens on.
+    await page.goto(`/chat/${folder}?agent=${enc(session.sessionId)}`);
+    const editor = page.locator('[data-hc-composer] [data-composer-editor]');
+    await editor.waitFor({ timeout: 30_000 });
+    // Every frame from here on: is the reply there, the panel, the spinner,
+    // the stop button.
+    await page.evaluate(
+      ([reply, progress]) => {
+        window.__frames = [];
+        const tick = () => {
+          const text = document.body.innerText;
+          const panel = document.querySelector('[data-hc-process-panel]');
+          window.__frames.push({
+            at: performance.now(),
+            reply: text.includes(reply),
+            panel: !!panel,
+            panelProgress: !!panel?.textContent?.includes(progress),
+            barProgress:
+              document.querySelector('[data-hc-run-progress]')?.textContent ===
+              progress,
+            progress: text.includes(progress),
+            // The run status bar, wherever the composer mounts it.
+            spinner: !!document.querySelector('[data-hc-run-status-bar]'),
+            stop: !!document.querySelector('[aria-label="停止当前运行"]'),
+          });
+          if (window.__frames.length < 20_000) requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      },
+      [PROACTIVE_TEXT, PROGRESS_TEXT],
+    );
+    await editor.click();
+    await page.keyboard.type('what are you doing');
+    await page.keyboard.press('Enter');
+    await page.locator('[data-hc-process-panel]').waitFor({ timeout: 90_000 });
+    if (shots)
+      await page.screenshot({
+        path: path.join(shots, `proactive-${visibility}-1-working.png`),
+      });
+    await page.getByText(PROACTIVE_TEXT).waitFor({ timeout: 90_000 });
+    if (shots) {
+      await sleep(300);
+      await page.screenshot({
+        path: path.join(shots, `proactive-${visibility}-2-replied.png`),
+      });
+    }
+    await page
+      .locator('[aria-label="停止当前运行"]')
+      .waitFor({ state: 'detached', timeout: 60_000 });
+    await sleep(500);
+    if (shots)
+      await page.screenshot({
+        path: path.join(shots, `proactive-${visibility}-3-done.png`),
+      });
+    const frames = await page.evaluate(() => window.__frames);
+    const first = frames.findIndex((f) => f.reply);
+    const after = first >= 0 ? frames.slice(first) : [];
+    check(
+      label,
+      'the panel was there while the turn worked',
+      frames.slice(0, Math.max(first, 0)).some((f) => f.panel),
+    );
+    check(
+      label,
+      'once the reply is in, no frame shows the panel or the spinner',
+      after.length > 0 && after.every((f) => !f.panel && !f.spinner),
+      (() => {
+        const shown = after.find((f) => f.panel || f.spinner);
+        return `${JSON.stringify(shown)} ${shown?.at - after[0]?.at}ms after the reply`;
+      })(),
+    );
+    const closing = after.filter((f) => f.stop);
+    check(
+      label,
+      'the run could still be stopped for a while after the reply',
+      closing.length > 0 && closing.at(-1).at - after[0].at > 1000,
+      `${closing.length} frames, ${closing.at(-1)?.at - after[0]?.at}ms`,
+    );
+    const before = frames.slice(0, Math.max(first, 0));
+    check(
+      label,
+      'while the turn worked, its progress was in the panel and the status bar',
+      before.some((f) => f.panelProgress) && before.some((f) => f.barProgress),
+      JSON.stringify(before.filter((f) => f.progress).slice(0, 1)),
+    );
+    check(
+      label,
+      'once the reply is in, the progress is folded away',
+      after.length > 0 && after.every((f) => !f.progress),
+      JSON.stringify(after.find((f) => f.progress)),
+    );
+    // Opened under the reply, here and after a reload: read from turn_traces.
+    const openProcess = async () => {
+      const row = page.getByRole('button', { name: /处理过程/ }).last();
+      await row.waitFor({ timeout: 30_000 });
+      await page.waitForFunction(
+        () =>
+          [...document.querySelectorAll('button')].some(
+            (b) => /处理过程/.test(b.textContent ?? '') && !b.disabled,
+          ),
+        undefined,
+        { timeout: 30_000 },
+      );
+      await row.click();
+      await page.getByText(PROGRESS_TEXT).first().waitFor({ timeout: 30_000 });
+    };
+    let reopened = false;
+    try {
+      await openProcess();
+      reopened = true;
+    } catch {
+      /* reported below */
+    }
+    check(
+      label,
+      'opening the process under the reply shows the progress',
+      reopened,
+    );
+    if (shots)
+      await page.screenshot({
+        path: path.join(shots, `proactive-${visibility}-4-opened.png`),
+      });
+    await page.reload();
+    await editor.waitFor({ timeout: 30_000 });
+    let restored = false;
+    try {
+      await openProcess();
+      restored = true;
+    } catch {
+      /* reported below */
+    }
+    check(label, 'and so it does after a reload', restored);
+  } finally {
+    stub.state.closingDelayMs = 0;
+    await browser.close();
+  }
 }
 
 let failed = false;

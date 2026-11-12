@@ -4,6 +4,7 @@ import { Plug, Puzzle, Server } from 'lucide-react';
 
 import { PageContainer } from '@/components/common/PageContainer';
 import { PageTopBar } from '@/components/common/PageTopBar';
+import { useIsPhone } from '@/components/layout/phone';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   CapabilityActionsSlotContext,
@@ -23,6 +24,7 @@ export function CapabilitiesPage() {
   const { section } = useParams<{ section?: string }>();
   const navigate = useNavigate();
   const [actionsSlot, setActionsSlot] = useState<HTMLDivElement | null>(null);
+  const isPhone = useIsPhone();
   if (!section) return <Navigate to="/capabilities/skills" replace />;
   if (!sections.some((item) => item.key === section)) {
     return <Navigate to="/capabilities/skills" replace />;
@@ -35,7 +37,9 @@ export function CapabilitiesPage() {
       className="min-h-full gap-0 bg-background"
     >
       <PageTopBar
-        title="能力库"
+        // On a phone the app's top bar names the page (see
+        // CapabilitySectionActions); this bar keeps only the tabs.
+        title={isPhone ? undefined : '能力库'}
         actions={
           <div ref={setActionsSlot} className="flex items-center gap-1.5" />
         }

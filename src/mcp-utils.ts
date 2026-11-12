@@ -360,15 +360,10 @@ export function readStoredUserMcpServers(userId: string): {
   return { definitions, secrets };
 }
 
-/**
- * Load enabled MCP server configs for a user.
- * Reads data/mcp-servers/{userId}/servers.json.
- * All workspaces owned by this user share the same MCP server set.
- */
-export function loadUserMcpServers(
-  userId: string,
+function projectStoredMcpServers(
+  definitions: StoredMcpServersFile,
+  secrets: StoredMcpSecretsFile,
 ): Record<string, Record<string, unknown>> {
-  const { definitions, secrets } = readStoredUserMcpServers(userId);
   const merged = {
     servers: Object.fromEntries(
       Object.entries(definitions.servers).map(([id, definition]) => [
@@ -407,12 +402,28 @@ export function loadUserMcpServers(
   return result;
 }
 
+/**
+ * Load enabled MCP server configs for a user.
+ * Reads data/mcp-servers/{userId}/servers.json.
+ * All workspaces owned by this user share the same MCP server set.
+ */
+export function loadUserMcpServers(
+  userId: string,
+): Record<string, Record<string, unknown>> {
+  const { definitions, secrets } = readStoredUserMcpServers(userId);
+  return projectStoredMcpServers(definitions, secrets);
+}
+
 export function loadManagedMcpLayers(
   userId: string,
   options: ManagedMcpAccessOptions = {},
 ): ManagedMcpLayers {
-  const systemDefinitions = readStoredUserMcpServers('system').definitions;
-  const allSystemServers = loadUserMcpServers('system');
+  const { definitions: systemDefinitions, secrets: systemSecrets } =
+    readStoredUserMcpServers('system');
+  const allSystemServers = projectStoredMcpServers(
+    systemDefinitions,
+    systemSecrets,
+  );
   const restrictedSystemIds = Object.keys(allSystemServers)
     .filter((id) => systemDefinitions.servers[id]?.memberAccess !== 'shared')
     .sort();

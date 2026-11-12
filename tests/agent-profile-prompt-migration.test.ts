@@ -49,7 +49,7 @@ beforeAll(() => {
 afterAll(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
 
 describe('AgentProfile v48 prompt migration', () => {
-  test('moves the old prompt to AGENTS without data loss and snapshots it', async () => {
+  test('moves the old prompt to AGENTS without data loss', async () => {
     const db = await import('../src/db.js');
     db.initDatabase();
     const profile = db.getAgentProfile('legacy-profile');
@@ -64,17 +64,6 @@ describe('AgentProfile v48 prompt migration', () => {
     });
 
     const raw = new Database(path.join(tmpStoreDir, 'messages.db'));
-    const history = raw
-      .prepare(
-        'SELECT version, agents_prompt, prompt_mode, change_source FROM agent_profile_prompt_versions WHERE agent_profile_id = ?',
-      )
-      .get('legacy-profile');
-    expect(history).toEqual({
-      version: 7,
-      agents_prompt: '  old prompt\n',
-      prompt_mode: 'replace',
-      change_source: 'migration',
-    });
     expect(
       raw
         .prepare("SELECT value FROM router_state WHERE key = 'schema_version'")

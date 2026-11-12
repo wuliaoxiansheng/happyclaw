@@ -34,9 +34,12 @@ describe('frontend identity ownership', () => {
     expect(
       resolveAgentDisplayIdentity({
         agentName: '代码审查员',
-        mainAvatarUrl: '/api/auth/avatars/system-agent-main.png',
-        mainAvatarEmoji: '🐱',
-        mainAvatarColor: '#123456',
+        appearance: {
+          aiAvatarUrl: '/api/auth/avatars/system-agent-main.png',
+          aiAvatarMode: 'emoji',
+          aiAvatarEmoji: '🐱',
+          aiAvatarColor: '#123456',
+        },
       }),
     ).toMatchObject({
       imageUrl: '/api/auth/avatars/system-agent-main.png',
@@ -46,9 +49,29 @@ describe('frontend identity ownership', () => {
     expect(
       resolveAgentDisplayIdentity({
         agentName: '代码审查员',
+        appearance: {
+          aiAvatarUrl: '/api/auth/avatars/system-agent-main.png',
+          aiAvatarMode: 'brand',
+          aiAvatarEmoji: '🐱',
+          aiAvatarColor: '#123456',
+        },
+      }),
+    ).toMatchObject({
+      imageUrl: '/api/auth/avatars/system-agent-main.png',
+      emoji: undefined,
+      color: undefined,
+    });
+    expect(
+      resolveAgentDisplayIdentity({
+        agentName: '代码审查员',
         avatarEmoji: '🧑‍💻',
         avatarColor: '#654321',
-        mainAvatarUrl: '/api/auth/avatars/system-agent-main.png',
+        appearance: {
+          aiAvatarUrl: '/api/auth/avatars/system-agent-main.png',
+          aiAvatarMode: 'brand',
+          aiAvatarEmoji: '',
+          aiAvatarColor: '',
+        },
       }),
     ).toMatchObject({
       imageUrl: undefined,
@@ -83,7 +106,7 @@ describe('frontend identity ownership', () => {
     expect(profile).not.toContain('我的机器人');
     expect(appearance).not.toContain('AI 默认外观');
     expect(chatSources).not.toMatch(/ai_name/);
-    expect(chatSources).toContain('mainAvatarUrl');
+    expect(chatSources).toContain('appearance,');
   });
 
   test('renders uploaded user images in desktop and mobile account menus', () => {

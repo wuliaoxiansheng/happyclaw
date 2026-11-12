@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Users, Search, Package, AlertTriangle } from 'lucide-react';
+import { Users, Package, AlertTriangle } from 'lucide-react';
 import {
   useBillingStore,
   type UserBillingOverview,
 } from '../../stores/billing';
+import { extractErrorMessage } from '../../utils/error';
 import { useCurrency } from './utils';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -89,7 +90,7 @@ export default function AdminUsersList({ onSelectUser }: AdminUsersListProps) {
     } catch (err) {
       setBatchResult({
         type: 'error',
-        msg: `批量分配失败: ${err instanceof Error ? err.message : String(err)}`,
+        msg: `批量分配失败: ${extractErrorMessage(err)}`,
       });
     } finally {
       setBatching(false);
@@ -280,7 +281,8 @@ export default function AdminUsersList({ onSelectUser }: AdminUsersListProps) {
         }
         empty={
           <EmptyState
-            icon={search ? Search : Users}
+            icon={Users}
+            variant={search ? 'search' : 'empty'}
             title={search ? '未找到匹配的用户' : '暂无用户'}
           />
         }

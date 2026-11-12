@@ -40,12 +40,44 @@ check_sync "$ROOT/shared/channel-prefixes.ts" \
   "$ROOT/src/channel-prefixes.ts" \
   "$ROOT/container/agent-runner/src/channel-prefixes.ts"
 
+# Claude environment HappyClaw owns
+check_sync "$ROOT/shared/claude-provider-env.ts" \
+  "$ROOT/src/claude-provider-env.ts" \
+  "$ROOT/container/agent-runner/src/claude-provider-env.ts"
+
 # Reply step list + reasoning text helpers
 for name in thinking-text stream-steps; do
   check_sync "$ROOT/shared/$name.ts" \
     "$ROOT/src/$name.ts" \
     "$ROOT/web/src/lib/$name.ts"
 done
+
+# Session list order
+check_sync "$ROOT/shared/session-order.ts" \
+  "$ROOT/src/session-order.ts" \
+  "$ROOT/web/src/lib/session-order.ts"
+
+# Model connection presets, model lists and upstream errors
+check_sync "$ROOT/shared/model-providers.ts" \
+  "$ROOT/src/model-providers.ts" \
+  "$ROOT/web/src/lib/model-providers.ts"
+
+# Automations
+check_sync "$ROOT/shared/automation.ts" \
+  "$ROOT/src/automation.ts" \
+  "$ROOT/web/src/lib/automation.ts" \
+  "$ROOT/container/agent-runner/src/automation.ts"
+
+# Workspace root problems
+check_sync "$ROOT/shared/workspace-root-problems.ts" \
+  "$ROOT/src/workspace-root-problems.ts" \
+  "$ROOT/web/src/lib/workspace-root-problems.ts"
+
+# Team mode shapes
+check_sync "$ROOT/shared/work-items.ts" \
+  "$ROOT/src/work-items.ts" \
+  "$ROOT/web/src/work-items.ts" \
+  "$ROOT/container/agent-runner/src/work-items.ts"
 
 if [ "$FAIL" -eq 0 ]; then
   echo "All shared type copies are in sync."

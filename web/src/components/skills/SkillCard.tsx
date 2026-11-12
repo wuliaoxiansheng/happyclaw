@@ -1,11 +1,7 @@
 import { Lock } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from '@/components/ui/tooltip';
+import { InfoTip } from '@/components/common/InfoTip';
 import {
   capabilityRowButtonClass,
   capabilityRowClass,
@@ -64,15 +60,16 @@ export function SkillCard({ skill, selected, onSelect }: SkillCardProps) {
       </button>
 
       {isReadonly && (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="grid size-7 shrink-0 place-items-center text-faint-foreground">
-              <Lock className="size-3.5" aria-hidden="true" />
-              <span className="sr-only">{managedBy}</span>
-            </span>
-          </TooltipTrigger>
-          <TooltipContent side="left">{managedBy}</TooltipContent>
-        </Tooltip>
+        // A tap shows who manages it on touch, where there is no hover.
+        <InfoTip content={managedBy} side="left">
+          <button
+            type="button"
+            aria-label={managedBy}
+            className="grid size-7 shrink-0 place-items-center rounded-md text-faint-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/50 phone:size-11"
+          >
+            <Lock className="size-3.5" aria-hidden="true" />
+          </button>
+        </InfoTip>
       )}
 
       {skill.source === 'user' && (

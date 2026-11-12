@@ -2,15 +2,19 @@ import { useEffect } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import { UnifiedSidebar } from './UnifiedSidebar';
 import { BottomTabBar } from './BottomTabBar';
+import { NavDrawer } from './NavDrawer';
+import { PhoneTopBar } from './PhonePageHeader';
+import { useIsPhone } from './phone';
 import { ConnectionBanner } from '../common/ConnectionBanner';
 import { wsManager } from '../../api/ws';
 import { useTheme } from '../../hooks/useTheme';
 import { useMediaQuery } from '../../hooks/useMediaQuery';
 import { useRouteRestore } from '../../hooks/useRouteRestore';
+import { useVisualViewportVars } from '../../hooks/useVisualViewport';
 import { useBillingStore } from '../../stores/billing';
 import { useGroupsStore } from '../../stores/groups';
 import { useChatStore } from '../../stores/chat';
-import { useAuthStore } from '../../stores/auth';
+import { useAuthStore, useIsGuest } from '../../stores/auth';
 import { ErrorBoundary } from '../common/ErrorBoundary';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { MotionProvider } from '@/lib/motion';
@@ -19,20 +23,41 @@ import { useShellStore } from '../../stores/shell';
 import { useNewConversation } from '../../hooks/useNewConversation';
 import { CommandPaletteHost } from '../command/CommandPaletteHost';
 import { useGlobalStreamSubscriptions } from '../../hooks/useStreamSubscriptions';
+import { useUsageLimitWaitSubscription } from '../../stores/usage-limit-waits';
+import { useAutomationSubscription } from '../../stores/automations';
+import { useWorkItemSubscription } from '../../stores/work-items';
+import { AutomationFormHost } from '../automations/AutomationFormHost';
+import { CreateWorkspaceHost } from './CreateWorkspaceHost';
+import { syncAppBadge } from '../../utils/appBadge';
+import { useWebPushLifecycle } from '../../hooks/useWebPushLifecycle';
 
 export function AppLayout() {
   const location = useLocation();
   const isDesktop = useMediaQuery('(min-width: 1024px)');
+  // Phones navigate from a drawer; narrow desktop windows keep the tab bar.
+  const isPhone = useIsPhone();
   const isChatRoute = location.pathname.startsWith('/chat');
   const hideMobileTabBar = /^\/chat\/.+/.test(location.pathname);
+  // The phone home and Settings put the drawer's hamburger in their own bar;
+  // other pages name themselves in it through PhonePageHeader.
+  const showPhoneTopBar =
+    isPhone && !isChatRoute && !location.pathname.startsWith('/settings');
   useTheme(); // 应用并同步持久化的主题偏好
   useRouteRestore(); // PWA 重启时恢复上次访问的路由（默认关闭，设置中启用）
+  useVisualViewportVars(); // 全局唯一的 --vvh / --keyboard-inset 来源
+  // Read-only guests may only call a small GET allowlist; skip everything
+  // else (billing, creating sessions) so they never see 403s.
+  const isGuest = useIsGuest();
+  // Web Push: presence for the server, the subscription, tapped notifications.
+  useWebPushLifecycle({ enabled: !isGuest });
 
   // ⌘B / Ctrl+B toggles the desktop sidebar between full width and icon rail.
   const toggleSidebar = useShellStore((s) => s.toggleSidebar);
   useShortcut(SHORTCUTS.toggleSidebar, toggleSidebar, { enabled: isDesktop });
   const { startNewConversation } = useNewConversation();
-  useShortcut(SHORTCUTS.newConversation, () => void startNewConversation());
+  useShortcut(SHORTCUTS.newConversation, () => void startNewConversation(), {
+    enabled: !isGuest,
+  });
 
   // The sidebar's workspace tree is visible on every route, not just /chat.
   const loadGroups = useChatStore((s) => s.loadGroups);
@@ -48,8 +73,9 @@ export function AppLayout() {
   // 加载计费状态（控制导航栏是否显示账单入口）
   const loadBillingStatus = useBillingStore((s) => s.loadBillingStatus);
   useEffect(() => {
+    if (isGuest) return;
     loadBillingStatus();
-  }, [loadBillingStatus]);
+  }, [isGuest, loadBillingStatus]);
 
   // 监听 WebSocket 计费更新
   useEffect(() => {
@@ -69,17 +95,12 @@ export function AppLayout() {
   useEffect(() => {
     const unsubRunner = wsManager.on('runner_state', (data: any) => {
       if (data.chatJid && data.state) {
-        if (!data.chatJid.includes('#agent:')) {
-          useGroupsStore.getState().setRunnerState(data.chatJid, data.state);
-        }
-        useChatStore.getState().handleRunnerState(data.chatJid, data.state);
+        useGroupsStore.getState().setRunnerState(data.chatJid, data.state);
       }
     });
     const unsubStarted = wsManager.on('run_started', (data: any) => {
       if (!data.chatJid) return;
-      if (!data.chatJid.includes('#agent:')) {
-        useGroupsStore.getState().setRunnerState(data.chatJid, 'running');
-      }
+      useGroupsStore.getState().setRunnerState(data.chatJid, 'running');
       useChatStore.getState().handleRunStarted(data.chatJid, data.runId);
     });
     const unsubFinished = wsManager.on('run_finished', (data: any) => {
@@ -93,8 +114,7 @@ export function AppLayout() {
         : [];
       useChatStore.getState().handleActiveRunSnapshot(runs, queuedChatJids);
       for (const run of runs) {
-        if (!run?.chatJid) continue;
-        if (!run.chatJid.includes('#agent:')) {
+        if (run?.chatJid) {
           useGroupsStore.getState().setRunnerState(run.chatJid, 'running');
         }
       }
@@ -110,6 +130,12 @@ export function AppLayout() {
   // Stream deltas and reconnect snapshots for every workspace, so switching
   // away mid-reply and back never leaves a gap in the streamed text.
   useGlobalStreamSubscriptions();
+  // Usage-limit waits, so a Session shows when its parked input goes on.
+  useUsageLimitWaitSubscription();
+  // Automations feed the sidebar tree and the chat header, not only their page.
+  useAutomationSubscription();
+  // Team mode: work items change from the group and the workers.
+  useWorkItemSubscription();
 
   // Message deletion is a durable server mutation. Apply it globally so a
   // second tab/device cannot retain a deleted main or Runtime Session bubble.
@@ -139,14 +165,10 @@ export function AppLayout() {
     };
   }, []);
 
-  // 监听 group_created（定时任务工作区创建），刷新侧边栏和任务列表
+  // 监听 group_created（其他标签页或渠道新建了工作区），刷新侧边栏
   useEffect(() => {
     const unsub = wsManager.on('group_created', () => {
       useGroupsStore.getState().loadGroups();
-      // Also refresh tasks — workspace_folder may have been populated
-      import('../../stores/tasks').then((m) =>
-        m.useTasksStore.getState().loadTasks(),
-      );
     });
     return () => {
       unsub();
@@ -162,6 +184,11 @@ export function AppLayout() {
     const appName = appearance?.appName || 'HappyClaw';
     document.title = totalUnread > 0 ? `(${totalUnread}) ${appName}` : appName;
   }, [totalUnread, appearance?.appName]);
+  // 同一个未读数也挂到安装后应用的图标上；离开已登录外壳（退出登录）时清掉
+  useEffect(() => {
+    syncAppBadge(totalUnread);
+  }, [totalUnread]);
+  useEffect(() => () => syncAppBadge(0), []);
 
   // 全局监听 agent_status，确保不在 ChatView 页面时也能更新 sub-agent 状态
   useEffect(() => {
@@ -178,6 +205,7 @@ export function AppLayout() {
             data.resultSummary,
             data.kind,
             data.titleGenerating,
+            data.worktree,
           );
       }
     });
@@ -194,8 +222,10 @@ export function AppLayout() {
           {isDesktop && <UnifiedSidebar />}
 
           {/* Desktop: pages render on an inset canvas floating in the shell. */}
-          <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden [--app-canvas-h:100dvh] lg:my-2 lg:mr-2 lg:rounded-xl lg:bg-background lg:shadow-canvas lg:ring-1 lg:ring-surface-border lg:[--app-canvas-h:calc(100dvh-1rem)]">
+          <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden [--app-canvas-h:100dvh] phone:pr-[env(safe-area-inset-right,0px)] phone:pl-[env(safe-area-inset-left,0px)] lg:my-2 lg:mr-2 lg:rounded-xl lg:bg-background lg:shadow-canvas lg:ring-1 lg:ring-surface-border lg:[--app-canvas-h:calc(100dvh-1rem)]">
             <ConnectionBanner />
+            {/* The page names itself below; the bar only holds the menu. */}
+            {showPhoneTopBar && <PhoneTopBar />}
             <main
               data-app-scroll-root="true"
               className={`flex-1 min-h-0 lg:overflow-auto lg:pb-0 ${
@@ -210,8 +240,11 @@ export function AppLayout() {
             </main>
           </div>
 
-          {!hideMobileTabBar && <BottomTabBar />}
+          {isPhone ? <NavDrawer /> : !hideMobileTabBar && <BottomTabBar />}
           <CommandPaletteHost />
+          {/* Read-only guests create nothing. */}
+          {!isGuest && <AutomationFormHost />}
+          {!isGuest && <CreateWorkspaceHost />}
         </div>
       </TooltipProvider>
     </MotionProvider>

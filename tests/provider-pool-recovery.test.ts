@@ -9,17 +9,10 @@ describe('provider pool recovery state', () => {
     try {
       vi.setSystemTime(new Date('2026-07-24T10:00:00.000Z'));
       const pool = new ProviderPool();
-      pool.refreshFromConfig(
-        [
-          { id: 'qwen', enabled: true, weight: 1 },
-          { id: 'glm', enabled: true, weight: 1 },
-        ],
-        {
-          strategy: 'failover',
-          unhealthyThreshold: 1,
-          recoveryIntervalMs: 60_000,
-        },
-      );
+      pool.refreshFromConfig([{ id: 'qwen' }, { id: 'glm' }], {
+        unhealthyThreshold: 1,
+        recoveryIntervalMs: 60_000,
+      });
       pool.reportFailure('glm', true);
       expect(pool.getHealthStatus('glm').healthy).toBe(false);
 
@@ -37,17 +30,10 @@ describe('provider pool recovery state', () => {
     try {
       vi.setSystemTime(new Date('2026-08-07T06:39:00.000Z'));
       const pool = new ProviderPool();
-      pool.refreshFromConfig(
-        [
-          { id: 'account-1', enabled: true, weight: 1 },
-          { id: 'account-2', enabled: true, weight: 1 },
-        ],
-        {
-          strategy: 'weighted-round-robin',
-          unhealthyThreshold: 1,
-          recoveryIntervalMs: 300_000,
-        },
-      );
+      pool.refreshFromConfig([{ id: 'account-1' }, { id: 'account-2' }], {
+        unhealthyThreshold: 1,
+        recoveryIntervalMs: 300_000,
+      });
 
       // Anthropic reported a five_hour rejection resetting at 16:00Z.
       const resetsAt = new Date('2026-08-07T16:00:00.000Z').getTime();
@@ -59,9 +45,9 @@ describe('provider pool recovery state', () => {
       vi.advanceTimersByTime(300_000);
       pool.refreshRecoveryState();
       expect(pool.getHealthStatus('account-1').healthy).toBe(false);
-      expect(pool.selectProvider()).toBe('account-2');
+      expect(pool.getHealthStatus('account-2').healthy).toBe(true);
 
-      // Once the reported window elapses the provider returns to rotation.
+      // Once the reported window elapses the provider is healthy again.
       vi.setSystemTime(new Date(resetsAt));
       pool.refreshRecoveryState();
       expect(pool.getHealthStatus('account-1').healthy).toBe(true);
@@ -75,8 +61,7 @@ describe('provider pool recovery state', () => {
     try {
       vi.setSystemTime(new Date('2026-08-07T06:39:00.000Z'));
       const pool = new ProviderPool();
-      pool.refreshFromConfig([{ id: 'account-1', enabled: true, weight: 1 }], {
-        strategy: 'failover',
+      pool.refreshFromConfig([{ id: 'account-1' }], {
         unhealthyThreshold: 1,
         recoveryIntervalMs: 300_000,
       });
@@ -94,21 +79,14 @@ describe('provider pool recovery state', () => {
   test('failure disposition sees providers added after one-time selection', () => {
     const pool = new ProviderPool();
     const balancing = {
-      strategy: 'failover' as const,
       unhealthyThreshold: 1,
       recoveryIntervalMs: 60_000,
     };
-    pool.refreshFromConfig(
-      [{ id: 'one-time-provider', enabled: true, weight: 1 }],
-      balancing,
-    );
+    pool.refreshFromConfig([{ id: 'one-time-provider' }], balancing);
     pool.reportFailure('one-time-provider', true);
 
     pool.refreshFromConfig(
-      [
-        { id: 'one-time-provider', enabled: true, weight: 1 },
-        { id: 'newly-enabled-provider', enabled: true, weight: 1 },
-      ],
+      [{ id: 'one-time-provider' }, { id: 'newly-enabled-provider' }],
       balancing,
     );
     pool.refreshRecoveryState();

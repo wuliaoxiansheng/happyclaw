@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 
-import { describeFollowUpOutcome } from '../src/qq.js';
+import { describeFollowUpOutcome } from '../src/im-connector-follow-up.js';
 
 const NOW = '2026-08-26T10:00:00.000Z';
 

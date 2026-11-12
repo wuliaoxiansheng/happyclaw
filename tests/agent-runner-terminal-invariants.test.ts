@@ -74,7 +74,7 @@ describe('Agent Runner terminal invariants', () => {
       register,
     );
     const contextLoad = source.indexOf(
-      'loadWorkspaceMemoryTurnContext(msg.text',
+      'fetchWorkspaceMemorySnapshot(\n              mcpToolsContext,\n              msg.text,',
       acknowledge,
     );
     expect(register).toBeGreaterThanOrEqual(0);

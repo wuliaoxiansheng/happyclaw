@@ -1,5 +1,12 @@
 import crypto from 'node:crypto';
 
+import {
+  normalizeCanonicalKey,
+  recallIndexText,
+  recallQueryTerms,
+  recallScopeToken,
+} from './workspace-memory-recall.js';
+
 interface SqliteRunResult {
   changes: number;
   lastInsertRowid?: number | bigint;
@@ -29,6 +36,20 @@ export type WorkspaceMemoryStatus =
   | 'deleted';
 
 export type WorkspaceMemoryChangeType = 'create' | 'update' | 'forget';
+
+/** Audit actions: every change type, and the owner's answer to a proposal. */
+export type WorkspaceMemoryAuditAction =
+  | WorkspaceMemoryChangeType
+  | 'confirm'
+  | 'reject';
+
+const OUTBOX_EVENT_TYPES: Record<WorkspaceMemoryAuditAction, string> = {
+  create: 'memory.created',
+  update: 'memory.updated',
+  forget: 'memory.forgotten',
+  confirm: 'memory.confirmed',
+  reject: 'memory.rejected',
+};
 
 export type WorkspaceMemorySourceType =
   | 'web_user'
@@ -66,6 +87,15 @@ export interface WorkspaceMemoryItem {
   updatedAt: string;
   deletedAt: string | null;
   provenance: WorkspaceMemoryProvenance;
+}
+
+/** What names an item to a client or a model without its content. */
+export interface WorkspaceMemoryItemSummary {
+  id: string;
+  kind: WorkspaceMemoryKind;
+  title: string | null;
+  status: WorkspaceMemoryStatus;
+  revision: number;
 }
 
 export interface WorkspaceMemoryVersion extends Omit<
@@ -146,11 +176,15 @@ export class WorkspaceMemoryStoreError extends Error {
       | 'item_not_found'
       | 'revision_conflict'
       | 'idempotency_conflict'
-      | 'reserved_canonical_key',
+      | 'reserved_canonical_key'
+      | 'duplicate'
+      | 'status_mismatch',
     message: string,
     public readonly details?: {
       currentRevision?: number;
       storeRevision?: number;
+      /** `duplicate`: the item that already holds the canonical key. */
+      existing?: WorkspaceMemoryItemSummary;
     },
   ) {
     super(message);
@@ -185,7 +219,15 @@ function isReservedCanonicalKey(value: string | null | undefined): boolean {
 }
 
 function rejectReservedCanonicalKey(value: string | null | undefined): void {
-  if (!isReservedCanonicalKey(value)) return;
+  // A write may not take the reserved key in any spelling the duplicate
+  // check would treat as the same key.
+  if (
+    !isReservedCanonicalKey(value) &&
+    normalizeCanonicalKey(value) !==
+      normalizeCanonicalKey(HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY)
+  ) {
+    return;
+  }
   throw new WorkspaceMemoryStoreError(
     'reserved_canonical_key',
     'This canonical key is owned by the HappyClaw Owner Profile service',
@@ -408,7 +450,7 @@ function appendVersion(
 function appendAuditAndOutbox(
   store: WorkspaceMemoryStore,
   item: WorkspaceMemoryItem,
-  action: WorkspaceMemoryChangeType,
+  action: WorkspaceMemoryAuditAction,
   context: WorkspaceMemoryMutationContext,
   at: string,
 ): void {
@@ -443,7 +485,7 @@ function appendAuditAndOutbox(
     store.id,
     item.id,
     item.revision,
-    action === 'forget' ? 'memory.forgotten' : `memory.${action}d`,
+    OUTBOX_EVENT_TYPES[action],
     JSON.stringify({
       workspaceJid: store.workspaceJid,
       storeRevision: store.revision,
@@ -456,22 +498,144 @@ function appendAuditAndOutbox(
   );
 }
 
+const SEARCH_INDEXES = ['workspace_memory_fts', 'workspace_memory_recall_fts'];
+
+interface IndexedText {
+  item_id: string;
+  workspace_jid: string;
+  title: string;
+  content: string;
+  canonical_key: string;
+}
+
+/** An item's recall row: its text pre-split, under its workspace's scope. */
+function insertRecallRow(db: SqliteDatabase, row: IndexedText): void {
+  db.prepare(
+    `INSERT INTO workspace_memory_recall_fts (
+      item_id, workspace_jid, scope, title, content, canonical_key
+    ) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    row.item_id,
+    row.workspace_jid,
+    recallScopeToken(row.workspace_jid),
+    recallIndexText(row.title),
+    recallIndexText(row.content),
+    recallIndexText(row.canonical_key),
+  );
+}
+
+/** The trigram (substring) and recall indexes hold exactly the active items. */
 function replaceFts(item: WorkspaceMemoryItem): void {
   const db = requireDatabase();
-  db.prepare('DELETE FROM workspace_memory_fts WHERE item_id = ?').run(item.id);
+  for (const table of SEARCH_INDEXES) {
+    db.prepare(`DELETE FROM ${table} WHERE item_id = ?`).run(item.id);
+  }
   if (item.status !== 'active' || isReservedMemoryItem(item)) {
     return;
   }
+  const row: IndexedText = {
+    item_id: item.id,
+    workspace_jid: item.workspaceJid,
+    title: item.title ?? '',
+    content: item.content,
+    canonical_key: item.canonicalKey ?? '',
+  };
   db.prepare(
     `INSERT INTO workspace_memory_fts (
       item_id, workspace_jid, title, content, canonical_key
     ) VALUES (?, ?, ?, ?, ?)`,
   ).run(
-    item.id,
-    item.workspaceJid,
-    item.title ?? '',
-    item.content,
-    item.canonicalKey ?? '',
+    row.item_id,
+    row.workspace_jid,
+    row.title,
+    row.content,
+    row.canonical_key,
+  );
+  insertRecallRow(db, row);
+}
+
+/**
+ * The recall index mirrors the trigram index row for row. A database from
+ * before it existed (or one whose rows drifted) is rebuilt from the trigram
+ * index's own copy of each active item's text.
+ */
+function rebuildRecallIndexIfStale(db: SqliteDatabase): void {
+  const count = (table: string) =>
+    Number(
+      (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number })
+        .n,
+    );
+  if (count('workspace_memory_recall_fts') === count('workspace_memory_fts')) {
+    return;
+  }
+  db.transaction(() => {
+    db.prepare('DELETE FROM workspace_memory_recall_fts').run();
+    const rows = db
+      .prepare(
+        `SELECT item_id, workspace_jid, title, content, canonical_key
+         FROM workspace_memory_fts`,
+      )
+      .all() as IndexedText[];
+    for (const row of rows) insertRecallRow(db, row);
+  })();
+}
+
+function summarizeItem(item: WorkspaceMemoryItem): WorkspaceMemoryItemSummary {
+  return {
+    id: item.id,
+    kind: item.kind,
+    title: item.title,
+    status: item.status,
+    revision: item.revision,
+  };
+}
+
+/**
+ * Reject a canonical key, after normalization, that an item other than
+ * `exceptId` already holds. An owner's write is held back only by active
+ * memory; a proposal also by another proposal, so one idea waits once.
+ */
+function rejectDuplicateCanonicalKey(
+  store: WorkspaceMemoryStore,
+  canonicalKey: string | null | undefined,
+  writer: 'owner' | 'proposal',
+  exceptId?: string,
+): void {
+  const normalized = normalizeCanonicalKey(canonicalKey);
+  if (!normalized) return;
+  const keys = requireDatabase()
+    .prepare(
+      `SELECT id, canonical_key FROM workspace_memory_items
+       WHERE store_id = ?
+         AND canonical_key IS NOT NULL
+         AND status IN (${writer === 'owner' ? "'active'" : "'active', 'proposed'"})
+       ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+         updated_at DESC, id DESC`,
+    )
+    .all(store.id) as Array<{ id: string; canonical_key: string }>;
+  for (const key of keys) {
+    if (key.id === exceptId) continue;
+    if (normalizeCanonicalKey(key.canonical_key) !== normalized) continue;
+    const existing = requireItem(store, key.id);
+    if (isReservedMemoryItem(existing)) continue;
+    throw new WorkspaceMemoryStoreError(
+      'duplicate',
+      'A memory with this canonical key already exists',
+      { existing: summarizeItem(existing), storeRevision: store.revision },
+    );
+  }
+}
+
+function rejectStatusMismatch(
+  current: WorkspaceMemoryItem,
+  required: WorkspaceMemoryStatus | undefined,
+  storeRevision: number,
+): void {
+  if (!required || current.status === required) return;
+  throw new WorkspaceMemoryStoreError(
+    'status_mismatch',
+    `Workspace memory item is ${current.status}, not ${required}`,
+    { currentRevision: current.revision, storeRevision },
   );
 }
 
@@ -638,6 +802,10 @@ export function createWorkspaceMemorySchema(db: SqliteDatabase): void {
     );
     CREATE INDEX IF NOT EXISTS idx_workspace_memory_audit_workspace_created
       ON workspace_memory_audit_events(workspace_jid, created_at DESC);
+    -- An index alone needs no schema version bump: this function runs on
+    -- every boot and IF NOT EXISTS adds it to an existing database.
+    CREATE INDEX IF NOT EXISTS idx_workspace_memory_audit_store_revision
+      ON workspace_memory_audit_events(store_id, store_revision);
 
     CREATE VIRTUAL TABLE IF NOT EXISTS workspace_memory_fts USING fts5(
       item_id UNINDEXED,
@@ -646,6 +814,20 @@ export function createWorkspaceMemorySchema(db: SqliteDatabase): void {
       content,
       canonical_key,
       tokenize='trigram'
+    );
+
+    -- Relevance recall: the same active items, their text pre-split into
+    -- words and CJK bigrams (workspace-memory-recall.ts).
+    -- One table serves every workspace; the scope token keeps a query to
+    -- the rows of its own.
+    CREATE VIRTUAL TABLE IF NOT EXISTS workspace_memory_recall_fts USING fts5(
+      item_id UNINDEXED,
+      workspace_jid UNINDEXED,
+      scope,
+      title,
+      content,
+      canonical_key,
+      tokenize='porter unicode61 remove_diacritics 2'
     );
 
     CREATE TRIGGER IF NOT EXISTS trg_workspace_memory_store_after_workspace_insert
@@ -690,6 +872,7 @@ export function createWorkspaceMemorySchema(db: SqliteDatabase): void {
     WHERE canonical_key = 'happyclaw.owner.preferred_address'
     GROUP BY item_id;
   `);
+  rebuildRecallIndexIfStale(db);
 }
 
 export function bindWorkspaceMemoryDatabase(db: SqliteDatabase | null): void {
@@ -797,20 +980,22 @@ export function reconcileHappyClawOwnerAddressCanonicalKey(): {
  * duplicates and would otherwise fail before the migration can repair them.
  */
 export function enforceHappyClawOwnerAddressCanonicalInvariant(): void {
-  requireDatabase()
-    .prepare(
-      `DELETE FROM workspace_memory_fts
-       WHERE item_id IN (
-         SELECT id FROM workspace_memory_items WHERE canonical_key = ?
-         UNION
-         SELECT item_id FROM workspace_memory_platform_items
-         WHERE namespace = ?
-       )`,
-    )
-    .run(
-      HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
-      HAPPYCLAW_OWNER_PROFILE_MEMORY_NAMESPACE,
-    );
+  for (const table of SEARCH_INDEXES) {
+    requireDatabase()
+      .prepare(
+        `DELETE FROM ${table}
+         WHERE item_id IN (
+           SELECT id FROM workspace_memory_items WHERE canonical_key = ?
+           UNION
+           SELECT item_id FROM workspace_memory_platform_items
+           WHERE namespace = ?
+         )`,
+      )
+      .run(
+        HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
+        HAPPYCLAW_OWNER_PROFILE_MEMORY_NAMESPACE,
+      );
+  }
   requireDatabase().exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_memory_owner_address_unique
       ON workspace_memory_items(store_id, canonical_key)
@@ -830,9 +1015,11 @@ export function deleteWorkspaceMemoryData(workspaceJid: string): void {
   const db = requireDatabase();
   const store = storeRow(workspaceJid);
   if (!store) return;
-  db.prepare('DELETE FROM workspace_memory_fts WHERE workspace_jid = ?').run(
-    workspaceJid,
-  );
+  for (const table of SEARCH_INDEXES) {
+    db.prepare(`DELETE FROM ${table} WHERE workspace_jid = ?`).run(
+      workspaceJid,
+    );
+  }
   db.prepare(
     'DELETE FROM workspace_memory_audit_events WHERE workspace_jid = ?',
   ).run(workspaceJid);
@@ -1340,6 +1527,12 @@ export function createWorkspaceMemoryItem(input: {
       }
     }
 
+    // Only a turn that may not write memory directly creates a proposal.
+    rejectDuplicateCanonicalKey(
+      initialStore,
+      input.value.canonicalKey,
+      input.value.status === 'proposed' ? 'proposal' : 'owner',
+    );
     const at = nowIso();
     const store = bumpStore(initialStore.id, at);
     const itemId = newId('wmi');
@@ -1386,6 +1579,16 @@ export function updateWorkspaceMemoryItem(input: {
   context: WorkspaceMemoryMutationContext;
   idempotencyKey?: string | null;
   requestHash?: string | null;
+  /** Change the item only while it has this status. */
+  requireStatus?: WorkspaceMemoryStatus;
+  /**
+   * The write comes from a turn that only proposes: it may revise a proposal,
+   * which stays one. Any other write to a proposal makes it active memory,
+   * so a proposer never again changes what the owner wrote.
+   */
+  proposal?: boolean;
+  /** Audit the change as this action (default `update`). */
+  auditAction?: Extract<WorkspaceMemoryAuditAction, 'update' | 'confirm'>;
 }): {
   store: WorkspaceMemoryStore;
   item: WorkspaceMemoryItem;
@@ -1446,9 +1649,15 @@ export function updateWorkspaceMemoryItem(input: {
         },
       );
     }
+    rejectStatusMismatch(
+      current,
+      input.proposal ? 'proposed' : input.requireStatus,
+      initialStore.revision,
+    );
 
     const at = nowIso();
     const nextRevision = current.revision + 1;
+    const promoted = !input.proposal && current.status === 'proposed';
     const next: WorkspaceMemoryValue = {
       kind: input.patch.kind ?? current.kind,
       title:
@@ -1458,7 +1667,9 @@ export function updateWorkspaceMemoryItem(input: {
         input.patch.canonicalKey === undefined
           ? current.canonicalKey
           : input.patch.canonicalKey,
-      status: input.patch.status ?? current.status,
+      status: input.proposal
+        ? 'proposed'
+        : (input.patch.status ?? (promoted ? 'active' : current.status)),
       importance: input.patch.importance ?? current.importance,
       confidence: input.patch.confidence ?? current.confidence,
       validFrom:
@@ -1474,6 +1685,18 @@ export function updateWorkspaceMemoryItem(input: {
           ? current.expiresAt
           : input.patch.expiresAt,
     };
+    if (
+      normalizeCanonicalKey(next.canonicalKey) !==
+        normalizeCanonicalKey(current.canonicalKey) ||
+      (next.status === 'active' && current.status !== 'active')
+    ) {
+      rejectDuplicateCanonicalKey(
+        initialStore,
+        next.canonicalKey,
+        input.proposal ? 'proposal' : 'owner',
+        current.id,
+      );
+    }
     const result = db
       .prepare(
         `UPDATE workspace_memory_items SET
@@ -1515,7 +1738,14 @@ export function updateWorkspaceMemoryItem(input: {
     appendVersion(versionItem, 'update', input.context, at);
     const item = requireItem(store, current.id);
     replaceFts(item);
-    appendAuditAndOutbox(store, item, 'update', input.context, at);
+    appendAuditAndOutbox(
+      store,
+      item,
+      input.auditAction ??
+        (promoted && item.status === 'active' ? 'confirm' : 'update'),
+      input.context,
+      at,
+    );
     if (idempotencyKey && input.requestHash) {
       db.prepare(
         `INSERT INTO workspace_memory_mutation_requests (
@@ -1543,6 +1773,10 @@ export function forgetWorkspaceMemoryItem(input: {
   context: WorkspaceMemoryMutationContext;
   idempotencyKey?: string | null;
   requestHash?: string | null;
+  /** Forget the item only while it has this status. */
+  requireStatus?: WorkspaceMemoryStatus;
+  /** Audit the change as this action (default `forget`). */
+  auditAction?: Extract<WorkspaceMemoryAuditAction, 'forget' | 'reject'>;
 }): {
   store: WorkspaceMemoryStore;
   item: WorkspaceMemoryItem;
@@ -1602,6 +1836,7 @@ export function forgetWorkspaceMemoryItem(input: {
         },
       );
     }
+    rejectStatusMismatch(current, input.requireStatus, initialStore.revision);
     const at = nowIso();
     const nextRevision = current.revision + 1;
     const result = db
@@ -1648,7 +1883,13 @@ export function forgetWorkspaceMemoryItem(input: {
       at,
     );
     replaceFts(item);
-    appendAuditAndOutbox(store, item, 'forget', input.context, at);
+    appendAuditAndOutbox(
+      store,
+      item,
+      input.auditAction ?? 'forget',
+      input.context,
+      at,
+    );
     if (idempotencyKey && input.requestHash) {
       db.prepare(
         `INSERT INTO workspace_memory_mutation_requests (
@@ -1714,6 +1955,19 @@ export function listWorkspaceMemoryItems(input: {
   return { store, items: rows.map(mapItem) };
 }
 
+/** Active, generic and valid at `?` (three times): what a turn may recall. */
+const RECALLABLE_ITEM = `
+  i.status = 'active'
+  AND (i.canonical_key IS NULL OR i.canonical_key <> '${HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY}')
+  AND NOT EXISTS (
+    SELECT 1 FROM workspace_memory_platform_items mpi
+    WHERE mpi.item_id = i.id
+  )
+  AND (i.valid_from IS NULL OR julianday(i.valid_from) <= julianday(?))
+  AND (i.valid_until IS NULL OR julianday(i.valid_until) > julianday(?))
+  AND (i.expires_at IS NULL OR julianday(i.expires_at) > julianday(?))
+`;
+
 export function listRecallableWorkspaceMemoryItems(input: {
   workspaceJid: string;
   kind?: WorkspaceMemoryKind;
@@ -1722,35 +1976,247 @@ export function listRecallableWorkspaceMemoryItems(input: {
 }): { store: WorkspaceMemoryStore; items: WorkspaceMemoryItem[] } {
   const store = requireStore(input.workspaceJid);
   const now = input.now ?? nowIso();
-  const kindClause = input.kind ? 'AND i.kind = ?' : '';
-  const params: unknown[] = [
-    store.id,
-    HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
-    now,
-    now,
-    now,
-    ...(input.kind ? [input.kind] : []),
-    input.limit,
-  ];
   const rows = requireDatabase()
     .prepare(
       `${ITEM_SELECT}
-       WHERE i.store_id = ?
-         AND i.status = 'active'
-         AND (i.canonical_key IS NULL OR i.canonical_key <> ?)
-         AND NOT EXISTS (
-           SELECT 1 FROM workspace_memory_platform_items mpi
-           WHERE mpi.item_id = i.id
-         )
-         AND (i.valid_from IS NULL OR julianday(i.valid_from) <= julianday(?))
-         AND (i.valid_until IS NULL OR julianday(i.valid_until) > julianday(?))
-         AND (i.expires_at IS NULL OR julianday(i.expires_at) > julianday(?))
-         ${kindClause}
+       WHERE i.store_id = ? AND ${RECALLABLE_ITEM}
+         ${input.kind ? 'AND i.kind = ?' : ''}
        ORDER BY i.importance DESC, i.updated_at DESC, i.id DESC
        LIMIT ?`,
     )
-    .all(...params) as MemoryItemRow[];
+    .all(
+      store.id,
+      now,
+      now,
+      now,
+      ...(input.kind ? [input.kind] : []),
+      input.limit,
+    ) as MemoryItemRow[];
   return { store, items: rows.map(mapItem) };
+}
+
+/** At most this many changed items are reported to one runtime turn. */
+const MAX_REPORTED_CHANGES = 200;
+
+/**
+ * What changed for a runtime conversation since store revision
+ * `sinceRevision`: the items with an audit event after it (every create,
+ * update and forget bumps the store revision and leaves one at it), with
+ * their current revision and status, and the `heldIds` that expired or are
+ * not yet valid at `now`, as `expired`. A store revision below
+ * `sinceRevision` means the store was replaced since; more changes than one
+ * turn reports are treated the same way, so nothing is dropped silently.
+ */
+export function listWorkspaceMemoryChangesSince(input: {
+  workspaceJid: string;
+  sinceRevision: number;
+  heldIds?: readonly string[];
+  now?: string;
+}): {
+  store: WorkspaceMemoryStore;
+  reset: boolean;
+  items: Array<{ id: string; revision: number; status: string }>;
+} {
+  const store = requireStore(input.workspaceJid);
+  if (store.revision < input.sinceRevision) {
+    return { store, reset: true, items: [] };
+  }
+  const db = requireDatabase();
+  const changed = db
+    .prepare(
+      `SELECT i.id AS id, i.revision AS revision, i.status AS status
+       FROM workspace_memory_items i
+       WHERE i.store_id = ?
+         AND i.id IN (
+           SELECT item_id FROM workspace_memory_audit_events
+           WHERE store_id = ? AND store_revision > ?
+         )
+       ORDER BY i.updated_at DESC, i.id DESC
+       LIMIT ?`,
+    )
+    .all(
+      store.id,
+      store.id,
+      input.sinceRevision,
+      MAX_REPORTED_CHANGES + 1,
+    ) as Array<{ id: string; revision: number; status: string }>;
+  const reported = new Set(changed.map((item) => item.id));
+  const held = [...new Set(input.heldIds ?? [])].filter(
+    (id) => !reported.has(id),
+  );
+  const now = input.now ?? nowIso();
+  const expired: Array<{ id: string; revision: number; status: string }> = [];
+  for (let start = 0; start < held.length; start += 500) {
+    const ids = held.slice(start, start + 500);
+    expired.push(
+      ...(db
+        .prepare(
+          `SELECT id, revision, 'expired' AS status
+           FROM workspace_memory_items
+           WHERE store_id = ?
+             AND status = 'active'
+             AND id IN (${ids.map(() => '?').join(', ')})
+             AND (
+               (valid_from IS NOT NULL AND julianday(valid_from) > julianday(?))
+               OR (valid_until IS NOT NULL AND julianday(valid_until) <= julianday(?))
+               OR (expires_at IS NOT NULL AND julianday(expires_at) <= julianday(?))
+             )`,
+        )
+        .all(store.id, ...ids, now, now, now) as Array<{
+        id: string;
+        revision: number;
+        status: string;
+      }>),
+    );
+  }
+  if (changed.length + expired.length > MAX_REPORTED_CHANGES) {
+    return { store, reset: true, items: [] };
+  }
+  return { store, reset: false, items: [...changed, ...expired] };
+}
+
+/**
+ * The recallable items that share terms with `query`, most relevant first
+ * (bm25 over title, content and canonical key; importance and recency break
+ * ties). `terms` are the ones the query was reduced to; none, no hits.
+ */
+export function recallWorkspaceMemoryItems(input: {
+  workspaceJid: string;
+  query: string;
+  kind?: WorkspaceMemoryKind;
+  limit: number;
+  now?: string;
+}): {
+  store: WorkspaceMemoryStore;
+  terms: string[];
+  hits: Array<{ item: WorkspaceMemoryItem; rank: number; snippet: string }>;
+} {
+  const store = requireStore(input.workspaceJid);
+  const terms = recallQueryTerms(input.query);
+  if (terms.length === 0) return { store, terms, hits: [] };
+  const now = input.now ?? nowIso();
+  const rows = requireDatabase()
+    .prepare(
+      `SELECT i.*, p.source_type, p.source_id, p.session_id, p.observed_at,
+        bm25(workspace_memory_recall_fts, 0, 0, 0, 3, 1, 2) AS search_rank
+       FROM workspace_memory_recall_fts
+       JOIN workspace_memory_items i
+         ON i.id = workspace_memory_recall_fts.item_id
+       LEFT JOIN workspace_memory_provenance p
+         ON p.item_id = i.id AND p.revision = i.revision
+       WHERE i.store_id = ?
+         AND ${RECALLABLE_ITEM}
+         ${input.kind ? 'AND i.kind = ?' : ''}
+         AND workspace_memory_recall_fts MATCH ?
+       ORDER BY search_rank ASC, i.importance DESC, i.updated_at DESC, i.id DESC
+       LIMIT ?`,
+    )
+    .all(
+      store.id,
+      now,
+      now,
+      now,
+      ...(input.kind ? [input.kind] : []),
+      `scope : ${ftsPhrase(recallScopeToken(input.workspaceJid))} AND (${terms
+        .map(ftsPhrase)
+        .join(' OR ')})`,
+      input.limit,
+    ) as Array<MemoryItemRow & { search_rank: number }>;
+  return {
+    store,
+    terms,
+    hits: rows.map((row) => ({
+      item: mapItem(row),
+      rank: Number(row.search_rank),
+      snippet: row.content.slice(0, 240),
+    })),
+  };
+}
+
+export interface WorkspaceMemoryDirectoryEntry {
+  id: string;
+  kind: WorkspaceMemoryKind;
+  title: string;
+}
+
+const DIRECTORY_TITLE_CHARS = 80;
+
+function directoryTitle(title: string | null, content: string): string {
+  const source =
+    title?.trim() ||
+    content
+      .split('\n')
+      .find((line) => line.trim())
+      ?.trim() ||
+    '';
+  const text = source.replace(/\s+/g, ' ');
+  const points = [...text];
+  return points.length > DIRECTORY_TITLE_CHARS
+    ? `${points.slice(0, DIRECTORY_TITLE_CHARS - 1).join('')}…`
+    : text;
+}
+
+/**
+ * Every recallable item as one `id · kind · title` entry, most important and
+ * then most recently updated first, until `maxEntries` or `maxChars` (of the
+ * rendered lines) runs out. `total` counts them all, listed or not.
+ */
+export function listWorkspaceMemoryDirectory(input: {
+  workspaceJid: string;
+  maxEntries: number;
+  maxChars: number;
+  now?: string;
+}): {
+  store: WorkspaceMemoryStore;
+  entries: WorkspaceMemoryDirectoryEntry[];
+  total: number;
+} {
+  const store = requireStore(input.workspaceJid);
+  const now = input.now ?? nowIso();
+  const db = requireDatabase();
+  const rows = db
+    .prepare(
+      `SELECT i.id, i.kind, i.title, substr(i.content, 1, 400) AS content
+       FROM workspace_memory_items i
+       WHERE i.store_id = ? AND ${RECALLABLE_ITEM}
+       ORDER BY i.importance DESC, i.updated_at DESC, i.id DESC
+       LIMIT ?`,
+    )
+    .all(store.id, now, now, now, input.maxEntries) as Array<{
+    id: string;
+    kind: WorkspaceMemoryKind;
+    title: string | null;
+    content: string;
+  }>;
+  const entries: WorkspaceMemoryDirectoryEntry[] = [];
+  let chars = 0;
+  for (const row of rows) {
+    const entry = {
+      id: row.id,
+      kind: row.kind,
+      title: directoryTitle(row.title, row.content),
+    };
+    // `id · kind · title` and its line break.
+    const size = entry.id.length + entry.kind.length + entry.title.length + 7;
+    if (chars + size > input.maxChars) break;
+    entries.push(entry);
+    chars += size;
+  }
+  // Fewer rows than the cap are all of them; only a full page needs a count.
+  const total =
+    rows.length < input.maxEntries
+      ? rows.length
+      : Number(
+          (
+            db
+              .prepare(
+                `SELECT COUNT(*) AS n FROM workspace_memory_items i
+                 WHERE i.store_id = ? AND ${RECALLABLE_ITEM}`,
+              )
+              .get(store.id, now, now, now) as { n: number }
+          ).n,
+        );
+  return { store, entries, total };
 }
 
 function ftsPhrase(query: string): string {
@@ -1774,7 +2240,6 @@ export function searchWorkspaceMemoryItems(input: {
   const kindClause = input.kind ? 'AND i.kind = ?' : '';
   const params: unknown[] = [
     store.id,
-    HAPPYCLAW_OWNER_PREFERRED_ADDRESS_CANONICAL_KEY,
     now,
     now,
     now,
@@ -1795,16 +2260,7 @@ export function searchWorkspaceMemoryItems(input: {
            ON i.id = workspace_memory_fts.item_id
          LEFT JOIN workspace_memory_provenance p
            ON p.item_id = i.id AND p.revision = i.revision
-         WHERE i.store_id = ?
-           AND i.status = 'active'
-           AND (i.canonical_key IS NULL OR i.canonical_key <> ?)
-           AND NOT EXISTS (
-             SELECT 1 FROM workspace_memory_platform_items mpi
-             WHERE mpi.item_id = i.id
-           )
-           AND (i.valid_from IS NULL OR julianday(i.valid_from) <= julianday(?))
-           AND (i.valid_until IS NULL OR julianday(i.valid_until) > julianday(?))
-           AND (i.expires_at IS NULL OR julianday(i.expires_at) > julianday(?))
+         WHERE i.store_id = ? AND ${RECALLABLE_ITEM}
            ${kindClause}
            AND workspace_memory_fts MATCH ?
          ORDER BY search_rank ASC, i.importance DESC, i.updated_at DESC
@@ -1823,16 +2279,7 @@ export function searchWorkspaceMemoryItems(input: {
          FROM workspace_memory_items i
          LEFT JOIN workspace_memory_provenance p
            ON p.item_id = i.id AND p.revision = i.revision
-         WHERE i.store_id = ?
-           AND i.status = 'active'
-           AND (i.canonical_key IS NULL OR i.canonical_key <> ?)
-           AND NOT EXISTS (
-             SELECT 1 FROM workspace_memory_platform_items mpi
-             WHERE mpi.item_id = i.id
-           )
-           AND (i.valid_from IS NULL OR julianday(i.valid_from) <= julianday(?))
-           AND (i.valid_until IS NULL OR julianday(i.valid_until) > julianday(?))
-           AND (i.expires_at IS NULL OR julianday(i.expires_at) > julianday(?))
+         WHERE i.store_id = ? AND ${RECALLABLE_ITEM}
            ${kindClause}
            AND (
              i.title LIKE ? ESCAPE '\\'

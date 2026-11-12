@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { downloadFromUrl } from '../utils/download';
+import { extractErrorMessage } from '../utils/error';
 
 // Several billing cards mount together and each asks for the same data;
 // concurrent calls share one request. A refresh after a mutation passes
@@ -181,14 +183,6 @@ export interface UserBillingOverview {
   min_balance_usd?: number;
 }
 
-export interface RevenueStats {
-  totalDeposited: number;
-  totalConsumed: number;
-  activeSubscriptions: number;
-  currentMonthRevenue: number;
-  blockedUsers?: number;
-}
-
 export interface DailyUsage {
   user_id: string;
   date: string;
@@ -258,7 +252,6 @@ interface BillingState {
   redeemCodes: RedeemCode[];
   auditLogs: BillingAuditLog[];
   auditLogsTotal: number;
-  revenue: RevenueStats | null;
   dailyUsage: DailyUsage[];
   dashboardData: DashboardData | null;
   revenueTrend: RevenueTrendItem[];
@@ -274,8 +267,6 @@ interface BillingState {
   redeemCode: (code: string) => Promise<{ success: boolean; message: string }>;
   loadPlans: () => Promise<void>;
   loadDailyUsage: (days?: number) => Promise<void>;
-  toggleAutoRenew: (autoRenew: boolean) => Promise<void>;
-  cancelMySubscription: () => Promise<void>;
 
   // WebSocket handler
   handleBillingUpdate: (data: BillingAccessResult) => void;
@@ -317,7 +308,6 @@ interface BillingState {
     userId?: string,
     eventType?: string,
   ) => Promise<void>;
-  loadRevenue: () => Promise<void>;
   cancelUserSubscription: (userId: string) => Promise<void>;
   batchAssignPlan: (
     userIds: string[],
@@ -362,7 +352,6 @@ export const useBillingStore = create<BillingState>((set, get) => ({
   redeemCodes: [],
   auditLogs: [],
   auditLogsTotal: 0,
-  revenue: null,
   dailyUsage: [],
   dashboardData: null,
   revenueTrend: [],
@@ -419,7 +408,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
     } catch (err) {
       set({
         loading: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
   },
@@ -429,7 +418,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
       const data = await api.get<UserBalance>('/api/billing/my/balance');
       set({ balance: data });
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
     }
   },
 
@@ -462,7 +451,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
               : null,
           }));
         } catch (err) {
-          set({ error: err instanceof Error ? err.message : String(err) });
+          set({ error: extractErrorMessage(err) });
         }
       },
       opts?.force,
@@ -482,7 +471,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
         plan: data.plan ?? get().plan,
       });
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
     }
   },
 
@@ -494,7 +483,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
       }>(`/api/billing/my/transactions?limit=${limit}&offset=${offset}`);
       set({ transactions: data.transactions, transactionsTotal: data.total });
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
     }
   },
 
@@ -503,7 +492,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
       const data = await api.get<QuotaCheckResult>('/api/billing/my/quota');
       set({ quota: data });
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
     }
   },
 
@@ -521,7 +510,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
       get().loadMyUsage();
       return { success: true, message: data.message };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = extractErrorMessage(err);
       return { success: false, message: msg };
     }
   },
@@ -533,28 +522,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
       );
       set({ plans: data.plans });
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
-    }
-  },
-
-  toggleAutoRenew: async (autoRenew: boolean) => {
-    try {
-      await api.patch('/api/billing/my/auto-renew', { auto_renew: autoRenew });
-      get().loadMySubscription();
-    } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
-      throw err;
-    }
-  },
-
-  cancelMySubscription: async () => {
-    try {
-      await api.post('/api/billing/my/cancel-subscription', {});
-      get().loadMySubscription();
-      get().loadMyQuota();
-    } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
-      throw err;
+      set({ error: extractErrorMessage(err) });
     }
   },
 
@@ -565,7 +533,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
       );
       set({ dailyUsage: data.history });
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
     }
   },
 
@@ -606,7 +574,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
     } catch (err) {
       set({
         loading: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
   },
@@ -638,7 +606,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
       );
       set({ allUsers: data.users });
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
     }
   },
 
@@ -667,7 +635,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
       );
       set({ redeemCodes: data.codes });
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
     }
   },
 
@@ -702,16 +670,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
       );
       set({ auditLogs: data.logs, auditLogsTotal: data.total });
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
-    }
-  },
-
-  loadRevenue: async () => {
-    try {
-      const data = await api.get<RevenueStats>('/api/billing/admin/revenue');
-      set({ revenue: data });
-    } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
     }
   },
 
@@ -732,19 +691,11 @@ export const useBillingStore = create<BillingState>((set, get) => ({
     get().loadAllUsers();
   },
 
-  exportRedeemCodesCSV: async () => {
-    const resp = await fetch('/api/billing/admin/redeem-codes/export', {
-      credentials: 'include',
-    });
-    if (!resp.ok) throw new Error('Export failed');
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `redeem-codes-${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-  },
+  exportRedeemCodesCSV: () =>
+    downloadFromUrl(
+      '/api/billing/admin/redeem-codes/export',
+      `redeem-codes-${new Date().toISOString().slice(0, 10)}.csv`,
+    ),
 
   getRedeemCodeUsage: async (code) => {
     const data = await api.get<{
@@ -762,7 +713,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
       const data = await api.get<DashboardData>('/api/billing/admin/dashboard');
       set({ dashboardData: data });
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
     }
   },
 
@@ -773,7 +724,7 @@ export const useBillingStore = create<BillingState>((set, get) => ({
       );
       set({ revenueTrend: data.trend });
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
     }
   },
 

@@ -148,7 +148,32 @@ export function memoryVersionsPath(
   return `${memoryItemPath(workspaceJid, itemId)}/versions`;
 }
 
-export function revisionConflictFrom(error: unknown): RevisionConflict | null {
+/** Where the owner confirms or rejects a proposal. */
+export function memoryProposalAnswerPath(
+  workspaceJid: string,
+  itemId: string,
+  answer: 'confirm' | 'reject',
+): string {
+  return `${memoryItemPath(workspaceJid, itemId)}/${answer}`;
+}
+
+/** The Memory page opened on one item of a workspace. */
+export function memoryPageHref(workspaceJid: string, itemId?: string): string {
+  const params = new URLSearchParams({ workspace: workspaceJid });
+  if (itemId) params.set('item', itemId);
+  return `/memory?${params}`;
+}
+
+export interface MemoryDuplicate {
+  id: string;
+  title: string | null;
+}
+
+/** The body of a 409 the Memory API sent with error `code`. */
+export function memoryConflictBody(
+  error: unknown,
+  code: string,
+): Record<string, unknown> | null {
   if (
     !error ||
     typeof error !== 'object' ||
@@ -157,10 +182,25 @@ export function revisionConflictFrom(error: unknown): RevisionConflict | null {
   ) {
     return null;
   }
-
   const body = (error as ApiError).body;
-  if (body?.error !== 'revision_conflict') return null;
+  return body?.error === code ? body : null;
+}
 
+/** The item a 409 `memory_duplicate` says already holds the canonical key. */
+export function memoryDuplicateFrom(error: unknown): MemoryDuplicate | null {
+  const existing = memoryConflictBody(error, 'memory_duplicate')?.existing as
+    | Record<string, unknown>
+    | undefined;
+  if (typeof existing?.id !== 'string') return null;
+  return {
+    id: existing.id,
+    title: typeof existing.title === 'string' ? existing.title : null,
+  };
+}
+
+export function revisionConflictFrom(error: unknown): RevisionConflict | null {
+  const body = memoryConflictBody(error, 'revision_conflict');
+  if (!body) return null;
   return {
     currentRevision:
       typeof body.currentRevision === 'number' ? body.currentRevision : null,

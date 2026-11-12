@@ -5,6 +5,24 @@ import {
   type TurnMessageDeliveryRole,
 } from './turn-output-coordinator.js';
 
+/**
+ * What the Agent is told when an IM turn's progress is rejected for want of a
+ * route: nothing was sent, and sending it again cannot help.
+ */
+export const NATIVE_ROUTE_UNAVAILABLE_ERROR =
+  "Progress was not delivered: this turn's native channel route is unavailable. Do not retry it. End the turn, or send your final answer once with send_message(delivery_role=final); the final uses the same route, so if it fails as well, do not retry it either.";
+
+/**
+ * An IPC request file is disposable only after its result ACK is durable.
+ * Legacy requests without requestId keep the fire-and-forget path.
+ */
+export function canDeleteAcknowledgedIpcSource(
+  requestId: string | undefined,
+  resultWritten: boolean,
+): boolean {
+  return !requestId || resultWritten;
+}
+
 export interface HostIpcOutputRouteInput {
   sourceGroup: string;
   agentId?: string | null;
@@ -12,8 +30,16 @@ export interface HostIpcOutputRouteInput {
   text: string;
   deliveryRole?: unknown;
   authorized: boolean;
-  scheduledTask: boolean;
   interactionMode?: 'assistant' | 'proactive';
+  /**
+   * The channel the input turn came from (recorded when its turn was bound):
+   * `im` when it has a native reply source, `web` when it has none. Unknown
+   * (no inputTurnId, or no bound turn) keeps the independent message lane a
+   * proactive progress statement always had.
+   */
+  turnSource?: 'web' | 'im';
+  /** An IM turn's own reply route is open (its outbox scope is bound). */
+  imRouteAvailable?: boolean;
 }
 
 /**
@@ -31,25 +57,15 @@ export interface HostIpcOutputRouteInput {
  */
 export function resolveHostIpcLogicalChatJid(input: {
   sourceChatJid: string;
-  agentId?: string | null;
+  agentId: string;
   agentChatJid?: string | null;
-  taskRunId?: string | null;
-  scheduledTask: boolean;
-  /** Immutable logical base captured when the input turn was admitted. */
-  runtimeChatJid?: string | null;
   resolveWorkspaceJid?: (chatJid: string) => string | null;
 }): string {
   const baseChatJid =
-    input.runtimeChatJid ||
+    input.agentChatJid ||
     input.resolveWorkspaceJid?.(input.sourceChatJid) ||
     input.sourceChatJid;
-  if (input.agentId) {
-    return `${input.agentChatJid || baseChatJid}#agent:${input.agentId}`;
-  }
-  if (input.taskRunId && input.scheduledTask) {
-    return `${baseChatJid}#task:${input.taskRunId}`;
-  }
-  return baseChatJid;
+  return `${baseChatJid}#agent:${input.agentId}`;
 }
 
 export type HostIpcOutputRoute =
@@ -73,7 +89,7 @@ export type HostIpcOutputRoute =
       delivered: false;
       staged: false;
       deliveryRole: TurnMessageDeliveryRole | null;
-      reason: 'unauthorized' | 'conflicting_final';
+      reason: 'unauthorized' | 'conflicting_final' | 'native_route_unavailable';
     };
 
 function normalizeDeliveryRole(value: unknown): TurnMessageDeliveryRole | null {
@@ -88,8 +104,17 @@ function normalizeDeliveryRole(value: unknown): TurnMessageDeliveryRole | null {
  * An explicit progress/final request is consumed by the exact active primary
  * turn, including conversation agents. Even a failed stage attempt is still
  * consumed so it cannot fall through and create a second provider message.
- * Legacy requests, explicit `separate`, and scheduled-task notifications keep
- * their independent delivery path.
+ * Legacy requests and explicit `separate` keep their independent delivery
+ * path.
+ *
+ * A proactive turn's final is always its own message. Its progress depends on
+ * where the turn came from: a Web turn stages it into the turn's process,
+ * which the Web shows at every process visibility and folds away once the
+ * final lands; an IM turn sends it as a message of its own, because a channel
+ * cannot fold anything and the user would otherwise hear nothing until the
+ * final. An IM turn whose route is gone (a recalled input, an address without
+ * its account) fails closed: the Agent is told nothing was delivered, and
+ * nothing goes to the Web in its place.
  */
 export function routeHostIpcOutput(
   input: HostIpcOutputRouteInput,
@@ -105,11 +130,7 @@ export function routeHostIpcOutput(
       reason: 'unauthorized',
     };
   }
-  if (
-    input.scheduledTask ||
-    deliveryRole === null ||
-    deliveryRole === 'separate'
-  ) {
+  if (deliveryRole === null || deliveryRole === 'separate') {
     return {
       path: 'separate_provider',
       delivered: false,
@@ -119,13 +140,9 @@ export function routeHostIpcOutput(
     };
   }
 
-  if (input.interactionMode === 'proactive') {
+  if (input.interactionMode === 'proactive' && deliveryRole === 'final') {
     let attemptedFinalRecorded = false;
-    if (
-      deliveryRole === 'final' &&
-      typeof input.inputTurnId === 'string' &&
-      input.inputTurnId
-    ) {
+    if (typeof input.inputTurnId === 'string' && input.inputTurnId) {
       attemptedFinalRecorded = activeTurnOutputs.recordAttemptedFinal({
         scopeKey: channelTurnScope(input.sourceGroup, input.agentId),
         inputTurnId: input.inputTurnId,
@@ -151,6 +168,25 @@ export function routeHostIpcOutput(
       staged: false,
       deliveryRole,
       attemptedFinalRecorded,
+    };
+  }
+
+  if (input.interactionMode === 'proactive' && input.turnSource !== 'web') {
+    if (input.turnSource === 'im' && !input.imRouteAvailable) {
+      return {
+        path: 'rejected',
+        delivered: false,
+        staged: false,
+        deliveryRole,
+        reason: 'native_route_unavailable',
+      };
+    }
+    return {
+      path: 'separate_provider',
+      delivered: false,
+      staged: false,
+      deliveryRole,
+      attemptedFinalRecorded: false,
     };
   }
 

@@ -19,7 +19,6 @@ import {
   storeMessageDirect,
   updateChatName,
 } from './db.js';
-import { notifyNewImMessage } from './message-notifier.js';
 import { logger } from './logger.js';
 import { saveDownloadedFile } from './im-downloader.js';
 import { downloadHttpsBuffer } from './im-media-download.js';
@@ -42,12 +41,22 @@ import {
   type PassiveReplyClaim,
 } from './qq-passive-reply.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
+import {
+  groupSenderAdmission,
+  type ChannelCommandMention,
+  type GroupAudienceConnectOpts,
+} from './im-group-audience.js';
 import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
 import {
   isRuntimeControlLike,
   parseRuntimeControl,
 } from './follow-up-policy.js';
-import type { FollowUpDisposition, FollowUpMode } from './types.js';
+import type { FollowUpMode } from './types.js';
+import {
+  projectChannelInbound,
+  runSessionBreak,
+  type ChannelFollowUpConnectOpts,
+} from './im-connector-follow-up.js';
 import {
   ChannelInboundLifecycle,
   type ChannelInboundLease,
@@ -410,7 +419,9 @@ export interface QQConnectionConfig {
   appSecret: string;
 }
 
-export interface QQConnectOpts {
+/** Group audience senders use the `group:` member namespace. */
+export interface QQConnectOpts
+  extends ChannelFollowUpConnectOpts, GroupAudienceConnectOpts {
   onReady?: () => void;
   onNewChat: (jid: string, name: string) => void;
   isChatAuthorized: (jid: string) => boolean;
@@ -426,6 +437,7 @@ export interface QQConnectOpts {
     chatJid: string,
     command: string,
     senderImId?: string,
+    mentions?: ChannelCommandMention[],
   ) => Promise<string | null>;
   resolveGroupFolder?: (jid: string) => string | undefined;
   resolveEffectiveChatJid?: (
@@ -433,25 +445,6 @@ export interface QQConnectOpts {
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
   onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
-  /**
-   * Offer a persisted inbound message to the durable follow-up queue. Returns
-   * whether it starts a turn now or waits behind the active one.
-   */
-  onFollowUpMessage?: (input: {
-    targetJid: string;
-    sourceJid: string;
-    messageId: string;
-    senderImId: string;
-    requestedMode?: FollowUpMode;
-  }) => FollowUpDisposition;
-  /** Notify host projections after the durable follow-up queue changes. */
-  onFollowUpsChanged?: import('./channel-contracts.js').OnChannelFollowUpsChanged;
-  /** `/break` — cancel the pending queue and interrupt the active query. */
-  onSessionBreak?: (input: {
-    sourceJid: string;
-    targetJid?: string;
-    senderImId: string;
-  }) => Promise<string>;
   normalizeIncomingJid?: (jid: string) => string | null;
 }
 
@@ -536,51 +529,22 @@ function parseQQChatId(
   return null;
 }
 
-export interface QQFollowUpOutcome {
-  /**
-   * Whether the caller should start a turn now. A queued or steered message is
-   * released later by the scheduler, so starting one here would run it twice.
-   */
-  shouldStartTurn: boolean;
-  disposition: FollowUpDisposition['disposition'];
-  /** Projection fields describing the outcome to `onMessagePersisted`. */
-  deliveryFields: Record<string, unknown>;
-  position?: number;
-}
-
 /**
- * Translate the host's follow-up decision into projection fields.
- *
- * Split out from the connector so the mapping can be pinned by tests: the
- * steer case is easy to get wrong because it reports as `steered` but must be
- * persisted as `queued`.
+ * Group members a QQ group command names, for `/allow` and `/disallow`, in
+ * the `group:` namespace of group senders. Only structured `mentions` entries
+ * that carry a member openid count; the bot itself is never named.
  */
-export function describeFollowUpOutcome(
-  followUp: FollowUpDisposition,
-  now: string = new Date().toISOString(),
-): QQFollowUpOutcome {
-  if (followUp.disposition === 'started') {
-    return {
-      shouldStartTurn: true,
-      disposition: 'started',
-      deliveryFields: {},
-    };
+export function qqGroupCommandMentions(data: {
+  mentions?: unknown;
+}): ChannelCommandMention[] {
+  if (!Array.isArray(data.mentions)) return [];
+  const ids = new Set<string>();
+  for (const mention of data.mentions as Array<Record<string, unknown>>) {
+    if (!mention || mention.is_you === true || mention.bot === true) continue;
+    const openId = mention.member_openid;
+    if (typeof openId === 'string' && openId) ids.add(`group:${openId}`);
   }
-
-  return {
-    shouldStartTurn: false,
-    disposition: followUp.disposition,
-    position: followUp.position,
-    deliveryFields: {
-      delivery_mode: followUp.disposition === 'steered' ? 'steer' : 'queue',
-      // Steering stays `queued`: it is a durable hand-off, and the row is only
-      // released once the interrupted query reports idle. Marking it anything
-      // else would hide it from the queue readers that must eventually run it.
-      delivery_status: 'queued',
-      delivery_run_id: followUp.runId ?? null,
-      delivery_updated_at: now,
-    },
-  };
+  return [...ids].map((imId) => ({ imId }));
 }
 
 export function validateQQGatewayUrl(value: string): string {
@@ -776,32 +740,6 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     const next = current + 1;
     msgSeqCounters.set(chatId, next);
     return next;
-  }
-
-  /**
-   * Offer a just-persisted inbound message to the durable follow-up queue.
-   *
-   * Order matters and mirrors the Feishu intake: the host applies its decision
-   * with an UPDATE keyed on the message row, so the row has to exist before
-   * this runs. Returns the projection fields describing the outcome plus
-   * whether the caller should start a turn now — a queued or steered message
-   * is released later by the scheduler, so starting one here would run it
-   * twice.
-   */
-  function offerFollowUp(
-    opts: QQConnectOpts,
-    input: {
-      targetJid: string;
-      sourceJid: string;
-      messageId: string;
-      senderImId: string;
-      requestedMode?: FollowUpMode;
-    },
-  ): QQFollowUpOutcome {
-    const followUp: FollowUpDisposition = opts.onFollowUpMessage?.(input) ?? {
-      disposition: 'started',
-    };
-    return describeFollowUpOutcome(followUp);
   }
 
   /**
@@ -1499,6 +1437,8 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     attachment: QQInboundAttachment,
     msgId: string,
     jid: string,
+    /** The admitted route; a session route picks that session's worktree. */
+    routeJid: string,
     content: string,
     opts: QQConnectOpts,
     logContext: string,
@@ -1534,6 +1474,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             'qq',
             fileName,
             buffer,
+            routeJid,
           );
           inboundLifecycle.assertCurrent(lease);
           if (relPath) content = `[图片: ${relPath}]\n${content}`.trim();
@@ -1562,6 +1503,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           'qq',
           fileName,
           buffer,
+          routeJid,
         );
         inboundLifecycle.assertCurrent(lease);
         if (relPath) {
@@ -2181,13 +2123,11 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           requestedFollowUpMode = 'steer';
           content = runtimeControl.text;
         } else if (runtimeControl?.kind === 'break') {
-          const reply = opts.onSessionBreak
-            ? await opts.onSessionBreak({
-                sourceJid: jid,
-                targetJid,
-                senderImId: `c2c:${userOpenId}`,
-              })
-            : '当前运行环境不支持 /break。';
+          const reply = await runSessionBreak(opts.onSessionBreak, {
+            sourceJid: jid,
+            targetJid,
+            senderImId: `c2c:${userOpenId}`,
+          });
           await sendQQMessage('c2c', userOpenId, markdownToPlainText(reply));
           return;
         }
@@ -2242,6 +2182,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             data.attachments[0],
             msgId,
             jid,
+            targetJid,
             content,
             opts,
             'c2c',
@@ -2288,16 +2229,8 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           { attachments: attachmentsJson, sourceJid: jid },
         );
 
-        const followUp = offerFollowUp(opts, {
-          targetJid,
-          sourceJid: jid,
-          messageId: id,
-          senderImId: senderId,
-          requestedMode: requestedFollowUpMode,
-        });
-
-        opts.onMessagePersisted?.(
-          targetJid,
+        const followUp = projectChannelInbound(
+          opts,
           {
             id,
             chat_jid: targetJid,
@@ -2308,13 +2241,14 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             timestamp,
             attachments: attachmentsJson,
             is_from_me: false,
-            ...followUp.deliveryFields,
           },
-          agentRouting?.agentId ?? undefined,
+          {
+            agentId: agentRouting?.agentId ?? undefined,
+            requestedMode: requestedFollowUpMode,
+          },
         );
 
         if (!followUp.shouldStartTurn) {
-          opts.onFollowUpsChanged?.(targetJid);
           logger.info(
             {
               jid,
@@ -2327,8 +2261,6 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           );
           return;
         }
-
-        notifyNewImMessage();
 
         if (agentRouting?.agentId) {
           opts.onAgentMessage?.(jid, agentRouting.agentId);
@@ -2421,6 +2353,14 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           return;
         }
 
+        const admission = groupSenderAdmission(
+          opts,
+          jid,
+          memberOpenId ? `group:${memberOpenId}` : undefined,
+          content,
+        );
+        if (admission === 'rejected') return;
+
         const resolvedRoute = resolveAdmittedChannelRoute(
           jid,
           opts.resolveEffectiveChatJid,
@@ -2454,13 +2394,11 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           // synthetic one would silently defeat any check added later.
           const reply = !memberOpenId
             ? '无法确认发送者身份，未执行 /break。'
-            : opts.onSessionBreak
-              ? await opts.onSessionBreak({
-                  sourceJid: jid,
-                  targetJid,
-                  senderImId: `group:${memberOpenId}`,
-                })
-              : '当前运行环境不支持 /break。';
+            : await runSessionBreak(opts.onSessionBreak, {
+                sourceJid: jid,
+                targetJid,
+                senderImId: `group:${memberOpenId}`,
+              });
           await sendQQMessage('group', groupOpenId, markdownToPlainText(reply));
           return;
         }
@@ -2489,6 +2427,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
               jid,
               cmdBody,
               memberOpenId ? `group:${memberOpenId}` : undefined,
+              qqGroupCommandMentions(data),
             );
             if (reply) {
               await sendQQMessage(
@@ -2508,6 +2447,8 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             return;
           }
         }
+        // Admitted only as `/owner_mention`, and not consumed as it.
+        if (admission === 'bootstrap') return;
 
         // Handle attachments (images / files)
         let attachmentsJson: string | undefined;
@@ -2516,6 +2457,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             data.attachments[0],
             msgId,
             jid,
+            targetJid,
             content,
             opts,
             'group',
@@ -2561,16 +2503,8 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           { attachments: attachmentsJson, sourceJid: jid },
         );
 
-        const followUp = offerFollowUp(opts, {
-          targetJid,
-          sourceJid: jid,
-          messageId: id,
-          senderImId: senderId,
-          requestedMode: requestedFollowUpMode,
-        });
-
-        opts.onMessagePersisted?.(
-          targetJid,
+        const followUp = projectChannelInbound(
+          opts,
           {
             id,
             chat_jid: targetJid,
@@ -2581,13 +2515,14 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             timestamp,
             attachments: attachmentsJson,
             is_from_me: false,
-            ...followUp.deliveryFields,
           },
-          agentRouting?.agentId ?? undefined,
+          {
+            agentId: agentRouting?.agentId ?? undefined,
+            requestedMode: requestedFollowUpMode,
+          },
         );
 
         if (!followUp.shouldStartTurn) {
-          opts.onFollowUpsChanged?.(targetJid);
           logger.info(
             {
               jid,
@@ -2600,8 +2535,6 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           );
           return;
         }
-
-        notifyNewImMessage();
 
         if (agentRouting?.agentId) {
           opts.onAgentMessage?.(jid, agentRouting.agentId);

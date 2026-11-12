@@ -1,5 +1,7 @@
 import { Hono } from 'hono';
 import crypto from 'node:crypto';
+import QRCode from 'qrcode';
+import type { z } from 'zod';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import type {
@@ -11,6 +13,7 @@ import type {
 import {
   ChannelAccountCreateSchema,
   ChannelAccountPatchSchema,
+  FeishuAppRegistrationCreateSchema,
 } from '../schemas.js';
 import {
   countChannelAccountBindings,
@@ -61,6 +64,19 @@ import {
   type WeChatQrStatusValue,
 } from '../wechat-onboarding.js';
 import type { WhatsAppConnectionState } from '../whatsapp.js';
+import {
+  feishuAppConsoleUrl,
+  normalizeFeishuBrand,
+  type FeishuBrand,
+} from '../feishu-domain.js';
+import {
+  beginFeishuAppRegistration,
+  createFeishuRegistrationHttp,
+  pollFeishuAppRegistration,
+  type FeishuRegistrationHttp,
+  type FeishuRegistrationPoll,
+} from '../feishu-app-registration.js';
+import { logger } from '../logger.js';
 
 export interface ChannelAccountRouteDeps {
   reloadChannelAccount?: (accountId: string) => Promise<boolean>;
@@ -78,6 +94,8 @@ export interface ChannelAccountRouteDeps {
   /** Remove DB history, registered-group state, and the process-local routing
    * cache atomically from the application's authoritative lifecycle service. */
   removeImGroupRecord?: (jid: string, reason: string) => void | Promise<void>;
+  /** Transport for Feishu/Lark device-code app registration (tests inject one). */
+  feishuRegistrationHttp?: FeishuRegistrationHttp;
 }
 
 let deps: ChannelAccountRouteDeps = {};
@@ -183,20 +201,30 @@ const PROVIDER_NAMES: Record<ChannelProvider, string> = {
   whatsapp: 'WhatsApp',
 };
 
-function publicAccount(account: ChannelAccount): ChannelAccountPublic {
+type PublicChannelAccount = Omit<ChannelAccountPublic, 'options'> & {
+  options?: NonNullable<ChannelAccountPublic['options']> & {
+    domain?: FeishuBrand;
+  };
+};
+
+function publicAccount(account: ChannelAccount): PublicChannelAccount {
   const {
     secret_ref: _secretRef,
     default_agent_profile_id: _deprecatedDefaultAgentProfileId,
     ...metadata
   } = account;
   const secret = loadChannelAccountSecret(account.secret_ref) ?? {};
-  const options: ChannelAccountPublic['options'] = {};
-  if (account.provider === 'wechat') {
+  const options: PublicChannelAccount['options'] = {};
+  if (account.provider === 'feishu') {
+    options.domain = normalizeFeishuBrand(secret.domain);
+  } else if (account.provider === 'wechat') {
     options.bypassProxy = secret.bypassProxy !== 'false';
   } else if (account.provider === 'dingtalk') {
     options.streamingMode = secret.streamingMode === 'text' ? 'text' : 'card';
   } else if (account.provider === 'discord') {
     options.streamingMode = secret.streamingMode === 'edit' ? 'edit' : 'off';
+  } else if (account.provider === 'telegram') {
+    options.streamingMode = secret.streamingMode === 'off' ? 'off' : 'edit';
   } else if (account.provider === 'whatsapp' && secret.phoneNumber) {
     options.phoneNumber = secret.phoneNumber;
   }
@@ -240,9 +268,10 @@ function credentialsError(
     feishu: [
       'appId',
       'appSecret',
+      'domain',
       ...(allowInternalQrSecrets ? ['ownerOpenId'] : []),
     ],
-    telegram: ['botToken', 'proxyUrl'],
+    telegram: ['botToken', 'proxyUrl', 'streamingMode'],
     qq: ['appId', 'appSecret'],
     wechat: [
       'bypassProxy',
@@ -269,10 +298,17 @@ function credentialsError(
   }
   if (
     credentials.streamingMode &&
-    provider === 'discord' &&
+    (provider === 'discord' || provider === 'telegram') &&
     !['edit', 'off'].includes(credentials.streamingMode)
   ) {
-    return 'Discord streamingMode must be edit or off';
+    return `${provider === 'telegram' ? 'Telegram' : 'Discord'} streamingMode must be edit or off`;
+  }
+  if (
+    credentials.domain &&
+    provider === 'feishu' &&
+    !['feishu', 'lark'].includes(credentials.domain)
+  ) {
+    return 'Feishu domain must be feishu or lark';
   }
   if (
     credentials.bypassProxy &&
@@ -338,6 +374,7 @@ function syncLegacyUserImFacade(
       appSecret: secret.appSecret || '',
       ownerOpenId: secret.ownerOpenId,
       autoIsolateContext: old?.autoIsolateContext ?? false,
+      domain: normalizeFeishuBrand(secret.domain),
       enabled,
     });
   } else if (account.provider === 'telegram') {
@@ -387,7 +424,7 @@ function syncLegacyUserImFacade(
 }
 
 function validateTargets(
-  user: AuthUser,
+  userId: string,
   input: {
     default_workspace_jid?: string | null;
   },
@@ -397,7 +434,7 @@ function validateTargets(
     if (
       !workspace ||
       !input.default_workspace_jid.startsWith('web:') ||
-      workspace.created_by !== user.id
+      workspace.created_by !== userId
     ) {
       return 'Default workspace does not belong to the current user';
     }
@@ -417,6 +454,7 @@ function legacyCredentialsFor(
             appId: value.appId,
             appSecret: value.appSecret,
             ownerOpenId: value.ownerOpenId,
+            domain: value.domain,
           },
           enabled: value.enabled !== false,
         }
@@ -540,65 +578,68 @@ routes.get('/status', authMiddleware, (c) => {
   );
 });
 
-routes.post('/', authMiddleware, async (c) => {
-  const user = c.get('user') as AuthUser;
-  const parsed = ChannelAccountCreateSchema.safeParse(
-    await c.req.json().catch(() => ({})),
-  );
-  if (!parsed.success) {
-    return c.json(
-      { error: 'Invalid request', details: parsed.error.format() },
-      400,
-    );
-  }
+type ChannelAccountCreateInput = z.output<typeof ChannelAccountCreateSchema>;
 
+type CreateChannelAccountResult =
+  | { ok: true; account: ChannelAccount }
+  | { ok: false; status: 400 | 409; error: string; code?: string };
+
+/**
+ * The one server-side path that creates a channel account: validation,
+ * secret storage, the DB row and the first connection attempt. Internal
+ * callers (QR-style onboarding) may write server-only secret fields.
+ */
+async function createAccountForUser(
+  userId: string,
+  input: ChannelAccountCreateInput,
+  allowInternalSecrets = false,
+): Promise<CreateChannelAccountResult> {
   // The web server becomes available before the startup migration finishes.
   // Project legacy singleton configs before creating a first-class account so
   // a direct POST cannot accidentally take the default slot and cause the
   // historical unscoped JID connector to disappear on this boot.
-  ensureLegacyDefaultChannelAccounts(user.id);
+  ensureLegacyDefaultChannelAccounts(userId);
 
-  const targetError = validateTargets(user, parsed.data);
-  if (targetError) return c.json({ error: targetError }, 400);
+  const targetError = validateTargets(userId, input);
+  if (targetError) return { ok: false, status: 400, error: targetError };
   const credentialError = credentialsError(
-    parsed.data.provider,
-    parsed.data.credentials,
+    input.provider,
+    input.credentials,
+    allowInternalSecrets,
   );
-  if (credentialError) return c.json({ error: credentialError }, 400);
-  if (parsed.data.provider === 'qq') {
-    const duplicate = qqIdentityConflict(
-      user.id,
-      parsed.data.credentials.appId,
-    );
+  if (credentialError) {
+    return { ok: false, status: 400, error: credentialError };
+  }
+  if (input.provider === 'qq') {
+    const duplicate = qqIdentityConflict(userId, input.credentials.appId);
     if (duplicate) {
-      return c.json(
-        {
-          error: `This QQ App ID is already used by channel account "${duplicate.name}"`,
-          code: 'duplicate_channel_identity',
-        },
-        409,
-      );
+      return {
+        ok: false,
+        status: 409,
+        error: `This QQ App ID is already used by channel account "${duplicate.name}"`,
+        code: 'duplicate_channel_identity',
+      };
     }
   }
 
   const id = crypto.randomUUID();
   const secretRef = channelAccountSecretRef(id);
-  saveChannelAccountSecret(secretRef, parsed.data.credentials);
+  saveChannelAccountSecret(secretRef, input.credentials);
   try {
     const account = createChannelAccount({
       id,
-      owner_user_id: user.id,
-      provider: parsed.data.provider,
-      name: parsed.data.name,
+      owner_user_id: userId,
+      provider: input.provider,
+      name: input.name,
       secret_ref: secretRef,
-      enabled: parsed.data.enabled,
-      is_default: parsed.data.is_default,
-      default_workspace_jid: parsed.data.default_workspace_jid,
-      auth_mode: authModeForProvider(parsed.data.provider),
+      enabled: input.enabled,
+      is_default: input.is_default,
+      default_workspace_jid: input.default_workspace_jid,
+      auth_mode: authModeForProvider(input.provider),
       auth_status:
-        authModeForProvider(parsed.data.provider) === 'qr_session'
+        authModeForProvider(input.provider) === 'qr_session'
           ? 'draft'
-          : parsed.data.enabled === false
+          : input.enabled === false
             ? 'authorized'
             : 'draft',
     });
@@ -615,15 +656,406 @@ routes.post('/', authMiddleware, async (c) => {
         updateChannelAccountAuthStatus(account.id, 'authorized');
       }
     }
-    return c.json(
-      { account: publicAccount(getChannelAccountForUser(id, user.id)!) },
-      201,
-    );
+    return { ok: true, account: getChannelAccountForUser(id, userId)! };
   } catch (error) {
     deleteChannelAccountSecret(secretRef);
     const message = error instanceof Error ? error.message : 'Create failed';
-    return c.json({ error: message }, 409);
+    return { ok: false, status: 409, error: message };
   }
+}
+
+routes.post('/', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const parsed = ChannelAccountCreateSchema.safeParse(
+    await c.req.json().catch(() => ({})),
+  );
+  if (!parsed.success) {
+    return c.json(
+      { error: 'Invalid request', details: parsed.error.format() },
+      400,
+    );
+  }
+  const result = await createAccountForUser(user.id, parsed.data);
+  if (!result.ok) {
+    return c.json(
+      { error: result.error, ...(result.code ? { code: result.code } : {}) },
+      result.status,
+    );
+  }
+  return c.json({ account: publicAccount(result.account) }, 201);
+});
+
+// ─── One-click Feishu/Lark app creation ─────────────────────────
+//
+// The server polls the registration endpoint itself, at the interval Feishu
+// asks for. Clients only read the in-memory state, so a fast-polling browser
+// cannot turn into fast polling of Feishu, and an app confirmed on the phone
+// still becomes an account after the browser tab is closed. Registrations are
+// process-local: after a restart the user simply generates a new QR code.
+
+const FEISHU_REGISTRATION_MAX_ACTIVE_PER_USER = 3;
+/** Upper bound on a registration's lifetime, whatever expires_in says. */
+const FEISHU_REGISTRATION_MAX_LIFETIME_MS = 15 * 60 * 1000;
+/** How long a finished registration stays readable. */
+const FEISHU_REGISTRATION_RESULT_TTL_MS = 10 * 60 * 1000;
+
+type FeishuRegistrationStatus =
+  | 'pending'
+  | 'creating'
+  | 'success'
+  | 'expired'
+  | 'denied'
+  | 'error'
+  | 'cancelled';
+
+interface FeishuRegistration {
+  id: string;
+  ownerUserId: string;
+  name?: string;
+  /** Verification page brand until success, then the app's brand. */
+  brand: FeishuBrand;
+  pollBrand: FeishuBrand;
+  /** Bearer for polling; cleared once the registration settles. */
+  deviceCode: string;
+  userCode: string;
+  verificationUrl: string;
+  qrDataUrl: string;
+  intervalS: number;
+  expiresAt: number;
+  status: FeishuRegistrationStatus;
+  error?: string;
+  accountId?: string;
+  eventConsoleUrl?: string;
+  timer?: ReturnType<typeof setTimeout>;
+  finishedAt?: number;
+}
+
+const feishuRegistrations = new Map<string, FeishuRegistration>();
+/** Begin requests still waiting for Feishu, per user, so a burst of
+ * concurrent POSTs cannot slip past the per-user limit. */
+const startingFeishuRegistrations = new Map<string, number>();
+
+function feishuRegistrationHttp(): FeishuRegistrationHttp {
+  return deps.feishuRegistrationHttp ?? createFeishuRegistrationHttp();
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function pruneFeishuRegistrations(now = Date.now()): void {
+  for (const [id, registration] of feishuRegistrations) {
+    if (
+      registration.finishedAt !== undefined &&
+      now - registration.finishedAt > FEISHU_REGISTRATION_RESULT_TTL_MS
+    ) {
+      feishuRegistrations.delete(id);
+    }
+  }
+}
+
+function activeFeishuRegistrationCount(userId: string): number {
+  let count = startingFeishuRegistrations.get(userId) ?? 0;
+  for (const registration of feishuRegistrations.values()) {
+    if (
+      registration.ownerUserId === userId &&
+      (registration.status === 'pending' || registration.status === 'creating')
+    ) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function settleFeishuRegistration(
+  registration: FeishuRegistration,
+  status: Exclude<FeishuRegistrationStatus, 'pending' | 'creating'>,
+  error?: string,
+): void {
+  if (registration.timer) clearTimeout(registration.timer);
+  registration.timer = undefined;
+  registration.status = status;
+  registration.error = error;
+  registration.deviceCode = '';
+  registration.qrDataUrl = '';
+  registration.finishedAt = Date.now();
+  logger.info(
+    {
+      registrationId: registration.id,
+      userId: registration.ownerUserId,
+      status,
+      accountId: registration.accountId,
+    },
+    'Feishu app registration settled',
+  );
+}
+
+function scheduleFeishuRegistrationPoll(
+  registration: FeishuRegistration,
+  delayMs: number,
+): void {
+  const untilExpiry = Math.max(0, registration.expiresAt - Date.now());
+  registration.timer = setTimeout(
+    () => void pollFeishuRegistration(registration),
+    Math.min(delayMs, untilExpiry),
+  );
+  registration.timer.unref?.();
+}
+
+async function pollFeishuRegistration(
+  registration: FeishuRegistration,
+): Promise<void> {
+  registration.timer = undefined;
+  if (registration.status !== 'pending') return;
+  if (Date.now() >= registration.expiresAt) {
+    settleFeishuRegistration(registration, 'expired', '二维码已过期');
+    return;
+  }
+  let result: FeishuRegistrationPoll;
+  try {
+    result = await pollFeishuAppRegistration(
+      feishuRegistrationHttp(),
+      registration.pollBrand,
+      registration.deviceCode,
+      registration.intervalS,
+    );
+  } catch (error) {
+    if (registration.status === 'pending') {
+      settleFeishuRegistration(registration, 'error', errorMessage(error));
+    }
+    return;
+  }
+  // Cancelled while the request was in flight.
+  if (registration.status !== 'pending') return;
+
+  // A Lark tenant answering a still-open poll moves polling to the Lark host.
+  // Settled answers are taken as they are: a success already carries the
+  // app's credentials (its brand says Lark), and re-polling a consumed
+  // device code would lose an app that already exists in the tenant.
+  if (
+    (result.status === 'pending' || result.status === 'slow_down') &&
+    registration.pollBrand === 'feishu' &&
+    result.tenantBrand === 'lark'
+  ) {
+    registration.pollBrand = 'lark';
+    scheduleFeishuRegistrationPoll(registration, 0);
+    return;
+  }
+  if (result.status === 'slow_down') registration.intervalS = result.interval;
+  if (result.status === 'pending' || result.status === 'slow_down') {
+    scheduleFeishuRegistrationPoll(registration, registration.intervalS * 1000);
+    return;
+  }
+  if (result.status === 'success') {
+    await completeFeishuRegistration(registration, result);
+    return;
+  }
+  settleFeishuRegistration(registration, result.status, result.message);
+}
+
+async function completeFeishuRegistration(
+  registration: FeishuRegistration,
+  result: Extract<FeishuRegistrationPoll, { status: 'success' }>,
+): Promise<void> {
+  registration.status = 'creating';
+  registration.deviceCode = '';
+  const brand = result.brand ?? registration.pollBrand;
+  try {
+    // The app already exists on Feishu now, so a name clash must not fail
+    // the account: account names are unique per user and provider.
+    const baseName =
+      registration.name || (brand === 'lark' ? 'Lark 机器人' : '飞书机器人');
+    const taken = new Set(
+      listChannelAccountsForUser(registration.ownerUserId)
+        .filter((account) => account.provider === 'feishu')
+        .map((account) => account.name),
+    );
+    let name = baseName;
+    for (let n = 2; taken.has(name); n += 1) name = `${baseName} ${n}`;
+    const created = await createAccountForUser(
+      registration.ownerUserId,
+      {
+        provider: 'feishu',
+        name,
+        enabled: true,
+        is_default: false,
+        credentials: {
+          appId: result.appId,
+          appSecret: result.appSecret,
+          domain: brand,
+          ...(result.ownerOpenId ? { ownerOpenId: result.ownerOpenId } : {}),
+        },
+      },
+      true,
+    );
+    if (!created.ok) {
+      settleFeishuRegistration(registration, 'error', created.error);
+      return;
+    }
+    registration.brand = brand;
+    registration.accountId = created.account.id;
+    registration.eventConsoleUrl = feishuAppConsoleUrl(
+      brand,
+      result.appId,
+      'event',
+    );
+    settleFeishuRegistration(registration, 'success');
+  } catch (error) {
+    settleFeishuRegistration(
+      registration,
+      'error',
+      `Failed to save the new app: ${errorMessage(error)}`,
+    );
+  }
+}
+
+/** The QR image never changes, so only the POST that created it carries it. */
+function publicFeishuRegistration(
+  registration: FeishuRegistration,
+  withQr = false,
+) {
+  // Undefined fields are dropped from the JSON response.
+  const pending = registration.status === 'pending';
+  return {
+    id: registration.id,
+    status: registration.status,
+    brand: registration.brand,
+    user_code: pending ? registration.userCode : undefined,
+    verification_url: pending ? registration.verificationUrl : undefined,
+    qr_data_url: pending && withQr ? registration.qrDataUrl : undefined,
+    expires_at: new Date(registration.expiresAt).toISOString(),
+    interval: registration.intervalS,
+    error: registration.error,
+    account_id: registration.accountId,
+    event_console_url: registration.eventConsoleUrl,
+  };
+}
+
+function ownedFeishuRegistration(
+  id: string,
+  userId: string,
+): FeishuRegistration | undefined {
+  pruneFeishuRegistrations();
+  const registration = feishuRegistrations.get(id);
+  return registration?.ownerUserId === userId ? registration : undefined;
+}
+
+routes.post('/feishu/registrations', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const parsed = FeishuAppRegistrationCreateSchema.safeParse(
+    await c.req.json().catch(() => ({})),
+  );
+  if (!parsed.success) {
+    return c.json(
+      { error: 'Invalid request', details: parsed.error.format() },
+      400,
+    );
+  }
+  pruneFeishuRegistrations();
+  if (
+    activeFeishuRegistrationCount(user.id) >=
+    FEISHU_REGISTRATION_MAX_ACTIVE_PER_USER
+  ) {
+    return c.json(
+      {
+        error:
+          'Too many Feishu app registrations in progress; cancel one or wait for it to expire',
+        code: 'too_many_registrations',
+      },
+      429,
+    );
+  }
+  startingFeishuRegistrations.set(
+    user.id,
+    (startingFeishuRegistrations.get(user.id) ?? 0) + 1,
+  );
+  try {
+    const begin = await beginFeishuAppRegistration(
+      feishuRegistrationHttp(),
+      parsed.data.brand,
+    );
+    const qrDataUrl = await QRCode.toDataURL(begin.verificationUrl, {
+      width: 512,
+      margin: 2,
+      color: { dark: '#000000', light: '#ffffff' },
+    });
+    const registration: FeishuRegistration = {
+      id: crypto.randomUUID(),
+      ownerUserId: user.id,
+      name: parsed.data.name,
+      brand: parsed.data.brand,
+      pollBrand: 'feishu',
+      deviceCode: begin.deviceCode,
+      userCode: begin.userCode,
+      verificationUrl: begin.verificationUrl,
+      qrDataUrl,
+      intervalS: Math.max(begin.interval, 1),
+      expiresAt:
+        Date.now() +
+        Math.min(begin.expiresIn * 1000, FEISHU_REGISTRATION_MAX_LIFETIME_MS),
+      status: 'pending',
+    };
+    feishuRegistrations.set(registration.id, registration);
+    scheduleFeishuRegistrationPoll(registration, registration.intervalS * 1000);
+    logger.info(
+      { registrationId: registration.id, userId: user.id },
+      'Feishu app registration started',
+    );
+    return c.json(
+      { registration: publicFeishuRegistration(registration, true) },
+      201,
+    );
+  } catch (error) {
+    return c.json(
+      {
+        error: `Failed to start Feishu app registration: ${errorMessage(error)}`,
+      },
+      502,
+    );
+  } finally {
+    const starting = (startingFeishuRegistrations.get(user.id) ?? 1) - 1;
+    if (starting > 0) startingFeishuRegistrations.set(user.id, starting);
+    else startingFeishuRegistrations.delete(user.id);
+  }
+});
+
+routes.get('/feishu/registrations/:registrationId', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  const registration = ownedFeishuRegistration(
+    c.req.param('registrationId'),
+    user.id,
+  );
+  if (!registration) return c.json({ error: 'Registration not found' }, 404);
+  const account = registration.accountId
+    ? getChannelAccountForUser(registration.accountId, user.id)
+    : undefined;
+  return c.json({
+    registration: publicFeishuRegistration(registration),
+    account: account ? publicAccount(account) : undefined,
+  });
+});
+
+routes.delete('/feishu/registrations/:registrationId', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  const registration = ownedFeishuRegistration(
+    c.req.param('registrationId'),
+    user.id,
+  );
+  if (!registration) return c.json({ error: 'Registration not found' }, 404);
+  if (registration.status === 'creating') {
+    return c.json(
+      {
+        error: 'The new app is already being saved as a channel account',
+        code: 'registration_completing',
+      },
+      409,
+    );
+  }
+  if (registration.status === 'pending') {
+    settleFeishuRegistration(registration, 'cancelled');
+  }
+  feishuRegistrations.delete(registration.id);
+  return c.json({ success: true });
 });
 
 routes.get('/:id', authMiddleware, (c) => {
@@ -648,7 +1080,7 @@ routes.patch('/:id', authMiddleware, async (c) => {
       400,
     );
   }
-  const targetError = validateTargets(user, parsed.data);
+  const targetError = validateTargets(user.id, parsed.data);
   if (targetError) return c.json({ error: targetError }, 400);
   const previousSecret = parsed.data.credentials
     ? loadChannelAccountSecret(current.secret_ref)

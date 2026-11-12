@@ -25,6 +25,7 @@ function LazyRow({
   failed,
   onClick,
   card = false,
+  pending = false,
 }: {
   icon: ComponentType<{ className?: string; 'aria-hidden'?: 'true' }>;
   label: string;
@@ -33,6 +34,8 @@ function LazyRow({
   onClick: () => void;
   /** Shaped like the process card's summary row, not like the older rows. */
   card?: boolean;
+  /** Held for a trace not stored yet: the row is there, not yet to open. */
+  pending?: boolean;
 }) {
   const icon = loading ? (
     <Loader2 className="size-3.5 shrink-0 animate-spin" aria-hidden="true" />
@@ -58,7 +61,7 @@ function LazyRow({
       <button
         type="button"
         onClick={onClick}
-        disabled={loading}
+        disabled={loading || pending}
         aria-busy={loading}
         className={card ? CARD_ROW_CLASS : ROW_CLASS}
       >
@@ -98,13 +101,25 @@ function LazyRow({
 export function LazyTurnTrace({
   message,
   reasoning,
+  stepsOnly = false,
   onRequest,
+  pending = false,
 }: {
   message: Pick<Message, 'id' | 'chat_jid' | 'turn_id'>;
   /** The server keeps reasoning text for this workspace (not just activity). */
   reasoning: boolean;
+  /**
+   * The server keeps only steps for this workspace (the progress the Agent
+   * sent, at `hidden`): one row in either layout.
+   */
+  stepsOnly?: boolean;
   /** Which row asked, so the loaded block opens at once. */
   onRequest: (row: 'thinking' | 'trace' | 'process') => void;
+  /**
+   * The reply's turn is still ending and its trace not stored: the rows hold
+   * their place, so the text does not move when it is, and open once it is.
+   */
+  pending?: boolean;
 }) {
   const { layout } = useStreamLayout();
   const status = useChatStore((s) => s.turnTraceStatus[message.id]);
@@ -121,7 +136,7 @@ export function LazyTurnTrace({
     onRequest(row);
     void loadTurnTrace(message);
   };
-  if (layout === 'timeline') {
+  if (layout === 'timeline' || stepsOnly) {
     return (
       <LazyRow
         icon={Sparkles}
@@ -129,6 +144,7 @@ export function LazyTurnTrace({
         loading={loading}
         failed={failed}
         onClick={ask('process')}
+        pending={pending}
         card
       />
     );
@@ -142,6 +158,7 @@ export function LazyTurnTrace({
           loading={loading}
           failed={failed}
           onClick={ask('thinking')}
+          pending={pending}
         />
       )}
       <LazyRow
@@ -150,6 +167,7 @@ export function LazyTurnTrace({
         loading={loading}
         failed={failed && !reasoning}
         onClick={ask('trace')}
+        pending={pending}
       />
     </>
   );

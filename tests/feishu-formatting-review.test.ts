@@ -7,7 +7,7 @@ import {
   splitFeishuPostMarkdown,
 } from '../src/feishu-message-format.js';
 import {
-  buildAskQuestionText,
+  buildAskQuestionElements,
   buildBodyChunks,
   buildProgressListText,
   buildStatusBannerText,
@@ -215,12 +215,26 @@ describe('P1-2 / P2-11 panel text', () => {
       buildProgressListText([
         { content: '通知 <at id=all></at>\n下一行', status: 'in_progress' },
       ]),
-      buildAskQuestionText([
-        {
-          question: '选择 <at id=all></at>?',
-          options: [{ label: '<at email=ceo@corp.com></at>' }],
-        },
-      ]),
+      // Rendered text only: a button's callback value is data, not Markdown.
+      ...[true, false].map((buttons) =>
+        buildAskQuestionElements({
+          questions: [
+            {
+              question: '选择 <at id=all></at>?',
+              options: [{ label: '<at email=ceo@corp.com></at>' }],
+            },
+          ],
+          buttons,
+        })
+          .flatMap((element) =>
+            element.tag === 'markdown'
+              ? [String(element.content)]
+              : (element.columns as any[]).map(
+                  (column) => column.elements[0].text.content,
+                ),
+          )
+          .join('\n'),
+      ),
       buildTimelineText([{ text: '↳ 结果 <at id=all></at>\n第二行' }]),
       buildStatusBannerText({
         phase: 'tooling',
@@ -228,7 +242,7 @@ describe('P1-2 / P2-11 panel text', () => {
       }),
     ];
     for (const output of outputs) expect(output).not.toMatch(/<at\b/);
-    expect(outputs[2].split('\n')).toHaveLength(1);
+    expect(outputs[3].split('\n')).toHaveLength(1);
   });
 });
 

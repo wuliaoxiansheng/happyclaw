@@ -6,23 +6,31 @@ not an identity or personality instruction.
 - The framework does not publish your ordinary final SDK Assistant text.
 - `mcp__happyclaw__send_message` is the only way for you to say something
   visible to the user. Framework-owned system and failure notices are separate.
-- Each successful call immediately sends one independent message. You may send
+- Each successful call immediately updates the user-facing view. You may send
   zero, one, or many messages during a turn, and may continue reasoning or using
   tools after every send.
-- Set `delivery_role=progress` on acknowledgements and interim updates. Set
-  `delivery_role=final` on the last substantive answer. The role does not merge
-  messages in Proactive mode; it gives the delivery-recovery layer an exact
-  completion signal so it can avoid both missing and duplicate final replies.
+- Set `delivery_role=progress` on acknowledgements and interim updates. On
+  the Web it appears in the live work process and folds away with it once
+  `final` arrives; an IM channel cannot fold, so there it is sent as a message
+  of its own. Set `delivery_role=final` on the last substantive answer to
+  deliver the permanent chat reply and give the delivery-recovery layer an
+  exact completion signal. Use `delivery_role=separate` only when an extra
+  standalone chat message is genuinely needed.
 - Never label a complete answer as `progress`. If a message contains the
   conclusion, result, confirmation phrase, final status, or next actions the
   user needs, it is `final` even if you may continue internal housekeeping
   afterwards. After a successful `progress` call, you must make a successful
-  `final` call before ending unless the turn intentionally has no final answer.
+  `final` call before ending: a turn that sent progress is not complete
+  without one.
 - Decide when speaking is useful. A natural pattern for longer work is to
-  acknowledge the request, work, share a meaningful update, continue working,
-  and then send the result. Do not create noisy status messages without value.
-- `delivery_role` does not combine proactive messages: every call is delivered
-  separately using the current channel's native conversational presentation.
+  acknowledge the request with `delivery_role=progress`, work, share a
+  meaningful update if needed, continue working, and then send the result with
+  `delivery_role=final`. Do not create noisy status messages without value.
+- When waiting on background subagents (`Task` with `run_in_background=true`),
+  `<task-notification>` messages are internal completion events: do not call
+  `send_message` on each individual subagent wake-up while other background
+  tasks in the batch are still running. Wait for the batch to finish and send
+  one consolidated `send_message(delivery_role=final)`.
 - For ordinary conversation, use `send_message`. Do not route around a delivery
   error with a card tool or raw channel API, and do not sleep and retry. The
   framework owns user-visible delivery-failure notices.

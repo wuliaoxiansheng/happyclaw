@@ -29,10 +29,16 @@ import {
   Music,
   AlertCircle,
   Copy,
+  Ellipsis,
 } from 'lucide-react';
-import { useFileStore, FileEntry, toBase64Url } from '../../stores/files';
+import {
+  useFileStore,
+  FileEntry,
+  toBase64Url,
+  workspaceFilesUrl,
+} from '../../stores/files';
 import { useChatStore } from '../../stores/chat';
-import { useAuthStore } from '../../stores/auth';
+import { useAuthStore, useIsGuest } from '../../stores/auth';
 import { useScrollIsolation } from '../../hooks/useScrollIsolation';
 import { api } from '../../api/client';
 import { withBasePath } from '../../utils/url';
@@ -48,6 +54,8 @@ import {
 } from '@/components/ui/dialog';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { IconButton } from '@/components/common/IconButton';
+import { ActionSheet } from '@/components/common/ActionSheet';
+import type { MenuAction } from '@/components/common/ResponsiveMenu';
 import {
   SegmentedControl,
   type SegmentedOption,
@@ -59,6 +67,8 @@ import { Badge } from '@/components/ui/badge';
 import { Label } from '@/components/ui/label';
 import { cn } from '@/lib/utils';
 import { useVisibleInterval } from '../../hooks/useVisibleInterval';
+import { useLongPress } from '../../hooks/useLongPress';
+import { useIsPhone } from '../layout/phone';
 import { FileUploadZone } from './FileUploadZone';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { PreviewDialog } from './PreviewDialog';
@@ -144,6 +154,19 @@ const ARCHIVE_EXTENSIONS = new Set([
 
 const PDF_EXTENSIONS = new Set(['pdf']);
 
+// 与后端 office-preview.ts 的 OFFICE_PREVIEW_EXTENSIONS 保持一致
+const OFFICE_EXTENSIONS = new Set([
+  'doc',
+  'docx',
+  'xls',
+  'xlsx',
+  'ppt',
+  'pptx',
+  'odt',
+  'ods',
+  'odp',
+]);
+
 const VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'mov', 'avi', 'mkv']);
 
 const AUDIO_EXTENSIONS = new Set(['mp3', 'wav', 'ogg', 'aac', 'm4a', 'flac']);
@@ -207,6 +230,7 @@ type PreviewState =
   | { kind: 'edit'; file: FileEntry }
   | { kind: 'markdown'; file: FileEntry }
   | { kind: 'pdf'; file: FileEntry }
+  | { kind: 'office'; file: FileEntry }
   | { kind: 'video'; file: FileEntry }
   | { kind: 'audio'; file: FileEntry }
   | { kind: 'text'; file: FileEntry };
@@ -216,11 +240,12 @@ type PreviewState =
 const PREVIEW_FRAME_CLASS =
   'inset-0 h-[100dvh] w-screen sm:left-1/2 sm:top-1/2 sm:h-[90vh] sm:w-[calc(100vw-2rem)] sm:max-w-4xl sm:-translate-x-1/2 sm:-translate-y-1/2 sm:supports-[height:100dvh]:h-[90dvh]';
 const PREVIEW_SHELL_CLASS =
-  'flex h-full w-full flex-col bg-surface-raised sm:animate-in sm:rounded-xl sm:shadow-floating sm:ring-1 sm:ring-foreground/10 sm:duration-200 sm:zoom-in-95';
+  'flex h-full w-full flex-col bg-surface-raised [--md-table-bg:var(--surface-raised)] sm:animate-in sm:rounded-xl sm:shadow-floating sm:ring-1 sm:ring-foreground/10 sm:duration-200 sm:zoom-in-95';
 const PREVIEW_HEADER_CLASS =
   'flex h-12 shrink-0 items-center justify-between gap-2 border-b border-surface-border pr-2 pl-3 sm:pl-4';
+// Keyboard hints only; a phone has no Esc or Ctrl+S to press.
 const PREVIEW_FOOTER_CLASS =
-  'shrink-0 border-t border-surface-border px-3 py-2 text-caption text-muted-foreground sm:px-4';
+  'shrink-0 border-t border-surface-border px-3 py-2 text-caption text-muted-foreground sm:px-4 phone:hidden';
 const PREVIEW_TEXTAREA_CLASS =
   'h-full w-full resize-none font-mono text-body text-foreground md:text-body';
 
@@ -232,6 +257,40 @@ const MARKDOWN_MODE_OPTIONS: SegmentedOption<'preview' | 'edit'>[] = [
 const BREADCRUMB_BUTTON_CLASS =
   'shrink-0 px-1.5 text-caption font-normal pointer-coarse:h-8';
 const FILE_ACTION_CLASS = 'text-muted-foreground pointer-coarse:size-9';
+
+// ─── Phone file row ──────────────────────────────────────────────
+
+/**
+ * A phone's file row: one ⋯ instead of four small buttons, and a long press
+ * on the row does the same. Both open the panel's single action sheet.
+ */
+function PhoneFileRow({
+  onOpenMenu,
+  children,
+}: {
+  onOpenMenu: () => void;
+  children: React.ReactNode;
+}) {
+  const longPress = useLongPress(onOpenMenu);
+  return (
+    <div
+      role="listitem"
+      {...longPress}
+      className="flex h-11 items-center gap-1 rounded-md pr-1 transition-colors active:bg-surface-hover"
+    >
+      {children}
+      <IconButton
+        // The row names the file; the label stays out of its name match.
+        label="更多操作"
+        icon={<Ellipsis />}
+        hideTooltip
+        aria-haspopup="dialog"
+        onClick={onOpenMenu}
+        className="text-muted-foreground"
+      />
+    </div>
+  );
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
@@ -246,9 +305,13 @@ function formatSize(bytes: number): string {
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 }
 
-function buildPreviewUrl(groupJid: string, filePath: string): string {
+function buildPreviewUrl(
+  groupJid: string,
+  filePath: string,
+  route: 'preview' | 'office-preview' = 'preview',
+): string {
   return withBasePath(
-    `/api/groups/${encodeURIComponent(groupJid)}/files/preview/${toBase64Url(filePath)}`,
+    workspaceFilesUrl(groupJid, `files/${route}/${toBase64Url(filePath)}`),
   );
 }
 
@@ -304,7 +367,7 @@ function ImagePreview({
       <img
         src={buildPreviewUrl(groupJid, file.path)}
         alt={file.name}
-        className="max-h-[calc(100dvh-2rem)] max-w-[calc(100vw-2rem)] object-contain rounded-lg"
+        className="max-h-[calc(100dvh-2rem)] max-w-[calc(100vw-2rem)] touch-callout-default object-contain rounded-lg"
         onClick={(e) => e.stopPropagation()}
       />
     </MediaOverlay>
@@ -435,10 +498,13 @@ function MarkdownFileViewer({
   groupJid,
   file,
   onClose,
+  readOnly = false,
 }: {
   groupJid: string;
   file: FileEntry;
   onClose: () => void;
+  /** Preview only (read-only guests): no edit mode, no save. */
+  readOnly?: boolean;
 }) {
   const { getFileContent, saveFileContent } = useFileStore();
   const [content, setContent] = useState('');
@@ -482,7 +548,7 @@ function MarkdownFileViewer({
   }, [groupJid, file.path, getFileContent]);
 
   const doSave = async () => {
-    if (!dirty || saving || mode !== 'edit') return;
+    if (readOnly || !dirty || saving || mode !== 'edit') return;
     setSaving(true);
     const ok = await saveFileContent(groupJid, file.path, editContent);
     setSaving(false);
@@ -528,18 +594,20 @@ function MarkdownFileViewer({
             )}
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            <SegmentedControl
-              label="查看方式"
-              value={mode}
-              options={MARKDOWN_MODE_OPTIONS}
-              onChange={(next) => {
-                if (next === 'edit') {
-                  if (mode !== 'edit') switchToEdit();
-                } else {
-                  switchToPreview();
-                }
-              }}
-            />
+            {!readOnly && (
+              <SegmentedControl
+                label="查看方式"
+                value={mode}
+                options={MARKDOWN_MODE_OPTIONS}
+                onChange={(next) => {
+                  if (next === 'edit') {
+                    if (mode !== 'edit') switchToEdit();
+                  } else {
+                    switchToPreview();
+                  }
+                }}
+              />
+            )}
             {mode === 'edit' && (
               <Button
                 onClick={doSave}
@@ -608,9 +676,11 @@ function MarkdownFileViewer({
 
         {/* Footer */}
         <div className={PREVIEW_FOOTER_CLASS}>
-          {mode === 'edit'
-            ? 'Ctrl/Cmd+S 保存 · Esc 关闭'
-            : '点击「编辑」修改内容 · Esc 关闭'}
+          {readOnly
+            ? 'Esc 关闭'
+            : mode === 'edit'
+              ? 'Ctrl/Cmd+S 保存 · Esc 关闭'
+              : '点击「编辑」修改内容 · Esc 关闭'}
         </div>
       </div>
     </PreviewDialog>
@@ -620,11 +690,11 @@ function MarkdownFileViewer({
 // ─── PDF Preview Overlay ────────────────────────────────────────
 
 function PdfPreview({
-  groupJid,
+  src,
   file,
   onClose,
 }: {
-  groupJid: string;
+  src: string;
   file: FileEntry;
   onClose: () => void;
 }) {
@@ -662,12 +732,113 @@ function PdfPreview({
     <MediaOverlay onClose={onClose} fileName={file.name}>
       <iframe
         ref={iframeRef}
-        src={buildPreviewUrl(groupJid, file.path)}
+        src={src}
         title={file.name}
         className="h-[90dvh] w-[90vw] rounded-lg bg-white"
         tabIndex={0}
         onLoad={() => setViewerLoadVersion((version) => version + 1)}
       />
+    </MediaOverlay>
+  );
+}
+
+// ─── Office Preview Overlay (server-side convert to PDF) ────────
+
+type OfficePreviewLoad =
+  | { status: 'loading' }
+  | { status: 'ready' }
+  | { status: 'error'; message: string };
+
+/** A HEAD response has no body, so the status (one per error code) speaks. */
+const OFFICE_PREVIEW_ERRORS: Record<number, string> = {
+  400: '不支持预览这种文件',
+  401: '登录已过期，请重新登录',
+  403: '没有权限预览这个文件',
+  404: '文件不存在',
+  413: '文件太大，无法预览',
+  501: '未配置 Office 预览转换器',
+  502: '转换失败',
+  503: '正在转换的文件较多，请稍后再试',
+  504: '转换超时',
+};
+
+export function OfficePreview({
+  groupJid,
+  file,
+  onClose,
+  onDownload,
+}: {
+  groupJid: string;
+  file: FileEntry;
+  onClose: () => void;
+  onDownload: (file: FileEntry) => void;
+}) {
+  const [state, setState] = useState<OfficePreviewLoad>({ status: 'loading' });
+  const url = buildPreviewUrl(groupJid, file.path, 'office-preview');
+
+  useEffect(() => {
+    // HEAD runs the conversion and reports how it went without sending the
+    // PDF; the iframe then loads the same URL from the server's cache, so
+    // the PDF keeps the response's CSP sandbox (a blob: URL would not).
+    const controller = new AbortController();
+    setState({ status: 'loading' });
+    fetch(url, {
+      method: 'HEAD',
+      credentials: 'include',
+      signal: controller.signal,
+    })
+      .then(
+        (res): OfficePreviewLoad =>
+          res.ok
+            ? { status: 'ready' }
+            : {
+                status: 'error',
+                message:
+                  OFFICE_PREVIEW_ERRORS[res.status] ??
+                  `Office 预览失败 (${res.status})`,
+              },
+        (): OfficePreviewLoad => ({
+          status: 'error',
+          message: '网络连接失败，请稍后重试',
+        }),
+      )
+      .then((next) => {
+        if (!controller.signal.aborted) setState(next);
+      });
+    return () => controller.abort();
+  }, [url]);
+
+  if (state.status === 'ready') {
+    return <PdfPreview src={url} file={file} onClose={onClose} />;
+  }
+
+  return (
+    <MediaOverlay onClose={onClose} fileName={file.name}>
+      <div
+        className="flex w-[min(90vw,24rem)] flex-col items-center gap-3 rounded-xl bg-surface-raised p-6 text-center"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {state.status === 'loading' ? (
+          <>
+            <Loader2 className="size-6 animate-spin text-muted-foreground" />
+            <p className="text-body text-foreground">正在转换为 PDF 预览...</p>
+            <p className="text-caption text-muted-foreground">
+              首次打开较大文件可能需要几十秒，之后会使用缓存。
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="text-body text-foreground">无法预览此文件</p>
+            <p className="text-caption text-muted-foreground">
+              {state.message}
+            </p>
+            <Button onClick={() => onDownload(file)}>
+              <Download />
+              下载原文件
+            </Button>
+          </>
+        )}
+      </div>
     </MediaOverlay>
   );
 }
@@ -859,6 +1030,10 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
     navigateTo,
   } = useFileStore();
 
+  const isPhone = useIsPhone();
+  // The file of the phone's action sheet; it stays while the sheet closes.
+  const [menuTarget, setMenuTarget] = useState<FileEntry | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
   const newDirInputId = useId();
   const [createDirModal, setCreateDirModal] = useState(false);
   const [newDirName, setNewDirName] = useState('');
@@ -877,8 +1052,18 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
   // Preview / Editor state — only one overlay can be open at a time
   const [preview, setPreview] = useState<PreviewState>(null);
 
-  const isStreaming = useChatStore((s) => !!s.streaming[groupJid]);
-  const canOpenLocalFolder = useAuthStore((s) => s.user?.role === 'admin');
+  // Any of the workspace's sessions at work may be writing files. Few
+  // sessions stream at once: look those up, not every session's row.
+  const isStreaming = useChatStore((s) =>
+    Object.keys(s.agentStreaming).some((id) =>
+      s.agents[groupJid]?.some((agent) => agent.id === id),
+    ),
+  );
+  // Read-only viewers (guests) browse, preview and download only.
+  const readOnly = useIsGuest();
+  const canOpenLocalFolder = useAuthStore(
+    (s) => s.user?.role === 'admin' && !readOnly,
+  );
   const prevStreamingRef = useRef(false);
   const fileListScrollRef = useRef<HTMLDivElement>(null);
 
@@ -939,22 +1124,24 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
         setPreview({ kind: 'image', file: item });
       } else if (PDF_EXTENSIONS.has(ext)) {
         setPreview({ kind: 'pdf', file: item });
+      } else if (OFFICE_EXTENSIONS.has(ext)) {
+        setPreview({ kind: 'office', file: item });
       } else if (VIDEO_EXTENSIONS.has(ext)) {
         setPreview({ kind: 'video', file: item });
       } else if (AUDIO_EXTENSIONS.has(ext)) {
         setPreview({ kind: 'audio', file: item });
-      } else if (ext === 'md' && isEntryEditable(item)) {
+      } else if (ext === 'md' && (readOnly || isEntryEditable(item))) {
         setPreview({ kind: 'markdown', file: item });
       } else {
         setPreview({ kind: 'text', file: item });
       }
     },
-    [groupJid, navigateTo],
+    [groupJid, navigateTo, readOnly],
   );
 
   const handleDownload = (item: FileEntry) => {
     const encoded = toBase64Url(item.path);
-    const url = `/api/groups/${encodeURIComponent(groupJid)}/files/download/${encoded}`;
+    const url = workspaceFilesUrl(groupJid, `files/download/${encoded}`);
     downloadFromUrl(url, item.name).catch((err) => {
       console.error('Download failed:', err);
       showToast(
@@ -975,6 +1162,41 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
           err instanceof Error ? err.message : '无法写入剪贴板',
         );
       });
+  };
+
+  const fileActions = (item: FileEntry): MenuAction[][] => {
+    const actions: MenuAction[] = [
+      {
+        label: '复制绝对路径',
+        icon: Copy,
+        onSelect: () => handleCopyPath(item),
+      },
+    ];
+    if (isEntryEditable(item) && TEXT_EXTENSIONS.has(getFileExt(item.name))) {
+      actions.push({
+        label: '编辑文件',
+        icon: Pencil,
+        onSelect: () => setPreview({ kind: 'edit', file: item }),
+      });
+    }
+    if (item.type === 'file') {
+      actions.push({
+        label: '下载文件',
+        icon: Download,
+        onSelect: () => handleDownload(item),
+      });
+    }
+    const remove: MenuAction[] = item.isSystem
+      ? []
+      : [
+          {
+            label: item.type === 'directory' ? '删除文件夹' : '删除文件',
+            icon: Trash2,
+            destructive: true,
+            onSelect: () => handleDeleteClick(item),
+          },
+        ];
+    return [actions, remove];
   };
 
   const handleDeleteClick = (item: FileEntry) => {
@@ -1006,12 +1228,9 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
     setOpenDirLoading(true);
     setOpenDirError(null);
     try {
-      await api.post(
-        `/api/groups/${encodeURIComponent(groupJid)}/files/open-directory`,
-        {
-          path: currentDir,
-        },
-      );
+      await api.post(workspaceFilesUrl(groupJid, 'files/open-directory'), {
+        path: currentDir,
+      });
     } catch (err) {
       if (err instanceof Error) {
         setOpenDirError(err.message);
@@ -1172,25 +1391,44 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                     )}
                   </>
                 );
+                const main = clickable ? (
+                  <button
+                    type="button"
+                    onClick={() => handleItemClick(item)}
+                    className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md pl-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
+                  >
+                    {summary}
+                  </button>
+                ) : (
+                  <div className="flex h-full min-w-0 flex-1 items-center gap-2 pl-2">
+                    {summary}
+                  </div>
+                );
+                if (isPhone) {
+                  return (
+                    <PhoneFileRow
+                      key={item.path}
+                      onOpenMenu={() => {
+                        setMenuTarget(item);
+                        setMenuOpen(true);
+                      }}
+                    >
+                      {main}
+                      {item.type === 'file' && (
+                        <span className="shrink-0 px-1 text-micro text-faint-foreground tabular-nums">
+                          {formatSize(item.size)}
+                        </span>
+                      )}
+                    </PhoneFileRow>
+                  );
+                }
                 return (
                   <div
                     key={item.path}
                     role="listitem"
                     className="group/file flex h-8 items-center gap-1 rounded-md pr-1 transition-colors hover:bg-surface-hover pointer-coarse:h-11"
                   >
-                    {clickable ? (
-                      <button
-                        type="button"
-                        onClick={() => handleItemClick(item)}
-                        className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md pl-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-inset"
-                      >
-                        {summary}
-                      </button>
-                    ) : (
-                      <div className="flex h-full min-w-0 flex-1 items-center gap-2 pl-2">
-                        {summary}
-                      </div>
-                    )}
+                    {main}
 
                     {/* Size gives way to the actions on hover / focus. */}
                     {item.type === 'file' && (
@@ -1211,7 +1449,8 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                       />
                       {/* Edit button for editable text files (系统文件里的
                           CLAUDE.md 例外也可编辑，但仍然没有删除按钮) */}
-                      {isEntryEditable(item) &&
+                      {!readOnly &&
+                        isEntryEditable(item) &&
                         TEXT_EXTENSIONS.has(getFileExt(item.name)) && (
                           <IconButton
                             label="编辑文件"
@@ -1230,7 +1469,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                           className={FILE_ACTION_CLASS}
                         />
                       )}
-                      {!item.isSystem && (
+                      {!readOnly && !item.isSystem && (
                         <IconButton
                           label="删除文件"
                           icon={<Trash2 />}
@@ -1252,20 +1491,35 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
       </div>
 
       {/* Footer */}
-      <div className="shrink-0 space-y-2 border-t border-surface-border p-3">
-        <Button variant="outline" onClick={handleCreateDir} className="w-full">
-          <FolderPlus />
-          新建文件夹
-        </Button>
-        <FileUploadZone groupJid={groupJid} />
-      </div>
+      {!readOnly && (
+        <div className="shrink-0 space-y-2 border-t border-surface-border p-3">
+          <Button
+            variant="outline"
+            onClick={handleCreateDir}
+            className="w-full phone:h-11"
+          >
+            <FolderPlus />
+            新建文件夹
+          </Button>
+          <FileUploadZone groupJid={groupJid} />
+        </div>
+      )}
+
+      {isPhone && (
+        <ActionSheet
+          open={menuOpen}
+          onOpenChange={setMenuOpen}
+          title={menuTarget?.name ?? ''}
+          groups={menuTarget ? fileActions(menuTarget) : []}
+        />
+      )}
 
       {/* Create Directory Dialog */}
       <Dialog
         open={createDirModal}
         onOpenChange={(v) => !v && setCreateDirModal(false)}
       >
-        <DialogContent className="sm:max-w-sm">
+        <DialogContent className="sm:max-w-sm" autoFocusOnPhone>
           <DialogHeader>
             <DialogTitle>新建文件夹</DialogTitle>
           </DialogHeader>
@@ -1329,7 +1583,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
           onClose={() => setPreview(null)}
         />
       )}
-      {preview?.kind === 'edit' && (
+      {preview?.kind === 'edit' && !readOnly && (
         <TextEditor
           groupJid={groupJid}
           file={preview.file}
@@ -1341,13 +1595,22 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
           groupJid={groupJid}
           file={preview.file}
           onClose={() => setPreview(null)}
+          readOnly={readOnly}
         />
       )}
       {preview?.kind === 'pdf' && (
         <PdfPreview
+          src={buildPreviewUrl(groupJid, preview.file.path)}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
+      )}
+      {preview?.kind === 'office' && (
+        <OfficePreview
           groupJid={groupJid}
           file={preview.file}
           onClose={() => setPreview(null)}
+          onDownload={handleDownload}
         />
       )}
       {preview?.kind === 'video' && (

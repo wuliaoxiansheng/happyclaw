@@ -6,6 +6,7 @@
  * to their home container.
  */
 import {
+  type ChatReachability,
   type IMChannel,
   type IMChannelConnectOpts,
   type ChannelMessageDeliveryOptions,
@@ -27,13 +28,18 @@ import type {
   DiscordGuildInfo,
 } from './discord.js';
 import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
+import type { FeishuBrand } from './feishu-domain.js';
+import type { ChannelCommandMention } from './im-group-audience.js';
 import type { WeChatConnectionState } from './wechat.js';
 import type { WeComConnectionConfig, WeComConnectionState } from './wecom.js';
 import type { WhatsAppConnectionState } from './whatsapp.js';
 import { rm } from 'fs/promises';
 import crypto from 'node:crypto';
 import { DATA_DIR } from './config.js';
-import type { StreamingSession } from './im-channel.js';
+import type {
+  StreamingSession,
+  StreamingSessionOptions,
+} from './im-channel.js';
 import type { StreamingCardLifecycle } from './feishu-streaming-card.js';
 import type { StreamingCardRecord } from './channel-reliability-store.js';
 import {
@@ -49,7 +55,6 @@ import { logger } from './logger.js';
 import type {
   ChannelMessageMeta,
   ChannelTurnContext,
-  FollowUpAction,
   FollowUpActionResult,
   FollowUpDisposition,
   FollowUpMode,
@@ -94,6 +99,8 @@ export interface UserIMConnection {
 export interface FeishuConnectConfig {
   appId: string;
   appSecret: string;
+  /** Feishu (China) or Lark (international); absent means Feishu. */
+  domain?: FeishuBrand;
   enabled?: boolean;
 }
 
@@ -101,6 +108,8 @@ export interface TelegramConnectConfig {
   botToken: string;
   proxyUrl?: string;
   enabled?: boolean;
+  /** Edit-based answer streaming; on unless the account opts out. */
+  streamingMode?: 'edit' | 'off';
 }
 
 export interface QQConnectConfig {
@@ -161,11 +170,7 @@ export interface ConnectFeishuOptions {
     chatJid: string,
     command: string,
     senderImId?: string,
-    mentions?: Array<{
-      key?: string;
-      name?: string;
-      id?: { open_id?: string };
-    }>,
+    mentions?: ChannelCommandMention[],
     messageMeta?: ChannelMessageMeta,
   ) => Promise<string | null>;
   resolveGroupFolder?: (chatJid: string) => string | undefined;
@@ -210,14 +215,6 @@ export interface ConnectFeishuOptions {
     /** Native chat type of the command message, when known. */
     chatType?: 'p2p' | 'group';
   }) => Promise<string>;
-  onFollowUpCardAction?: (input: {
-    sourceJid: string;
-    targetJid: string;
-    messageId: string;
-    action: FollowUpAction;
-    expectedRunId: string;
-    operatorImId: string;
-  }) => Promise<FollowUpActionResult> | FollowUpActionResult;
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   onBotRemovedFromGroup?: (chatJid: string) => void;
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
@@ -237,7 +234,24 @@ export interface ConnectFeishuOptions {
     chatJid: string,
     messageId: string,
   ) => void | Promise<void>;
+  getOwnerOpenId?: IMChannelConnectOpts['getOwnerOpenId'];
+  onTransportIssue?: IMChannelConnectOpts['onTransportIssue'];
 }
+
+/** Durable follow-up queue and `/steer`/`/break` host callbacks. */
+type ConnectorQueueOptions = Pick<
+  IMChannelConnectOpts,
+  | 'onFollowUpMessage'
+  | 'onFollowUpsChanged'
+  | 'onSessionBreak'
+  | 'lookupEffectiveChatJid'
+>;
+
+/** Group response-audience host callbacks. */
+type ConnectorAudienceOptions = Pick<
+  IMChannelConnectOpts,
+  'isSenderAllowedInGroup' | 'resolveRegisteredGroup'
+>;
 
 export class IMConnectionManager {
   private connections = new Map<string, UserIMConnection>();
@@ -524,6 +538,24 @@ export class IMConnectionManager {
             },
           }
         : {}),
+      ...(opts.lookupEffectiveChatJid
+        ? {
+            lookupEffectiveChatJid: (
+              jid: string,
+              meta?: ChannelMessageMeta,
+            ) => {
+              if (!inboundAllowed()) return null;
+              const found = opts.lookupEffectiveChatJid!(scope(jid), meta);
+              if (!found) return null;
+              return {
+                ...found,
+                ...(found.sourceJid
+                  ? { sourceJid: scope(found.sourceJid) }
+                  : {}),
+              };
+            },
+          }
+        : {}),
       ...(opts.onAgentMessage
         ? {
             onAgentMessage: (jid: string, agentId: string) => {
@@ -592,21 +624,6 @@ export class IMConnectionManager {
                     sourceJid: scope(input.sourceJid),
                   })
                 : Promise.resolve('当前通道暂不可用。'),
-          }
-        : {}),
-      ...(opts.onFollowUpCardAction
-        ? {
-            onFollowUpCardAction: (
-              input: Parameters<
-                NonNullable<IMChannelConnectOpts['onFollowUpCardAction']>
-              >[0],
-            ) =>
-              inboundAllowed()
-                ? opts.onFollowUpCardAction!(input)
-                : {
-                    ok: false,
-                    message: '当前连接已停用，无法执行操作。',
-                  },
           }
         : {}),
       ...(opts.onBotAddedToGroup
@@ -1159,24 +1176,18 @@ export class IMConnectionManager {
   }
 
   /**
-   * Create a streaming card session for an IM chat (Feishu or DingTalk).
-   * Returns undefined for unsupported channels.
+   * Create a streaming card session for an IM chat.
+   * Returns undefined for channels whose adapter has no streaming support.
    */
   async createStreamingSession(
     jid: string,
     onCardCreated?: (messageId: string) => void,
     lifecycle?: StreamingCardLifecycle,
     inputMessageId?: string,
+    options?: StreamingSessionOptions,
   ): Promise<StreamingSession | undefined> {
     const channelType = getChannelType(jid);
-    if (
-      channelType !== 'feishu' &&
-      channelType !== 'dingtalk' &&
-      channelType !== 'discord' &&
-      channelType !== 'qq' &&
-      channelType !== 'wecom'
-    )
-      return undefined;
+    if (!channelType) return undefined;
 
     // Check DingTalk streaming mode: if text mode, skip streaming session creation
     if (channelType === 'dingtalk') {
@@ -1209,6 +1220,7 @@ export class IMConnectionManager {
         onCardCreated,
         lifecycle,
         inputMessageId,
+        options,
       );
     }
     return undefined;
@@ -1419,6 +1431,7 @@ export class IMConnectionManager {
       appId: config.appId,
       appSecret: config.appSecret,
       channelAccountId: options?.accountId,
+      domain: config.domain,
     });
 
     return this.connectChannel(
@@ -1442,7 +1455,6 @@ export class IMConnectionManager {
         onSessionBreak: options?.onSessionBreak,
         onSessionClear: options?.onSessionClear,
         onSessionFresh: options?.onSessionFresh,
-        onFollowUpCardAction: options?.onFollowUpCardAction,
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
@@ -1452,6 +1464,8 @@ export class IMConnectionManager {
         onCardInterrupt: options?.onCardInterrupt,
         onP2pSender: options?.onP2pSender,
         onMessageRecalled: options?.onMessageRecalled,
+        getOwnerOpenId: options?.getOwnerOpenId,
+        onTransportIssue: options?.onTransportIssue,
       },
       options?.accountId,
       options?.scopeIncomingJids,
@@ -1475,7 +1489,7 @@ export class IMConnectionManager {
     options?: {
       accountId?: string;
       scopeIncomingJids?: boolean;
-      onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+      onCommand?: IMChannelConnectOpts['onCommand'];
       ignoreMessagesBefore?: number;
       resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (chatJid: string) => {
@@ -1491,17 +1505,18 @@ export class IMConnectionManager {
         chatJid: string,
         contextType: 'thread',
       ) => boolean | void | Promise<boolean | void>;
-    },
+    } & ConnectorQueueOptions &
+      ConnectorAudienceOptions,
   ): Promise<boolean> {
     if (!config.botToken) {
       logger.info({ userId }, 'Telegram config empty, skipping connection');
       return false;
     }
 
-    const channel = createTelegramChannel({
-      botToken: config.botToken,
-      proxyUrl: config.proxyUrl,
-    });
+    const channel = createTelegramChannel(
+      { botToken: config.botToken, proxyUrl: config.proxyUrl },
+      { streamingMode: config.streamingMode },
+    );
 
     return this.connectChannel(
       userId,
@@ -1518,11 +1533,17 @@ export class IMConnectionManager {
         ignoreMessagesBefore: options?.ignoreMessagesBefore,
         resolveGroupFolder: options?.resolveGroupFolder,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
+        lookupEffectiveChatJid: options?.lookupEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
         onMessagePersisted: options?.onMessagePersisted,
+        onFollowUpMessage: options?.onFollowUpMessage,
+        onFollowUpsChanged: options?.onFollowUpsChanged,
+        onSessionBreak: options?.onSessionBreak,
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
         onNativeContextDetected: options?.onNativeContextDetected,
+        isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
+        resolveRegisteredGroup: options?.resolveRegisteredGroup,
       },
       options?.accountId,
       options?.scopeIncomingJids,
@@ -1546,7 +1567,7 @@ export class IMConnectionManager {
     options?: {
       accountId?: string;
       scopeIncomingJids?: boolean;
-      onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+      onCommand?: IMChannelConnectOpts['onCommand'];
       resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (chatJid: string) => {
         effectiveJid: string;
@@ -1555,10 +1576,8 @@ export class IMConnectionManager {
       } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
       onMessagePersisted?: IMChannelConnectOpts['onMessagePersisted'];
-      onFollowUpMessage?: IMChannelConnectOpts['onFollowUpMessage'];
-      onFollowUpsChanged?: IMChannelConnectOpts['onFollowUpsChanged'];
-      onSessionBreak?: IMChannelConnectOpts['onSessionBreak'];
-    },
+    } & ConnectorQueueOptions &
+      ConnectorAudienceOptions,
   ): Promise<boolean> {
     if (!config.appId || !config.appSecret) {
       logger.info({ userId }, 'QQ config empty, skipping connection');
@@ -1589,6 +1608,8 @@ export class IMConnectionManager {
         onFollowUpMessage: options?.onFollowUpMessage,
         onFollowUpsChanged: options?.onFollowUpsChanged,
         onSessionBreak: options?.onSessionBreak,
+        isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
+        resolveRegisteredGroup: options?.resolveRegisteredGroup,
       },
       options?.accountId,
       options?.scopeIncomingJids,
@@ -1627,7 +1648,7 @@ export class IMConnectionManager {
       accountId?: string;
       scopeIncomingJids?: boolean;
       ignoreMessagesBefore?: number;
-      onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+      onCommand?: IMChannelConnectOpts['onCommand'];
       resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (chatJid: string) => {
         effectiveJid: string;
@@ -1644,7 +1665,7 @@ export class IMConnectionManager {
       ) => Promise<boolean>;
       onConnectionStateChange?: (state: WeChatConnectionState) => void;
       onUpdatesBuf?: (cursor: string) => void | Promise<void>;
-    },
+    } & ConnectorQueueOptions,
   ): Promise<boolean> {
     if (!config.botToken || !config.ilinkBotId) {
       logger.info({ userId }, 'WeChat config empty, skipping connection');
@@ -1685,6 +1706,9 @@ export class IMConnectionManager {
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
         onMessagePersisted: options?.onMessagePersisted,
+        onFollowUpMessage: options?.onFollowUpMessage,
+        onFollowUpsChanged: options?.onFollowUpsChanged,
+        onSessionBreak: options?.onSessionBreak,
         isChatAuthorized: options?.isChatAuthorized,
         onPairAttempt: options?.onPairAttempt,
         onWeChatConnectionStateChange: options?.onConnectionStateChange,
@@ -1707,6 +1731,7 @@ export class IMConnectionManager {
       accountId?: string;
       scopeIncomingJids?: boolean;
       ignoreMessagesBefore?: number;
+      resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (chatJid: string) => {
         effectiveJid: string;
         agentId: string | null;
@@ -1727,9 +1752,8 @@ export class IMConnectionManager {
       ) => Promise<boolean>;
       onConnectionStateChange?: (state: WeComConnectionState) => void;
       onCommand?: IMChannelConnectOpts['onCommand'];
-      isSenderAllowedInGroup?: IMChannelConnectOpts['isSenderAllowedInGroup'];
-      resolveRegisteredGroup?: IMChannelConnectOpts['resolveRegisteredGroup'];
-    },
+    } & ConnectorQueueOptions &
+      ConnectorAudienceOptions,
   ): Promise<boolean> {
     if (!config.botId || !config.secret) {
       logger.info({ userId }, 'WeCom config empty, skipping connection');
@@ -1759,9 +1783,13 @@ export class IMConnectionManager {
         isChatAuthorized: options?.isChatAuthorized,
         onPairAttempt: options?.onPairAttempt,
         onCommand: options?.onCommand,
+        resolveGroupFolder: options?.resolveGroupFolder,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
         onMessagePersisted: options?.onMessagePersisted,
+        onFollowUpMessage: options?.onFollowUpMessage,
+        onFollowUpsChanged: options?.onFollowUpsChanged,
+        onSessionBreak: options?.onSessionBreak,
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
         isGroupOwnerMessage: options?.isGroupOwnerMessage,
         isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
@@ -1772,10 +1800,6 @@ export class IMConnectionManager {
       options?.scopeIncomingJids,
       config.botId,
     );
-  }
-
-  async disconnectUserWeCom(userId: string): Promise<void> {
-    await this.disconnectChannel(userId, 'wecom');
   }
 
   /**
@@ -1798,7 +1822,7 @@ export class IMConnectionManager {
         chatName: string,
         code: string,
       ) => Promise<boolean>;
-      onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+      onCommand?: IMChannelConnectOpts['onCommand'];
       resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (chatJid: string) => {
         effectiveJid: string;
@@ -1814,17 +1838,14 @@ export class IMConnectionManager {
         senderImId?: string,
       ) => boolean;
       isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
-      isSenderAllowedInGroup?: (
-        chatJid: string,
-        senderImId?: string,
-      ) => boolean;
       normalizeIncomingJid?: (jid: string) => string | null;
       onConnectionUpdate?: (
         userId: string,
         accountId: string,
         state: WhatsAppConnectionStateSnapshot,
       ) => void;
-    },
+    } & ConnectorQueueOptions &
+      ConnectorAudienceOptions,
   ): Promise<boolean> {
     const { getWhatsAppAuthDir } = await import('./whatsapp-auth.js');
     const channel = createWhatsAppChannel(
@@ -1860,13 +1881,18 @@ export class IMConnectionManager {
         onCommand: options?.onCommand,
         resolveGroupFolder: options?.resolveGroupFolder,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
+        lookupEffectiveChatJid: options?.lookupEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
         onMessagePersisted: options?.onMessagePersisted,
+        onFollowUpMessage: options?.onFollowUpMessage,
+        onFollowUpsChanged: options?.onFollowUpsChanged,
+        onSessionBreak: options?.onSessionBreak,
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
         isGroupOwnerMessage: options?.isGroupOwnerMessage,
         isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
+        resolveRegisteredGroup: options?.resolveRegisteredGroup,
         normalizeIncomingJid: options?.normalizeIncomingJid,
       },
       options?.accountId,
@@ -1974,7 +2000,7 @@ export class IMConnectionManager {
         chatName: string,
         code: string,
       ) => Promise<boolean>;
-      onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+      onCommand?: IMChannelConnectOpts['onCommand'];
       resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (chatJid: string) => {
         effectiveJid: string;
@@ -1990,10 +2016,8 @@ export class IMConnectionManager {
         senderImId?: string,
       ) => boolean;
       isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
-      resolveRegisteredGroup?: (
-        jid: string,
-      ) => { activation_mode?: string } | undefined;
-    },
+    } & ConnectorQueueOptions &
+      ConnectorAudienceOptions,
   ): Promise<boolean> {
     if (!config.clientId || !config.clientSecret) {
       logger.info({ userId }, 'DingTalk config empty, skipping connection');
@@ -2029,10 +2053,14 @@ export class IMConnectionManager {
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
         onMessagePersisted: options?.onMessagePersisted,
+        onFollowUpMessage: options?.onFollowUpMessage,
+        onFollowUpsChanged: options?.onFollowUpsChanged,
+        onSessionBreak: options?.onSessionBreak,
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
         isGroupOwnerMessage: options?.isGroupOwnerMessage,
+        isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
         resolveRegisteredGroup: options?.resolveRegisteredGroup,
       },
       options?.accountId,
@@ -2062,7 +2090,7 @@ export class IMConnectionManager {
         chatName: string,
         code: string,
       ) => Promise<boolean>;
-      onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+      onCommand?: IMChannelConnectOpts['onCommand'];
       resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (chatJid: string) => {
         effectiveJid: string;
@@ -2078,7 +2106,8 @@ export class IMConnectionManager {
         senderImId?: string,
       ) => boolean;
       isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
-    },
+    } & ConnectorQueueOptions &
+      ConnectorAudienceOptions,
   ): Promise<boolean> {
     if (!config.botToken) return false;
     const channel = createDiscordChannel(
@@ -2098,12 +2127,18 @@ export class IMConnectionManager {
         onCommand: options?.onCommand,
         resolveGroupFolder: options?.resolveGroupFolder,
         resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
+        lookupEffectiveChatJid: options?.lookupEffectiveChatJid,
         onAgentMessage: options?.onAgentMessage,
         onMessagePersisted: options?.onMessagePersisted,
+        onFollowUpMessage: options?.onFollowUpMessage,
+        onFollowUpsChanged: options?.onFollowUpsChanged,
+        onSessionBreak: options?.onSessionBreak,
         onBotAddedToGroup: options?.onBotAddedToGroup,
         onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
         shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
         isGroupOwnerMessage: options?.isGroupOwnerMessage,
+        isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
+        resolveRegisteredGroup: options?.resolveRegisteredGroup,
       },
       options?.accountId,
       options?.scopeIncomingJids,
@@ -2113,74 +2148,6 @@ export class IMConnectionManager {
 
   async disconnectUserDiscord(userId: string): Promise<void> {
     await this.disconnectChannel(userId, 'discord');
-  }
-
-  /**
-   * Send a message to a Feishu chat.
-   * @deprecated Use sendMessage(jid, text) which auto-routes.
-   */
-  async sendFeishuMessage(
-    chatJid: string,
-    text: string,
-    localImagePaths?: string[],
-  ): Promise<void> {
-    const chatId = extractProviderTarget(chatJid);
-    const channel = this.findChannelForJid(chatJid, 'feishu');
-    if (channel) {
-      await channel.sendMessage(chatId, text, localImagePaths);
-      return;
-    }
-    logger.warn({ chatJid }, 'No Feishu connection available to send message');
-  }
-
-  /**
-   * Send a message to a Telegram chat.
-   * @deprecated Use sendMessage(jid, text) which auto-routes.
-   */
-  async sendTelegramMessage(
-    chatJid: string,
-    text: string,
-    localImagePaths?: string[],
-  ): Promise<void> {
-    const chatId = extractProviderTarget(chatJid);
-    const channel = this.findChannelForJid(chatJid, 'telegram');
-    if (channel) {
-      await channel.sendMessage(chatId, text, localImagePaths);
-      return;
-    }
-    logger.warn(
-      { chatJid },
-      'No Telegram connection available to send message',
-    );
-  }
-
-  /**
-   * Set Telegram typing chat action for a chat.
-   * @deprecated Use setTyping(jid, isTyping) which auto-routes.
-   */
-  async setTelegramTyping(chatJid: string, isTyping: boolean): Promise<void> {
-    const chatId = extractProviderTarget(chatJid);
-    const channel = this.findChannelForJid(chatJid, 'telegram');
-    if (channel) {
-      await channel.setTyping(chatId, isTyping);
-    }
-  }
-
-  /**
-   * Sync Feishu groups via a specific user's connection.
-   */
-  async syncFeishuGroups(userId: string, accountId?: string): Promise<void> {
-    const conn = this.connections.get(userId);
-    const effectiveId =
-      accountId ?? getDefaultChannelAccount(userId, 'feishu')?.id ?? null;
-    const channel =
-      conn?.channels.get(this.channelKey('feishu', accountId)) ??
-      (effectiveId
-        ? conn?.channels.get(this.channelKey('feishu', effectiveId))
-        : undefined);
-    if (channel?.isConnected() && channel.syncGroups) {
-      await channel.syncGroups();
-    }
   }
 
   /**
@@ -2334,30 +2301,6 @@ export class IMConnectionManager {
     );
   }
 
-  /** Get the Telegram channel for a user */
-  getTelegramConnection(userId: string): IMChannel | undefined {
-    const conn = this.connections.get(userId);
-    const account = getDefaultChannelAccount(userId, 'telegram');
-    return (
-      conn?.channels.get('telegram') ??
-      (account
-        ? conn?.channels.get(this.channelKey('telegram', account.id))
-        : undefined)
-    );
-  }
-
-  /** Get the QQ channel for a user */
-  getQQConnection(userId: string): IMChannel | undefined {
-    const conn = this.connections.get(userId);
-    const account = getDefaultChannelAccount(userId, 'qq');
-    return (
-      conn?.channels.get('qq') ??
-      (account
-        ? conn?.channels.get(this.channelKey('qq', account.id))
-        : undefined)
-    );
-  }
-
   /** Get chat info from the Feishu API for a specific user's connection */
   async getFeishuChatInfo(
     userId: string,
@@ -2375,12 +2318,13 @@ export class IMConnectionManager {
   }
 
   /**
-   * Get chat info for an IM group by JID, auto-routing to the correct connection.
-   * Used for health checks to detect disbanded groups.
+   * Get chat info for an IM group by JID, auto-routing to the correct
+   * connection, for binding and listing routes and backfill. The health
+   * check uses probeChat instead: a null here proves nothing about the chat.
    *
    * Returns:
-   * - object: chat info (reachable)
-   * - null: channel supports getChatInfo but chat is not reachable
+   * - object: chat info
+   * - null: the lookup failed or returned nothing (any reason)
    * - undefined: channel does not support getChatInfo (e.g. Telegram, QQ)
    */
   async getChatInfo(jid: string): Promise<
@@ -2404,6 +2348,20 @@ export class IMConnectionManager {
     }
     // Channel doesn't implement getChatInfo — not a reachability failure
     return undefined;
+  }
+
+  /**
+   * Probe whether an IM group is still visible to its bot, for the binding
+   * health check. `undefined` when the channel cannot probe (Telegram, QQ);
+   * `unknown` when no connection serves the JID right now.
+   */
+  async probeChat(jid: string): Promise<ChatReachability | undefined> {
+    const channelType = getChannelType(jid);
+    if (!channelType) return 'unknown';
+    const channel = this.findChannelForJid(jid, channelType);
+    if (!channel) return 'unknown';
+    if (!channel.probeChat) return undefined;
+    return channel.probeChat(extractProviderTarget(jid));
   }
 
   /** Get all user IDs with active connections */

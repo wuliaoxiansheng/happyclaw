@@ -15,7 +15,7 @@ const ownerInput = {
   source_jid: 'web:home',
   is_from_me: 0,
   source_kind: null,
-  task_id: null,
+  automation_run_id: null,
 };
 
 describe('Agent Builder host turn authorization', () => {
@@ -27,15 +27,15 @@ describe('Agent Builder host turn authorization', () => {
         chatJid: 'web:home',
         messageId: 'scheduled-queued',
         runtimeTurnId: 'scheduled-delivery',
-        scheduledTaskId: 'task-queued',
+        automationRunId: 'run-queued',
       },
     ]);
     const load = (_chatJid: string, messageId: string) =>
       messageId === 'scheduled-queued'
         ? {
             ...ownerInput,
-            task_id: 'task-queued',
-            source_kind: 'scheduled_task_prompt',
+            automation_run_id: 'run-queued',
+            source_kind: 'automation_prompt',
           }
         : ownerInput;
 
@@ -47,7 +47,7 @@ describe('Agent Builder host turn authorization', () => {
     ]);
     expect(
       registry.classifyActiveTurn('home', 'scheduled-delivery', load),
-    ).toBe('scheduled');
+    ).toBe('automation');
     registry.clearCompleted('home', [
       { chatJid: 'web:home', messageId: 'scheduled-queued' },
     ]);
@@ -71,13 +71,13 @@ describe('Agent Builder host turn authorization', () => {
         chatJid: 'web:home',
         messageId: 'cursor-a',
         runtimeTurnId: 'delivery-current',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
       {
         chatJid: 'web:home',
         messageId: 'cursor-b',
         runtimeTurnId: 'delivery-current',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
     ]);
     const load = () => ownerInput;
@@ -126,42 +126,42 @@ describe('Agent Builder host turn authorization', () => {
       chatJid: 'web:home',
       messageId: 'human-1',
       runtimeTurnId: 'human-1',
-      scheduledTaskId: null,
+      automationRunId: null,
       content: ownerInput.content,
     });
   });
 
   test.each([
     {
-      name: 'host-recorded scheduled task',
-      scheduledTaskId: 'task-1',
+      name: 'host-recorded automation run',
+      automationRunId: 'run-1',
       input: ownerInput,
     },
     {
-      name: 'database scheduled task marker',
-      scheduledTaskId: null,
-      input: { ...ownerInput, task_id: 'task-2' },
+      name: 'database automation run marker',
+      automationRunId: null,
+      input: { ...ownerInput, automation_run_id: 'run-2' },
     },
     {
-      name: 'scheduled source kind',
-      scheduledTaskId: null,
-      input: { ...ownerInput, source_kind: 'scheduled_task_prompt' },
+      name: 'automation source kind',
+      automationRunId: null,
+      input: { ...ownerInput, source_kind: 'automation_prompt' },
     },
     {
       name: 'assistant-authored row',
-      scheduledTaskId: null,
+      automationRunId: null,
       input: { ...ownerInput, is_from_me: 1 },
     },
-  ])('rejects $name', ({ scheduledTaskId, input }) => {
+  ])('rejects $name', ({ automationRunId, input }) => {
     const registry = new AgentBuilderTurnRegistry();
-    registry.set('home', 'web:home', 'message-1', scheduledTaskId);
+    registry.set('home', 'web:home', 'message-1', automationRunId);
     expect(() =>
       registry.requireOwnerHumanTurn(
         'home',
         () => input,
         () => true,
       ),
-    ).toThrow('scheduled or non-human');
+    ).toThrow('automation or non-human');
   });
 
   test('rejects a human message from a non-owner in a shared channel', () => {
@@ -202,30 +202,30 @@ describe('Agent Builder host turn authorization', () => {
     ).toThrow('active owner conversation turn');
   });
 
-  test('does not let an in-flight scheduled turn borrow a queued owner turn', () => {
+  test('does not let an in-flight automation turn borrow a queued owner turn', () => {
     const registry = new AgentBuilderTurnRegistry();
-    registry.set('home', 'web:home', 'scheduled-1', 'task-1');
+    registry.set('home', 'web:home', 'scheduled-1', 'run-1');
     registry.enqueueBatch('home', [
       {
         chatJid: 'web:home',
         messageId: 'owner-queued',
         runtimeTurnId: 'owner-queued',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
     ]);
     const load = (_chatJid: string, messageId: string) =>
       messageId === 'scheduled-1'
         ? {
             ...ownerInput,
-            content: 'scheduled prompt',
-            source_kind: 'scheduled_task_prompt',
-            task_id: 'task-1',
+            content: 'automation prompt',
+            source_kind: 'automation_prompt',
+            automation_run_id: 'run-1',
           }
         : ownerInput;
 
     expect(() =>
       registry.requireOwnerHumanTurn('home', load, () => true),
-    ).toThrow('scheduled or non-human');
+    ).toThrow('automation or non-human');
 
     registry.clearCompleted('home', [
       { chatJid: 'web:home', messageId: 'scheduled-1' },
@@ -235,7 +235,7 @@ describe('Agent Builder host turn authorization', () => {
     ).toBe('owner-queued');
   });
 
-  test('fails closed when a scheduled or non-owner input is queued behind an owner turn', () => {
+  test('fails closed when an automation or non-owner input is queued behind an owner turn', () => {
     const registry = new AgentBuilderTurnRegistry();
     registry.set('home', 'web:home', 'owner-running');
     registry.enqueueBatch('home', [
@@ -243,7 +243,7 @@ describe('Agent Builder host turn authorization', () => {
         chatJid: 'web:home',
         messageId: 'scheduled-queued',
         runtimeTurnId: 'scheduled-queued',
-        scheduledTaskId: 'task-2',
+        automationRunId: 'run-2',
       },
     ]);
     expect(() =>
@@ -251,11 +251,11 @@ describe('Agent Builder host turn authorization', () => {
         'home',
         (_chatJid, messageId) =>
           messageId === 'scheduled-queued'
-            ? { ...ownerInput, task_id: 'task-2' }
+            ? { ...ownerInput, automation_run_id: 'run-2' }
             : ownerInput,
         () => true,
       ),
-    ).toThrow('scheduled or non-human');
+    ).toThrow('automation or non-human');
   });
 
   test('retires startup inputs and already-completed queued receipts together', () => {
@@ -266,7 +266,7 @@ describe('Agent Builder host turn authorization', () => {
         chatJid: 'web:home',
         messageId: 'boot-drained-owner',
         runtimeTurnId: 'boot-drained-owner',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
     ]);
     registry.clearCompleted('home', [
@@ -292,7 +292,7 @@ describe('Agent Builder host turn authorization', () => {
         chatJid: 'web:home',
         messageId: 'confirmation-turn',
         runtimeTurnId: 'confirmation-delivery',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
     ]);
 
@@ -312,53 +312,31 @@ describe('Agent Builder host turn authorization', () => {
 
 describe('Agent Builder runtime eligibility', () => {
   const base = {
-    isScheduledTask: false,
-    isolatedTaskId: null,
-    runtimeAgentId: null,
-    runtimeAgentKind: null,
-    runtimeAgentFolder: null,
+    runtimeAgentKind: 'conversation',
+    runtimeAgentFolder: 'workspace-a',
     sourceFolder: 'workspace-a',
     sourceProfileIsDefault: true,
   } as const;
 
-  test('allows the main session and ordinary runtime sessions in any workspace', () => {
+  test('allows any conversation session of the workspace', () => {
     expect(getAgentBuilderRuntimeRejection(base)).toBeNull();
-    expect(
-      getAgentBuilderRuntimeRejection({
-        ...base,
-        runtimeAgentId: 'conversation-a',
-        runtimeAgentKind: 'conversation',
-        runtimeAgentFolder: 'workspace-a',
-      }),
-    ).toBeNull();
   });
 
-  test('rejects custom profiles, task runs, spawn agents, and cross-workspace impersonation', () => {
+  test('rejects custom profiles, spawn agents, and cross-workspace impersonation', () => {
     expect(
       getAgentBuilderRuntimeRejection({
         ...base,
         sourceProfileIsDefault: false,
       }),
     ).toMatch(/main HappyClaw/);
+    for (const runtimeAgentKind of ['spawn', 'task', null] as const) {
+      expect(
+        getAgentBuilderRuntimeRejection({ ...base, runtimeAgentKind }),
+      ).toMatch(/ordinary main-Agent conversations/);
+    }
     expect(
       getAgentBuilderRuntimeRejection({
         ...base,
-        isScheduledTask: true,
-      }),
-    ).toMatch(/task runs/);
-    expect(
-      getAgentBuilderRuntimeRejection({
-        ...base,
-        runtimeAgentId: 'spawn-a',
-        runtimeAgentKind: 'spawn',
-        runtimeAgentFolder: 'workspace-a',
-      }),
-    ).toMatch(/ordinary main-Agent conversations/);
-    expect(
-      getAgentBuilderRuntimeRejection({
-        ...base,
-        runtimeAgentId: 'conversation-b',
-        runtimeAgentKind: 'conversation',
         runtimeAgentFolder: 'workspace-b',
       }),
     ).toMatch(/ordinary main-Agent conversations/);

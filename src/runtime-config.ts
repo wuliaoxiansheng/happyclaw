@@ -3,8 +3,16 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
+import {
+  fileSignatureSettled,
+  sameFileSignature,
+  statFileSignature,
+  type FileSignature,
+} from './file-signature.js';
 import { ASSISTANT_NAME, DATA_DIR } from './config.js';
+import type { FeishuBrand } from './feishu-domain.js';
 import { logger } from './logger.js';
+import { HAPPYCLAW_OWNED_CLAUDE_ENV_KEYS } from './claude-provider-env.js';
 import { clearProviderQuotaObservation } from './provider-quota-observation.js';
 import {
   CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
@@ -17,6 +25,34 @@ import { resolveCodexDefaultEffort } from './codex-gateway/model-catalog.js';
 import { getResolvedCodexCatalog } from './codex-gateway/model-catalog-sync.js';
 import { normalizeLegacyCodexModel } from './codex-gateway/convert-request.js';
 import { retiredCodexReauthReason } from './codex-gateway/oauth.js';
+import {
+  buildConnectionModelEnv,
+  CONNECTION_ENV_PREFILL,
+  CONNECTION_MODEL_ENV_KEYS,
+  effectiveProviderModels,
+  findModelEntry,
+  getModelPreset,
+  isModelEffort,
+  isValidModelId,
+  launchModelName,
+  MAX_PROVIDER_MODEL_ID_LENGTH,
+  MAX_PROVIDER_MODELS,
+  MODEL_EFFORTS,
+  normalizeConnectionModelRoles,
+  normalizeContextWindow,
+  normalizeProviderBaseUrl,
+  normalizeProviderModels,
+  ONE_MILLION_CONTEXT,
+  PROVIDER_ERROR_CODES,
+  resolveModelCapabilities,
+  splitOneMillionSuffix,
+  windowOf,
+  type ConnectionModelRoles,
+  type ModelEffort,
+  type ProviderErrorCode,
+  type ProviderModelEntry,
+  type ProviderTestRecord,
+} from './model-providers.js';
 
 const MAX_FIELD_LENGTH = 2000;
 const DEFAULT_THIRD_PARTY_PROFILE_ID = 'default';
@@ -30,7 +66,7 @@ const OFFICIAL_CLAUDE_PROFILE_ID = '__official__';
  * 的 ciphertext，配合 key 文件泄漏即可解密）。统一走该 helper：tmp 文件以
  * 0o600 创建，rename 后再次 chmod 防御 APFS 上 mode 不跟随 inode 的边角情况。
  */
-function writeSecretFile(targetPath: string, data: string): void {
+export function writeSecretFile(targetPath: string, data: string): void {
   const tmp = `${targetPath}.tmp`;
   // 先 unlink stale tmp，避免 fs.writeFileSync 在文件已存在时复用旧 mode
   // (Node 文档：mode 仅在 on-create 时应用)。残留 0o644 会让我们这次写入
@@ -98,27 +134,18 @@ const RESERVED_CLAUDE_ENV_KEYS = new Set([
 
 const CLAUDE_ENDPOINT_KIND_ENV = 'HAPPYCLAW_CLAUDE_ENDPOINT_KIND';
 
-const INHERITED_CLAUDE_PROVIDER_ENV_KEYS = [
+/**
+ * Every Claude environment key HappyClaw owns (shared/claude-provider-env.ts),
+ * plus the provider tuning a connection sets and the endpoint kind marker.
+ */
+const INHERITED_CLAUDE_PROVIDER_ENV_KEYS: readonly string[] = [
+  ...HAPPYCLAW_OWNED_CLAUDE_ENV_KEYS,
   CLAUDE_ENDPOINT_KIND_ENV,
-  'CLAUDE_CODE_OAUTH_TOKEN',
-  'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_AUTH_TOKEN',
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_MODEL',
-  'ANTHROPIC_CUSTOM_HEADERS',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL',
-  'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
   'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
-  'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_NO_FLICKER',
-  'CLAUDE_CODE_SUBAGENT_MODEL',
-  'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
-  'ANTHROPIC_SMALL_FAST_MODEL',
   'ANTHROPIC_BETAS',
   'API_TIMEOUT_MS',
-] as const;
+];
 
 /**
  * Remove provider-owned values inherited from the HappyClaw parent process.
@@ -134,28 +161,20 @@ export function clearInheritedClaudeProviderEnv(
   }
 }
 
-const THIRD_PARTY_CONFIGURABLE_ENV_KEYS = new Set([
-  // These values receive provider-level defaults below, but remain editable
-  // through the provider's advanced settings. Workspace overrides stay
-  // blocked so one workspace cannot silently change provider behavior.
-  'ANTHROPIC_DEFAULT_OPUS_MODEL',
-  'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  'CLAUDE_CODE_SUBAGENT_MODEL',
-  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
-  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
-  'CLAUDE_CODE_EFFORT_LEVEL',
-  'CLAUDE_CODE_NO_FLICKER',
-  'API_TIMEOUT_MS',
-]);
+/** Keys a connection's models and roles decide; never free env. */
+const CONNECTION_MODEL_ENV_KEY_SET: ReadonlySet<string> = new Set(
+  CONNECTION_MODEL_ENV_KEYS,
+);
 
-/** Model-tier mappings that default to the provider model. */
-const THIRD_PARTY_MODEL_ENV_KEYS = [
-  'ANTHROPIC_DEFAULT_OPUS_MODEL',
-  'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  'CLAUDE_CODE_SUBAGENT_MODEL',
-] as const;
+/**
+ * Keys a workspace override may not set on a third-party endpoint: the model
+ * environment and the connection's runtime tuning belong to the connection,
+ * so one workspace cannot silently change provider behavior.
+ */
+const THIRD_PARTY_CONFIGURABLE_ENV_KEYS: ReadonlySet<string> = new Set([
+  ...CONNECTION_MODEL_ENV_KEYS,
+  ...Object.keys(CONNECTION_ENV_PREFILL),
+]);
 
 /**
  * Haiku tier behind the ChatGPT subscription gateway: Claude Code's own
@@ -182,17 +201,8 @@ function isCodexGatewayEndpoint(baseUrl: string): boolean {
 
 /** Provider env values that Claude Code parses as positive integers. */
 const POSITIVE_INTEGER_PROVIDER_ENV_KEYS = new Set([
-  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
   'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
   'API_TIMEOUT_MS',
-]);
-
-const PROVIDER_EFFORT_LEVELS = new Set([
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-  'max',
 ]);
 
 /**
@@ -202,6 +212,8 @@ const PROVIDER_EFFORT_LEVELS = new Set([
  * existed have no mode and keep the legacy inference in buildClaudeEnvLines.
  */
 export type ProviderAuthMode = 'bearer' | 'x-api-key';
+
+export type WebFetchPreflightPolicy = 'check' | 'skip';
 
 /**
  * Reject provider env the runtime would otherwise drop or misread, so the
@@ -229,36 +241,37 @@ export function validateProviderCustomEnv(
         return `${key} 必须是正整数`;
       }
     }
-    if (
-      key === 'CLAUDE_CODE_EFFORT_LEVEL' &&
-      trimmed &&
-      !PROVIDER_EFFORT_LEVELS.has(trimmed)
-    ) {
-      return `CLAUDE_CODE_EFFORT_LEVEL 只能是 ${[...PROVIDER_EFFORT_LEVELS].join(' / ')}`;
-    }
   }
   return null;
 }
 
-const THIRD_PARTY_RUNTIME_DEFAULTS = {
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-  CLAUDE_CODE_EFFORT_LEVEL: 'max',
-  CLAUDE_CODE_NO_FLICKER: '1',
-  API_TIMEOUT_MS: '3000000',
-} as const;
-
 /**
- * Whether a third-party provider defaults to a 1M auto-compact window.
- *
- * Only an explicit `[1m]` model ID does. Claude Code 2.1.285+ gives 1M-native
- * Claude models (Sonnet 5+, Opus 4.7+, Fable) a 1M window behind a gateway
- * too, but it cannot see a gateway capped at 200K, which then fails with
- * "Prompt is too long" instead of compacting; a provider that serves 1M sets
- * the `[1m]` suffix or its own CLAUDE_CODE_AUTO_COMPACT_WINDOW.
+ * The keys of a connection env that the launch derives from the connection's
+ * models and roles (CONNECTION_MODEL_ENV_KEYS). A write naming one is refused
+ * with RESERVED_ENV_KEY rather than saved and silently ignored.
  */
-export function isOneMillionContextModel(model: string): boolean {
-  return /\[1m\]$/i.test(model.trim());
+export function reservedConnectionEnvKeys(
+  customEnv: Record<string, string>,
+): string[] {
+  return Object.keys(customEnv).filter((key) =>
+    CONNECTION_MODEL_ENV_KEY_SET.has(key),
+  );
 }
+
+/** The 400 body for a connection env naming such a key, or null. */
+export function reservedConnectionEnvError(
+  customEnv: Record<string, string> | undefined,
+): { error: string; code: 'RESERVED_ENV_KEY'; keys: string[] } | null {
+  const keys = reservedConnectionEnvKeys(customEnv ?? {});
+  return keys.length > 0
+    ? {
+        error: `${keys.join(', ')} 由模型设置决定，请在模型列表里配置`,
+        code: 'RESERVED_ENV_KEY',
+        keys,
+      }
+    : null;
+}
+
 const DANGEROUS_ENV_VARS = new Set([
   // Code execution / preload attacks
   'LD_PRELOAD',
@@ -417,6 +430,13 @@ export interface ClaudeProviderConfig {
   claudeCodeOauthToken: string;
   claudeOAuthCredentials: ClaudeOAuthCredentials | null;
   anthropicModel: string;
+  /**
+   * The connection's model list and roles, from which a third-party launch
+   * derives its tiers, `[1m]` and compact window (buildClaudeEnvLines).
+   * Absent for configurations that are not a saved connection.
+   */
+  models?: ProviderModelEntry[];
+  roles?: ConnectionModelRoles;
   updatedAt: string | null;
 }
 
@@ -513,6 +533,7 @@ interface StoredFeishuProviderConfigV1 {
   updatedAt: string;
   ownerOpenId?: string;
   autoIsolateContext?: boolean;
+  domain?: FeishuBrand;
   secret: EncryptedSecrets;
 }
 
@@ -570,13 +591,14 @@ interface ClaudeStoredStateV3Resolved {
 
 // ─── V5 模型配置（每项都是一套完整 Provider 运行环境）──────────
 
-export interface BalancingConfig {
-  strategy: 'round-robin' | 'weighted-round-robin' | 'failover';
-  unhealthyThreshold: number;
-  recoveryIntervalMs: number;
-}
+/**
+ * The automatic pool's settings as older releases store them. This release
+ * reads nothing from them; they are kept as found (or written as the old
+ * defaults) so a rollback reads a complete file.
+ */
+type StoredBalancing = Record<string, unknown>;
 
-const DEFAULT_BALANCING_CONFIG: BalancingConfig = {
+const LEGACY_BALANCING: StoredBalancing = {
   strategy: 'round-robin',
   unhealthyThreshold: 3,
   recoveryIntervalMs: 300_000,
@@ -587,22 +609,54 @@ interface StoredProviderV4 {
   id: string;
   name: string;
   type: 'official' | 'third_party';
+  /**
+   * Legacy pool membership and weight, for older releases and the one-time
+   * binding backfill (readLegacyModelDefaults). This release decides nothing
+   * by them: membership is carried through as read, new connections are out.
+   */
   enabled: boolean;
   weight: number;
   anthropicBaseUrl: string;
   anthropicModel: string;
   anthropicAuthMode?: ProviderAuthMode;
+  /** Stored only for skip; absent follows Claude Code's own settings. */
+  webFetchPreflightPolicy?: 'skip';
   secrets: EncryptedSecrets;
   customEnv?: Record<string, string>;
   /** ChatGPT/Codex 订阅：最近一次 token 刷新失败（非机密运行态，凭据写入时清除）。 */
   codexOAuthLastRefreshError?: CodexOAuthRefreshErrorState;
+  /**
+   * The models the connection offers. Absent: just `anthropicModel`. Not kept
+   * for ChatGPT subscriptions, whose live catalog is their list. Optional
+   * fields like this one are ignored by older releases, so a rollback keeps
+   * every credential; the file version stays 5.
+   */
+  models?: ProviderModelEntry[];
+  /** The vendor preset (MODEL_PRESETS id) the connection started from. */
+  presetId?: string;
+  /** The last connection test; written only by the test route. */
+  lastTest?: ProviderTestRecord;
+  /** Which of the connection's models Claude Code uses besides the turn's. */
+  roles?: ConnectionModelRoles;
+  /**
+   * Set once CONNECTION_ENV_PREFILL has been given to the connection (by the
+   * add wizard, or by the read-time migration for older connections), so a
+   * key the user deleted afterwards stays deleted.
+   */
+  envPrefill?: 1;
+  /**
+   * Which Claude login the OAuth credentials come from: a new one on every
+   * login or pasted credential, kept through token renewals. Random, so it
+   * says nothing about the tokens.
+   */
+  claudeOAuthGrantId?: string;
   updatedAt: string;
 }
 
 interface StoredClaudeProviderConfigV4 {
   version: 4;
   providers: StoredProviderV4[];
-  balancing: BalancingConfig;
+  balancing?: StoredBalancing;
   updatedAt: string;
 }
 
@@ -612,13 +666,12 @@ interface StoredClaudeProviderConfigV5 {
   /** Legacy V5 field. Read only so older files can be normalized in place. */
   defaultProviderId?: string | null;
   /**
-   * The configuration conversations run on when nothing more specific chose
-   * one. Absent means the automatic pool of enabled configurations. A
-   * separate key from the legacy pointer, which every installation once had
-   * and which therefore must never be read as a deliberate choice.
+   * The retired global default model, read once by the binding backfill and
+   * then cleared. A separate key from the legacy pointer above, which every
+   * installation once had and which must never be read as a choice.
    */
   defaultModelConfigId?: string | null;
-  balancing: BalancingConfig;
+  balancing?: StoredBalancing;
   updatedAt: string;
 }
 
@@ -627,11 +680,11 @@ export interface UnifiedProvider {
   id: string;
   name: string;
   type: 'official' | 'third_party';
-  enabled: boolean;
-  weight: number;
   anthropicBaseUrl: string;
   anthropicAuthToken: string;
   anthropicAuthMode?: ProviderAuthMode;
+  /** Set only when the connection skips WebFetch's domain check. */
+  webFetchPreflightPolicy?: 'skip';
   anthropicModel: string;
   anthropicApiKey: string;
   claudeCodeOauthToken: string;
@@ -643,6 +696,14 @@ export interface UnifiedProvider {
   claudeOAuthLastRefreshError?: ClaudeOAuthRefreshError | null;
   /** 缺省视为无刷新失败；存量配置没有这个字段。 */
   codexOAuthLastRefreshError?: CodexOAuthRefreshErrorState | null;
+  /** See StoredProviderV4.models; read through effectiveProviderModels. */
+  models?: ProviderModelEntry[];
+  /** Only roles naming one of `models`; absent when none is set. */
+  roles?: ConnectionModelRoles;
+  envPrefill?: 1;
+  presetId?: string;
+  lastTest?: ProviderTestRecord | null;
+  claudeOAuthGrantId?: string;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
@@ -652,12 +713,11 @@ export interface UnifiedProviderPublic {
   id: string;
   name: string;
   type: 'official' | 'third_party';
-  enabled: boolean;
-  weight: number;
   anthropicBaseUrl: string;
   anthropicModel: string;
   /** null for providers saved before the explicit choice existed. */
   anthropicAuthMode: ProviderAuthMode | null;
+  webFetchPreflightPolicy: WebFetchPreflightPolicy;
   hasAnthropicAuthToken: boolean;
   anthropicAuthTokenMasked: string | null;
   hasAnthropicApiKey: boolean;
@@ -695,6 +755,15 @@ export interface UnifiedProviderPublic {
    * 非 Codex provider 为 null。网关请求侧使用同一个解析函数。
    */
   codexDefaultEffort: string | null;
+  /**
+   * What the connection offers: the connection's own model first when the
+   * list does not name it. Empty for ChatGPT subscriptions (the Web reads
+   * their catalog) and for a pass-through relay without models.
+   */
+  models: ProviderModelEntry[];
+  roles: ConnectionModelRoles;
+  presetId: string | null;
+  lastTest: ProviderTestRecord | null;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
@@ -764,7 +833,7 @@ function normalizeModel(input: unknown): string {
   }
   const value = input.trim();
   if (!value) return '';
-  if (value.length > 128) {
+  if (value.length > MAX_PROVIDER_MODEL_ID_LENGTH) {
     throw new Error('Field too long: anthropicModel');
   }
   return value;
@@ -831,9 +900,19 @@ function normalizeProfileId(input: unknown): string {
   return value;
 }
 
+/**
+ * A stored or submitted env map with invalid keys refused and dangerous ones
+ * dropped. An empty value is dropped too: a key the user left blank is not
+ * injected. `skipConnectionModelKeys` also drops the keys a connection's
+ * models decide; reads keep them until migrateConnectionModelFields moves
+ * them into the model list.
+ */
 function sanitizeCustomEnvMap(
   input: Record<string, string>,
-  options?: { skipReservedClaudeKeys?: boolean },
+  options?: {
+    skipReservedClaudeKeys?: boolean;
+    skipConnectionModelKeys?: boolean;
+  },
 ): Record<string, string> {
   const entries = Object.entries(input);
   if (entries.length > MAX_CUSTOM_ENV_ENTRIES) {
@@ -850,13 +929,35 @@ function sanitizeCustomEnvMap(
     if (options?.skipReservedClaudeKeys && RESERVED_CLAUDE_ENV_KEYS.has(key)) {
       continue;
     }
+    if (
+      options?.skipConnectionModelKeys &&
+      CONNECTION_MODEL_ENV_KEY_SET.has(key)
+    ) {
+      continue;
+    }
     if (isDangerousEnvKey(key)) continue;
-    out[key] = sanitizeCustomEnvValue(
+    const value = sanitizeCustomEnvValue(
       key,
       typeof rawValue === 'string' ? rawValue : String(rawValue),
     );
+    if (value.trim()) out[key] = value;
   }
   return out;
+}
+
+/** The env options every write of a connection's own env uses. */
+const CONNECTION_ENV_WRITE = {
+  skipReservedClaudeKeys: true,
+  skipConnectionModelKeys: true,
+} as const;
+
+/** Whether a launch leaves a connection env key out (see CONNECTION_ENV_WRITE). */
+function isSkippedConnectionEnvKey(key: string): boolean {
+  return (
+    RESERVED_CLAUDE_ENV_KEYS.has(key) ||
+    CONNECTION_MODEL_ENV_KEY_SET.has(key) ||
+    isDangerousEnvKey(key)
+  );
 }
 
 function normalizeConfig(
@@ -886,60 +987,6 @@ function buildConfig(
     ...normalizeConfig(input),
     updatedAt,
   };
-}
-
-/**
- * What stat can tell about a file's contents. Atomic rewrites (tmp + rename)
- * change `ino`; in-place rewrites change mtime/ctime and usually size.
- */
-interface FileSignature {
-  ino: number;
-  size: number;
-  mtimeMs: number;
-  ctimeMs: number;
-}
-
-function statFileSignature(filePath: string): FileSignature | null {
-  try {
-    const st = fs.statSync(filePath);
-    return {
-      ino: st.ino,
-      size: st.size,
-      mtimeMs: st.mtimeMs,
-      ctimeMs: st.ctimeMs,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function sameFileSignature(
-  a: FileSignature | null,
-  b: FileSignature | null,
-): boolean {
-  if (a === null || b === null) return a === b;
-  return (
-    a.ino === b.ino &&
-    a.size === b.size &&
-    a.mtimeMs === b.mtimeMs &&
-    a.ctimeMs === b.ctimeMs
-  );
-}
-
-/**
- * File timestamps are coarse (a kernel tick, or a whole second on some
- * filesystems), so a same-size in-place rewrite right after the observed one
- * can keep its signature. As with git's "racily clean" index entries, a
- * signature only proves the contents unchanged once it was observed at least
- * this long after the file's mtime; until then readers re-read the file.
- */
-const RACY_SIGNATURE_WINDOW_MS = 2_000;
-
-function fileSignatureSettled(
-  sig: FileSignature | null,
-  observedAt: number,
-): boolean {
-  return sig === null || observedAt - sig.mtimeMs >= RACY_SIGNATURE_WINDOW_MS;
 }
 
 // The key never rotates in-process, but channel-account-secrets or another
@@ -1452,7 +1499,10 @@ function readStoredState(): ClaudeStoredStateV3Resolved | null {
 
 // ─── V5 模型配置 Read / Write / CRUD ───────────────────────────
 
-function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
+function toStoredProviderV4(
+  provider: UnifiedProvider,
+  enabled: boolean,
+): StoredProviderV4 {
   const secrets: SecretPayload = {
     anthropicAuthToken: provider.anthropicAuthToken || '',
     anthropicApiKey: provider.anthropicApiKey || '',
@@ -1463,6 +1513,8 @@ function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
     claudeOAuthLastRefreshAt: provider.claudeOAuthLastRefreshAt ?? null,
     claudeOAuthLastRefreshError: provider.claudeOAuthLastRefreshError ?? null,
   };
+  // Writes from the API are sanitized on the way in; this keeps what the
+  // read-time migration deliberately left in place.
   const sanitizedEnv = sanitizeCustomEnvMap(provider.customEnv || {}, {
     skipReservedClaudeKeys: true,
   });
@@ -1470,12 +1522,15 @@ function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
     id: provider.id,
     name: provider.name,
     type: provider.type,
-    enabled: provider.enabled,
-    weight: Math.max(1, Math.min(100, provider.weight || 1)),
+    enabled,
+    weight: 1,
     anthropicBaseUrl: provider.anthropicBaseUrl || '',
     anthropicModel: provider.anthropicModel || '',
     ...(provider.anthropicAuthMode
       ? { anthropicAuthMode: provider.anthropicAuthMode }
+      : {}),
+    ...(provider.webFetchPreflightPolicy
+      ? { webFetchPreflightPolicy: provider.webFetchPreflightPolicy }
       : {}),
     secrets: encryptSecrets(secrets),
     ...(Object.keys(sanitizedEnv).length > 0
@@ -1484,7 +1539,102 @@ function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
     ...(provider.codexOAuthLastRefreshError
       ? { codexOAuthLastRefreshError: provider.codexOAuthLastRefreshError }
       : {}),
+    ...connectionListFields(provider),
+    ...(provider.envPrefill === 1 ? { envPrefill: 1 as const } : {}),
+    ...(provider.claudeOAuthCredentials && provider.claudeOAuthGrantId
+      ? { claudeOAuthGrantId: provider.claudeOAuthGrantId }
+      : {}),
     updatedAt: provider.updatedAt || new Date().toISOString(),
+  };
+}
+
+/**
+ * The non-secret model fields of a provider as they are stored and read: a
+ * well-formed model list and a preset id this release knows whose endpoint
+ * the provider uses (neither for ChatGPT subscriptions), a complete test
+ * record. Anything else is dropped, so a
+ * hand-edited or newer file never fails to load.
+ */
+function connectionListFields(provider: {
+  anthropicBaseUrl: string;
+  anthropicModel: string;
+  models?: unknown;
+  roles?: unknown;
+  presetId?: unknown;
+  lastTest?: unknown;
+}): Pick<StoredProviderV4, 'models' | 'roles' | 'presetId' | 'lastTest'> {
+  const chatGpt = isCodexGatewayProvider(provider);
+  const models = chatGpt ? null : normalizeProviderModels(provider.models);
+  // Roles name models of this connection; one whose model left the list
+  // follows the turn's model again.
+  const roles = chatGpt
+    ? {}
+    : normalizeConnectionModelRoles(
+        provider.roles,
+        effectiveProviderModels({
+          anthropicModel: provider.anthropicModel,
+          models: models ?? undefined,
+        }),
+      );
+  // A preset describes one vendor endpoint; moved elsewhere, it no longer
+  // applies (its model list address, its models).
+  const preset =
+    !chatGpt && typeof provider.presetId === 'string'
+      ? getModelPreset(provider.presetId)
+      : null;
+  const presetId =
+    preset &&
+    normalizeProviderBaseUrl(provider.anthropicBaseUrl) ===
+      normalizeProviderBaseUrl(preset.baseUrl)
+      ? preset.id
+      : null;
+  // Absent fields stay undefined, which JSON leaves out of the file.
+  return {
+    models: models ?? undefined,
+    roles: Object.keys(roles).length > 0 ? roles : undefined,
+    presetId: presetId ?? undefined,
+    lastTest: normalizeProviderTestRecord(provider.lastTest) ?? undefined,
+  };
+}
+
+function nullableNumber(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  return typeof value === 'number' && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+/** A stored test record, or null when any field is missing or malformed. */
+export function normalizeProviderTestRecord(
+  raw: unknown,
+): ProviderTestRecord | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const status = nullableNumber(record.status);
+  const latencyMs = nullableNumber(record.latencyMs);
+  if (
+    typeof record.ok !== 'boolean' ||
+    typeof record.at !== 'string' ||
+    Number.isNaN(Date.parse(record.at)) ||
+    status === undefined ||
+    latencyMs === undefined ||
+    (record.model !== null && typeof record.model !== 'string')
+  ) {
+    return null;
+  }
+  // A code from a newer release reads as UNKNOWN rather than dropping the test.
+  const code: ProviderErrorCode | null = record.ok
+    ? null
+    : (PROVIDER_ERROR_CODES as readonly unknown[]).includes(record.code)
+      ? (record.code as ProviderErrorCode)
+      : 'UNKNOWN';
+  return {
+    ok: record.ok,
+    code,
+    status,
+    model: record.model as string | null,
+    latencyMs,
+    at: record.at,
   };
 }
 
@@ -1525,10 +1675,11 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
     id: stored.id,
     name: stored.name,
     type: stored.type,
-    enabled: stored.enabled,
-    weight: Math.max(1, Math.min(100, stored.weight || 1)),
     anthropicBaseUrl: stored.anthropicBaseUrl || '',
     anthropicAuthToken: secrets.anthropicAuthToken || '',
+    ...(stored.webFetchPreflightPolicy === 'skip'
+      ? { webFetchPreflightPolicy: 'skip' as const }
+      : {}),
     ...(normalizeProviderAuthMode(stored.anthropicAuthMode)
       ? {
           anthropicAuthMode: normalizeProviderAuthMode(
@@ -1550,16 +1701,235 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
     customEnv: sanitizeCustomEnvMap(stored.customEnv || {}, {
       skipReservedClaudeKeys: true,
     }),
+    ...connectionListFields({
+      ...stored,
+      anthropicBaseUrl: stored.anthropicBaseUrl || '',
+      anthropicModel: stored.anthropicModel || '',
+    }),
+    ...(stored.envPrefill === 1 ? { envPrefill: 1 as const } : {}),
+    ...(typeof stored.claudeOAuthGrantId === 'string'
+      ? { claudeOAuthGrantId: stored.claudeOAuthGrantId }
+      : {}),
     updatedAt: stored.updatedAt || '',
   };
 }
 
+/** Legacy env keys that named a role, and the role each becomes. */
+const LEGACY_ROLE_ENV_KEYS: ReadonlyArray<
+  readonly [string, keyof ConnectionModelRoles]
+> = [
+  ['ANTHROPIC_DEFAULT_HAIKU_MODEL', 'smallFast'],
+  ['CLAUDE_CODE_SUBAGENT_MODEL', 'subagent'],
+  ['ANTHROPIC_DEFAULT_OPUS_MODEL', 'opus'],
+  ['ANTHROPIC_DEFAULT_SONNET_MODEL', 'sonnet'],
+];
+
+/**
+ * Legacy model keys a connection without a model of its own keeps in its env
+ * when it has no entry to carry them: they are not injected (the launch
+ * derives these keys), but they are not dropped either.
+ */
+const UNATTACHED_LEGACY_KEYS = [
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_EFFORT_LEVEL',
+] as const;
+
+/** The legacy keys a connection's env still keeps (see above). */
+function keptLegacyEnv(env: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    UNATTACHED_LEGACY_KEYS.filter((key) => env[key]?.trim()).map((key) => [
+      key,
+      env[key],
+    ]),
+  );
+}
+
+/** Connections whose kept legacy keys were already logged this process. */
+const loggedUnattachedLegacyKeys = new Set<string>();
+
+/**
+ * Moves what a connection saved before models carried their window and
+ * efforts into the structured fields, in place; true when anything changed.
+ * Run again on its own output it changes nothing.
+ *
+ * - `[1m]` on a model name becomes that entry's 1M window.
+ * - A legacy haiku/sub-agent/opus/sonnet key becomes a role; a model the
+ *   connection does not list yet is added for it.
+ * - CLAUDE_CODE_AUTO_COMPACT_WINDOW and CLAUDE_CODE_EFFORT_LEVEL applied to
+ *   every launch, so they go to every entry that declares no window or
+ *   default effort. A compact window below 1M replaces a 1M that only came
+ *   from `[1m]` (it lowered that ceiling). An effort the registry knows
+ *   nothing about declares every effort, so the default stays usable.
+ * - A connection with an endpoint gets CONNECTION_ENV_PREFILL once, where its
+ *   env has no value, so the runtime defaults it ran with keep applying.
+ */
+function migrateConnectionModelFields(
+  provider: UnifiedProvider,
+  storedModelIds: readonly unknown[] = [],
+): boolean {
+  const env = provider.customEnv;
+  const legacyKeys = CONNECTION_MODEL_ENV_KEYS.filter((key) =>
+    Object.hasOwn(env, key),
+  );
+  const { model, oneMillion } = splitOneMillionSuffix(provider.anthropicModel);
+  const needsPrefill = provider.envPrefill !== 1;
+  if (!oneMillion && legacyKeys.length === 0 && !needsPrefill) return false;
+  const before = JSON.stringify([
+    provider.anthropicModel,
+    provider.models,
+    provider.roles,
+    env,
+    provider.envPrefill,
+  ]);
+
+  if (!isCodexGatewayProvider(provider)) {
+    let models = model
+      ? effectiveProviderModels({
+          anthropicModel: model,
+          models: provider.models,
+        })
+      : [...(provider.models ?? [])];
+    /**
+     * Ids named with `[1m]` (the connection's model, a role key, or the
+     * stored list): their 1M is a ceiling a compact window lowers. A 1M the
+     * user declared as a window is theirs and stays.
+     */
+    const oneMillionIds = new Set<string>(oneMillion ? [model] : []);
+    for (const id of storedModelIds) {
+      if (typeof id !== 'string') continue;
+      const named = splitOneMillionSuffix(id);
+      if (named.oneMillion) oneMillionIds.add(named.model);
+    }
+    const legacyRoles: Record<string, string> = {};
+    for (const [key, role] of LEGACY_ROLE_ENV_KEYS) {
+      const named = splitOneMillionSuffix(env[key]?.trim() ?? '');
+      if (!named.model || named.model === model) continue;
+      if (!isValidModelId(named.model)) continue;
+      if (!models.some((entry) => entry.id === named.model)) {
+        if (models.length >= MAX_PROVIDER_MODELS) continue;
+        models.push({ id: named.model });
+      }
+      legacyRoles[role] = named.model;
+      if (named.oneMillion) oneMillionIds.add(named.model);
+    }
+    models = models.map((entry) =>
+      oneMillionIds.has(entry.id) && !entry.contextWindow
+        ? { ...entry, contextWindow: ONE_MILLION_CONTEXT }
+        : entry,
+    );
+
+    const compact = normalizeContextWindow(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW);
+    const effort = env.CLAUDE_CODE_EFFORT_LEVEL?.trim();
+    const attached = models.length > 0;
+    if (attached && compact) {
+      models = models.map((entry) =>
+        !entry.contextWindow ||
+        (oneMillionIds.has(entry.id) &&
+          entry.contextWindow === ONE_MILLION_CONTEXT &&
+          compact < ONE_MILLION_CONTEXT)
+          ? { ...entry, contextWindow: compact }
+          : entry,
+      );
+    }
+    if (attached && isModelEffort(effort)) {
+      models = models.map((entry) => {
+        if (entry.defaultEffort) return entry;
+        const { efforts } = resolveModelCapabilities(entry);
+        if (efforts.length === 0) {
+          return {
+            ...entry,
+            efforts: [...MODEL_EFFORTS],
+            defaultEffort: effort,
+          };
+        }
+        return efforts.includes(effort)
+          ? { ...entry, defaultEffort: effort }
+          : entry;
+      });
+    }
+    const roles = {
+      ...normalizeConnectionModelRoles(legacyRoles, models),
+      ...(provider.roles ?? {}),
+    };
+    // A connection without a list keeps none unless the migration added to
+    // what its one model implies.
+    const implied = model ? [{ id: model }] : [];
+    if (provider.models || JSON.stringify(models) !== JSON.stringify(implied)) {
+      provider.models = models;
+    }
+    provider.roles = Object.keys(roles).length > 0 ? roles : undefined;
+
+    const kept = attached
+      ? []
+      : UNATTACHED_LEGACY_KEYS.filter((key) => env[key]?.trim());
+    for (const key of legacyKeys) {
+      if (!(kept as readonly string[]).includes(key)) delete env[key];
+    }
+    if (kept.length > 0 && !loggedUnattachedLegacyKeys.has(provider.id)) {
+      loggedUnattachedLegacyKeys.add(provider.id);
+      logger.warn(
+        { providerId: provider.id, keys: kept },
+        'Model connection without models keeps legacy env keys it can no longer inject',
+      );
+    }
+  } else {
+    for (const key of legacyKeys) delete env[key];
+  }
+  provider.anthropicModel = model;
+  if (needsPrefill) {
+    if (provider.anthropicBaseUrl) {
+      for (const [key, value] of Object.entries(CONNECTION_ENV_PREFILL)) {
+        if (!env[key]?.trim()) env[key] = value;
+      }
+    }
+    provider.envPrefill = 1;
+  }
+  return (
+    JSON.stringify([
+      provider.anthropicModel,
+      provider.models,
+      provider.roles,
+      env,
+      provider.envPrefill,
+    ]) !== before
+  );
+}
+
+/**
+ * Runs migrateConnectionModelFields over every provider; true when the file
+ * should be rewritten: a provider changed, or a stored model list or roles
+ * were in an older shape than they read as (`[1m]` ids, `hidden`, `effort`).
+ */
+function migrateConnectionsInPlace(
+  providers: UnifiedProvider[],
+  stored?: ReadonlyArray<StoredProviderV4>,
+): boolean {
+  let changed = false;
+  providers.forEach((provider, index) => {
+    const raw = stored?.[index];
+    if (
+      raw &&
+      (JSON.stringify(raw.models) !== JSON.stringify(provider.models) ||
+        JSON.stringify(raw.roles) !== JSON.stringify(provider.roles))
+    ) {
+      changed = true;
+    }
+    const storedIds = Array.isArray(raw?.models)
+      ? raw.models.map((entry: unknown) =>
+          typeof entry === 'string'
+            ? entry
+            : (entry as { id?: unknown } | null)?.id,
+        )
+      : [];
+    if (migrateConnectionModelFields(provider, storedIds)) changed = true;
+  });
+  return changed;
+}
+
 /** Migrate V3 stored state to V4 unified provider list */
-function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
-  providers: UnifiedProvider[];
-  balancing: BalancingConfig;
-} {
+function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): StoredStateV5 {
   const providers: UnifiedProvider[] = [];
+  const enabled = new Set<string>();
   const now = new Date().toISOString();
 
   // 1. Official credentials → official provider (if any secret present)
@@ -1572,8 +1942,6 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
       id: OFFICIAL_CLAUDE_PROFILE_ID,
       name: '官方 Claude',
       type: 'official',
-      enabled: isOfficialClaudeMode(v3.activeProfileId),
-      weight: 1,
       anthropicBaseUrl: '',
       anthropicAuthToken: '',
       anthropicModel: '',
@@ -1584,6 +1952,9 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
       customEnv: v3.officialCustomEnv || {},
       updatedAt: v3.officialUpdatedAt || now,
     });
+    if (isOfficialClaudeMode(v3.activeProfileId)) {
+      enabled.add(OFFICIAL_CLAUDE_PROFILE_ID);
+    }
   }
 
   // 2. Each third-party profile → third_party provider
@@ -1593,8 +1964,6 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
       id: profile.id,
       name: profile.name,
       type: 'third_party',
-      enabled: profile.id === v3.activeProfileId,
-      weight: 1,
       anthropicBaseUrl: profile.anthropicBaseUrl,
       anthropicAuthToken: profile.anthropicAuthToken,
       anthropicModel: profile.anthropicModel,
@@ -1605,10 +1974,11 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
       customEnv: profile.customEnv || {},
       updatedAt: profile.updatedAt || now,
     });
+    if (profile.id === v3.activeProfileId) enabled.add(profile.id);
   }
 
-  // 3. If provider-pool.json exists with mode=pool, use its members' enabled/weight
-  let balancing: BalancingConfig = { ...DEFAULT_BALANCING_CONFIG };
+  // 3. A provider-pool.json in pool mode says which members were enabled.
+  let balancing: StoredBalancing = { ...LEGACY_BALANCING };
   try {
     if (fs.existsSync(POOL_CONFIG_FILE)) {
       const poolContent = fs.readFileSync(POOL_CONFIG_FILE, 'utf-8');
@@ -1616,52 +1986,84 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
       if (pool.version === 1 && pool.mode === 'pool') {
         const members = pool.members as Array<{
           profileId: string;
-          weight: number;
           enabled: boolean;
         }>;
         if (Array.isArray(members)) {
           for (const member of members) {
-            const p = providers.find((pv) => pv.id === member.profileId);
-            if (p) {
-              p.enabled = member.enabled;
-              p.weight = Math.max(1, Math.min(100, member.weight || 1));
-            }
+            if (!providers.some((p) => p.id === member.profileId)) continue;
+            if (member.enabled) enabled.add(member.profileId);
+            else enabled.delete(member.profileId);
           }
         }
-        // Migrate strategy and thresholds
-        if (
-          typeof pool.strategy === 'string' &&
-          ['round-robin', 'weighted-round-robin', 'failover'].includes(
-            pool.strategy,
-          )
-        ) {
-          balancing.strategy = pool.strategy as BalancingConfig['strategy'];
-        }
-        if (typeof pool.unhealthyThreshold === 'number') {
-          balancing.unhealthyThreshold = pool.unhealthyThreshold;
-        }
-        if (typeof pool.recoveryIntervalMs === 'number') {
-          balancing.recoveryIntervalMs = pool.recoveryIntervalMs;
-        }
+        balancing = {
+          ...balancing,
+          ...(typeof pool.strategy === 'string'
+            ? { strategy: pool.strategy }
+            : {}),
+          ...(typeof pool.unhealthyThreshold === 'number'
+            ? { unhealthyThreshold: pool.unhealthyThreshold }
+            : {}),
+          ...(typeof pool.recoveryIntervalMs === 'number'
+            ? { recoveryIntervalMs: pool.recoveryIntervalMs }
+            : {}),
+        };
       }
     }
   } catch (err) {
     logger.warn({ err }, 'Failed to read provider-pool.json during migration');
   }
 
-  // 4. Ensure at least one provider is enabled
-  if (providers.length > 0 && !providers.some((p) => p.enabled)) {
-    providers[0].enabled = true;
-  }
+  // 4. Older releases need at least one enabled provider.
+  if (providers.length > 0 && enabled.size === 0) enabled.add(providers[0].id);
 
-  return { providers, balancing };
+  return {
+    providers,
+    legacy: {
+      balancing,
+      defaultModelConfigId: null,
+      enabledIds: providers.map((p) => p.id).filter((id) => enabled.has(id)),
+    },
+  };
+}
+
+/**
+ * What the file keeps from the retired default model and automatic pool:
+ * nothing reads it but readLegacyModelDefaults, and saves carry it through
+ * so the one-time binding backfill and older releases still find it.
+ */
+interface LegacyPoolFields {
+  balancing: StoredBalancing;
+  /** Always the id of an existing provider with a credential, or null. */
+  defaultModelConfigId: string | null;
+  /** The providers that were enabled, in file order. */
+  enabledIds: string[];
 }
 
 interface StoredStateV5 {
   providers: UnifiedProvider[];
-  balancing: BalancingConfig;
-  /** Always the id of an existing provider, or null for the automatic pool. */
-  defaultModelConfigId: string | null;
+  legacy: LegacyPoolFields;
+}
+
+/** The legacy fields as a V4/V5 file stores them. */
+function readLegacyPoolFields(
+  file: Pick<StoredClaudeProviderConfigV5, 'providers' | 'balancing'> & {
+    defaultModelConfigId?: unknown;
+  },
+  providers: ReadonlyArray<UnifiedProvider>,
+): LegacyPoolFields {
+  return {
+    balancing:
+      file.balancing && typeof file.balancing === 'object'
+        ? file.balancing
+        : { ...LEGACY_BALANCING },
+    defaultModelConfigId: normalizeDefaultModelConfigId(
+      providers,
+      file.defaultModelConfigId,
+    ),
+    enabledIds: file.providers
+      .filter((stored) => stored.enabled === true)
+      .map((stored) => stored.id),
+  };
 }
 
 /**
@@ -1679,9 +2081,24 @@ function normalizeDefaultModelConfigId(
   return named && providerHasCredentials(named) ? candidate : null;
 }
 
-/** Legacy subscriptions can predate the internal identifier used to mint grants. */
+/**
+ * Identifiers assigned but not yet saved, by provider id. While the disk
+ * refuses the save, every read re-derives the state from the same file, so a
+ * fresh random identifier per read would make a grant minted from one read
+ * unresolvable through the next. Emptied by the next successful save.
+ */
+const unsavedGatewayIdentifiers = new Map<string, string>();
+/** Reason of the last unsaved-repair warning; null once a save succeeds. */
+let unsavedRepairWarning: string | null = null;
+
+/**
+ * Legacy subscriptions can predate the internal identifier used to mint grants,
+ * and the secrets route can clear it. Fills the gap in place, so callers that
+ * pass a provider list to be saved get the identifier saved with it.
+ */
 function ensureCodexGatewayIdentifiers(providers: UnifiedProvider[]): boolean {
-  let changed = false;
+  const created: string[] = [];
+  let filled = false;
   for (const provider of providers) {
     if (
       provider.codexOAuthCredentials &&
@@ -1690,11 +2107,23 @@ function ensureCodexGatewayIdentifiers(providers: UnifiedProvider[]): boolean {
     ) {
       // This stays encrypted with the provider. Only per-runner grants, never
       // this identifier, authenticate requests to the embedded gateway.
-      provider.anthropicAuthToken = crypto.randomBytes(32).toString('hex');
-      changed = true;
+      let identifier = unsavedGatewayIdentifiers.get(provider.id);
+      if (!identifier) {
+        identifier = crypto.randomBytes(32).toString('hex');
+        unsavedGatewayIdentifiers.set(provider.id, identifier);
+        created.push(provider.id);
+      }
+      provider.anthropicAuthToken = identifier;
+      filled = true;
     }
   }
-  return changed;
+  if (created.length > 0) {
+    logger.info(
+      { providerIds: created },
+      'Assigned missing ChatGPT gateway identifiers',
+    );
+  }
+  return filled;
 }
 
 /**
@@ -1761,37 +2190,48 @@ function readStoredStateV4FromDisk(): StoredStateV5 | null {
     if (parsed.version === 5) {
       const v5 = parsed as unknown as StoredClaudeProviderConfigV5;
       const providers = v5.providers.map(fromStoredProviderV4);
+      const modelFieldsMigrated = migrateConnectionsInPlace(
+        providers,
+        v5.providers,
+      );
       const state: StoredStateV5 = {
         providers,
-        defaultModelConfigId: normalizeDefaultModelConfigId(
-          providers,
-          v5.defaultModelConfigId,
-        ),
-        balancing: {
-          strategy: v5.balancing?.strategy || DEFAULT_BALANCING_CONFIG.strategy,
-          unhealthyThreshold:
-            v5.balancing?.unhealthyThreshold ??
-            DEFAULT_BALANCING_CONFIG.unhealthyThreshold,
-          recoveryIntervalMs:
-            v5.balancing?.recoveryIntervalMs ??
-            DEFAULT_BALANCING_CONFIG.recoveryIntervalMs,
-        },
+        legacy: readLegacyPoolFields(v5, providers),
       };
       const repairedGatewayIdentifiers =
         ensureCodexGatewayIdentifiers(providers);
       if (
         repairedGatewayIdentifiers ||
+        modelFieldsMigrated ||
         Object.hasOwn(v5, 'defaultProviderId')
       ) {
-        writeStoredStateV4(
-          state.providers,
-          state.balancing,
-          state.defaultModelConfigId,
-        );
+        // Tidying a readable file must not make the whole configuration
+        // unreadable: if the disk refuses the write, serve what was read and
+        // retry on the next read.
+        try {
+          writeStoredStateV4(state);
+        } catch (err) {
+          // Reads are frequent: say so once per distinct failure, not once
+          // per read, until a save goes through.
+          const reason = err instanceof Error ? err.message : String(err);
+          if (reason !== unsavedRepairWarning) {
+            unsavedRepairWarning = reason;
+            logger.warn(
+              { err, file: CLAUDE_CONFIG_FILE },
+              'Could not persist the repaired Claude model configuration; using it unsaved',
+            );
+          }
+          return state;
+        }
       }
       if (Object.hasOwn(v5, 'defaultProviderId')) {
         logger.info(
           'Removed legacy default model pointer from Claude model configuration',
+        );
+      }
+      if (modelFieldsMigrated) {
+        logger.info(
+          'Moved model settings of Claude model connections into their model lists',
         );
       }
       return state;
@@ -1800,20 +2240,15 @@ function readStoredStateV4FromDisk(): StoredStateV5 | null {
     if (parsed.version === 4) {
       const v4 = parsed as unknown as StoredClaudeProviderConfigV4;
       const providers = v4.providers.map(fromStoredProviderV4);
+      migrateConnectionsInPlace(providers, v4.providers);
       const migrated: StoredStateV5 = {
         providers,
-        defaultModelConfigId: null,
-        balancing: {
-          strategy: v4.balancing?.strategy || DEFAULT_BALANCING_CONFIG.strategy,
-          unhealthyThreshold:
-            v4.balancing?.unhealthyThreshold ??
-            DEFAULT_BALANCING_CONFIG.unhealthyThreshold,
-          recoveryIntervalMs:
-            v4.balancing?.recoveryIntervalMs ??
-            DEFAULT_BALANCING_CONFIG.recoveryIntervalMs,
+        legacy: {
+          ...readLegacyPoolFields(v4, providers),
+          defaultModelConfigId: null,
         },
       };
-      writeStoredStateV4(migrated.providers, migrated.balancing, null);
+      writeStoredStateV4(migrated);
       logger.info('Migrated Claude model configuration from V4 to V5');
       return migrated;
     }
@@ -1822,13 +2257,11 @@ function readStoredStateV4FromDisk(): StoredStateV5 | null {
     const v3 = readStoredState();
     if (!v3) return null;
 
-    const migrated: StoredStateV5 = {
-      ...migrateV3toV4(v3),
-      defaultModelConfigId: null,
-    };
+    const migrated = migrateV3toV4(v3);
+    migrateConnectionsInPlace(migrated.providers);
 
     // Auto-save as V5 on first read (lazy migration)
-    writeStoredStateV4(migrated.providers, migrated.balancing, null);
+    writeStoredStateV4(migrated);
     logger.info(
       { providerCount: migrated.providers.length },
       'Migrated Claude provider config from V3 to V5',
@@ -1844,12 +2277,9 @@ function readStoredStateV4FromDisk(): StoredStateV5 | null {
   }
 }
 
-function writeStoredStateV4(
-  providers: UnifiedProvider[],
-  balancing: BalancingConfig,
-  defaultModelConfigId: string | null,
-): void {
-  // Cover V3/V4 migration and newly imported subscriptions as well as V5 reads.
+function writeStoredStateV4({ providers, legacy }: StoredStateV5): void {
+  // Fills in place: a subscription created without an identifier, or one whose
+  // identifier the secrets route cleared, is saved with a fresh one.
   ensureCodexGatewayIdentifiers(providers);
   // Every save goes through here: drop the decrypted cache first, so the next
   // read decrypts what was actually persisted.
@@ -1857,18 +2287,23 @@ function writeStoredStateV4(
   storedStateWriteGeneration++;
   const defaultId = normalizeDefaultModelConfigId(
     providers,
-    defaultModelConfigId,
+    legacy.defaultModelConfigId,
   );
+  const enabled = new Set(legacy.enabledIds);
   const payload: StoredClaudeProviderConfigV5 = {
     version: 5,
-    providers: providers.map(toStoredProviderV4),
+    providers: providers.map((provider) =>
+      toStoredProviderV4(provider, enabled.has(provider.id)),
+    ),
     ...(defaultId ? { defaultModelConfigId: defaultId } : {}),
-    balancing,
+    balancing: legacy.balancing,
     updatedAt: new Date().toISOString(),
   };
 
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
   writeSecretFile(CLAUDE_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
+  unsavedGatewayIdentifiers.clear();
+  unsavedRepairWarning = null;
 }
 
 // ─── V5 公开 API ─────────────────────────────────────────────
@@ -1878,96 +2313,31 @@ export function getProviders(): UnifiedProvider[] {
   return state?.providers ?? [];
 }
 
-export function getEnabledProviders(): UnifiedProvider[] {
-  return getProviders().filter((p) => p.enabled);
-}
-
 /**
- * The configuration conversations run on when nothing more specific (a
- * conversation pick, an Agent binding, a Workspace environment) chose one;
- * null when the automatic pool decides.
+ * What the file still says about the retired global default and pool, for
+ * the one-time binding backfill: the legacy default (only while it names a
+ * connection with a credential) and the connections that were enabled, in
+ * file order. Nothing else reads these.
  */
-export function getDefaultModelConfigId(): string | null {
-  return readStoredStateV4()?.defaultModelConfigId ?? null;
-}
-
-/**
- * The default configuration when it can serve a launch right now. One that
- * lost its credential or was switched off behind the pointer's back does not
- * pin anything: the conversation falls through to the automatic pool rather
- * than failing every turn on it.
- */
-export function getUsableDefaultProvider(): UnifiedProvider | null {
-  const state = readStoredStateV4();
-  if (!state?.defaultModelConfigId) return null;
-  const provider = state.providers.find(
-    (item) => item.id === state.defaultModelConfigId,
-  );
-  return provider?.enabled && providerHasCredentials(provider)
-    ? provider
-    : null;
-}
-
-export const DEFAULT_MODEL_DISABLE_ERROR =
-  '默认模型配置不能禁用，请先取消默认或改选其他默认模型';
-
-/**
- * Make a configuration the default, or clear the choice with null so the
- * automatic pool decides again. The pool is what a default replaces, so the
- * default has to be a member of it: a disabled configuration is switched on
- * together with being chosen, and the default cannot be switched off while it
- * is the default.
- */
-export function setDefaultModelConfig(
-  id: string | null,
-): UnifiedProvider | null {
-  const state = readStoredStateV4();
-  if (!state) throw new Error('Claude 配置不存在');
-  if (id === null) {
-    if (state.defaultModelConfigId !== null) {
-      writeStoredStateV4(state.providers, state.balancing, null);
-    }
-    return null;
-  }
-
-  const idx = state.providers.findIndex((p) => p.id === id);
-  if (idx < 0) throw new Error('未找到指定供应商');
-  const provider = state.providers[idx];
-  if (!providerHasCredentials(provider)) {
-    throw new Error('该模型配置还没有可用的凭据，请先填写密钥或完成授权');
-  }
-  if (state.defaultModelConfigId === id && provider.enabled) return provider;
-
-  if (!provider.enabled) {
-    state.providers[idx] = {
-      ...provider,
-      enabled: true,
-      updatedAt: new Date().toISOString(),
-    };
-  }
-  writeStoredStateV4(state.providers, state.balancing, id);
-  return state.providers[idx];
-}
-
-export function getBalancingConfig(): BalancingConfig {
-  const state = readStoredStateV4();
-  return state?.balancing ?? { ...DEFAULT_BALANCING_CONFIG };
-}
-
-export function saveBalancingConfig(
-  config: Partial<BalancingConfig>,
-): BalancingConfig {
-  const state: StoredStateV5 = readStoredStateV4() || {
-    providers: [],
-    defaultModelConfigId: null,
-    balancing: { ...DEFAULT_BALANCING_CONFIG },
+export function readLegacyModelDefaults(): {
+  defaultModelConfigId: string | null;
+  enabledIds: string[];
+} {
+  const legacy = readStoredStateV4()?.legacy;
+  return {
+    defaultModelConfigId: legacy?.defaultModelConfigId ?? null,
+    enabledIds: legacy?.enabledIds ?? [],
   };
-  const merged: BalancingConfig = {
-    ...state.balancing,
-    ...config,
-  };
-  writeStoredStateV4(state.providers, merged, state.defaultModelConfigId);
-  return merged;
+}
+
+/** Drops the legacy default pointer from the file once it has been backfilled. */
+export function clearLegacyDefaultModelConfigId(): void {
+  const state = readStoredStateV4();
+  if (!state || state.legacy.defaultModelConfigId === null) return;
+  writeStoredStateV4({
+    ...state,
+    legacy: { ...state.legacy, defaultModelConfigId: null },
+  });
 }
 
 type ClaudeAuthKind = 'oauth' | 'setup_token' | 'api_key';
@@ -2032,12 +2402,129 @@ function applyClaudeAuthKind(
   }
 }
 
+/**
+ * The model list a write leaves a connection with, the connection's own
+ * model first. Without a new list, a new connection model joins the current
+ * list instead of replacing the old one, so changing it never drops a model
+ * by itself. A `[1m]` on the model (an older client) gives its entry the 1M
+ * window. Undefined leaves a connection without a list (`anthropicModel`
+ * alone), as connections saved before lists existed are.
+ */
+export function nextProviderModelList(
+  current: Pick<
+    UnifiedProvider,
+    'anthropicBaseUrl' | 'anthropicModel' | 'models'
+  > | null,
+  next: { anthropicModel: string; models?: readonly ProviderModelEntry[] },
+): ProviderModelEntry[] | undefined {
+  const { model, oneMillion } = splitOneMillionSuffix(next.anthropicModel);
+  const list =
+    next.models !== undefined
+      ? next.models
+      : current && splitOneMillionSuffix(current.anthropicModel).model !== model
+        ? effectiveProviderModels(current)
+        : current?.models;
+  if (!list && !oneMillion) return undefined;
+  let models = effectiveProviderModels({
+    anthropicModel: model,
+    models: list ?? [],
+  });
+  if (oneMillion) {
+    models = models.map((entry) =>
+      entry.id === model && !entry.contextWindow
+        ? { ...entry, contextWindow: ONE_MILLION_CONTEXT }
+        : entry,
+    );
+  }
+  if (models.length > MAX_PROVIDER_MODELS) {
+    throw new Error(
+      `一个模型配置最多 ${MAX_PROVIDER_MODELS} 个模型，请先移除不用的模型`,
+    );
+  }
+  return models;
+}
+
+/** A connection's model as submitted: '' or a valid id, `[1m]` still on. */
+function normalizeDefaultModel(input: unknown): string {
+  const model = normalizeModel(input);
+  if (model && !isValidModelId(model)) {
+    throw new Error(`模型名无效：${model}`);
+  }
+  return model;
+}
+
+/** What a connection test sends or probes with besides the endpoint and key. */
+function testedConnectionExtras(
+  provider: Pick<UnifiedProvider, 'customEnv' | 'roles'>,
+): [string, string] {
+  return [
+    provider.customEnv?.ANTHROPIC_CUSTOM_HEADERS ?? '',
+    provider.roles?.smallFast ?? '',
+  ];
+}
+
+/**
+ * What a connection test checks. A renewed OAuth token is the same login; a
+ * new login (even into the same account) is not.
+ */
+function testedConnectionIdentity(provider: UnifiedProvider): string {
+  return JSON.stringify([
+    provider.type,
+    provider.anthropicBaseUrl,
+    provider.anthropicAuthMode ?? null,
+    provider.anthropicAuthToken,
+    provider.anthropicApiKey,
+    provider.claudeCodeOauthToken,
+    provider.claudeOAuthCredentials
+      ? [
+          provider.claudeOAuthGrantId ?? null,
+          provider.claudeOAuthAccount?.accountUuid ?? null,
+        ]
+      : null,
+    provider.codexOAuthCredentials?.accountId ?? null,
+    testedConnectionExtras(provider),
+  ]);
+}
+
+/**
+ * Keep a connection test's outcome with the connection, together with the
+ * auth header style the test found for a connection that had none. Nothing
+ * is written when the connection's endpoint or credential changed while the
+ * test ran, since the outcome describes the old one. Runtime state like a
+ * refresh error: `updatedAt` stays.
+ */
+export function recordProviderTest(
+  id: string,
+  tested: UnifiedProvider,
+  record: ProviderTestRecord,
+  authMode?: ProviderAuthMode,
+): UnifiedProvider | null {
+  const state = readStoredStateV4();
+  if (!state) return null;
+  const idx = state.providers.findIndex((provider) => provider.id === id);
+  if (idx < 0) return null;
+  const current = state.providers[idx];
+  if (testedConnectionIdentity(current) !== testedConnectionIdentity(tested)) {
+    return null;
+  }
+  state.providers[idx] = {
+    ...current,
+    lastTest: record,
+    ...(authMode && !current.anthropicAuthMode
+      ? { anthropicAuthMode: authMode }
+      : {}),
+  };
+  writeStoredStateV4(state);
+  return state.providers[idx];
+}
+
 export function createProvider(input: {
   name: string;
   type: 'official' | 'third_party';
   anthropicBaseUrl?: string;
   anthropicAuthToken?: string;
   anthropicAuthMode?: ProviderAuthMode;
+  webFetchPreflightPolicy?: WebFetchPreflightPolicy;
   anthropicModel?: string;
   anthropicApiKey?: string;
   claudeCodeOauthToken?: string;
@@ -2045,14 +2532,21 @@ export function createProvider(input: {
   claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
   codexOAuthCredentials?: CodexOAuthCredentials | null;
   customEnv?: Record<string, string>;
-  weight?: number;
-  enabled?: boolean;
+  models?: ProviderModelEntry[];
+  /** Raw roles; those not naming one of the connection's models are dropped. */
+  roles?: unknown;
+  presetId?: string;
 }): UnifiedProvider {
   const authKind = selectedClaudeAuthKind(input.type, input);
+  const requestedModel = normalizeDefaultModel(input.anthropicModel ?? '');
+  const anthropicModel = splitOneMillionSuffix(requestedModel).model;
   const state: StoredStateV5 = readStoredStateV4() || {
     providers: [],
-    defaultModelConfigId: null,
-    balancing: { ...DEFAULT_BALANCING_CONFIG },
+    legacy: {
+      balancing: { ...LEGACY_BALANCING },
+      defaultModelConfigId: null,
+      enabledIds: [],
+    },
   };
 
   if (state.providers.length >= MAX_PROVIDERS) {
@@ -2064,8 +2558,9 @@ export function createProvider(input: {
     id: crypto.randomBytes(8).toString('hex'),
     name: normalizeProfileName(input.name),
     type: input.type,
-    enabled: input.enabled ?? false,
-    weight: Math.max(1, Math.min(100, input.weight ?? 1)),
+    ...(input.webFetchPreflightPolicy === 'skip'
+      ? { webFetchPreflightPolicy: 'skip' as const }
+      : {}),
     anthropicBaseUrl: input.anthropicBaseUrl
       ? normalizeBaseUrl(input.anthropicBaseUrl)
       : '',
@@ -2075,9 +2570,7 @@ export function createProvider(input: {
     ...(input.anthropicAuthMode
       ? { anthropicAuthMode: input.anthropicAuthMode }
       : {}),
-    anthropicModel: input.anthropicModel
-      ? normalizeModel(input.anthropicModel)
-      : '',
+    anthropicModel,
     anthropicApiKey: input.anthropicApiKey
       ? normalizeSecret(input.anthropicApiKey, 'anthropicApiKey')
       : '',
@@ -2089,19 +2582,34 @@ export function createProvider(input: {
     claudeOAuthAccount: input.claudeOAuthAccount ?? null,
     claudeOAuthLastRefreshAt: null,
     claudeOAuthLastRefreshError: null,
-    customEnv: sanitizeCustomEnvMap(input.customEnv || {}, {
-      skipReservedClaudeKeys: true,
-    }),
+    customEnv: sanitizeCustomEnvMap(
+      input.customEnv || {},
+      CONNECTION_ENV_WRITE,
+    ),
+    // The caller's env is the whole env: the prefill is the wizard's to offer.
+    envPrefill: 1,
     updatedAt: now,
   };
+  Object.assign(
+    provider,
+    connectionListFields({
+      anthropicBaseUrl: provider.anthropicBaseUrl,
+      anthropicModel,
+      models: nextProviderModelList(null, {
+        anthropicModel: requestedModel,
+        models: input.models,
+      }),
+      roles: input.roles,
+      presetId: input.presetId,
+    }),
+  );
   applyClaudeAuthKind(provider, authKind);
+  if (provider.claudeOAuthCredentials) {
+    provider.claudeOAuthGrantId = crypto.randomBytes(8).toString('hex');
+  }
 
   state.providers.push(provider);
-  writeStoredStateV4(
-    state.providers,
-    state.balancing,
-    state.defaultModelConfigId,
-  );
+  writeStoredStateV4(state);
   return provider;
 }
 
@@ -2110,10 +2618,16 @@ export function updateProvider(
   patch: {
     name?: string;
     anthropicBaseUrl?: string;
-    anthropicAuthMode?: ProviderAuthMode;
+    /** Null forgets the style, so it is inferred from the token again. */
+    anthropicAuthMode?: ProviderAuthMode | null;
+    webFetchPreflightPolicy?: WebFetchPreflightPolicy;
     anthropicModel?: string;
     customEnv?: Record<string, string>;
-    weight?: number;
+    models?: ProviderModelEntry[];
+    /** Raw roles replacing the current ones; absent keeps them. */
+    roles?: unknown;
+    /** Null forgets the preset (the endpoint no longer is the vendor's). */
+    presetId?: string | null;
   },
 ): UnifiedProvider {
   const state = readStoredStateV4();
@@ -2123,6 +2637,11 @@ export function updateProvider(
   if (idx < 0) throw new Error('未找到指定供应商');
 
   const current = state.providers[idx];
+  const requestedModel =
+    patch.anthropicModel !== undefined
+      ? normalizeDefaultModel(patch.anthropicModel)
+      : current.anthropicModel;
+  const anthropicModel = splitOneMillionSuffix(requestedModel).model;
   const updated: UnifiedProvider = {
     ...current,
     ...(patch.name !== undefined
@@ -2132,30 +2651,54 @@ export function updateProvider(
       ? { anthropicBaseUrl: normalizeBaseUrl(patch.anthropicBaseUrl) }
       : {}),
     ...(patch.anthropicAuthMode !== undefined
-      ? { anthropicAuthMode: patch.anthropicAuthMode }
+      ? { anthropicAuthMode: patch.anthropicAuthMode ?? undefined }
       : {}),
-    ...(patch.anthropicModel !== undefined
-      ? { anthropicModel: normalizeModel(patch.anthropicModel) }
-      : {}),
-    ...(patch.customEnv !== undefined
+    // check is the default, kept as an absent field like a stored one.
+    ...(patch.webFetchPreflightPolicy !== undefined
       ? {
-          customEnv: sanitizeCustomEnvMap(patch.customEnv, {
-            skipReservedClaudeKeys: true,
-          }),
+          webFetchPreflightPolicy:
+            patch.webFetchPreflightPolicy === 'skip'
+              ? ('skip' as const)
+              : undefined,
         }
       : {}),
-    ...(patch.weight !== undefined
-      ? { weight: Math.max(1, Math.min(100, patch.weight)) }
+    anthropicModel,
+    ...(patch.customEnv !== undefined
+      ? {
+          customEnv: {
+            ...sanitizeCustomEnvMap(patch.customEnv, CONNECTION_ENV_WRITE),
+            // The API never shows these, so a new env cannot mean to drop them.
+            ...keptLegacyEnv(current.customEnv),
+          },
+        }
       : {}),
     updatedAt: new Date().toISOString(),
   };
+  Object.assign(
+    updated,
+    connectionListFields({
+      anthropicBaseUrl: updated.anthropicBaseUrl,
+      anthropicModel,
+      models: nextProviderModelList(current, {
+        anthropicModel: requestedModel,
+        models: patch.models,
+      }),
+      roles: patch.roles === undefined ? current.roles : patch.roles,
+      presetId:
+        patch.presetId === undefined ? current.presetId : patch.presetId,
+    }),
+  );
+  // A test describes the endpoint, header, env and probe it ran against.
+  updated.lastTest =
+    updated.anthropicBaseUrl === current.anthropicBaseUrl &&
+    updated.anthropicAuthMode === current.anthropicAuthMode &&
+    JSON.stringify(testedConnectionExtras(updated)) ===
+      JSON.stringify(testedConnectionExtras(current))
+      ? current.lastTest
+      : undefined;
 
   state.providers[idx] = updated;
-  writeStoredStateV4(
-    state.providers,
-    state.balancing,
-    state.defaultModelConfigId,
-  );
+  writeStoredStateV4(state);
   return updated;
 }
 
@@ -2242,13 +2785,24 @@ export function updateProviderSecrets(
     updated.claudeOAuthLastRefreshAt = null;
     updated.claudeOAuthLastRefreshError = null;
   }
+  if (claudeGrantChanged) {
+    updated.claudeOAuthGrantId = updated.claudeOAuthCredentials
+      ? crypto.randomBytes(8).toString('hex')
+      : undefined;
+  }
+  // The last test vouched for the old credential.
+  if (
+    claudeGrantChanged ||
+    current.anthropicAuthToken !== updated.anthropicAuthToken ||
+    current.anthropicApiKey !== updated.anthropicApiKey ||
+    !!secrets.codexOAuthCredentials ||
+    !!secrets.clearCodexOAuthCredentials
+  ) {
+    delete updated.lastTest;
+  }
 
   state.providers[idx] = updated;
-  writeStoredStateV4(
-    state.providers,
-    state.balancing,
-    state.defaultModelConfigId,
-  );
+  writeStoredStateV4(state);
   clearProviderQuotaObservation(id);
   return updated;
 }
@@ -2327,11 +2881,7 @@ export function updateProviderOAuthCredentialsIfCurrent(
     claudeOAuthLastRefreshError: null,
     updatedAt: new Date().toISOString(),
   };
-  writeStoredStateV4(
-    state.providers,
-    state.balancing,
-    state.defaultModelConfigId,
-  );
+  writeStoredStateV4(state);
   return true;
 }
 
@@ -2353,11 +2903,7 @@ export function markProviderOAuthRefreshFailureIfCurrent(
     ...state.providers[idx],
     claudeOAuthLastRefreshError: error,
   };
-  writeStoredStateV4(
-    state.providers,
-    state.balancing,
-    state.defaultModelConfigId,
-  );
+  writeStoredStateV4(state);
   return true;
 }
 
@@ -2404,11 +2950,7 @@ export function updateProviderCodexOAuthCredentialsIfCurrent(
     codexOAuthLastRefreshError: null,
     updatedAt: new Date().toISOString(),
   };
-  writeStoredStateV4(
-    state.providers,
-    state.balancing,
-    state.defaultModelConfigId,
-  );
+  writeStoredStateV4(state);
   return true;
 }
 
@@ -2447,11 +2989,7 @@ export function setProviderCodexOAuthRefreshErrorIfCurrent(
     ...current,
     codexOAuthLastRefreshError: normalized,
   };
-  writeStoredStateV4(
-    state.providers,
-    state.balancing,
-    state.defaultModelConfigId,
-  );
+  writeStoredStateV4(state);
   return true;
 }
 
@@ -2494,43 +3032,9 @@ export function providerHasCredentials(provider: UnifiedProvider): boolean {
   );
 }
 
-export function setProviderEnabled(
-  id: string,
-  enabled: boolean,
-): UnifiedProvider {
-  const state = readStoredStateV4();
-  if (!state) throw new Error('Claude 配置不存在');
-
-  const idx = state.providers.findIndex((p) => p.id === id);
-  if (idx < 0) throw new Error('未找到指定供应商');
-
-  const provider = state.providers[idx];
-  if (provider.enabled === enabled) return provider;
-  if (!enabled && state.defaultModelConfigId === id) {
-    throw new Error(DEFAULT_MODEL_DISABLE_ERROR);
-  }
-  // An enabled provider joins the automatic pool at once; without a
-  // credential every turn routed to it would fail authentication.
-  if (enabled && !providerHasCredentials(provider)) {
-    throw new Error('该模型配置还没有可用的凭据，请先填写密钥或完成授权');
-  }
-
-  state.providers[idx] = {
-    ...provider,
-    enabled,
-    updatedAt: new Date().toISOString(),
-  };
-  writeStoredStateV4(
-    state.providers,
-    state.balancing,
-    state.defaultModelConfigId,
-  );
-  return state.providers[idx];
-}
-
 /**
- * Copy a provider together with its encrypted secrets, disabled, right after
- * the original. OAuth providers are refused: two configurations rotating one
+ * Copy a provider together with its encrypted secrets right after the
+ * original. OAuth providers are refused: two configurations rotating one
  * refresh token would invalidate each other on the first refresh.
  */
 export function duplicateProvider(id: string): UnifiedProvider {
@@ -2554,15 +3058,10 @@ export function duplicateProvider(id: string): UnifiedProvider {
     ...structuredClone(source),
     id: crypto.randomBytes(8).toString('hex'),
     name: `${source.name.slice(0, 64 - suffix.length)}${suffix}`,
-    enabled: false,
     updatedAt: new Date().toISOString(),
   };
   state.providers.splice(idx + 1, 0, copy);
-  writeStoredStateV4(
-    state.providers,
-    state.balancing,
-    state.defaultModelConfigId,
-  );
+  writeStoredStateV4(state);
   return copy;
 }
 
@@ -2574,11 +3073,7 @@ export function deleteProvider(id: string): void {
   if (idx < 0) throw new Error('未找到指定供应商');
 
   state.providers.splice(idx, 1);
-  writeStoredStateV4(
-    state.providers,
-    state.balancing,
-    state.defaultModelConfigId,
-  );
+  writeStoredStateV4(state);
   clearProviderQuotaObservation(id);
 }
 
@@ -2596,6 +3091,8 @@ export function providerToConfig(
     claudeCodeOauthToken: provider.claudeCodeOauthToken,
     claudeOAuthCredentials: provider.claudeOAuthCredentials,
     anthropicModel: provider.anthropicModel,
+    ...(provider.models ? { models: provider.models } : {}),
+    ...(provider.roles ? { roles: provider.roles } : {}),
     updatedAt: provider.updatedAt,
   };
 }
@@ -2608,11 +3105,10 @@ export function toPublicProvider(
     id: provider.id,
     name: provider.name,
     type: provider.type,
-    enabled: provider.enabled,
-    weight: provider.weight,
     anthropicBaseUrl: provider.anthropicBaseUrl,
     anthropicModel: provider.anthropicModel,
     anthropicAuthMode: provider.anthropicAuthMode ?? null,
+    webFetchPreflightPolicy: provider.webFetchPreflightPolicy ?? 'check',
     hasAnthropicAuthToken: !!provider.anthropicAuthToken,
     anthropicAuthTokenMasked: maskSecret(provider.anthropicAuthToken),
     hasAnthropicApiKey: !!provider.anthropicApiKey,
@@ -2659,9 +3155,61 @@ export function toPublicProvider(
     codexDefaultEffort: isCodexGatewayProvider(provider)
       ? resolveCodexProviderDefaultEffort(provider)
       : null,
-    customEnv: provider.customEnv || {},
+    models: providerModels(provider),
+    roles: provider.roles ?? {},
+    presetId: provider.presetId ?? null,
+    lastTest: provider.lastTest ?? null,
+    customEnv: sanitizeCustomEnvMap(
+      provider.customEnv || {},
+      CONNECTION_ENV_WRITE,
+    ),
     updatedAt: provider.updatedAt,
   };
+}
+
+/**
+ * The default effort the connection declares for its own model, or null when
+ * it declares none (the model's registry default then applies, if any).
+ * Nothing is implied by the endpoint: a third-party connection no longer runs
+ * at max unless asked to.
+ */
+export function providerEffortLevel(
+  provider: Pick<
+    UnifiedProvider,
+    'anthropicBaseUrl' | 'anthropicModel' | 'models'
+  >,
+): ModelEffort | null {
+  if (!provider.anthropicModel) return null;
+  return (
+    findProviderModel(provider, provider.anthropicModel)?.defaultEffort ?? null
+  );
+}
+
+/**
+ * The models a connection offers a conversation or an Agent. ChatGPT
+ * subscriptions offer their live catalog instead, which callers read from
+ * the catalog.
+ */
+export function providerModels(
+  provider: Pick<
+    UnifiedProvider,
+    'anthropicBaseUrl' | 'anthropicModel' | 'models'
+  >,
+): ProviderModelEntry[] {
+  return isCodexGatewayProvider(provider)
+    ? []
+    : effectiveProviderModels(provider);
+}
+
+/** The entry for `model` (with or without `[1m]`) in a connection's list. */
+export function findProviderModel(
+  provider: Pick<
+    UnifiedProvider,
+    'anthropicBaseUrl' | 'anthropicModel' | 'models'
+  >,
+  model: string,
+): ProviderModelEntry | null {
+  return findModelEntry(providerModels(provider), model) ?? null;
 }
 
 function claudeAuthKindOf(
@@ -2689,7 +3237,7 @@ export function resolveProviderById(providerId: string): {
   if (!provider) {
     logger.warn(
       { providerId },
-      'resolveProviderById: provider not found, falling back to the default or first enabled',
+      'resolveProviderById: provider not found, falling back to the global connection',
     );
     const fallback = selectGlobalProvider(state) || state.providers[0];
     if (!fallback) return { config: defaultsFromEnv(), customEnv: {} };
@@ -2950,22 +3498,49 @@ export function toPublicClaudeProviderConfig(
   };
 }
 
+/** Picks the connection host-side calls use; see setGlobalModelConfigResolver. */
+let globalModelConfigResolver: (() => string | null) | null = null;
+
 /**
- * The configuration the host's own, non-conversation Claude calls use: the
- * default while it can serve (the same test as getUsableDefaultProvider),
- * else the first enabled one.
+ * Tell the configuration which connection the host's own, non-conversation
+ * Claude calls (titles, recall, bug reports, a launch nothing else chose a
+ * connection for) run on, e.g. the system main HappyClaw's binding. Without
+ * one, or when it names a connection that is gone or has no credential, the
+ * first connection holding a credential is used.
  */
+export function setGlobalModelConfigResolver(
+  resolver: (() => string | null) | null,
+): void {
+  globalModelConfigResolver = resolver;
+}
+
 function selectGlobalProvider(
   state: StoredStateV5,
 ): UnifiedProvider | undefined {
+  let wanted: string | null = null;
+  try {
+    wanted = globalModelConfigResolver?.() ?? null;
+  } catch (err) {
+    logger.warn({ err }, 'Global model connection resolver failed');
+  }
+  const usable = state.providers.filter(providerHasCredentials);
   return (
-    state.providers.find(
-      (p) =>
-        p.enabled &&
-        p.id === state.defaultModelConfigId &&
-        providerHasCredentials(p),
-    ) ?? state.providers.find((p) => p.enabled)
+    usable.find((provider) => provider.id === wanted) ??
+    usable[0] ??
+    state.providers[0]
   );
+}
+
+/** The connection getClaudeProviderConfig() describes, if there is one. */
+export function getGlobalProvider(): UnifiedProvider | null {
+  const state = readStoredStateV4();
+  return (state && selectGlobalProvider(state)) ?? null;
+}
+
+class NoModelConnectionError extends Error {
+  constructor() {
+    super('还没有模型连接，请先在设置里添加模型');
+  }
 }
 
 export function getClaudeProviderConfig(): ClaudeProviderConfig {
@@ -2974,15 +3549,10 @@ export function getClaudeProviderConfig(): ClaudeProviderConfig {
     if (state) {
       const selected = selectGlobalProvider(state);
       if (selected) return providerToConfig(selected);
-      throw new Error('没有启用的模型配置，请先在模型配置页面打开一个模型');
+      throw new NoModelConnectionError();
     }
   } catch (err) {
-    if (
-      err instanceof Error &&
-      err.message === '没有启用的模型配置，请先在模型配置页面打开一个模型'
-    ) {
-      throw err;
-    }
+    if (err instanceof NoModelConnectionError) throw err;
     // Ignore corrupted files and use the legacy environment fallback.
   }
   return defaultsFromEnv();
@@ -3014,6 +3584,20 @@ export function shellQuoteEnvLines(lines: string[]): string[] {
   });
 }
 
+/**
+ * The Claude environment of one launch on `config`. `config.anthropicModel`
+ * is the model this launch runs on (callers replace it with a conversation's
+ * or an Agent's pick); `config.models` and `config.roles` are the
+ * connection's.
+ *
+ * A third-party endpoint gets the model environment buildConnectionModelEnv
+ * derives (tiers, sub-agent model, `[1m]`, compact window) and nothing else
+ * implicitly. The official endpoint gets `[1m]` only for an entry that
+ * declares a window above 200K: there the suffix is the billed 1M opt-in,
+ * which a registry window must not turn on. The connection's env follows,
+ * minus empty values, reserved keys and the keys the models decide;
+ * CLAUDE_CODE_EFFORT_LEVEL is the effort logic's to add.
+ */
 export function buildClaudeEnvLines(
   config: ClaudeProviderConfig,
   profileCustomEnv?: Record<string, string>,
@@ -3052,57 +3636,51 @@ export function buildClaudeEnvLines(
         : `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(token)}`,
     );
   }
-  if (config.anthropicModel) {
-    lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
-  }
 
-  // Use explicit profileCustomEnv if provided (pool mode), otherwise active profile.
-  const customEnv = profileCustomEnv ?? getActiveProfileCustomEnv();
-
-  // Anthropic-compatible third-party endpoints need a predictable Claude Code
-  // runtime. Prefill the implementation-level environment from the model and
-  // [1m] suffix, while allowing provider-level advanced settings to replace
-  // any default explicitly.
-  if (config.anthropicBaseUrl) {
-    // A blank override means "use the default": an empty model mapping would
-    // send Claude Code back to first-party model IDs the gateway lacks.
-    const configuredValue = (key: string, fallback: string): string =>
-      Object.hasOwn(customEnv, key) && customEnv[key].trim()
-        ? sanitizeCustomEnvValue(key, customEnv[key])
-        : fallback;
-
-    // Every model tier follows the provider model by default. A pass-through
-    // relay leaves the model empty, so only explicit per-tier mappings apply.
-    // The Codex gateway keeps a Claude haiku id so it can tell Claude Code's
-    // background calls apart from agent turns.
+  const models = effectiveProviderModels({
+    anthropicModel: config.anthropicModel,
+    models: config.models,
+  });
+  if (isCodexGatewayEndpoint(config.anthropicBaseUrl)) {
+    // A ChatGPT subscription keeps no model list: every tier runs the turn's
+    // Codex model as named, except a Claude haiku id that lets the gateway
+    // tell Claude Code's background calls apart from agent turns.
     const model = sanitizeEnvValue(config.anthropicModel);
-    const codexGateway = isCodexGatewayEndpoint(config.anthropicBaseUrl);
-    for (const key of THIRD_PARTY_MODEL_ENV_KEYS) {
-      const value = configuredValue(
-        key,
-        codexGateway && key === 'ANTHROPIC_DEFAULT_HAIKU_MODEL'
-          ? CODEX_GATEWAY_HAIKU_MODEL
-          : model,
+    if (model) {
+      lines.push(
+        `ANTHROPIC_MODEL=${model}`,
+        `ANTHROPIC_DEFAULT_OPUS_MODEL=${model}`,
+        `ANTHROPIC_DEFAULT_SONNET_MODEL=${model}`,
+        `CLAUDE_CODE_SUBAGENT_MODEL=${model}`,
       );
-      if (value) lines.push(`${key}=${value}`);
     }
-
+    lines.push(`ANTHROPIC_DEFAULT_HAIKU_MODEL=${CODEX_GATEWAY_HAIKU_MODEL}`);
+  } else if (config.anthropicBaseUrl) {
+    const modelEnv = buildConnectionModelEnv({
+      model: config.anthropicModel,
+      models,
+      roles: config.roles,
+    });
+    for (const [key, value] of Object.entries(modelEnv)) {
+      lines.push(`${key}=${sanitizeEnvValue(value)}`);
+    }
+  } else if (config.anthropicModel) {
+    // Declared or `[1m]`-named windows only: on the official endpoint `[1m]`
+    // is the billed 1M opt-in, which a registry window must not turn on.
     lines.push(
-      `CLAUDE_CODE_AUTO_COMPACT_WINDOW=${configuredValue(
-        'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
-        isOneMillionContextModel(config.anthropicModel) ? '1000000' : '200000',
+      `ANTHROPIC_MODEL=${sanitizeEnvValue(
+        launchModelName(
+          config.anthropicModel,
+          windowOf(models, config.anthropicModel),
+        ),
       )}`,
     );
-    for (const [key, value] of Object.entries(THIRD_PARTY_RUNTIME_DEFAULTS)) {
-      lines.push(`${key}=${configuredValue(key, value)}`);
-    }
   }
 
+  // The selected connection's env when given, else the global connection's.
+  const customEnv = profileCustomEnv ?? getActiveProfileCustomEnv();
   for (const [key, value] of Object.entries(customEnv)) {
-    if (RESERVED_CLAUDE_ENV_KEYS.has(key) || isDangerousEnvKey(key)) continue;
-    if (config.anthropicBaseUrl && THIRD_PARTY_CONFIGURABLE_ENV_KEYS.has(key)) {
-      continue;
-    }
+    if (!value.trim() || isSkippedConnectionEnvKey(key)) continue;
     lines.push(`${key}=${sanitizeCustomEnvValue(key, value)}`);
   }
 
@@ -3116,9 +3694,7 @@ export function getActiveProfileCustomEnv(): Record<string, string> {
   const selected = selectGlobalProvider(state);
   if (!selected) return {};
 
-  return sanitizeCustomEnvMap(selected.customEnv || {}, {
-    skipReservedClaudeKeys: true,
-  });
+  return sanitizeCustomEnvMap(selected.customEnv || {}, CONNECTION_ENV_WRITE);
 }
 
 export function appendClaudeConfigAudit(
@@ -3348,6 +3924,13 @@ export function mergeClaudeEnvConfig(
       ? null
       : (override.claudeOAuthCredentials ?? global.claudeOAuthCredentials),
     anthropicModel: override.anthropicModel || global.anthropicModel,
+    // The connection's models and roles describe its own endpoint only.
+    ...(!override.anthropicBaseUrl && global.models
+      ? { models: global.models }
+      : {}),
+    ...(!override.anthropicBaseUrl && global.roles
+      ? { roles: global.roles }
+      : {}),
     updatedAt: global.updatedAt,
   };
 
@@ -3670,6 +4253,7 @@ export interface UserFeishuConfig {
   updatedAt: string | null;
   ownerOpenId?: string; // auto-detected from first DM; used as sender_allowlist seed for new groups
   autoIsolateContext?: boolean; // auto-create isolated conversation for each new IM chat
+  domain?: FeishuBrand; // Feishu (default) or Lark; picks the platform hosts
 }
 
 export interface UserTelegramConfig {
@@ -3762,6 +4346,7 @@ export function getUserFeishuConfig(userId: string): UserFeishuConfig | null {
       updatedAt: stored.updatedAt || null,
       ownerOpenId: stored.ownerOpenId || undefined,
       autoIsolateContext: stored.autoIsolateContext ?? false,
+      domain: stored.domain === 'lark' ? 'lark' : undefined,
     };
   } catch (err) {
     logger.warn({ err, userId }, 'Failed to read user Feishu config');
@@ -3780,6 +4365,7 @@ export function saveUserFeishuConfig(
     updatedAt: new Date().toISOString(),
     ownerOpenId: next.ownerOpenId,
     autoIsolateContext: next.autoIsolateContext,
+    domain: next.domain === 'lark' ? 'lark' : undefined,
   };
 
   const payload: StoredFeishuProviderConfigV1 = {
@@ -3789,6 +4375,7 @@ export function saveUserFeishuConfig(
     updatedAt: normalized.updatedAt || new Date().toISOString(),
     ownerOpenId: normalized.ownerOpenId,
     autoIsolateContext: normalized.autoIsolateContext,
+    domain: normalized.domain,
     secret: encryptChannelSecret<FeishuSecretPayload>({
       appSecret: normalized.appSecret,
     }),
@@ -4236,7 +4823,22 @@ export interface SystemSettings {
   // false = 关闭定时扫描，admin 仍可手点 POST /api/plugins/catalog/scan。
   // 适用于不希望本机私有 plugin 自动入共享 catalog 的环境。
   pluginAutoScan: boolean;
+  // 普通成员能否创建只读访客账号。默认关闭：访客由所有者直接建号，不经过邀请码，
+  // 开放给成员等于绕过邀请制注册。关闭时成员已有的访客也一并失效；admin 不受限。
+  allowMemberGuests: boolean;
+  // Where new Host workspaces without a custom directory are created. '' =
+  // unset: HAPPYCLAW_WORKSPACE_ROOT, then ~/happyclaw (src/workspace-root.ts).
+  workspaceRoot: string;
+  // '' = unset: HAPPYCLAW_DEPLOYMENT_MODE, then 'multi_user'
+  // (src/deployment-mode.ts). Stored as configured, never as resolved.
+  deploymentMode: '' | DeploymentMode;
 }
+
+export type DeploymentMode = 'multi_user' | 'single_user_host';
+export const DEPLOYMENT_MODES: readonly DeploymentMode[] = [
+  'multi_user',
+  'single_user_host',
+];
 
 // Upper bound for the login lockout window. auth.ts reclaims login-attempt
 // records on a fixed 24h TTL (its authoritative window check assumes the
@@ -4265,6 +4867,9 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   mainAgentAutoCompactPercentage: 0,
   fallbackModel: '',
   pluginAutoScan: true,
+  allowMemberGuests: false,
+  workspaceRoot: '',
+  deploymentMode: '',
 };
 
 type SystemSettingsSource = 'file' | 'env' | 'api';
@@ -4395,6 +5000,28 @@ function normalizeSystemSettings(
     }
   }
 
+  // Stored as configured; src/workspace-root.ts validates and resolves it.
+  let workspaceRoot = DEFAULT_SYSTEM_SETTINGS.workspaceRoot;
+  if (raw.workspaceRoot !== undefined) {
+    if (typeof raw.workspaceRoot === 'string') {
+      workspaceRoot = raw.workspaceRoot.trim();
+    } else {
+      invalidFields.add('workspaceRoot');
+    }
+  }
+
+  let deploymentMode = DEFAULT_SYSTEM_SETTINGS.deploymentMode;
+  if (raw.deploymentMode !== undefined && raw.deploymentMode !== '') {
+    if (
+      typeof raw.deploymentMode === 'string' &&
+      (DEPLOYMENT_MODES as readonly string[]).includes(raw.deploymentMode)
+    ) {
+      deploymentMode = raw.deploymentMode as DeploymentMode;
+    } else {
+      invalidFields.add('deploymentMode');
+    }
+  }
+
   let mainAgentContextSource = DEFAULT_SYSTEM_SETTINGS.mainAgentContextSource;
   if (raw.mainAgentContextSource !== undefined) {
     if (
@@ -4478,6 +5105,12 @@ function normalizeSystemSettings(
       'pluginAutoScan',
       DEFAULT_SYSTEM_SETTINGS.pluginAutoScan,
     ),
+    allowMemberGuests: booleanField(
+      'allowMemberGuests',
+      DEFAULT_SYSTEM_SETTINGS.allowMemberGuests,
+    ),
+    workspaceRoot,
+    deploymentMode,
   };
 
   if (invalidFields.size > 0) {
@@ -4493,11 +5126,30 @@ function normalizeSystemSettings(
 let _settingsCache: SystemSettings | null = null;
 let _settingsMtimeMs = 0;
 
+const SYSTEM_SETTING_KEYS = Object.keys(DEFAULT_SYSTEM_SETTINGS) as Array<
+  keyof SystemSettings
+>;
+
 function readSystemSettingsFromFile(): SystemSettings | null {
   if (!fs.existsSync(SYSTEM_SETTINGS_FILE)) return null;
   const raw = JSON.parse(
     fs.readFileSync(SYSTEM_SETTINGS_FILE, 'utf-8'),
   ) as Record<string, unknown>;
+  // Per key: a key the file does not have (the setup wizard stores only the
+  // deployment mode) follows its environment variable, then the default.
+  const missing = SYSTEM_SETTING_KEYS.filter(
+    (key) =>
+      raw[key] === undefined &&
+      // The former name of the main Agent compact window still counts.
+      !(
+        key === 'mainAgentAutoCompactWindow' &&
+        raw.autoCompactWindow !== undefined
+      ),
+  );
+  if (missing.length > 0) {
+    const fromEnv = buildEnvFallbackSettings();
+    for (const key of missing) raw[key] = fromEnv[key];
+  }
   return normalizeSystemSettings(raw, 'file');
 }
 
@@ -4525,6 +5177,7 @@ function buildEnvFallbackSettings(): SystemSettings {
         process.env.AUTO_COMPACT_PERCENTAGE,
       fallbackModel: process.env.FALLBACK_MODEL,
       pluginAutoScan: process.env.PLUGIN_AUTO_SCAN,
+      allowMemberGuests: process.env.ALLOW_MEMBER_GUESTS,
     },
     'env',
   );
@@ -4601,16 +5254,21 @@ export function getEffectiveExternalDir(): string {
   return settings.externalClaudeDir || path.join(os.homedir(), '.claude');
 }
 
+function writeSystemSettingsFile(content: Record<string, unknown>): void {
+  fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
+  const tmp = `${SYSTEM_SETTINGS_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(content, null, 2) + '\n', 'utf-8');
+  fs.renameSync(tmp, SYSTEM_SETTINGS_FILE);
+}
+
+/** Store every setting: the current values with `partial` applied. */
 export function saveSystemSettings(
   partial: Partial<SystemSettings>,
 ): SystemSettings {
   const existing = getSystemSettings();
   const merged = normalizeSystemSettings({ ...existing, ...partial }, 'api');
 
-  fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-  const tmp = `${SYSTEM_SETTINGS_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, SYSTEM_SETTINGS_FILE);
+  writeSystemSettingsFile(merged as unknown as Record<string, unknown>);
 
   // Update in-memory cache immediately
   _settingsCache = merged;
@@ -4621,6 +5279,41 @@ export function saveSystemSettings(
   }
 
   return merged;
+}
+
+/**
+ * Store only `partial`'s keys: what the file already has stays, and every
+ * key it does not have keeps following its environment variable. The setup
+ * wizard stores the deployment mode this way, so a new install does not
+ * freeze the environment's values of every other setting into the file.
+ */
+export function saveSystemSettingKeys(
+  partial: Partial<SystemSettings>,
+): SystemSettings {
+  let stored: Record<string, unknown> = {};
+  try {
+    if (fs.existsSync(SYSTEM_SETTINGS_FILE)) {
+      const parsed: unknown = JSON.parse(
+        fs.readFileSync(SYSTEM_SETTINGS_FILE, 'utf-8'),
+      );
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        stored = parsed as Record<string, unknown>;
+      }
+    }
+  } catch {
+    /* unreadable: replaced, as saveSystemSettings would */
+  }
+  const normalized = normalizeSystemSettings(
+    { ...getSystemSettings(), ...partial },
+    'api',
+  );
+  for (const key of SYSTEM_SETTING_KEYS) {
+    if (partial[key] !== undefined) stored[key] = normalized[key];
+  }
+  writeSystemSettingsFile(stored);
+  _settingsCache = null;
+  _settingsMtimeMs = 0;
+  return getSystemSettings();
 }
 
 // ─── OAuth Usage Types ─────────────────────────────────────────────────────

@@ -5,10 +5,8 @@
  * commands and Web intercepts format the same handoff the runner MCP tool
  * produces. This does not summarize history and does not replace auto-compact.
  */
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { neutralFilterArgs, runGit } from './git-review.js';
 
-const execFileAsync = promisify(execFile);
 const GIT_TIMEOUT_MS = 2000;
 
 export const FRESH_WINDOW_HANDOFF_MARKER = '[HAPPYCLAW_FRESH_WINDOW_HANDOFF]';
@@ -21,13 +19,21 @@ export interface WorkspaceSnapshot {
   reason?: string;
 }
 
-async function gitText(cwd: string, args: string[]): Promise<string | null> {
+/**
+ * A container Agent writes data/groups/<folder>/.git/config, so these host
+ * reads run with fsmonitor, hooks, filter drivers and submodule recursion
+ * off: nothing the repository configures may execute here.
+ */
+async function gitText(
+  cwd: string,
+  args: string[],
+  config: string[] = [],
+): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync('git', args, {
-      cwd,
-      timeout: GIT_TIMEOUT_MS,
-      encoding: 'utf8',
-      maxBuffer: 64 * 1024,
+    const { stdout } = await runGit(cwd, args, {
+      timeoutMs: GIT_TIMEOUT_MS,
+      maxBytes: 64 * 1024,
+      config,
     });
     return stdout.trim();
   } catch {
@@ -53,7 +59,17 @@ export async function captureWorkspaceSnapshot(
   const branch =
     (await gitText(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])) || 'HEAD';
   const commit = (await gitText(cwd, ['rev-parse', '--short', 'HEAD'])) || '';
-  const statusRaw = await gitText(cwd, ['status', '--short']);
+  let statusRaw: string | null = null;
+  try {
+    const filterConfig = await neutralFilterArgs(cwd);
+    statusRaw = await gitText(
+      cwd,
+      ['status', '--short', '--ignore-submodules=all'],
+      filterConfig,
+    );
+  } catch {
+    statusRaw = null;
+  }
   const statusLines = statusRaw
     ? statusRaw.split('\n').filter(Boolean).slice(0, 10)
     : [];

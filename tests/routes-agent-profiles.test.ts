@@ -171,41 +171,39 @@ describe('/api/agent-profiles routes', () => {
     const listRes = await routes.request('/', { method: 'GET' });
     const listBody = await listRes.json();
     expect(listBody).not.toHaveProperty('default_model_config_id');
+    // Every connection, with no enable switch or default mark.
     expect(listBody.model_configs).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({
+        {
           id: automaticModel.id,
           name: 'Automatic model config',
-          enabled: true,
-        }),
+          type: 'official',
+          model: 'claude-default-test',
+          usable: true,
+          models: [
+            {
+              id: 'claude-default-test',
+              efforts: [],
+              defaultEffort: null,
+              contextWindow: null,
+              effortsSource: 'none',
+            },
+          ],
+        },
         expect.objectContaining({
           id: selectedModel.id,
           name: 'Research model config',
-          enabled: false,
+          model: 'research-model',
+          usable: true,
         }),
       ]),
     );
-    // Without a global default no configuration is marked as what an
-    // unbound Agent follows.
-    expect(
-      listBody.model_configs.every((item: any) => item.is_default === false),
-    ).toBe(true);
-
-    runtimeConfig.setDefaultModelConfig(selectedModel.id);
-    const defaulted = await (
-      await routes.request('/', { method: 'GET' })
-    ).json();
-    expect(
-      defaulted.model_configs.map((item: any) => [item.id, item.is_default]),
-    ).toEqual(
-      expect.arrayContaining([
-        [selectedModel.id, true],
-        [automaticModel.id, false],
-      ]),
-    );
-    // Choosing a configuration as the default switches it on; put it back.
-    runtimeConfig.setDefaultModelConfig(null);
-    runtimeConfig.setProviderEnabled(selectedModel.id, false);
+    // Nothing is bound yet: no main Agent hands anything down.
+    expect(listBody.inherited_model).toEqual({
+      owner_main: null,
+      system_main: null,
+      system_main_profile_id: null,
+    });
 
     const createRes = await routes.request('/', {
       method: 'POST',
@@ -569,7 +567,11 @@ describe('/api/agent-profiles routes', () => {
         auto_compact_window: 0,
         auto_compact_percentage: 0,
       },
-      skills: { mode: 'disabled', ids: ['research'] },
+      skills: {
+        mode: 'disabled',
+        ids: ['research'],
+        host: { mode: 'disabled', ids: [] },
+      },
       mcp: { mode: 'custom', ids: ['github'] },
     });
   });
@@ -1063,6 +1065,7 @@ describe('/api/agent-profiles routes', () => {
         pauseGroupsForMutation: () => ({ keys: ['retry-invalidation'] }),
         resumeGroupsAfterMutation: () => {},
         listDescendantJids: () => [],
+        getStatus: () => ({ groups: [] }),
         stopGroup,
       },
     } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
@@ -1133,6 +1136,7 @@ describe('/api/agent-profiles routes', () => {
         pauseGroupsForMutation: () => ({ keys: ['post-commit'] }),
         resumeGroupsAfterMutation: () => {},
         listDescendantJids: () => [],
+        getStatus: () => ({ groups: [] }),
         stopGroup,
         blockGroupsForRuntimeSafety: () => {
           runtimeSafetyBlocked = true;
@@ -1238,6 +1242,7 @@ describe('/api/agent-profiles routes', () => {
         pauseGroupsForMutation: () => ({ keys: ['locked-governance'] }),
         resumeGroupsAfterMutation: () => {},
         listDescendantJids: () => [],
+        getStatus: () => ({ groups: [] }),
         stopGroup,
         blockGroupsForRuntimeSafety: () => {
           runtimeSafetyBlocked = true;
@@ -1304,6 +1309,7 @@ describe('/api/agent-profiles routes', () => {
         pauseGroupsForMutation: () => ({ id: 1 }),
         resumeGroupsAfterMutation: () => {},
         listDescendantJids: () => [],
+        getStatus: () => ({ groups: [] }),
         stopGroup,
       },
     } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
@@ -1364,6 +1370,7 @@ describe('/api/agent-profiles routes', () => {
         pauseGroupsForMutation: () => ({ id: 1 }),
         resumeGroupsAfterMutation: () => {},
         listDescendantJids: () => [],
+        getStatus: () => ({ groups: [] }),
         stopGroup,
       },
     } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
@@ -1414,6 +1421,7 @@ describe('/api/agent-profiles routes', () => {
         pauseGroupsForMutation: () => ({ id: 1 }),
         resumeGroupsAfterMutation: () => {},
         listDescendantJids: () => [],
+        getStatus: () => ({ groups: [] }),
         stopGroup,
       },
     } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
@@ -1441,7 +1449,7 @@ describe('/api/agent-profiles routes', () => {
     );
   });
 
-  test('persists four-part prompt history and restores an old version as a new version', async () => {
+  test('persists the four prompt sections and the prompt mode', async () => {
     const createResponse = await routes.request('/', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1482,118 +1490,6 @@ describe('/api/agent-profiles routes', () => {
       include_claude_preset: false,
       version: 2,
     });
-
-    const historyResponse = await routes.request(
-      `/${created.id}/prompt-versions`,
-    );
-    expect(historyResponse.status).toBe(200);
-    const history = (await historyResponse.json()).versions;
-    expect(history.map((item: { version: number }) => item.version)).toEqual([
-      2, 1,
-    ]);
-    expect(history[0]).toMatchObject({
-      tools_prompt: 'Tools v2',
-      prompt_mode: 'replace',
-      change_source: 'update',
-    });
-
-    const restoreResponse = await routes.request(
-      `/${created.id}/prompt-versions/1/restore`,
-      { method: 'POST' },
-    );
-    expect(restoreResponse.status).toBe(200);
-    expect(await restoreResponse.json()).toMatchObject({
-      restored_from_version: 1,
-      profile: {
-        identity_prompt: '\nIdentity\n',
-        tools_prompt: 'Tools v1',
-        prompt_mode: 'append',
-        include_claude_preset: true,
-        version: 3,
-      },
-    });
-
-    const restoredHistory = await routes.request(
-      `/${created.id}/prompt-versions`,
-    );
-    const restoredVersions = (await restoredHistory.json()).versions;
-    expect(restoredVersions[0]).toMatchObject({
-      version: 3,
-      change_source: 'restore',
-      restored_from_version: 1,
-    });
-  });
-
-  test('keeps prompt-restore workspaces fail-closed until teardown retry succeeds', async () => {
-    const profile = db.createAgentProfile({
-      ownerUserId: 'routes-agent-user',
-      name: 'Restore Safety Agent',
-      identityPrompt: 'Restore v1',
-    });
-    const updated = db.updateAgentProfile(profile.id, 'routes-agent-user', {
-      identityPrompt: 'Restore v2',
-    })!;
-    const workspaceJid = 'web:prompt-restore-safety';
-    db.setRegisteredGroup(workspaceJid, {
-      name: 'Prompt Restore Safety',
-      folder: 'prompt-restore-safety',
-      added_at: '2026-07-10T00:00:00.000Z',
-      created_by: 'routes-agent-user',
-    });
-    db.assignWorkspaceAgentProfile('prompt-restore-safety', profile.id);
-
-    let stopCalls = 0;
-    let runtimeSafetyBlocked = false;
-    webContext.setWebDeps({
-      queue: {
-        pauseGroupsForMutation: () => ({ keys: ['prompt-restore-safety'] }),
-        resumeGroupsAfterMutation: () => {},
-        listDescendantJids: () => [],
-        stopGroup: async () => {
-          stopCalls += 1;
-          if (stopCalls === 2) {
-            throw new Error('injected restore post-commit cleanup failure');
-          }
-        },
-        blockGroupsForRuntimeSafety: () => {
-          runtimeSafetyBlocked = true;
-        },
-        unblockGroupsForRuntimeSafety: () => {
-          runtimeSafetyBlocked = false;
-        },
-        isGroupRuntimeSafetyBlocked: () => runtimeSafetyBlocked,
-      },
-    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
-
-    const restore = () =>
-      routes.request(`/${profile.id}/prompt-versions/1/restore`, {
-        method: 'POST',
-      });
-    const failed = await restore();
-    expect(failed.status).toBe(503);
-    expect(await failed.json()).toMatchObject({
-      persisted: true,
-      profile: { identity_prompt: 'Restore v1', version: updated.version + 1 },
-    });
-    expect(runtimeSafetyBlocked).toBe(true);
-
-    const retried = await restore();
-    expect(retried.status).toBe(200);
-    expect(await retried.json()).toMatchObject({
-      profile: { identity_prompt: 'Restore v1', version: updated.version + 1 },
-      restored_from_version: 1,
-    });
-    expect(stopCalls).toBe(4);
-    expect(runtimeSafetyBlocked).toBe(false);
-
-    const historyResponse = await routes.request(
-      `/${profile.id}/prompt-versions`,
-    );
-    expect(
-      (await historyResponse.json()).versions.map(
-        (item: { version: number }) => item.version,
-      ),
-    ).toEqual([updated.version + 1, updated.version, profile.version]);
   });
 
   test('DELETE waits for membership publication and then refuses to archive the target', async () => {
@@ -1640,5 +1536,383 @@ describe('/api/agent-profiles routes', () => {
       db.getAgentProfileForUser(profile.id, 'routes-agent-user'),
     ).toBeDefined();
     expect(db.getWorkspaceAgentProfileId(folder)).toBe(profile.id);
+  });
+});
+
+describe('/api/agent-profiles model within a configuration', () => {
+  let listed: ReturnType<typeof runtimeConfig.createProvider>;
+  let other: ReturnType<typeof runtimeConfig.createProvider>;
+
+  beforeAll(() => {
+    listed = runtimeConfig.createProvider({
+      name: 'Model list config',
+      type: 'third_party',
+      anthropicBaseUrl: 'https://list.example.test',
+      anthropicAuthToken: 'list-token',
+      anthropicModel: 'list-default',
+      models: [
+        { id: 'list-default' },
+        { id: 'list-fast', effort: 'low' },
+        { id: 'list-old', hidden: true },
+      ],
+      enabled: false,
+    });
+    other = runtimeConfig.createProvider({
+      name: 'Other list config',
+      type: 'third_party',
+      anthropicBaseUrl: 'https://other.example.test',
+      anthropicAuthToken: 'other-token',
+      anthropicModel: 'other-default',
+      enabled: false,
+    });
+  });
+
+  const send = async (
+    method: 'POST' | 'PATCH',
+    pathname: string,
+    body: unknown,
+  ) => {
+    const res = await routes.request(pathname, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, body: await res.json() };
+  };
+
+  test('GET lists what each configuration offers and each Agent model', async () => {
+    const created = await send('POST', '/', {
+      name: 'Listed Model Agent',
+      model_config_id: listed.id,
+      model: 'list-fast',
+    });
+    const body = await (await routes.request('/', { method: 'GET' })).json();
+    const unknown = (id: string) => ({
+      id,
+      efforts: [],
+      defaultEffort: null,
+      contextWindow: null,
+      effortsSource: 'none',
+    });
+    expect(
+      body.model_configs
+        .find((item: any) => item.id === listed.id)
+        .models.map((model: any) => model.id),
+    ).toEqual(['list-default', 'list-fast', 'list-old']);
+    // A configuration saved without a list offers its one model.
+    expect(
+      body.model_configs.find((item: any) => item.id === other.id).models,
+    ).toEqual([unknown('other-default')]);
+    expect(
+      body.profiles.find((item: any) => item.id === created.body.profile.id),
+    ).toMatchObject({ model_config_id: listed.id, model: 'list-fast' });
+    expect(body.profiles.find((item: any) => item.is_default).model).toBeNull();
+  });
+
+  test('inherited_model names what the main Agents hand down; PATCH checks the effort', async () => {
+    const effortful = runtimeConfig.createProvider({
+      name: 'Effortful config',
+      type: 'third_party',
+      anthropicBaseUrl: 'https://effort.example.test',
+      anthropicAuthToken: 'effort-token',
+      anthropicModel: 'eff-a',
+      models: [
+        { id: 'eff-a', efforts: ['low', 'high'], defaultEffort: 'low' },
+        { id: 'eff-none' },
+      ],
+    });
+    const main = db.getOrCreateDefaultAgentProfile('routes-agent-user');
+    expect(
+      await send('PATCH', `/${main.id}`, {
+        model_config_id: effortful.id,
+        model: 'eff-a',
+        runtime_policy: { reasoning: { effort: 'high' } },
+      }),
+    ).toMatchObject({ status: 200 });
+    const list = async () =>
+      (await (await routes.request('/', { method: 'GET' })).json())
+        .inherited_model;
+    expect(await list()).toEqual({
+      owner_main: {
+        model_config_id: effortful.id,
+        model: 'eff-a',
+        effort: 'high',
+      },
+      system_main: null,
+      system_main_profile_id: null,
+    });
+
+    // The bound model must take the Agent's explicit effort.
+    expect(
+      await send('PATCH', `/${main.id}`, { model: 'eff-none' }),
+    ).toMatchObject({ status: 400, body: { code: 'EFFORT_NOT_SUPPORTED' } });
+    expect(
+      await send('PATCH', `/${main.id}`, {
+        runtime_policy: { reasoning: { effort: 'max' } },
+      }),
+    ).toMatchObject({ status: 400, body: { code: 'EFFORT_NOT_SUPPORTED' } });
+    expect(
+      await send('PATCH', `/${main.id}`, {
+        model: 'eff-none',
+        runtime_policy: { reasoning: { effort: 'inherit' } },
+      }),
+    ).toMatchObject({ status: 200 });
+    // A name saved with `[1m]` is the same model.
+    expect(
+      await send('PATCH', `/${main.id}`, {
+        model: 'eff-a[1m]',
+        runtime_policy: { reasoning: { effort: 'high' } },
+      }),
+    ).toMatchObject({ status: 200 });
+    // Creating checks the same; a copy of what cannot run inherits instead.
+    expect(
+      await send('POST', '/', {
+        name: `Effortless ${Math.random()}`,
+        model_config_id: effortful.id,
+        model: 'eff-none',
+        runtime_policy: { reasoning: { effort: 'high' } },
+      }),
+    ).toMatchObject({ status: 400, body: { code: 'EFFORT_NOT_SUPPORTED' } });
+    const custom = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: `Copy source ${Math.random()}`,
+      modelConfigId: effortful.id,
+      model: 'eff-a',
+      runtimePolicy: { reasoning: { effort: 'high' } } as never,
+    });
+    db.updateAgentProfile(custom.id, 'routes-agent-user', {
+      model: 'eff-none',
+    });
+    const copied = await send('POST', `/${custom.id}/duplicate`, {});
+    expect(copied.status).toBe(201);
+    expect(copied.body.profile).toMatchObject({
+      model_config_id: effortful.id,
+      model: 'eff-none',
+      runtime_policy: { reasoning: { effort: 'inherit' } },
+    });
+    db.updateAgentProfile(main.id, 'routes-agent-user', {
+      model: 'eff-none',
+      runtimePolicy: { reasoning: { effort: 'inherit' } } as never,
+    });
+
+    // The system main is the earliest active admin's main Agent; its id is
+    // only told to its owner.
+    const at = new Date().toISOString();
+    db.createUser({
+      id: 'routes-agent-admin',
+      username: 'routes-agent-admin',
+      password_hash: 'hash',
+      display_name: 'Admin',
+      role: 'admin',
+      status: 'active',
+      created_at: at,
+      updated_at: at,
+      must_change_password: false,
+    });
+    const adminMain = db.getOrCreateDefaultAgentProfile('routes-agent-admin');
+    db.updateAgentProfile(adminMain.id, 'routes-agent-admin', {
+      modelConfigId: effortful.id,
+    });
+    expect(await list()).toMatchObject({
+      system_main: {
+        model_config_id: effortful.id,
+        model: 'eff-a',
+        effort: 'low',
+      },
+      system_main_profile_id: null,
+    });
+    db.updateAgentProfile(adminMain.id, 'routes-agent-admin', {
+      modelConfigId: null,
+    });
+    db.updateAgentProfile(main.id, 'routes-agent-user', {
+      modelConfigId: null,
+    });
+  });
+
+  test('a ChatGPT configuration offers its catalog', async () => {
+    const { CODEX_GATEWAY_BASE_URL_PLACEHOLDER } =
+      await import('../src/codex-gateway/types.js');
+    const chatGpt = runtimeConfig.createProvider({
+      name: 'ChatGPT catalog config',
+      type: 'third_party',
+      anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+      anthropicAuthToken: 'gateway-identifier',
+      anthropicModel: 'gpt-6-sol',
+      codexOAuthCredentials: {
+        accessToken: 'upstream-access',
+        refreshToken: 'upstream-refresh',
+        expiresAt: Date.now() + 3_600_000,
+        accountId: 'account',
+        planType: 'plus',
+        email: 'fake@example.invalid',
+        updatedAt: new Date().toISOString(),
+      },
+      enabled: false,
+    });
+    const body = await (await routes.request('/', { method: 'GET' })).json();
+    const models = body.model_configs.find(
+      (item: any) => item.id === chatGpt.id,
+    ).models;
+    // The account catalog: verified efforts, window unknown.
+    expect(models).toContainEqual(
+      expect.objectContaining({
+        id: 'gpt-6-sol',
+        contextWindow: null,
+        effortsSource: 'registry',
+      }),
+    );
+    expect(models.every((model: any) => !('hidden' in model))).toBe(true);
+
+    const bound = await send('POST', '/', {
+      name: 'ChatGPT Model Agent',
+      model_config_id: chatGpt.id,
+      model: 'gpt-6-sol',
+    });
+    expect(bound.status).toBe(201);
+    expect(bound.body.profile.model).toBe('gpt-6-sol');
+    const refused = await send('POST', '/', {
+      name: 'Imaginary Model Agent',
+      model_config_id: chatGpt.id,
+      model: 'gpt-0-imaginary',
+    });
+    expect(refused).toMatchObject({
+      status: 400,
+      body: { code: 'MODEL_NOT_IN_CONNECTION' },
+    });
+  });
+
+  test('POST accepts a model of the configuration, hidden ones included', async () => {
+    const hidden = await send('POST', '/', {
+      name: 'Hidden Model Agent',
+      model_config_id: listed.id,
+      model: 'list-old',
+    });
+    expect(hidden.status).toBe(201);
+    expect(hidden.body.profile).toMatchObject({
+      model_config_id: listed.id,
+      model: 'list-old',
+    });
+
+    const before = db.listAgentProfilesForUser('routes-agent-user').length;
+    const unlisted = await send('POST', '/', {
+      name: 'Unlisted Model Agent',
+      model_config_id: listed.id,
+      model: 'other-default',
+    });
+    expect(unlisted).toMatchObject({
+      status: 400,
+      body: { code: 'MODEL_NOT_IN_CONNECTION' },
+    });
+    expect(unlisted.body.error).toContain('other-default');
+    const unbound = await send('POST', '/', {
+      name: 'Unbound Model Agent',
+      model: 'list-fast',
+    });
+    expect(unbound).toMatchObject({
+      status: 400,
+      body: { code: 'MODEL_NOT_IN_CONNECTION' },
+    });
+    expect(db.listAgentProfilesForUser('routes-agent-user')).toHaveLength(
+      before,
+    );
+  });
+
+  test('PATCH checks a model against the configuration it will belong to', async () => {
+    const created = (
+      await send('POST', '/', {
+        name: 'Patched Model Agent',
+        model_config_id: listed.id,
+      })
+    ).body.profile;
+    expect(created.model).toBeNull();
+    const at = `/${created.id}`;
+
+    // Only a model: the Agent's current configuration decides.
+    const fast = await send('PATCH', at, { model: 'list-fast' });
+    expect(fast.status).toBe(200);
+    expect(fast.body.profile).toMatchObject({
+      model: 'list-fast',
+      version: created.version + 1,
+    });
+    expect(await send('PATCH', at, { model: 'other-default' })).toMatchObject({
+      status: 400,
+      body: { code: 'MODEL_NOT_IN_CONNECTION' },
+    });
+    // With a new configuration, that one decides.
+    expect(
+      await send('PATCH', at, {
+        model_config_id: other.id,
+        model: 'list-fast',
+      }),
+    ).toMatchObject({ status: 400, body: { code: 'MODEL_NOT_IN_CONNECTION' } });
+    const moved = await send('PATCH', at, {
+      model_config_id: other.id,
+      model: 'other-default',
+    });
+    expect(moved.body.profile).toMatchObject({
+      model_config_id: other.id,
+      model: 'other-default',
+    });
+    // Another configuration without a model starts from its default.
+    const back = await send('PATCH', at, { model_config_id: listed.id });
+    expect(back.body.profile).toMatchObject({
+      model_config_id: listed.id,
+      model: null,
+    });
+    // Null clears; a model needs a configuration.
+    await send('PATCH', at, { model: 'list-old' });
+    const cleared = await send('PATCH', at, { model: null });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body.profile.model).toBeNull();
+    await send('PATCH', at, { model_config_id: null });
+    expect(await send('PATCH', at, { model: 'list-fast' })).toMatchObject({
+      status: 400,
+      body: { code: 'MODEL_NOT_IN_CONNECTION' },
+    });
+  });
+
+  test('a model change quiesces the Agent workspaces like a configuration change', async () => {
+    const profile = db.createAgentProfile({
+      ownerUserId: 'routes-agent-user',
+      name: 'Warm Model Agent',
+      modelConfigId: listed.id,
+    });
+    const folder = 'warm-model-workspace';
+    db.setRegisteredGroup('web:warm-model-workspace', {
+      name: 'Warm Model Workspace',
+      folder,
+      added_at: '2026-10-28T00:00:00.000Z',
+      created_by: 'routes-agent-user',
+    });
+    db.assignWorkspaceAgentProfile(folder, profile.id);
+
+    const stopGroup = vi.fn(async () => {});
+    webContext.setWebDeps({
+      queue: {
+        pauseGroupsForMutation: () => ({ id: 1 }),
+        resumeGroupsAfterMutation: () => {},
+        listDescendantJids: () => [],
+        getStatus: () => ({ groups: [] }),
+        stopGroup,
+      },
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    const changed = await send('PATCH', `/${profile.id}`, {
+      model: 'list-fast',
+    });
+    expect(changed.status).toBe(200);
+    expect(changed.body).toMatchObject({
+      invalidated_runtime_jids: 1,
+      profile: { model: 'list-fast', version: profile.version + 1 },
+    });
+    expect(stopGroup).toHaveBeenCalled();
+
+    stopGroup.mockClear();
+    const same = await send('PATCH', `/${profile.id}`, { model: 'list-fast' });
+    expect(same.body).toMatchObject({
+      invalidated_runtime_jids: 0,
+      profile: { version: profile.version + 1 },
+    });
+    expect(stopGroup).not.toHaveBeenCalled();
   });
 });

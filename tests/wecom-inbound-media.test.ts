@@ -52,9 +52,6 @@ vi.mock('../src/db.js', () => ({
   ),
   storeMessageDirect: vi.fn(),
 }));
-vi.mock('../src/message-notifier.js', () => ({
-  notifyNewImMessage: vi.fn(),
-}));
 vi.mock('../src/im-downloader.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/im-downloader.js')>()),
   saveDownloadedFile: mediaStore.saveDownloadedFile,
@@ -74,7 +71,6 @@ import {
   sequenceInboundTimestampAfterChatTail,
   storeMessageDirect,
 } from '../src/db.js';
-import { notifyNewImMessage } from '../src/message-notifier.js';
 import {
   createWeComConnection,
   type WeComConnectionConfig,
@@ -203,7 +199,6 @@ describe('WeCom inbound media persist/notify', () => {
     );
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
     expect(storeMessageDirect.mock.calls[0][4]).toBe('你好');
-    expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
   test('authorized C2C mixed persists text items and notifies', async () => {
@@ -238,7 +233,6 @@ describe('WeCom inbound media persist/notify', () => {
         },
       ],
     );
-    expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
   test('mixed media enforces the image-count ceiling', async () => {
@@ -304,7 +298,6 @@ describe('WeCom inbound media persist/notify', () => {
       '[图片: downloads/wecom/a.jpg]',
     );
     expect(storeMessageDirect.mock.calls[0][7].attachments).toBeTruthy();
-    expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
   test('unauthorized C2C voice does not persist', async () => {
@@ -317,7 +310,6 @@ describe('WeCom inbound media persist/notify', () => {
     );
     await vi.waitFor(() => expect(client.replyStream).toHaveBeenCalled());
     expect(storeMessageDirect).not.toHaveBeenCalled();
-    expect(notifyNewImMessage).not.toHaveBeenCalled();
   });
 
   test('authorization rejects image before any download', async () => {
@@ -642,6 +634,8 @@ describe('WeCom inbound media persist/notify', () => {
       'wecom',
       'route.pdf',
       Buffer.from('pdf'),
+      // The staged route, which picks a session's worktree.
+      'wecom:c2c:target-a',
     );
     expect(storeMessageDirect.mock.calls[1][1]).toBe('wecom:c2c:target-a');
     expect(storeMessageDirect.mock.calls[1][4]).toBe(
@@ -730,20 +724,78 @@ describe('WeCom inbound media persist/notify', () => {
     expect(mediaStore.saveDownloadedFile).toHaveBeenCalledTimes(1);
   });
 
-  test('group image is dropped because official media is C2C-only', async () => {
-    const { client } = await connect();
+  test('group image is saved to the group workspace like a single-chat image', async () => {
+    const resolveGroupFolder = vi.fn(() => 'group-workspace');
+    const { client } = await connect({ resolveGroupFolder });
     mediaDownload.mockResolvedValue({
-      buffer: Buffer.from('img'),
-      filename: 'a.jpg',
+      buffer: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]),
+      filename: 'g.jpg',
     });
     client.emit(
       'message.image',
       mediaFrame({ reqId: 'image-g', msgtype: 'image', chattype: 'group' }),
     );
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(storeMessageDirect).not.toHaveBeenCalled();
-    expect(notifyNewImMessage).not.toHaveBeenCalled();
-    expect(mediaDownload).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
+    expect(mediaDownload).toHaveBeenCalledTimes(1);
+    expect(resolveGroupFolder).toHaveBeenCalledWith('wecom:group:group-1');
+    expect(mediaStore.saveDownloadedFile).toHaveBeenCalledWith(
+      'group-workspace',
+      'wecom',
+      'g.jpg',
+      expect.any(Buffer),
+      'wecom:group:group-1',
+    );
+    expect(storeMessageDirect.mock.calls[0][1]).toBe('wecom:group:group-1');
+    expect(storeMessageDirect.mock.calls[0][4]).toBe(
+      '[图片: downloads/wecom/g.jpg]',
+    );
+    expect(storeMessageDirect.mock.calls[0][7].attachments).toBeTruthy();
+  });
+
+  test('group file and video are saved under the single-chat limits', async () => {
+    const { client } = await connect();
+    mediaDownload.mockResolvedValueOnce({
+      buffer: Buffer.from('pdf'),
+      filename: 'group-notes.pdf',
+    });
+    client.emit(
+      'message.file',
+      mediaFrame({ reqId: 'file-g', msgtype: 'file', chattype: 'group' }),
+    );
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(1));
+    expect(storeMessageDirect.mock.calls[0][4]).toBe(
+      '[文件: downloads/wecom/group-notes.pdf]',
+    );
+
+    // The image ceiling (20 MiB) applies to groups exactly as to single chats.
+    const oversized = Buffer.alloc(20 * 1024 * 1024 + 1, 1);
+    oversized.set([0xff, 0xd8, 0xff, 0xe0], 0);
+    mediaDownload.mockResolvedValueOnce({
+      buffer: oversized,
+      filename: 'huge.jpg',
+    });
+    client.emit(
+      'message.image',
+      mediaFrame({ reqId: 'image-g-big', msgtype: 'image', chattype: 'group' }),
+    );
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalledTimes(2));
+    expect(storeMessageDirect.mock.calls[1][4]).toBe('[图片（文件过大）]');
+    expect(mediaStore.saveDownloadedFile).toHaveBeenCalledTimes(1);
+  });
+
+  test('group voice persists its transcript', async () => {
+    const { client } = await connect();
+    client.emit(
+      'message.voice',
+      mediaFrame({
+        reqId: 'voice-g',
+        msgtype: 'voice',
+        chattype: 'group',
+        voice: '群语音',
+      }),
+    );
+    await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
+    expect(storeMessageDirect.mock.calls[0][4]).toBe('群语音');
   });
 
   test('authorized group mixed persists text items and notifies', async () => {
@@ -759,7 +811,6 @@ describe('WeCom inbound media persist/notify', () => {
     );
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
     expect(storeMessageDirect.mock.calls[0][4]).toBe('group hello');
-    expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
   test('authorized C2C file downloads and persists exact file marker', async () => {
@@ -779,11 +830,11 @@ describe('WeCom inbound media persist/notify', () => {
       'wecom',
       'notes.pdf',
       Buffer.from('pdf'),
+      storeMessageDirect.mock.calls[0][1],
     );
     expect(storeMessageDirect.mock.calls[0][4]).toBe(
       '[文件: downloads/wecom/notes.pdf]',
     );
-    expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
   test('authorized C2C video downloads and persists exact video marker', async () => {
@@ -801,7 +852,6 @@ describe('WeCom inbound media persist/notify', () => {
     expect(storeMessageDirect.mock.calls[0][4]).toBe(
       '[视频: downloads/wecom/clip.mp4]',
     );
-    expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
   test('C2C image CDN-fail persists exact [图片]', async () => {
@@ -814,7 +864,6 @@ describe('WeCom inbound media persist/notify', () => {
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
     expect(mediaDownload).toHaveBeenCalled();
     expect(storeMessageDirect.mock.calls[0][4]).toBe('[图片]');
-    expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
   test('C2C file CDN-fail persists exact [文件]', async () => {
@@ -826,7 +875,6 @@ describe('WeCom inbound media persist/notify', () => {
     );
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
     expect(storeMessageDirect.mock.calls[0][4]).toBe('[文件（下载失败）]');
-    expect(notifyNewImMessage).toHaveBeenCalled();
   });
 
   test('C2C video CDN-fail persists exact [视频消息]', async () => {
@@ -838,7 +886,6 @@ describe('WeCom inbound media persist/notify', () => {
     );
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
     expect(storeMessageDirect.mock.calls[0][4]).toBe('[视频（下载失败）]');
-    expect(notifyNewImMessage).toHaveBeenCalled();
   });
   test('existing authorized C2C text path still persists and notifies', async () => {
     const { client } = await connect();
@@ -848,6 +895,5 @@ describe('WeCom inbound media persist/notify', () => {
     );
     await vi.waitFor(() => expect(storeMessageDirect).toHaveBeenCalled());
     expect(storeMessageDirect.mock.calls[0][4]).toBe('hello');
-    expect(notifyNewImMessage).toHaveBeenCalled();
   });
 });

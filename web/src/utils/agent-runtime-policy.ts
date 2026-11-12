@@ -1,7 +1,9 @@
+import type { Skill } from '../stores/skills';
 import {
   getAgentContextSource,
   type AgentProfileRuntimePolicy,
 } from '../types';
+import { buildMcpPolicyOptions } from './mcp-servers';
 
 export type RuntimePolicyMode = 'inherit' | 'custom' | 'disabled';
 
@@ -16,12 +18,14 @@ export const DEFAULT_HOST_SKILL_POLICY: SkillSourcePolicy = {
 };
 
 /**
- * Profiles saved before host Skill governance was introduced inherited every
- * host Skill together with host Claude context. Preserve that behavior until
- * the profile is saved with an explicit host policy.
+ * The host Skill grant a profile runs with. The server stores it on every
+ * profile; one from an older server without it followed the context source
+ * the runner actually uses, which for the main HappyClaw is the system
+ * setting reflected in `effective`, not its persisted `managed`.
  */
 export function getHostSkillPolicy(
   policy?: Partial<AgentProfileRuntimePolicy> | null,
+  effective?: Partial<AgentProfileRuntimePolicy> | null,
 ): SkillSourcePolicy {
   const explicit = policy?.skills?.host;
   if (explicit) {
@@ -30,9 +34,19 @@ export function getHostSkillPolicy(
       ids: explicit.ids ?? [],
     };
   }
-  return getAgentContextSource(policy) === 'host_claude'
+  return getAgentContextSource(effective ?? policy) === 'host_claude'
     ? { mode: 'inherit', ids: [] }
     : { ...DEFAULT_HOST_SKILL_POLICY };
+}
+
+/** Running or queued conversations a runner restart would interrupt. */
+export function countActiveConversations(
+  workspaces: Array<{ active_conversations?: number }> | undefined,
+): number {
+  return (workspaces ?? []).reduce(
+    (sum, workspace) => sum + (workspace.active_conversations ?? 0),
+    0,
+  );
 }
 
 export function skillSelectionError(
@@ -57,11 +71,65 @@ export function hostSkillPolicyForMode(
   };
 }
 
-export function skillPolicySummary(
-  policy: SkillSourcePolicy,
-  allLabel = '全部已启用',
-): string {
-  if (policy.mode === 'disabled') return '不使用';
-  if (policy.mode === 'inherit') return allLabel;
-  return `选择 ${policy.ids.length} 项`;
+const HOST_SKILL_SOURCE_LABEL = '宿主机';
+
+/** Keep selected ids that no longer resolve visible so they can be removed. */
+function withUnavailableSelections<T extends { id: string }, U>(
+  available: T[],
+  selectedIds: string[],
+  unavailable: (id: string) => U,
+): Array<T | U> {
+  const known = new Set(available.map((item) => item.id));
+  return [
+    ...available,
+    ...selectedIds.filter((id) => !known.has(id)).map(unavailable),
+  ];
+}
+
+export function buildManagedSkillOptions(
+  skills: Skill[],
+  selectedIds: string[],
+) {
+  return withUnavailableSelections(
+    skills
+      .filter((skill) => skill.source === 'user' && skill.enabled)
+      .map((skill) => ({
+        id: skill.id,
+        name: skill.name || skill.id,
+        description: skill.description,
+      })),
+    selectedIds,
+    (id) => ({ id, name: id, unavailable: true }),
+  );
+}
+
+export function buildHostSkillOptions(skills: Skill[], selectedIds: string[]) {
+  return withUnavailableSelections(
+    skills
+      .filter((skill) => skill.source === 'external' && skill.enabled)
+      .map((skill) => ({
+        id: skill.id,
+        name: skill.name || skill.id,
+        description: skill.description,
+        sourceLabel: HOST_SKILL_SOURCE_LABEL,
+      })),
+    selectedIds,
+    (id) => ({
+      id,
+      name: id,
+      sourceLabel: HOST_SKILL_SOURCE_LABEL,
+      unavailable: true,
+    }),
+  );
+}
+
+export function buildMcpSelectionOptions(
+  servers: Parameters<typeof buildMcpPolicyOptions>[0],
+  selectedIds: string[],
+) {
+  return withUnavailableSelections(
+    buildMcpPolicyOptions(servers),
+    selectedIds,
+    (id) => ({ id, name: id, unavailable: true }),
+  );
 }

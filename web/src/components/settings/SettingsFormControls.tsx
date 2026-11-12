@@ -26,11 +26,11 @@ export function SettingsFormFooter({
 
 /**
  * Save footer for long multi-field forms. It sticks to the bottom of the app
- * scroll root and stays opaque. On mobile it extends down behind the floating
- * BottomTabBar so nothing scrolls through between the bar and the capsule:
- * the offsets cancel `pb-nav-safe` (7rem + safe area) and clear
- * `.floating-nav-container` (bottom max(24px, safe area), 58px tall) from
- * globals.css.
+ * scroll root and stays opaque. Below the desktop layout it extends down
+ * to the bottom edge so nothing scrolls through between it and the bottom
+ * navigation: the offsets cancel `pb-nav-safe` (`--nav-clearance`) and the
+ * padding covers the floating BottomTabBar of narrow windows, or only the
+ * home indicator on phones (`--nav-cover`, both in globals.css).
  */
 export function SettingsStickySaveBar({
   status,
@@ -42,7 +42,7 @@ export function SettingsStickySaveBar({
   return (
     <div
       data-slot="settings-sticky-save-bar"
-      className="sticky bottom-0 z-10 mt-8 -mx-4 border-t border-surface-border bg-background px-4 max-lg:bottom-[calc(-7rem_-_env(safe-area-inset-bottom,0px))] max-lg:-mb-[calc(7rem_+_env(safe-area-inset-bottom,0px))] max-lg:pb-[calc(max(24px,env(safe-area-inset-bottom,0px))_+_58px_+_0.5rem)] sm:-mx-6 sm:px-6 lg:mx-0 lg:px-0"
+      className="sticky bottom-0 z-10 mt-8 -mx-4 border-t border-surface-border bg-background px-4 max-lg:-bottom-(--nav-clearance) max-lg:-mb-(--nav-clearance) max-lg:pb-(--nav-cover) sm:-mx-6 sm:px-6 lg:mx-0 lg:px-0"
     >
       <div className="flex h-14 items-center justify-between gap-4">
         <div className="min-w-0">{status}</div>

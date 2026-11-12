@@ -4,57 +4,26 @@ import {
   useEffect,
   useLayoutEffect,
   useCallback,
+  useMemo,
   useId,
   useImperativeHandle,
-  useMemo,
   memo,
   type ReactNode,
   type Ref,
 } from 'react';
 import { toast } from 'sonner';
+import type { Editor, JSONContent } from '@tiptap/core';
+import { EditorContent } from '@tiptap/react';
+import { Selection } from '@tiptap/pm/state';
+import type { Node as PMNode } from '@tiptap/pm/model';
+import type { EditorView } from '@tiptap/pm/view';
 import { useKeyboardHeight } from '@/hooks/useKeyboardHeight';
 import { useStableCallback } from '@/hooks/useStableCallback';
 import { successTap } from '../../hooks/useHaptic';
-import {
-  ArrowUp,
-  Eraser,
-  FileUp,
-  FolderUp,
-  X,
-  Paperclip,
-  Image as ImageIcon,
-  TerminalSquare,
-  Loader2,
-  Clock3,
-  CornerUpLeft,
-  Square,
-  Pencil,
-  ChevronUp,
-  ChevronDown,
-  Check,
-  Trash2,
-  Plus,
-  ListPlus,
-  MoreHorizontal,
-} from 'lucide-react';
-import { formatUploadRetryStatus, useFileStore } from '../../stores/files';
 import { useShellStore } from '../../stores/shell';
-import { Button } from '@/components/ui/button';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from '@/components/ui/tooltip';
+import { useAuthStore } from '../../stores/auth';
 import { cn } from '@/lib/utils';
-import { IconButton } from '../common/IconButton';
-import { Shortcut } from '../common/Shortcut';
+import { EASE_SNAPPY } from '@/lib/motion';
 import { ImageLightbox } from './ImageLightbox';
 import {
   useChatStore,
@@ -64,34 +33,61 @@ import {
 } from '../../stores/chat';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { useMediaQuery } from '../../hooks/useMediaQuery';
+import { useIsPhone } from '../layout/phone';
 import {
   alternateFollowUpMode,
   FOLLOW_UP_MODE_KEY,
   FOLLOW_UP_MODE_CHANGED_EVENT,
   getDefaultFollowUpMode,
 } from '../../lib/follow-up-preferences';
-import { planImageClipboardPaste } from '../../lib/mixed-paste';
+import { noteComposerInput } from '../../lib/composer-activity';
 import { SHORTCUTS } from '../../lib/shortcuts';
-import { prepareImageForUpload } from '../../lib/image-upload';
 import {
   composerTextAfterSend,
   isGlobalStopEscape,
-  parseQueuedImageAttachments,
-  queuedFollowUpLabel,
-  type QueuedImagePreview,
+  MAX_MESSAGE_CHARS,
+  withUploadedFiles,
 } from './composer-helpers';
-
-interface PendingFile {
-  /** Display name: relative path for folder uploads, file name otherwise */
-  label: string;
-}
-
-interface PendingImage {
-  name: string;
-  data: string; // base64 data
-  mimeType: string;
-  preview: string; // object URL for preview
-}
+import {
+  isComposerBlankPointerTarget,
+  resolveComposerBlankFocusIntent,
+} from './composer/cindy/composerBlankPointerFocus';
+import { serializeEditorContent } from './composer/cindy/composerContentSerialization';
+import {
+  composerDocIsEmpty,
+  docContainsAtomChip,
+} from './composer/cindy/composerDocState';
+import {
+  handleComposerListEnter,
+  handleStructuredListBackspace,
+} from './composer/cindy/ComposerListNodes';
+import { applyListBackspace } from './composer/cindy/composerListContinuation';
+import { plainTextToComposerDocument } from './composer/cindy/composerListDocument';
+import { restoreComposerDocument } from './composer/cindy/restoreComposerDocument';
+import {
+  appendComposerText,
+  caretOnEdgeLine,
+  composerDocFor,
+  fillComposerDraft,
+} from './composer/composerDocument';
+import { AttachmentTray } from './composer/AttachmentTray';
+import {
+  ComposerDockContext,
+  type ComposerDockApi,
+} from './composer/composerDock';
+import { ComposerPalette, paletteOptionId } from './composer/ComposerPalette';
+import { ComposerToolbar } from './composer/ComposerToolbar';
+import {
+  draftDocFor,
+  readPersistedDraft,
+  writePersistedDraft,
+} from './composer/draftStorage';
+import { QueuedFollowUpsPanel } from './composer/QueuedFollowUps';
+import { sentMessageHistory } from './composer/sentHistory';
+import { UploadProgress } from './composer/UploadProgress';
+import { useComposerAttachments } from './composer/useComposerAttachments';
+import { useComposerEditor } from './composer/useComposerEditor';
+import { useComposerPalette } from './composer/useComposerPalette';
 
 export interface MessageInputHandle {
   /**
@@ -116,18 +112,30 @@ interface MessageInputProps {
   groupJid?: string;
   /**
    * Conversation the draft and pending attachments belong to: the session
-   * chat jid (`${groupJid}#agent:${id}`), or the workspace jid for the main
-   * conversation. Defaults to `groupJid`.
+   * chat jid (`${groupJid}#agent:${id}`). Defaults to `groupJid`.
    */
   draftKey?: string;
   disabled?: boolean;
-  contextLabel?: string;
   /** Composer placeholder, e.g. naming the agent being addressed. */
   placeholder?: string;
   onResetSession?: () => void;
   onToggleTerminal?: () => void;
   /** Conversation-scoped model picker shown in the action bar. */
   modelSelector?: ReactNode;
+  /**
+   * How full the conversation's context is, in the toolbar after the tools
+   * while docked and wider than a phone (a phone's row is full of touch
+   * targets).
+   */
+  contextUsage?: ReactNode;
+  /**
+   * The run's status (phase, elapsed time), directly above the card while
+   * docked. Its row is always reserved there, idle included (the bar then
+   * renders nothing), so a run starting or ending never moves the card or
+   * the list's bottom row; on a phone it rides with the floating dock and
+   * counts in its height.
+   */
+  statusBar?: ReactNode;
   /** Stop the active run when the composer has no follow-up to send. */
   onStop?: () => Promise<boolean> | boolean;
   isRunning?: boolean;
@@ -138,6 +146,12 @@ interface MessageInputProps {
     content?: string,
   ) => Promise<boolean> | boolean;
   ref?: Ref<MessageInputHandle>;
+  /**
+   * `docked` at the bottom of a conversation (default), or `centered` in an
+   * empty one: a taller card without the docked bar's backdrop. Switching to
+   * `docked` slides the card down to its new place.
+   */
+  layout?: 'docked' | 'centered';
 }
 
 // ChatView remounts the composer per conversation. Focus and starter-prompt
@@ -149,9 +163,33 @@ const FOCUS_HANDOFF_MS = 1000;
 // A visual viewport at least this much shorter than the layout viewport means
 // a software keyboard is up (a hardware keyboard's shortcut bar is smaller).
 const SOFT_KEYBOARD_MIN_PX = 150;
+// The phone dock sits 8px above the safe area, or above the keyboard.
+const DOCK_LIFT =
+  'max(calc(var(--safe-bottom, 0px) + 8px), calc(var(--keyboard-height, 0px) + 8px))';
+// Its feathered top edge (pt-6), over which the conversation fades out.
+const DOCK_FEATHER_PX = 24;
+// The docking slide covers half the window; a little longer than a fade.
+const DOCK_SLIDE_MS = 280;
 let focusHandoffAt = Number.NEGATIVE_INFINITY;
 let handledFocusRequest = { nonce: 0, at: Number.NEGATIVE_INFINITY };
 let handledDraftRequestNonce = 0;
+
+/** The draft a composer for `key` opens with, chips included when known. */
+function initialDraft(
+  key: string | undefined,
+  stored: string | undefined,
+  owner: string | undefined,
+): { text: string; doc: JSONContent } {
+  const draft = !key
+    ? null
+    : stored !== undefined
+      ? { text: stored, doc: draftDocFor(key, stored) }
+      : owner
+        ? readPersistedDraft(owner, key)
+        : null;
+  const text = draft?.text ?? '';
+  return { text, doc: composerDocFor(text, draft?.doc) };
+}
 
 // Memoized: ChatView re-renders for dialogs, panels and run status; the
 // transcript and composer only need to when their own props change.
@@ -160,25 +198,32 @@ export const MessageInput = memo(function MessageInput({
   groupJid,
   draftKey,
   disabled = false,
-  contextLabel,
   placeholder = '输入消息...',
   onResetSession,
   onToggleTerminal,
   modelSelector,
+  contextUsage,
+  statusBar,
   onStop,
   isRunning = false,
   queuedFollowUps = [],
   onFollowUpAction,
   ref,
+  layout = 'docked',
 }: MessageInputProps) {
   const draftTarget = draftKey ?? groupJid;
-  const storedDraft = useChatStore((s) =>
-    draftTarget ? s.drafts[draftTarget] : undefined,
+  const userId = useAuthStore((s) => s.user?.id);
+  const agentProfileId = useChatStore((s) =>
+    groupJid ? s.groups[groupJid]?.agent_profile_id : undefined,
   );
-  const [content, setContent] = useState(() => storedDraft ?? '');
-  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
-  const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
-  const [previewIndex, setPreviewIndex] = useState<number | null>(null);
+  // Read once: the composer follows later changes through a subscription
+  // (see the adoption effect) instead of re-rendering on its own saves.
+  const [storedAtMount] = useState(() =>
+    draftTarget ? useChatStore.getState().drafts[draftTarget] : undefined,
+  );
+  const [initial] = useState(() =>
+    initialDraft(draftTarget, storedAtMount, userId),
+  );
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
@@ -193,35 +238,6 @@ export const MessageInput = memo(function MessageInput({
   const [savingFollowUpId, setSavingFollowUpId] = useState<string | null>(null);
   const editingFollowUpInitialContentRef = useRef('');
   const editingFollowUpContentRef = useRef('');
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  // "New conversation" (sidebar / ⌘⇧O / ⌘K) asks the composer for focus.
-  const composerFocusNonce = useShellStore((s) => s.composerFocusNonce);
-  useEffect(() => {
-    if (composerFocusNonce === 0) return;
-    const now = performance.now();
-    if (composerFocusNonce === handledFocusRequest.nonce) {
-      // Applied already; only the composer that replaced it moments ago
-      // (new session + focus in one tick) still takes it.
-      if (now - handledFocusRequest.at > FOCUS_HANDOFF_MS) return;
-    } else {
-      handledFocusRequest = { nonce: composerFocusNonce, at: now };
-    }
-    const frame = requestAnimationFrame(() => textareaRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
-  }, [composerFocusNonce]);
-  useLayoutEffect(() => {
-    const textarea = textareaRef.current;
-    if (textarea && performance.now() - focusHandoffAt < FOCUS_HANDOFF_MS) {
-      focusHandoffAt = Number.NEGATIVE_INFINITY;
-      textarea.focus({ preventScroll: true });
-    }
-    return () => {
-      // Layout cleanups run before the node leaves the DOM.
-      if (textarea && document.activeElement === textarea) {
-        focusHandoffAt = performance.now();
-      }
-    };
-  }, []);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -230,40 +246,54 @@ export const MessageInput = memo(function MessageInput({
   );
   const draftTargetRef = useRef(draftTarget);
   draftTargetRef.current = draftTarget;
-  const latestContentRef = useRef(content);
-  latestContentRef.current = content;
+  const userIdRef = useRef(userId);
+  userIdRef.current = userId;
+  // The composer text as it will be sent (chips expanded), kept current on
+  // every document change.
+  const latestTextRef = useRef(initial.text);
   // The send in flight. Its text leaves the stored draft as soon as it starts
   // and stays out of every draft written meanwhile, so a composer remounted
   // for this conversation mid-send never offers it for sending again.
   const inFlightSendRef = useRef<{ key: string; text: string } | null>(null);
   // The stored draft as this instance last wrote or adopted it, and the
   // composer text at the last adoption (see the adoption effect).
-  const knownDraftRef = useRef(storedDraft ?? '');
-  const adoptedContentRef = useRef(storedDraft ?? '');
-  const pendingImagesRef = useRef(pendingImages);
-  pendingImagesRef.current = pendingImages;
-  // The conversation async attachment work may still stage into. Cleared on
-  // unmount, so results that resolve after a switch are dropped.
-  const stagingTargetRef = useRef<string | null>(null);
-  useEffect(() => {
-    stagingTargetRef.current = draftTarget ?? '';
-    return () => {
-      stagingTargetRef.current = null;
-    };
-  }, [draftTarget]);
-  const isCurrentTarget = (target: string | undefined) =>
-    stagingTargetRef.current === (target ?? '');
+  const knownDraftRef = useRef(storedAtMount ?? '');
+  const adoptedContentRef = useRef(initial.text);
+  // A programmatic replacement, not typing: no activity signal, no save.
+  const replacingRef = useRef(false);
+  // ↑/↓ recall while browsing: the entry shown, the document it put in the
+  // editor, and the user's own draft it replaced.
+  const recallRef = useRef<{
+    index: number;
+    doc: PMNode;
+    draftBefore: JSONContent;
+  } | null>(null);
+  // The conversation's draft as of now. A recalled message is not one until
+  // it is edited, and recall only starts from an empty composer.
+  const draftText = () => (recallRef.current ? '' : latestTextRef.current);
 
-  // 窄 selector：这是 1200+ 行常驻组件，无 selector 的整 store 订阅会让它在
-  // 流式输出的每一帧（rAF 级 set()）都重渲染一次。actions 引用稳定。
-  const uploadFiles = useFileStore((s) => s.uploadFiles);
-  const cancelUpload = useFileStore((s) => s.cancelUpload);
-  const uploading = useFileStore((s) => s.uploading);
-  const uploadProgress = useFileStore((s) => s.uploadProgress);
+  const paletteListId = useId();
+
+  const showSendError = useCallback((message: string, ms = 4000) => {
+    setSendError(message);
+    window.setTimeout(
+      () => setSendError((current) => (current === message ? null : current)),
+      ms,
+    );
+  }, []);
+
+  const attachments = useComposerAttachments({
+    groupJid,
+    draftTarget,
+    disabled,
+    onError: showSendError,
+  });
+  const { pendingFiles, pendingImages } = attachments;
+
   const saveDraft = useChatStore((s) => s.saveDraft);
   /** Store `text` as the draft of `key`, minus a send still in flight. */
   const persistDraft = useCallback(
-    (key: string | undefined, text: string) => {
+    (key: string | undefined, text: string, editor?: Editor) => {
       if (!key) return;
       const inFlight = inFlightSendRef.current;
       const value = (
@@ -273,6 +303,16 @@ export const MessageInput = memo(function MessageInput({
       ).trim();
       if (key === draftTargetRef.current) knownDraftRef.current = value;
       saveDraft(key, value);
+      // The document is kept for its chips (text alone rebuilds the rest),
+      // and describes the draft only while nothing was cut from the text.
+      const doc =
+        editor &&
+        !editor.isDestroyed &&
+        value === text.trim() &&
+        docContainsAtomChip(editor.state.doc)
+          ? editor.getJSON()
+          : undefined;
+      writePersistedDraft(userIdRef.current ?? null, key, value, doc);
     },
     [saveDraft],
   );
@@ -280,6 +320,10 @@ export const MessageInput = memo(function MessageInput({
   const isCompact = displayMode === 'compact';
   const isTouchInput = useMediaQuery('(pointer: coarse) and (hover: none)');
   const isPhoneWidth = useMediaQuery('(max-width: 639px)');
+  // Too narrow for every tool beside a readable model name.
+  const foldToolbarActions = useMediaQuery('(max-width: 479px)');
+  // A phone: cindy's floating dock, a pill at rest that opens into the card.
+  const phoneDock = useIsPhone();
   const isWideViewport = useMediaQuery('(min-width: 1024px)');
 
   // iOS keyboard adaptation
@@ -315,6 +359,86 @@ export const MessageInput = memo(function MessageInput({
     };
   }, []);
 
+  // Debounced draft save
+  const debouncedSaveDraft = useCallback(
+    (editor: Editor) => {
+      if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+      const key = draftTargetRef.current;
+      draftTimerRef.current = setTimeout(() => {
+        draftTimerRef.current = undefined;
+        persistDraft(key, draftText(), editor);
+      }, 300);
+    },
+    [persistDraft],
+  );
+
+  const { editor, snapshot, setPopupAria } = useComposerEditor({
+    content: initial.doc,
+    placeholder,
+    editable: !disabled,
+    handlers: {
+      onKeyDown: (view, event) => handleEditorKeyDown(view, event),
+      onPasteImages: (files) => void attachments.addPastedImages(files),
+      onPasteTooLong: () =>
+        showSendError('粘贴的内容超过 64K 字符上限，请改为上传文件', 6000),
+      onDocChange: (current) => {
+        latestTextRef.current = serializeEditorContent(current).text;
+        // Editing a recalled message makes it the user's own draft.
+        if (!recallRef.current?.doc.eq(current.state.doc)) {
+          recallRef.current = null;
+        }
+        if (replacingRef.current) return;
+        noteComposerInput();
+        debouncedSaveDraft(current);
+      },
+    },
+  });
+
+  /**
+   * Replace what the composer holds with a draft that is already stored and
+   * adopt it. The change handler updates the text synchronously.
+   */
+  const setEditorText = (text: string, doc?: JSONContent | null) => {
+    replacingRef.current = true;
+    try {
+      restoreComposerDocument(editor, composerDocFor(text, doc));
+    } finally {
+      replacingRef.current = false;
+    }
+    adoptedContentRef.current = latestTextRef.current;
+  };
+
+  // "New conversation" (sidebar / ⌘⇧O / ⌘K) asks the composer for focus.
+  const composerFocusNonce = useShellStore((s) => s.composerFocusNonce);
+  useEffect(() => {
+    if (composerFocusNonce === 0) return;
+    const now = performance.now();
+    if (composerFocusNonce === handledFocusRequest.nonce) {
+      // Applied already; only the composer that replaced it moments ago
+      // (new session + focus in one tick) still takes it.
+      if (now - handledFocusRequest.at > FOCUS_HANDOFF_MS) return;
+    } else {
+      handledFocusRequest = { nonce: composerFocusNonce, at: now };
+    }
+    const frame = requestAnimationFrame(() => {
+      if (!editor.isDestroyed) editor.commands.focus('end');
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [composerFocusNonce, editor]);
+  useLayoutEffect(() => {
+    const dom = editor.view.dom;
+    if (performance.now() - focusHandoffAt < FOCUS_HANDOFF_MS) {
+      focusHandoffAt = Number.NEGATIVE_INFINITY;
+      dom.focus({ preventScroll: true });
+    }
+    return () => {
+      // Layout cleanups run before the node leaves the DOM.
+      if (dom.contains(document.activeElement)) {
+        focusHandoffAt = performance.now();
+      }
+    };
+  }, [editor]);
+
   // ChatView remounts the composer per conversation (key = draft key), which
   // restores the draft through the initial state. A parent that reuses one
   // instance across conversations gets the same isolation here.
@@ -323,22 +447,18 @@ export const MessageInput = memo(function MessageInput({
     const previous = prevDraftTargetRef.current;
     if (previous === draftTarget) return;
     prevDraftTargetRef.current = draftTarget;
-    persistDraft(previous, latestContentRef.current);
-    knownDraftRef.current = storedDraft ?? '';
-    adoptedContentRef.current = storedDraft ?? '';
-    setContent(storedDraft ?? '');
-    // Pending attachments were staged for the previous conversation and must
-    // not leak into this one (会话隔离). Release their preview URLs.
-    setPendingImages((prev) => {
-      prev.forEach((img) => URL.revokeObjectURL(img.preview));
-      return [];
-    });
-    setPendingFiles([]);
-    setPreviewIndex(null);
     if (draftTimerRef.current) {
       clearTimeout(draftTimerRef.current);
       draftTimerRef.current = undefined;
     }
+    persistDraft(previous, draftText(), editor);
+    const stored = draftTarget
+      ? useChatStore.getState().drafts[draftTarget]
+      : undefined;
+    const next = initialDraft(draftTarget, stored, userIdRef.current);
+    knownDraftRef.current = stored ?? '';
+    setEditorText(next.text, next.doc);
+    recallRef.current = null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draftTarget]);
 
@@ -346,44 +466,29 @@ export const MessageInput = memo(function MessageInput({
   // its send resolves (the text comes back after a failure). Follow such a
   // change while nothing has been typed here since.
   useEffect(() => {
-    const next = storedDraft ?? '';
-    if (next === knownDraftRef.current) return;
-    knownDraftRef.current = next;
-    if (latestContentRef.current !== adoptedContentRef.current) return;
-    adoptedContentRef.current = next;
-    setContent(next);
-  }, [storedDraft]);
+    if (!draftTarget) return;
+    return useChatStore.subscribe((state) => {
+      const next = state.drafts[draftTarget] ?? '';
+      if (next === knownDraftRef.current) return;
+      knownDraftRef.current = next;
+      if (latestTextRef.current !== adoptedContentRef.current) return;
+      setEditorText(next, draftDocFor(draftTarget, next));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftTarget]);
 
   // On unmount, flush a draft save that is still waiting on its debounce,
-  // so the last keystrokes before leaving the conversation are kept, and
-  // release the previews of attachments that were never sent.
+  // so the last keystrokes before leaving the conversation are kept.
   useEffect(() => {
     return () => {
       if (draftTimerRef.current) {
         clearTimeout(draftTimerRef.current);
         draftTimerRef.current = undefined;
-        persistDraft(draftTargetRef.current, latestContentRef.current);
+        persistDraft(draftTargetRef.current, draftText(), editor);
       }
-      pendingImagesRef.current.forEach((img) =>
-        URL.revokeObjectURL(img.preview),
-      );
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Debounced draft save
-  const debouncedSaveDraft = useCallback(
-    (text: string) => {
-      if (draftTimerRef.current) {
-        clearTimeout(draftTimerRef.current);
-      }
-      draftTimerRef.current = setTimeout(() => {
-        draftTimerRef.current = undefined;
-        persistDraft(draftTarget, text);
-      }, 300);
-    },
-    [draftTarget, persistDraft],
-  );
 
   // Starter prompts fill the composer so the user can edit before sending.
   const composerDraftRequest = useShellStore((s) => s.composerDraftRequest);
@@ -395,89 +500,130 @@ export const MessageInput = memo(function MessageInput({
       return;
     }
     handledDraftRequestNonce = composerDraftRequest.nonce;
-    const text = composerDraftRequest.text;
-    const next = content.trim() ? `${content.trimEnd()}\n${text}` : text;
-    setContent(next);
-    debouncedSaveDraft(next);
-    requestAnimationFrame(() => {
-      const textarea = textareaRef.current;
-      if (!textarea) return;
-      textarea.focus();
-      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
-    });
+    fillComposerDraft(editor, composerDraftRequest);
     // Only a new request inserts text; typing must not re-run this.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [composerDraftRequest]);
 
-  // Auto-resize textarea (1-6 lines)
-  // useLayoutEffect runs BEFORE paint → height update is invisible to the user (no jitter)
-  useLayoutEffect(() => {
-    const textarea = textareaRef.current;
-    if (!textarea) return;
-
-    // Temporarily hide overflow to prevent scrollbar flash during measurement
-    const prevOverflow = textarea.style.overflow;
-    textarea.style.overflow = 'hidden';
-    textarea.style.height = '0px';
-    const scrollHeight = textarea.scrollHeight;
-    const lineHeight = 24;
-    const maxHeight = lineHeight * 6;
-    const newHeight = Math.max(lineHeight, Math.min(scrollHeight, maxHeight));
-    textarea.style.height = `${newHeight}px`;
-    textarea.style.overflow =
-      newHeight >= maxHeight ? 'auto' : prevOverflow || '';
-  }, [content]);
-
-  const hasContent = content.trim().length > 0;
+  const hasContent = snapshot.hasMessage;
   const hasPayload =
     hasContent || pendingFiles.length > 0 || pendingImages.length > 0;
   const canSend = hasPayload && !sending;
   const canStop = isRunning && !!onStop;
   const showStop = canStop && !hasPayload && !sending;
 
-  // IME composition state — prevent Enter from sending while composing (e.g. Chinese input)
-  // On Chrome macOS, compositionEnd fires before the Enter keyDown, so we track
-  // the timestamp and ignore Enter within 100ms after composition ends.
-  const composingRef = useRef(false);
-  const compositionEndTimeRef = useRef(0);
+  const palette = useComposerPalette({
+    editor,
+    trigger: snapshot.trigger,
+    workspaceJid: groupJid,
+    agentProfileId,
+    allowReset: !!onResetSession,
+  });
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // Safari and some Android IMEs deliver the committing Enter after
-    // compositionend, marked only by keyCode 229.
-    if (
-      composingRef.current ||
-      e.nativeEvent.isComposing ||
-      e.nativeEvent.keyCode === 229
-    ) {
-      return;
+  const paletteActive =
+    palette.open && palette.items.length > 0 ? palette.activeIndex : -1;
+  useEffect(() => {
+    setPopupAria(
+      palette.open
+        ? {
+            'aria-controls': paletteListId,
+            ...(paletteActive >= 0
+              ? {
+                  'aria-activedescendant': paletteOptionId(
+                    paletteListId,
+                    paletteActive,
+                  ),
+                }
+              : {}),
+          }
+        : {},
+    );
+  }, [palette.open, paletteActive, paletteListId, setPopupAria]);
+
+  /**
+   * ↑ (older) / ↓ (newer) through this conversation's sent messages. While a
+   * recalled message shows, the arrows move the caret inside it and only
+   * step from its first line (↑) or last line (↓), as in a terminal.
+   */
+  const recallHistory = (view: EditorView, step: 1 | -1): boolean => {
+    const recall = recallRef.current;
+    if (!recall && !composerDocIsEmpty(view.state.doc)) return false;
+    if (recall && !caretOnEdgeLine(view, step === 1 ? 'up' : 'down')) {
+      return false;
     }
-    if (e.key === 'Escape') {
-      if (showStop) {
-        e.preventDefault();
-        void handleStop();
-      }
-      return;
-    }
-    if (e.key !== 'Enter') return;
-    if (Date.now() - compositionEndTimeRef.current < 100) return;
-    const withMod = e.metaKey || e.ctrlKey;
-    if (e.shiftKey) {
-      if (!withMod) return;
-      e.preventDefault();
-      void handleSend(
-        isRunning ? alternateFollowUpMode(followUpMode) : undefined,
-      );
-      return;
-    }
-    if (enterInsertsNewline && !withMod) return;
-    e.preventDefault();
-    void handleSend();
+    const key = draftTargetRef.current;
+    if (!key) return false;
+    const history = sentMessageHistory(
+      useChatStore.getState(),
+      key,
+      userIdRef.current,
+    );
+    const next = (recall?.index ?? -1) + step;
+    if (next >= history.length || (next < 0 && !recall)) return false;
+    const draftBefore = recall?.draftBefore ?? view.state.doc.toJSON();
+    const doc = view.state.schema.nodeFromJSON(
+      next < 0 ? draftBefore : plainTextToComposerDocument(history[next]),
+    );
+    const tr = view.state.tr.replaceWith(
+      0,
+      view.state.doc.content.size,
+      doc.content,
+    );
+    tr.setSelection(Selection.atEnd(tr.doc));
+    // Set before dispatching: the change handler compares against it.
+    recallRef.current =
+      next < 0 ? null : { index: next, doc: tr.doc, draftBefore };
+    view.dispatch(tr.scrollIntoView());
+    return true;
   };
+
+  function handleEditorKeyDown(view: EditorView, event: KeyboardEvent) {
+    if (palette.captureKey(event)) return true;
+    if (event.key === 'Escape') {
+      if (!showStop) return false;
+      void handleStop();
+      return true;
+    }
+    const plain =
+      !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey;
+    if (
+      plain &&
+      (event.key === 'ArrowUp' || event.key === 'ArrowDown') &&
+      recallHistory(view, event.key === 'ArrowUp' ? 1 : -1)
+    ) {
+      return true;
+    }
+    if (
+      plain &&
+      event.key === 'Backspace' &&
+      (handleStructuredListBackspace(view) || applyListBackspace(view))
+    ) {
+      return true;
+    }
+    if (event.key !== 'Enter') return false;
+    if (event.metaKey || event.ctrlKey) {
+      void handleSend(
+        event.shiftKey && isRunning
+          ? alternateFollowUpMode(followUpMode)
+          : undefined,
+      );
+      return true;
+    }
+    if (event.shiftKey || event.altKey || enterInsertsNewline) {
+      // Newline keys continue or leave a list, otherwise break the line.
+      if (!handleComposerListEnter(view, event, 'modifier-enter')) {
+        editor.commands.setHardBreak();
+      }
+      return true;
+    }
+    void handleSend();
+    return true;
+  }
 
   const handleSend = async (modeOverride?: FollowUpMode) => {
     // Snapshot what this send carries. The composer stays editable while the
     // request is in flight; only this snapshot leaves it on success.
-    const sentText = content;
+    const sentText = serializeEditorContent(editor).text;
     const trimmed = sentText.trim();
     const sentFiles = pendingFiles;
     const sentImages = pendingImages;
@@ -486,22 +632,27 @@ export const MessageInput = memo(function MessageInput({
     if (!trimmed && sentFiles.length === 0 && sentImages.length === 0) return;
     if (disabled || sending) return;
 
+    // 先组装 message 但不立刻清空 pendingFiles/pendingImages，
+    // 让 onSend 失败时用户的附件也能保留、可以重试。
+    const message = withUploadedFiles(
+      trimmed,
+      sentFiles.map((file) => file.path),
+    );
+    if (message.length > MAX_MESSAGE_CHARS) {
+      showSendError(
+        '消息超过 64K 字符上限，请精简内容，长文本可以改为上传文件',
+        6000,
+      );
+      return;
+    }
+
     setSending(true);
     setSendError(null);
     if (target) {
       inFlightSendRef.current = { key: target, text: sentText };
       persistDraft(target, sentText);
     }
-
-    // 先组装 message 但不立刻清空 pendingFiles/pendingImages，
-    // 让 onSend 失败时用户的附件也能保留、可以重试。
-    let message = trimmed;
-    if (sentFiles.length > 0) {
-      const list = sentFiles.map((f) => `- ${f.label}`).join('\n');
-      const prefix = `[我上传了以下文件到工作区，请查看并使用]\n${list}`;
-      message = message ? `${prefix}\n\n${message}` : prefix;
-    }
-    const attachments =
+    const attachmentsPayload =
       sentImages.length > 0
         ? sentImages.map((img) => ({ data: img.data, mimeType: img.mimeType }))
         : undefined;
@@ -510,7 +661,7 @@ export const MessageInput = memo(function MessageInput({
     try {
       ok = await onSend(
         message,
-        attachments,
+        attachmentsPayload,
         modeOverride ?? (isRunning ? followUpMode : undefined),
       );
     } catch {
@@ -519,7 +670,8 @@ export const MessageInput = memo(function MessageInput({
 
     // Switched away mid-flight: this instance's state is gone or belongs to
     // another conversation; only the stored draft of `target` is fixed up.
-    const stillHere = isCurrentTarget(target);
+    const stillHere =
+      attachments.isCurrentTarget(target) && !editor.isDestroyed;
     inFlightSendRef.current = null;
     if (ok) {
       successTap();
@@ -527,34 +679,26 @@ export const MessageInput = memo(function MessageInput({
         clearTimeout(draftTimerRef.current);
         draftTimerRef.current = undefined;
       }
+      const remaining = composerTextAfterSend(latestTextRef.current, sentText);
       persistDraft(
         target,
-        composerTextAfterSend(latestContentRef.current, sentText),
+        remaining,
+        stillHere && remaining === latestTextRef.current ? editor : undefined,
       );
-      sentImages.forEach((img) => URL.revokeObjectURL(img.preview));
-      if (stillHere) {
-        setContent((current) => composerTextAfterSend(current, sentText));
-        if (sentFiles.length > 0) {
-          setPendingFiles((prev) =>
-            prev.filter((file) => !sentFiles.includes(file)),
-          );
-        }
-        if (sentImages.length > 0) {
-          setPreviewIndex(null);
-          setPendingImages((prev) =>
-            prev.filter((img) => !sentImages.includes(img)),
-          );
-        }
+      if (stillHere && remaining !== latestTextRef.current) {
+        setEditorText(remaining);
       }
+      recallRef.current = null;
+      attachments.releaseSent(sentFiles, sentImages, stillHere);
     } else {
       // 失败：保留输入、保留附件；同步保存草稿，切换会话后也能恢复。
-      persistDraft(target, latestContentRef.current);
-      if (stillHere) {
-        setSendError('发送失败，输入已保留，请重试');
-        setTimeout(() => setSendError(null), 4000);
-      } else {
-        toast.error('发送失败，内容已放回该会话的输入框');
-      }
+      persistDraft(
+        target,
+        latestTextRef.current,
+        stillHere ? editor : undefined,
+      );
+      if (stillHere) showSendError('发送失败，输入已保留，请重试');
+      else toast.error('发送失败，内容已放回该会话的输入框');
     }
     setSending(false);
   };
@@ -624,27 +768,21 @@ export const MessageInput = memo(function MessageInput({
     if (queuedFollowUps.some((item) => item.id === editingFollowUpId)) return;
 
     const recovered = editingFollowUpContentRef.current.trim();
-    const initial = editingFollowUpInitialContentRef.current.trim();
+    const initialContent = editingFollowUpInitialContentRef.current.trim();
     setEditingFollowUpId(null);
     setEditingFollowUpContent('');
     editingFollowUpInitialContentRef.current = '';
     editingFollowUpContentRef.current = '';
 
-    if (!recovered || recovered === initial) return;
-    const nextContent = content.trim()
-      ? `${content.trimEnd()}\n\n${recovered}`
-      : recovered;
-    setContent(nextContent);
-    debouncedSaveDraft(nextContent);
-    setSendError('这条消息已开始处理，未保存的修改已移到输入框');
-    const timer = window.setTimeout(() => setSendError(null), 5000);
-    return () => window.clearTimeout(timer);
+    if (!recovered || recovered === initialContent) return;
+    appendComposerText(editor, recovered, { gap: 1, focus: false });
+    showSendError('这条消息已开始处理，未保存的修改已移到输入框', 5000);
   }, [
-    content,
-    debouncedSaveDraft,
+    editor,
     editingFollowUpId,
     queuedFollowUps,
     savingFollowUpId,
+    showSendError,
   ]);
 
   const handleStop = async () => {
@@ -665,7 +803,9 @@ export const MessageInput = memo(function MessageInput({
   // Esc stops the run from the page too, when nothing has focus and no
   // dialog or menu is open (those keep Esc for closing themselves).
   const stopFromPageEscape = useStableCallback((event: KeyboardEvent) => {
-    if (previewIndex !== null || !isGlobalStopEscape(event)) return;
+    if (attachments.previewIndex !== null || !isGlobalStopEscape(event)) {
+      return;
+    }
     event.preventDefault();
     void handleStop();
   });
@@ -675,278 +815,153 @@ export const MessageInput = memo(function MessageInput({
     return () => document.removeEventListener('keydown', stopFromPageEscape);
   }, [canStop, stopFromPageEscape]);
 
-  /** Add attachments for `target` unless the composer has moved on. */
-  const stageImages = (target: string | undefined, images: PendingImage[]) => {
-    if (images.length === 0) return;
-    if (!isCurrentTarget(target)) {
-      images.forEach((img) => URL.revokeObjectURL(img.preview));
+  useImperativeHandle(ref, () => ({ acceptDrop: attachments.acceptDrop }), [
+    attachments.acceptDrop,
+  ]);
+
+  // Docking after the first message slides the card from where it sat in the
+  // empty conversation (a one-shot transform; none when less motion is asked
+  // for). The start is read in the render that docks it, while the DOM still
+  // shows the centred layout: the card also moves without committing (the
+  // editor grows, the page scrolls), so an earlier reading can be stale.
+  const cardRef = useRef<HTMLDivElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const dockColumnRef = useRef<HTMLDivElement>(null);
+
+  // Text entry inside the dock opens the pill; it closes again when focus
+  // leaves for the page. A sheet or menu a dock control opened (the model
+  // sheet, + sheet) keeps it open on its own: its open state is reported
+  // here as it opens, before focus moves into it, so nothing depends on
+  // when a trigger's aria-expanded flips.
+  const [textFocused, setTextFocused] = useState(false);
+  const [overlayOpen, setOverlayOpenState] = useState(false);
+  const openOverlaysRef = useRef(new Set<string>());
+  const setOverlayOpen = useCallback((id: string, open: boolean) => {
+    const overlays = openOverlaysRef.current;
+    if (open) overlays.add(id);
+    else overlays.delete(id);
+    setOverlayOpenState(overlays.size > 0);
+    // While an overlay was up, focus leaving the dock was not counted (see
+    // noteFocusOut). With the last one closing, count it now: focus that is
+    // not back in the dock leaves the card free to fold into the pill.
+    if (
+      !open &&
+      overlays.size === 0 &&
+      !rootRef.current?.contains(document.activeElement)
+    ) {
+      setTextFocused(false);
+    }
+  }, []);
+  const noteFocusIn = (event: React.FocusEvent<HTMLDivElement>) => {
+    // As below: a field inside an overlay the dock opened is not its text.
+    if (!event.currentTarget.contains(event.target as Node)) return;
+    const target = event.target as HTMLElement;
+    if (target.isContentEditable || target.matches('input, textarea')) {
+      setTextFocused(true);
+    }
+  };
+  const noteFocusOut = (event: React.FocusEvent<HTMLDivElement>) => {
+    // Focus moving inside a portal the dock opened bubbles here through
+    // React; only the dock's own elements losing focus count.
+    if (!event.currentTarget.contains(event.target as Node)) return;
+    const next = event.relatedTarget as Node | null;
+    if (next && event.currentTarget.contains(next)) return;
+    if (openOverlaysRef.current.size > 0) return;
+    setTextFocused(false);
+  };
+
+  // The conversation scrolls under the floating dock. The dock publishes
+  // its height on the area it floats over (the card and its feathered
+  // edge; the keyboard lift is --composer-dock-lift, set alongside, so
+  // keyboard frames don't come through here).
+  useLayoutEffect(() => {
+    const column = dockColumnRef.current;
+    const host = rootRef.current?.parentElement?.closest<HTMLElement>(
+      '[data-composer-dock-host]',
+    );
+    if (!column || !host || !phoneDock || layout === 'centered') return;
+    host.style.setProperty('--composer-dock-lift', DOCK_LIFT);
+    // The list's bottom room already clears the dock; its own end room
+    // would only add a blank band above it.
+    host.style.setProperty('--list-end-room', '0px');
+    let published = '';
+    const update = () => {
+      const height = `${column.offsetHeight + DOCK_FEATHER_PX}px`;
+      if (height === published) return;
+      published = height;
+      host.style.setProperty('--composer-dock-height', height);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(column);
+    return () => {
+      observer.disconnect();
+      host.style.removeProperty('--composer-dock-height');
+      host.style.removeProperty('--composer-dock-lift');
+      host.style.removeProperty('--list-end-room');
+    };
+  }, [phoneDock, layout]);
+  const committedLayoutRef = useRef(layout);
+  const dockFromRef = useRef<number | null>(null);
+  if (layout === 'docked' && committedLayoutRef.current === 'centered') {
+    dockFromRef.current = cardRef.current?.getBoundingClientRect().top ?? null;
+  }
+  useLayoutEffect(() => {
+    committedLayoutRef.current = layout;
+    const from = dockFromRef.current;
+    dockFromRef.current = null;
+    const card = cardRef.current;
+    if (from === null || !card) return;
+    const offset = from - card.getBoundingClientRect().top;
+    if (
+      Math.abs(offset) > 1 &&
+      !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    ) {
+      card.animate?.(
+        [{ transform: `translateY(${offset}px)` }, { transform: 'none' }],
+        {
+          duration: DOCK_SLIDE_MS,
+          easing: `cubic-bezier(${EASE_SNAPPY.join(', ')})`,
+        },
+      );
+    }
+  }, [layout]);
+
+  // Blank parts of the card (around the text, between toolbar groups) enter
+  // the editor instead of dropping focus; the caret stays where it was.
+  const focusFromBlankArea = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || editor.isDestroyed) return;
+    // A press on one of the dock's own buttons keeps the editor's focus. iOS
+    // never focuses a tapped button: the editor would blur (relatedTarget
+    // null) and fold the card into the pill before the click arrives, which
+    // then lands on whatever moved under the finger. (A portal the dock
+    // opened bubbles here through React; its buttons are not the dock's.)
+    const button = (event.target as Element).closest?.('button');
+    if (dock && button && event.currentTarget.contains(button)) {
+      event.preventDefault();
       return;
     }
-    setPendingImages((prev) => [...prev, ...images]);
-  };
-  const stageFiles = (target: string | undefined, files: PendingFile[]) => {
-    if (files.length === 0) return;
-    if (!isCurrentTarget(target)) {
-      toast.info(
-        `${files.length} 个文件已上传到工作区，会话已切换，未附加到消息`,
-      );
+    if (
+      !isComposerBlankPointerTarget(
+        event.target,
+        event.currentTarget,
+        editor.view.dom,
+        event,
+      )
+    ) {
       return;
     }
-    setPendingFiles((prev) => [...prev, ...files]);
-  };
-
-  /** Downscale and encode one image; reports oversize/undecodable files. */
-  const toPendingImage = async (
-    file: File,
-    fallbackName?: string,
-  ): Promise<PendingImage | null> => {
-    try {
-      const prepared = await prepareImageForUpload(file);
-      return {
-        name: file.name || fallbackName || `image-${Date.now()}.png`,
-        data: prepared.data,
-        mimeType: prepared.mimeType,
-        preview: URL.createObjectURL(file),
-      };
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : '图片读取失败');
-      return null;
-    }
-  };
-
-  const toPendingImages = async (files: File[], fallbackName?: string) => {
-    const images: PendingImage[] = [];
-    for (const file of files) {
-      const image = await toPendingImage(file, fallbackName);
-      if (image) images.push(image);
-    }
-    return images;
-  };
-
-  const uploadAndStage = async (
-    target: string | undefined,
-    workspaceJid: string,
-    files: File[],
-  ) => {
-    if (files.length === 0) return;
-    const ok = await uploadFiles(workspaceJid, files);
-    if (!ok) return;
-    stageFiles(
-      target,
-      files.map((f) => ({
-        label:
-          (f as unknown as { webkitRelativePath?: string })
-            .webkitRelativePath || f.name,
-      })),
-    );
-  };
-
-  // "上传文件" puts every picked file in the workspace, images included, as
-  // its label says; "添加图片" is the inline-image path.
-  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    e.target.value = '';
-    if (!groupJid || files.length === 0) return;
-    await uploadAndStage(draftTarget, groupJid, files);
-  };
-
-  const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    e.target.value = '';
-    if (!groupJid || files.length === 0) return;
-    await uploadAndStage(draftTarget, groupJid, files);
-  };
-
-  const handleImageSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []).filter((file) =>
-      file.type.startsWith('image/'),
-    );
-    e.target.value = '';
-    if (files.length === 0) return;
-    const target = draftTarget;
-    stageImages(target, await toPendingImages(files));
-  };
-
-  const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-
-    const imageItems: DataTransferItem[] = [];
-    for (let i = 0; i < items.length; i++) {
-      if (items[i].type.startsWith('image/')) {
-        imageItems.push(items[i]);
-      }
-    }
-
-    if (imageItems.length === 0) return;
-
-    const textarea = e.currentTarget;
-    const pastePlan = planImageClipboardPaste({
-      value: textarea.value,
-      selectionStart: textarea.selectionStart,
-      selectionEnd: textarea.selectionEnd,
-      text: e.clipboardData.getData('text/plain'),
-      imageItemCount: imageItems.length,
+    event.preventDefault();
+    const { selection, doc } = editor.state;
+    const intent = resolveComposerBlankFocusIntent({
+      isDestroyed: editor.isDestroyed,
+      isEditable: editor.isEditable,
+      isFocused: editor.isFocused,
+      caretAtDocStart:
+        selection.empty && selection.from === Selection.atStart(doc).from,
     });
-    e.preventDefault();
-
-    if (pastePlan.value !== textarea.value) {
-      setContent(pastePlan.value);
-      debouncedSaveDraft(pastePlan.value);
-    }
-    requestAnimationFrame(() => {
-      const el = textareaRef.current;
-      if (!el) return;
-      el.setSelectionRange(pastePlan.selectionStart, pastePlan.selectionEnd);
-    });
-
-    const target = draftTarget;
-    const files = imageItems
-      .map((item) => item.getAsFile())
-      .filter((file): file is File => !!file);
-    stageImages(
-      target,
-      await toPendingImages(files, `pasted-${Date.now()}.png`),
-    );
-  };
-
-  // --- Drag and drop helpers ---
-
-  /** Recursively traverse a dropped directory entry and collect all files */
-  const readEntriesRecursively = (
-    entry: FileSystemDirectoryEntry,
-  ): Promise<File[]> => {
-    return new Promise((resolve, reject) => {
-      const reader = entry.createReader();
-      const allFiles: File[] = [];
-
-      const readBatch = () => {
-        reader.readEntries(
-          async (entries) => {
-            if (entries.length === 0) {
-              resolve(allFiles);
-              return;
-            }
-            for (const e of entries) {
-              if (e.isFile) {
-                const file = await new Promise<File>((res, rej) =>
-                  (e as FileSystemFileEntry).file(res, (err) => rej(err)),
-                );
-                // Attach relative path for display
-                Object.defineProperty(file, 'webkitRelativePath', {
-                  value: e.fullPath.slice(1), // remove leading "/"
-                  writable: false,
-                });
-                allFiles.push(file);
-              } else if (e.isDirectory) {
-                const subFiles = await readEntriesRecursively(
-                  e as FileSystemDirectoryEntry,
-                );
-                allFiles.push(...subFiles);
-              }
-            }
-            // readEntries may return partial results; keep reading until empty
-            readBatch();
-          },
-          (err) => reject(err),
-        );
-      };
-      readBatch();
-    });
-  };
-
-  // Drops land on the whole chat canvas (ChatView) and are routed here.
-  const acceptDrop = useStableCallback((dataTransfer: DataTransfer) => {
-    // Guard: respect disabled/uploading state. Sending is fine: only the
-    // attachments of the in-flight message leave the composer.
-    if (!groupJid || disabled) return;
-    if (uploading) {
-      toast.info('正在上传，请等当前上传完成后再拖入文件');
-      return;
-    }
-
-    // Capture the targets at drop time to prevent stale-chat attachment
-    const targetGroupJid = groupJid;
-    const target = draftTarget;
-
-    // Collect files, expanding directories via webkitGetAsEntry.
-    // 同步提取所有 item 的 entry/file，避免 drop 事件结束后 DataTransferItemList
-    // 被浏览器清理（Firefox/Safari）导致后续 item 返回 null 而静默丢失。
-    const collected = Array.from(dataTransfer.items).map((item) => ({
-      entry: item.webkitGetAsEntry?.() ?? null,
-      file: item.getAsFile(),
-    }));
-
-    void (async () => {
-      const allFiles: File[] = [];
-      let hasDirectory = false;
-
-      for (const { entry, file } of collected) {
-        if (entry?.isDirectory) {
-          hasDirectory = true;
-          try {
-            const dirFiles = await readEntriesRecursively(
-              entry as FileSystemDirectoryEntry,
-            );
-            allFiles.push(...dirFiles);
-          } catch (err) {
-            if (isCurrentTarget(target)) {
-              setSendError('读取文件夹失败');
-              setTimeout(() => setSendError(null), 4000);
-            }
-            console.warn('读取文件夹失败:', err);
-            return;
-          }
-        } else if (file) {
-          allFiles.push(file);
-        }
-      }
-
-      if (allFiles.length === 0) return;
-
-      // If a directory was dropped, upload ALL files to workspace (including images)
-      // to match the button-based folder upload behavior.
-      if (hasDirectory) {
-        await uploadAndStage(target, targetGroupJid, allFiles);
-        return;
-      }
-
-      // For individual files: images inline, regular files to the workspace
-      const imageFiles = allFiles.filter((file) =>
-        file.type.startsWith('image/'),
-      );
-      const regularFiles = allFiles.filter(
-        (file) => !file.type.startsWith('image/'),
-      );
-      if (imageFiles.length > 0) {
-        stageImages(target, await toPendingImages(imageFiles));
-      }
-      await uploadAndStage(target, targetGroupJid, regularFiles);
-    })();
-  });
-  useImperativeHandle(ref, () => ({ acceptDrop }), [acceptDrop]);
-
-  const removePendingFile = (index: number) => {
-    setPendingFiles((prev) => prev.filter((_, i) => i !== index));
-  };
-
-  const removePendingImage = (index: number) => {
-    setPreviewIndex(null);
-    setPendingImages((prev) => {
-      const img = prev[index];
-      if (img) URL.revokeObjectURL(img.preview);
-      return prev.filter((_, i) => i !== index);
-    });
-  };
-
-  const clearPendingFiles = () => {
-    setPendingFiles([]);
-  };
-
-  const clearPendingImages = () => {
-    setPreviewIndex(null);
-    pendingImages.forEach((img) => URL.revokeObjectURL(img.preview));
-    setPendingImages([]);
+    if (intent === 'keep-caret') editor.commands.focus();
+    else if (intent === 'doc-end') editor.commands.focus('end');
   };
 
   // While a run is active, a payload is queued or steers the run depending on
@@ -963,353 +978,237 @@ export const MessageInput = memo(function MessageInput({
   // composer leaves too little room for the conversation.
   const queueCollapsible = isTouchInput || isPhoneWidth;
 
-  const progressPercent =
-    uploadProgress && uploadProgress.totalBytes > 0
-      ? Math.round(
-          (uploadProgress.uploadedBytes / uploadProgress.totalBytes) * 100,
-        )
-      : 0;
-  const uploadRetryStatus = uploadProgress
-    ? formatUploadRetryStatus(uploadProgress)
-    : null;
+  const centered = layout === 'centered';
+  const dock = phoneDock && !centered;
+  // The resting pill opens into the card when the text gets focus (in the
+  // same tap, so iOS raises its keyboard) and stays open while anything is
+  // in it or being worked on, a sheet it opened included.
+  const pill =
+    dock &&
+    !textFocused &&
+    !overlayOpen &&
+    !hasPayload &&
+    queuedFollowUps.length === 0 &&
+    !palette.open &&
+    !editingFollowUpId &&
+    !sendError;
+  const dockCard = dock && !pill;
+  const dockApi = useMemo<ComposerDockApi>(
+    () => ({ compact: pill, setOverlayOpen }),
+    [pill, setOverlayOpen],
+  );
 
   return (
     <div
+      ref={rootRef}
       data-hc-composer
-      className="relative bg-background pt-1 pb-3 max-lg:border-t max-lg:border-surface-border max-lg:bg-background/80 max-lg:backdrop-blur-xl"
-      style={{
-        paddingBottom: `max(0.75rem, env(safe-area-inset-bottom, 0px), var(--keyboard-height, 0px))`,
-      }}
+      data-composer-layout={layout}
+      data-composer-dock={dock ? (pill ? 'pill' : 'card') : undefined}
+      onFocus={dock ? noteFocusIn : undefined}
+      onBlur={dock ? noteFocusOut : undefined}
+      className={cn(
+        'relative w-full',
+        dock
+          ? // Floats over the conversation: 16px from the sides, 8px above
+            // the safe area (or the keyboard), its top edge feathered into
+            // the page instead of a border.
+            'absolute inset-x-0 bottom-0 z-20 bg-[linear-gradient(to_bottom,transparent,var(--color-background)_1.5rem)] pt-6'
+          : !centered &&
+              'bg-background pt-1 pb-3 max-lg:border-t max-lg:border-surface-border max-lg:bg-background/80 max-lg:backdrop-blur-xl',
+      )}
+      style={
+        centered
+          ? undefined
+          : {
+              paddingBottom: dock
+                ? DOCK_LIFT
+                : `max(0.75rem, var(--safe-bottom, 0px), var(--keyboard-height, 0px))`,
+            }
+      }
     >
       {/* Soft fade so scrolled messages don't end at a hard edge. */}
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-x-0 -top-6 h-6 bg-linear-to-b from-transparent to-background max-lg:hidden"
-      />
+      {!centered && (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-x-0 -top-6 h-6 bg-linear-to-b from-transparent to-background max-lg:hidden"
+        />
+      )}
       {/* Same column as the message list (max-w-3xl + px-6) so the
-          composer edges line up with message content. */}
+          composer edges line up with message content. The centred hero is
+          the exception: it belongs to the heading/starter column, so it
+          keeps that width even in compact mode. */}
       <div
+        ref={dockColumnRef}
+        data-composer-column
         className={
-          isCompact ? 'mx-auto px-4' : 'mx-auto max-w-3xl px-4 lg:px-6'
+          isCompact && !centered
+            ? 'mx-auto px-4'
+            : 'mx-auto max-w-3xl px-4 lg:px-6'
         }
       >
-        {/* Upload progress bar */}
-        {uploading && uploadProgress && (
+        <UploadProgress />
+
+        {/* Reserved whenever docked, run or not (cindy's activity frame):
+            starting, switching or ending a status never moves the card or
+            changes the list's bottom room. */}
+        {statusBar && !centered && (
           <div
-            className={`mb-2 bg-surface-raised px-4 py-2.5 ring-1 ring-surface-border ${isCompact ? 'rounded-lg' : 'rounded-xl'}`}
+            data-composer-status-bar
+            className="mb-1.5 flex h-8 items-center *:min-w-0 *:flex-1"
           >
-            <div className="flex items-center justify-between mb-1.5">
-              <span className="max-w-[65%] truncate text-caption text-foreground/80">
-                {uploadProgress.currentFile || '完成'}
-                {uploadRetryStatus ? (
-                  <span data-upload-retry-status>（{uploadRetryStatus}）</span>
-                ) : null}
-              </span>
-              <span className="flex items-center gap-2 text-caption text-muted-foreground tabular-nums">
-                {uploadProgress.completed}/{uploadProgress.total} ·{' '}
-                {progressPercent}%
-                <button
-                  type="button"
-                  data-upload-cancel
-                  onClick={cancelUpload}
-                  className="inline-flex items-center gap-0.5 hover:text-foreground pointer-coarse:min-h-10 pointer-coarse:px-2"
-                >
-                  <X className="h-3 w-3" />
-                  取消
-                </button>
-              </span>
-            </div>
-            <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
-              <div
-                className="h-full bg-primary rounded-full transition-all duration-300 ease-out"
-                style={{ width: `${progressPercent}%` }}
-              />
-            </div>
+            {statusBar}
           </div>
         )}
 
-        {/* Queue tucks behind the composer like a card in a stack. */}
-        {queuedFollowUps.length > 0 && (
-          <QueuedFollowUpsPanel
-            queuedFollowUps={queuedFollowUps}
-            compact={isCompact}
-            touch={isTouchInput}
-            collapsible={queueCollapsible}
-            // Typing with the keyboard up needs the room more than the queue;
-            // editing a queued item is the exception (its own field is up).
-            collapseNow={!!isKeyboardVisible && !editingFollowUpId}
-            actingOn={actingOn}
-            editingFollowUpId={editingFollowUpId}
-            editingFollowUpContent={editingFollowUpContent}
-            handleFollowUpAction={followUpAction}
-            beginEditingFollowUp={beginEditFollowUp}
-            saveFollowUpEdit={saveEditedFollowUp}
-            onEditChange={changeEditedFollowUp}
-            onCancelEdit={cancelFollowUpEdit}
-          />
-        )}
-
-        {/* Main input card */}
-        <div
-          className={
-            isCompact
-              ? 'relative z-10 rounded-lg bg-surface-raised ring-1 ring-surface-border transition-shadow focus-within:ring-foreground/20'
-              : 'relative z-10 rounded-2xl bg-surface-raised shadow-canvas ring-1 ring-surface-border transition-shadow focus-within:shadow-menu focus-within:ring-foreground/20'
-          }
-        >
-          {/* Send error banner */}
-          {sendError && (
-            <div
-              className={`flex items-center gap-2 border-b border-error/15 bg-error/5 px-4 py-2 text-caption font-medium text-error ${isCompact ? 'rounded-t-lg' : 'rounded-t-2xl'}`}
-            >
-              <span>{sendError}</span>
-            </div>
-          )}
-
-          {/* Attachment tray: image thumbnails and file chips in one row */}
-          {(pendingImages.length > 0 || pendingFiles.length > 0) && (
-            <div className="flex flex-wrap items-center gap-2 px-3 pt-3">
-              {pendingImages.map((img, i) => (
-                <div key={img.preview} className="group/attachment relative">
-                  <button
-                    type="button"
-                    onClick={() => setPreviewIndex(i)}
-                    className="block cursor-zoom-in rounded-lg focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-                    aria-label={`预览图片：${img.name}`}
-                  >
-                    <img
-                      src={img.preview}
-                      alt={img.name}
-                      className="size-14 rounded-lg object-cover ring-1 ring-surface-border"
-                    />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => removePendingImage(i)}
-                    className="absolute -top-2 -right-2 flex size-6 cursor-pointer items-center justify-center rounded-full bg-foreground text-background shadow-menu transition-opacity pointer-fine:opacity-0 pointer-fine:group-hover/attachment:opacity-100 pointer-fine:group-focus-within/attachment:opacity-100 focus-visible:opacity-100 pointer-coarse:before:absolute pointer-coarse:before:-inset-2"
-                    aria-label="移除图片"
-                  >
-                    <X className="size-3.5" />
-                  </button>
-                </div>
-              ))}
-              {pendingFiles.map((file, i) => (
-                <span
-                  key={`file-${i}`}
-                  title={`${file.label}（已上传，发送时将告知 AI）`}
-                  className="inline-flex h-8 max-w-[220px] items-center gap-1.5 rounded-lg bg-muted pl-2.5 text-caption text-foreground ring-1 ring-surface-border pointer-coarse:h-10"
-                >
-                  <Paperclip className="size-3.5 shrink-0 text-muted-foreground" />
-                  <span className="truncate">{file.label}</span>
-                  <button
-                    type="button"
-                    onClick={() => removePendingFile(i)}
-                    className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:text-foreground pointer-coarse:size-10"
-                    aria-label="移除文件"
-                  >
-                    <X className="size-3.5" />
-                  </button>
-                </span>
-              ))}
-              {pendingImages.length + pendingFiles.length > 1 && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    clearPendingImages();
-                    clearPendingFiles();
-                  }}
-                  className="h-8 cursor-pointer rounded-md px-2 text-caption text-muted-foreground hover:bg-surface-hover hover:text-foreground pointer-coarse:h-10"
-                >
-                  清空
-                </button>
-              )}
-            </div>
-          )}
-
-          {/* Textarea */}
-          <div className="px-4 pt-3 pb-1">
-            <textarea
-              ref={textareaRef}
-              value={content}
-              onChange={(e) => {
-                setContent(e.target.value);
-                debouncedSaveDraft(e.target.value);
-              }}
-              onKeyDown={handleKeyDown}
-              onCompositionStart={() => {
-                composingRef.current = true;
-              }}
-              onCompositionEnd={() => {
-                composingRef.current = false;
-                compositionEndTimeRef.current = Date.now();
-              }}
-              onPaste={handlePaste}
-              placeholder={placeholder}
-              disabled={disabled}
-              className="w-full resize-none bg-transparent text-base leading-6 placeholder:text-faint-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 lg:text-body-lg"
-              rows={1}
-              style={{ minHeight: '28px', maxHeight: '144px' }}
+        {/* Palettes anchor on the whole card, queue included. */}
+        <div className="relative">
+          {palette.open && (
+            <ComposerPalette
+              palette={palette}
+              touch={isTouchInput}
+              listId={paletteListId}
             />
-          </div>
-
-          {/* Bottom action bar */}
-          <div className="flex items-center gap-1 px-2 pb-2">
-            {/* Left: action icons */}
-            <div className="flex items-center gap-0.5">
-              {groupJid && (
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      disabled={uploading}
-                      aria-label="添加文件"
-                      className="text-muted-foreground pointer-coarse:size-10"
-                    >
-                      <Plus />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent
-                    align="start"
-                    side="top"
-                    className="w-44"
-                  >
-                    <DropdownMenuItem
-                      onClick={() => imageInputRef.current?.click()}
-                    >
-                      <ImageIcon />
-                      添加图片
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      disabled={uploading}
-                      onClick={() => fileInputRef.current?.click()}
-                    >
-                      <FileUp />
-                      上传文件
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      disabled={uploading}
-                      className="max-lg:hidden"
-                      onClick={() => folderInputRef.current?.click()}
-                    >
-                      <FolderUp />
-                      上传文件夹
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              )}
-              {onResetSession && (
-                <IconButton
-                  label="清除当前会话上下文"
-                  icon={<Eraser />}
-                  onClick={onResetSession}
-                  tooltipSide="top"
-                  className="text-muted-foreground pointer-coarse:size-10"
-                />
-              )}
-              {onToggleTerminal && (
-                <IconButton
-                  label="终端"
-                  icon={<TerminalSquare />}
-                  onClick={onToggleTerminal}
-                  tooltipSide="top"
-                  className="text-muted-foreground pointer-coarse:size-10"
-                />
-              )}
-              {modelSelector}
-            </div>
-
-            {contextLabel && (
-              <span
-                className="ml-1 inline-flex h-6 max-w-[min(42vw,180px)] min-w-0 items-center rounded-md bg-muted px-2 text-micro font-medium text-muted-foreground"
-                title={`发送到：${contextLabel}`}
-              >
-                <span className="truncate">{contextLabel}</span>
-              </span>
+          )}
+          {/* One card: the queue on top, then the editor. Focus only
+              changes the border color. */}
+          <div
+            ref={cardRef}
+            data-composer-card
+            className={cn(
+              'relative overflow-hidden border border-surface-border bg-surface-raised transition-[color,background-color,border-color,border-radius] focus-within:border-foreground/25 motion-reduce:transition-none',
+              !dock
+                ? 'rounded-[12px]'
+                : pill
+                  ? 'rounded-[25px]'
+                  : 'rounded-[30px]',
             )}
-
-            {/* Spacer */}
-            <div className="flex-1" />
-
-            {/* A draft turns the primary action into queue/send; keep stop
-                reachable next to it. */}
-            {canStop && hasPayload && !sending && (
-              <IconButton
-                label="停止当前运行"
-                icon={
-                  stopping ? (
-                    <Loader2 className="size-3.5 animate-spin" />
-                  ) : (
-                    <Square className="size-3 fill-current" />
-                  )
-                }
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => void handleStop()}
-                disabled={disabled || stopping}
-                tooltipSide="top"
-                className="rounded-full text-muted-foreground pointer-coarse:size-10"
+          >
+            {dockCard && (
+              // cindy's card handle: a cue that the pill opened into this.
+              <span
+                aria-hidden="true"
+                className="pointer-events-none absolute top-2 left-1/2 h-1 w-9 -translate-x-1/2 rounded-full bg-muted-foreground/25"
+              />
+            )}
+            {queuedFollowUps.length > 0 && (
+              <QueuedFollowUpsPanel
+                queuedFollowUps={queuedFollowUps}
+                touch={isTouchInput}
+                collapsible={queueCollapsible}
+                // Typing with the keyboard up needs the room more than the
+                // queue; editing a queued item is the exception (its own
+                // field is up).
+                collapseNow={!!isKeyboardVisible && !editingFollowUpId}
+                actingOn={actingOn}
+                editingFollowUpId={editingFollowUpId}
+                editingFollowUpContent={editingFollowUpContent}
+                handleFollowUpAction={followUpAction}
+                beginEditingFollowUp={beginEditFollowUp}
+                saveFollowUpEdit={saveEditedFollowUp}
+                onEditChange={changeEditedFollowUp}
+                onCancelEdit={cancelFollowUpEdit}
               />
             )}
 
-            {/* Right: one contextual primary action, matching Codex. */}
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  // Keep the caret (and the mobile keyboard) in the composer.
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() =>
-                    showStop ? void handleStop() : void handleSend()
+            {sendError && (
+              <div className="flex items-center gap-2 border-b border-error/15 bg-error/5 px-3 py-2 text-caption font-medium text-error">
+                <span>{sendError}</span>
+              </div>
+            )}
+
+            {/* cindy's card: the text on top, the toolbar on the bottom
+                edge, and blank space between that still focuses the text. */}
+            <div
+              className={cn(
+                pill
+                  ? // The pill: + | text | send on one line.
+                    'flex min-h-[50px] items-center gap-1.5 px-2 py-2'
+                  : 'flex flex-col justify-between px-[11px] pt-[11px] pb-[6px]',
+                dockCard && 'min-h-[104px] pt-[22px]',
+                !dock &&
+                  (centered
+                    ? 'min-h-[140px]'
+                    : 'min-h-[96px] sm:min-h-[118px]'),
+              )}
+              onMouseDown={focusFromBlankArea}
+            >
+              <div className={cn(pill && 'min-w-0 flex-1')}>
+                <AttachmentTray
+                  images={pendingImages}
+                  files={pendingFiles}
+                  onPreview={attachments.setPreviewIndex}
+                  onRemoveImage={attachments.removeImage}
+                  onRemoveFile={attachments.removeFile}
+                  onClear={attachments.clearAll}
+                />
+                <EditorContent
+                  editor={editor}
+                  className={cn(disabled && 'cursor-not-allowed opacity-50')}
+                />
+              </div>
+              <ComposerDockContext.Provider value={dockApi}>
+                <ComposerToolbar
+                  canAttach={!!groupJid}
+                  uploading={attachments.uploading}
+                  onPickImages={() => imageInputRef.current?.click()}
+                  onPickFiles={() => fileInputRef.current?.click()}
+                  onPickFolder={() => folderInputRef.current?.click()}
+                  onResetSession={onResetSession}
+                  onToggleTerminal={onToggleTerminal}
+                  foldActions={foldToolbarActions}
+                  phone={phoneDock}
+                  collapsed={pill}
+                  contextUsage={
+                    !centered && !isPhoneWidth ? contextUsage : undefined
                   }
-                  disabled={
-                    showStop
+                  modelSelector={modelSelector}
+                  // A draft turns the primary action into queue/send; keep
+                  // stop reachable next to it.
+                  showSideStop={canStop && hasPayload && !sending}
+                  stopping={stopping}
+                  stopDisabled={disabled || stopping}
+                  onStop={() => void handleStop()}
+                  send={{
+                    glyph:
+                      sending || (showStop && stopping)
+                        ? 'busy'
+                        : showStop
+                          ? 'stop'
+                          : isRunning && followUpMode === 'queue'
+                            ? 'queue'
+                            : 'send',
+                    disabled: showStop
                       ? disabled || stopping
-                      : !canSend || disabled || sending
-                  }
-                  aria-label={sendLabel}
-                  className={`flex size-8 cursor-pointer items-center justify-center rounded-full transition-[background-color,color,transform] duration-100 active:scale-90 pointer-coarse:size-10 ${
-                    showStop && !disabled && !stopping
-                      ? 'bg-foreground text-background hover:bg-foreground/90'
-                      : canSend && !disabled && !sending
-                        ? 'bg-primary text-primary-foreground hover:bg-primary/90'
-                        : 'bg-muted text-faint-foreground'
-                  } focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:outline-none`}
-                >
-                  {sending || (showStop && stopping) ? (
-                    <Loader2 className="size-4 animate-spin" />
-                  ) : showStop ? (
-                    <Square className="size-3.5 fill-current" />
-                  ) : isRunning && followUpMode === 'queue' ? (
-                    <ListPlus className="size-4" />
-                  ) : (
-                    <ArrowUp className="size-4" />
-                  )}
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="top" className="flex-col items-start">
-                <span className="flex items-center gap-1.5">
-                  {sendLabel}
-                  {showStop && <Shortcut keys="escape" />}
-                </span>
-                {isRunning && !showStop && (
-                  <span className="flex items-center gap-1.5 opacity-70">
-                    {followUpLabel(alternateFollowUpMode(followUpMode))}
-                    <Shortcut keys={SHORTCUTS.steer} />
-                  </span>
-                )}
-              </TooltipContent>
-            </Tooltip>
+                      : !canSend || disabled,
+                    label: sendLabel,
+                    onClick: () =>
+                      showStop ? void handleStop() : void handleSend(),
+                    escapeStops: showStop,
+                    alternate:
+                      isRunning && !showStop
+                        ? {
+                            label: followUpLabel(
+                              alternateFollowUpMode(followUpMode),
+                            ),
+                            shortcut: SHORTCUTS.steer,
+                          }
+                        : undefined,
+                  }}
+                />
+              </ComposerDockContext.Provider>
+            </div>
           </div>
         </div>
       </div>
 
-      {previewIndex !== null && pendingImages[previewIndex] && (
-        <ImageLightbox
-          images={pendingImages.map((img) => img.preview)}
-          initialIndex={previewIndex}
-          onClose={() => setPreviewIndex(null)}
-        />
-      )}
+      {attachments.previewIndex !== null &&
+        pendingImages[attachments.previewIndex] && (
+          <ImageLightbox
+            images={pendingImages.map((img) => img.preview)}
+            initialIndex={attachments.previewIndex}
+            onClose={() => attachments.setPreviewIndex(null)}
+          />
+        )}
 
       {/* Hidden file inputs */}
       <input
@@ -1317,438 +1216,26 @@ export const MessageInput = memo(function MessageInput({
         type="file"
         accept="image/*"
         multiple
-        onChange={handleImageSelect}
+        onChange={attachments.handleImageSelect}
         className="hidden"
       />
       <input
         ref={fileInputRef}
         type="file"
         multiple
-        onChange={handleFileSelect}
+        onChange={attachments.handleFileSelect}
         className="hidden"
-        disabled={uploading}
+        disabled={attachments.uploading}
       />
       <input
         ref={folderInputRef}
         type="file"
         // @ts-expect-error webkitdirectory is non-standard but widely supported
         webkitdirectory=""
-        onChange={handleFolderSelect}
+        onChange={attachments.handleFileSelect}
         className="hidden"
-        disabled={uploading}
+        disabled={attachments.uploading}
       />
     </div>
   );
 });
-
-interface QueuedFollowUpsPanelProps {
-  queuedFollowUps: QueuedFollowUp[];
-  compact: boolean;
-  /** Coarse pointer: one row per item, secondary actions in a menu. */
-  touch: boolean;
-  /** Start as a one-line summary that expands on demand. */
-  collapsible: boolean;
-  /** Fold an expanded queue back to its summary (keyboard came up). */
-  collapseNow: boolean;
-  actingOn: Set<string>;
-  editingFollowUpId: string | null;
-  editingFollowUpContent: string;
-  handleFollowUpAction: (
-    item: QueuedFollowUp,
-    action: FollowUpQueueAction,
-  ) => Promise<boolean>;
-  beginEditingFollowUp: (item: QueuedFollowUp) => void;
-  saveFollowUpEdit: (item: QueuedFollowUp) => Promise<void>;
-  onEditChange: (value: string) => void;
-  onCancelEdit: () => void;
-}
-
-/**
- * Queued follow-ups above the composer. Memoized with stable handlers, so
- * typing in the composer does not re-render every queued message.
- */
-const QueuedFollowUpsPanel = memo(function QueuedFollowUpsPanel({
-  queuedFollowUps,
-  compact,
-  touch,
-  collapsible,
-  collapseNow,
-  actingOn,
-  editingFollowUpId,
-  editingFollowUpContent,
-  handleFollowUpAction,
-  beginEditingFollowUp,
-  saveFollowUpEdit,
-  onEditChange,
-  onCancelEdit,
-}: QueuedFollowUpsPanelProps) {
-  const listId = useId();
-  const [expanded, setExpanded] = useState(false);
-  useEffect(() => {
-    if (collapseNow) setExpanded(false);
-  }, [collapseNow]);
-  // Collapsing mid-edit only hides the editor; the edit itself is kept.
-  const open = !collapsible || expanded;
-  const steering = queuedFollowUps.some(
-    (item) => item.delivery_mode === 'steer',
-  );
-  const summary = steering
-    ? '正在停止当前回复，随后发送引导消息'
-    : queuedFollowUps.length > 1
-      ? `${queuedFollowUps.length} 条消息已排队，将合并为下一轮`
-      : '1 条消息已排队';
-  const collapsedSummary = steering
-    ? '正在发送引导消息'
-    : `${queuedFollowUps.length} 条已排队`;
-
-  return (
-    <div
-      data-testid="queued-follow-ups"
-      data-state={open ? 'open' : 'closed'}
-      className={`relative z-0 -mb-3 overflow-hidden bg-app-shell pb-3 ring-1 ring-surface-border ${compact ? 'mx-2 rounded-t-lg' : 'mx-3 rounded-t-xl'}`}
-    >
-      {collapsible ? (
-        <button
-          type="button"
-          aria-expanded={open}
-          aria-controls={listId}
-          onClick={() => setExpanded((value) => !value)}
-          className="flex h-8 w-full cursor-pointer items-center gap-2 px-3 text-left text-caption text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none focus-visible:ring-inset pointer-coarse:h-10"
-        >
-          <Clock3 className="size-3.5 shrink-0" />
-          <span className="min-w-0 truncate">
-            {open ? summary : collapsedSummary}
-          </span>
-          <span className="shrink-0 font-medium text-foreground/70">
-            · {open ? '收起' : '展开'}
-          </span>
-          {open ? (
-            <ChevronDown className="ml-auto size-3.5 shrink-0" />
-          ) : (
-            <ChevronUp className="ml-auto size-3.5 shrink-0" />
-          )}
-        </button>
-      ) : (
-        <div className="flex h-8 items-center gap-2 px-3 text-caption text-muted-foreground">
-          <Clock3 className="h-3.5 w-3.5" />
-          <span>{summary}</span>
-        </div>
-      )}
-      {open && (
-        <div
-          id={listId}
-          data-testid="queued-follow-ups-list"
-          className={cn(
-            'divide-y divide-surface-border overflow-y-auto overscroll-contain border-t border-surface-border',
-            collapsible ? 'max-h-[30dvh]' : 'max-h-56',
-          )}
-        >
-          {queuedFollowUps.map((item, index) => (
-            <QueuedFollowUpRow
-              key={item.id}
-              item={item}
-              index={index}
-              isLast={index === queuedFollowUps.length - 1}
-              touch={touch}
-              busy={actingOn.has(item.id)}
-              editing={editingFollowUpId === item.id}
-              editingFollowUpContent={editingFollowUpContent}
-              handleFollowUpAction={handleFollowUpAction}
-              beginEditingFollowUp={beginEditingFollowUp}
-              saveFollowUpEdit={saveFollowUpEdit}
-              onEditChange={onEditChange}
-              onCancelEdit={onCancelEdit}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-});
-
-interface QueuedFollowUpRowProps {
-  item: QueuedFollowUp;
-  index: number;
-  isLast: boolean;
-  touch: boolean;
-  busy: boolean;
-  editing: boolean;
-  editingFollowUpContent: string;
-  handleFollowUpAction: QueuedFollowUpsPanelProps['handleFollowUpAction'];
-  beginEditingFollowUp: QueuedFollowUpsPanelProps['beginEditingFollowUp'];
-  saveFollowUpEdit: QueuedFollowUpsPanelProps['saveFollowUpEdit'];
-  onEditChange: QueuedFollowUpsPanelProps['onEditChange'];
-  onCancelEdit: QueuedFollowUpsPanelProps['onCancelEdit'];
-}
-
-const ROW_ICON_BUTTON =
-  'flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-surface-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35 pointer-coarse:size-10';
-
-/**
- * A steer stops the current reply and releases the queue with it: queued
- * messages go to the next turn together with this one (CLAUDE.md §6.4).
- */
-const STEER_NOW_DESCRIPTION = '将停止当前回复，与已排队的消息一起立即发送';
-
-function QueuedFollowUpRow({
-  item,
-  index,
-  isLast,
-  touch,
-  busy,
-  editing,
-  editingFollowUpContent,
-  handleFollowUpAction,
-  beginEditingFollowUp,
-  saveFollowUpEdit,
-  onEditChange,
-  onCancelEdit,
-}: QueuedFollowUpRowProps) {
-  const steering = item.delivery_mode === 'steer';
-  const locked = steering || item.delivery_status === 'promoting';
-  const images = useMemo(
-    () => parseQueuedImageAttachments(item.attachments),
-    [item.attachments],
-  );
-  const label = queuedFollowUpLabel(item.content, images.length);
-
-  const sendNow = (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          disabled={busy || locked}
-          onClick={() => void handleFollowUpAction(item, 'steer')}
-          className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md px-2 text-caption font-medium text-primary-text transition-colors hover:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-50 pointer-coarse:h-10"
-          aria-label={`立即发送：${label}`}
-          aria-description={STEER_NOW_DESCRIPTION}
-        >
-          {busy || locked ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <CornerUpLeft className="h-3.5 w-3.5" />
-          )}
-          {locked ? '发送中' : '立即发送'}
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="top">{STEER_NOW_DESCRIPTION}</TooltipContent>
-    </Tooltip>
-  );
-
-  return (
-    <div className="group/queued flex min-w-0 items-start gap-2 px-3 py-1.5">
-      <span className="mt-1.5 shrink-0 text-micro font-medium text-faint-foreground tabular-nums pointer-coarse:mt-3">
-        {index + 1}
-      </span>
-      {editing ? (
-        <div className="min-w-0 flex-1 space-y-2">
-          <textarea
-            value={editingFollowUpContent}
-            onChange={(event) => onEditChange(event.target.value)}
-            onFocus={(event) => {
-              // The editor opens with the caret where the message ends, not
-              // before it; later focus keeps wherever the user clicked.
-              const field = event.currentTarget;
-              if (field.dataset.caretPlaced) return;
-              field.dataset.caretPlaced = 'true';
-              field.setSelectionRange(field.value.length, field.value.length);
-            }}
-            onKeyDown={(event) => {
-              if (
-                event.nativeEvent.isComposing ||
-                event.nativeEvent.keyCode === 229
-              ) {
-                return;
-              }
-              if (event.key === 'Escape') {
-                event.preventDefault();
-                event.stopPropagation();
-                onCancelEdit();
-              } else if (
-                event.key === 'Enter' &&
-                (event.metaKey || event.ctrlKey)
-              ) {
-                event.preventDefault();
-                void saveFollowUpEdit(item);
-              }
-            }}
-            rows={2}
-            autoFocus
-            className="w-full resize-none rounded-lg border border-input bg-background px-2.5 py-2 text-caption leading-5 text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 pointer-coarse:text-base"
-            aria-label="编辑排队消息"
-          />
-          <div className="flex items-center justify-end gap-1">
-            <span className="mr-auto text-micro text-faint-foreground pointer-coarse:hidden">
-              Esc 取消 · <Shortcut keys="mod+enter" /> 保存
-            </span>
-            <button
-              type="button"
-              onClick={onCancelEdit}
-              className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-caption text-muted-foreground hover:bg-surface-hover hover:text-foreground pointer-coarse:h-10"
-            >
-              <X className="h-3.5 w-3.5" />
-              取消
-            </button>
-            <button
-              type="button"
-              disabled={busy || !editingFollowUpContent.trim()}
-              onClick={() => void saveFollowUpEdit(item)}
-              className="inline-flex h-7 items-center gap-1 rounded-md bg-primary px-2 text-caption font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50 pointer-coarse:h-10"
-            >
-              {busy ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Check className="h-3.5 w-3.5" />
-              )}
-              保存
-            </button>
-          </div>
-        </div>
-      ) : (
-        <div className="flex min-w-0 flex-1 items-start gap-2">
-          <QueuedFollowUpContent
-            content={item.content}
-            images={images}
-            touch={touch}
-          />
-          {touch ? (
-            // One row per item on touch: the primary action inline, the
-            // rest behind a menu instead of a second row of buttons.
-            <div className="flex shrink-0 items-center gap-0.5 -mr-1.5">
-              {sendNow}
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <button
-                    type="button"
-                    disabled={busy || locked}
-                    className={ROW_ICON_BUTTON}
-                    aria-label={`更多操作：${label}`}
-                  >
-                    <MoreHorizontal className="h-4 w-4" />
-                  </button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" side="top" className="w-36">
-                  <DropdownMenuItem
-                    disabled={index === 0}
-                    onSelect={() => void handleFollowUpAction(item, 'move_up')}
-                  >
-                    <ChevronUp />
-                    上移
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    disabled={isLast}
-                    onSelect={() =>
-                      void handleFollowUpAction(item, 'move_down')
-                    }
-                  >
-                    <ChevronDown />
-                    下移
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onSelect={() => beginEditingFollowUp(item)}>
-                    <Pencil />
-                    编辑
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    variant="destructive"
-                    onSelect={() => void handleFollowUpAction(item, 'cancel')}
-                  >
-                    <Trash2 />
-                    删除
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          ) : (
-            <div className="flex shrink-0 items-center gap-0.5 transition-opacity pointer-fine:opacity-0 pointer-fine:group-hover/queued:opacity-100 pointer-fine:group-focus-within/queued:opacity-100">
-              <button
-                type="button"
-                disabled={busy || locked || index === 0}
-                onClick={() => void handleFollowUpAction(item, 'move_up')}
-                className={ROW_ICON_BUTTON}
-                aria-label={`上移：${label}`}
-                title="上移"
-              >
-                <ChevronUp className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                disabled={busy || locked || isLast}
-                onClick={() => void handleFollowUpAction(item, 'move_down')}
-                className={ROW_ICON_BUTTON}
-                aria-label={`下移：${label}`}
-                title="下移"
-              >
-                <ChevronDown className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                disabled={busy || locked}
-                onClick={() => beginEditingFollowUp(item)}
-                className={ROW_ICON_BUTTON}
-                aria-label={`编辑：${label}`}
-                title="编辑"
-              >
-                <Pencil className="h-3.5 w-3.5" />
-              </button>
-              {sendNow}
-              <button
-                type="button"
-                disabled={busy || locked}
-                onClick={() => void handleFollowUpAction(item, 'cancel')}
-                className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50 pointer-coarse:size-10"
-                aria-label={`删除排队消息：${label}`}
-                title="删除"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function QueuedFollowUpContent({
-  content,
-  images,
-  touch,
-}: {
-  content: string;
-  images: QueuedImagePreview[];
-  touch: boolean;
-}) {
-  const text = content.trim();
-  return (
-    <div className="flex min-w-0 flex-1 items-start gap-1.5 pt-1 pointer-coarse:pt-2.5">
-      {images.length > 0 && (
-        <span className="flex shrink-0 items-center gap-1">
-          {images.slice(0, 3).map((image, i) => (
-            <img
-              key={i}
-              src={image.src}
-              alt=""
-              className="size-5 rounded object-cover ring-1 ring-surface-border"
-            />
-          ))}
-          {images.length > 3 && (
-            <span className="text-micro text-muted-foreground">
-              +{images.length - 3}
-            </span>
-          )}
-        </span>
-      )}
-      <span
-        className={cn(
-          'block min-w-0 flex-1 text-caption leading-5 break-words whitespace-pre-wrap',
-          text ? 'text-foreground/85' : 'text-muted-foreground',
-          touch && 'line-clamp-2',
-        )}
-        title={text || undefined}
-      >
-        {text || (images.length > 0 ? '[图片]' : '')}
-      </span>
-    </div>
-  );
-}

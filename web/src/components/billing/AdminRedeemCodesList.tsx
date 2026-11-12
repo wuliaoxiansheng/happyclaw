@@ -1,16 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
-import {
-  Gift,
-  Search,
-  Download,
-  Copy,
-  Check,
-  Trash2,
-  Eye,
-  Plus,
-} from 'lucide-react';
+import { Gift, Download, Copy, Check, Trash2, Eye, Plus } from 'lucide-react';
 import { toast } from 'sonner';
 import { useBillingStore, type RedeemCode } from '../../stores/billing';
+import { copyToClipboard } from '../../utils/clipboard';
 import { useCurrency } from './utils';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -78,7 +70,7 @@ export default function AdminRedeemCodesList() {
   }, [redeemCodes, typeFilter, search]);
 
   const handleCopy = (code: string) => {
-    navigator.clipboard.writeText(code);
+    copyToClipboard(code);
     setCopiedCode(code);
     setTimeout(() => setCopiedCode(null), 2000);
   };
@@ -347,7 +339,8 @@ export default function AdminRedeemCodesList() {
         }}
         empty={
           <EmptyState
-            icon={search || typeFilter !== 'all' ? Search : Gift}
+            icon={Gift}
+            variant={search || typeFilter !== 'all' ? 'search' : 'empty'}
             title={
               search || typeFilter !== 'all'
                 ? '未找到匹配的兑换码'

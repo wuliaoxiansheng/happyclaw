@@ -51,7 +51,9 @@ export function SearchInput({
         onChange={(e) => handleChange(e.target.value)}
         placeholder={placeholder}
         aria-label={ariaLabel ?? placeholder}
-        className="pr-8 pl-8"
+        variant="code"
+        enterKeyHint="search"
+        className="pr-8 pl-8 phone:pr-11"
         autoFocus={autoFocus}
       />
       {localValue && (
@@ -59,7 +61,7 @@ export function SearchInput({
           type="button"
           onClick={handleClear}
           aria-label="清空搜索"
-          className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded-sm text-muted-foreground hover:text-foreground transition-colors"
+          className="absolute top-1/2 right-0 grid size-8 -translate-y-1/2 place-items-center rounded-sm text-muted-foreground transition-colors hover:text-foreground phone:size-11"
         >
           <X className="size-3.5" />
         </button>

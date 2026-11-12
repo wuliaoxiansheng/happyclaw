@@ -44,7 +44,7 @@ describe('internal context audit visibility contract', () => {
     );
     expect(
       broadcaster.indexOf("event.eventType === 'context_audit'"),
-    ).toBeLessThan(broadcaster.indexOf('safeBroadcast('));
+    ).toBeLessThan(broadcaster.indexOf('broadcastToGroupAudience('));
 
     const snapshotUpdater = section(
       web,

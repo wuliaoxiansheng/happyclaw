@@ -68,25 +68,16 @@ afterAll(() => {
 });
 
 describe('launch-time Claude OAuth renewal', () => {
-  test('renews only due OAuth candidates of the automatic pool', async () => {
-    const due = oauthProvider('due', 20 * MINUTE);
-    oauthProvider('fresh', 8 * 60 * MINUTE);
-    oauthProvider('disabled-due', 20 * MINUTE, false);
-    runtimeConfig.createProvider({
-      name: 'api-key',
-      type: 'official',
-      enabled: true,
-      anthropicApiKey: 'sk-ant-api03-pool',
-    });
+  test('nothing bound: no candidate, enabled or not', async () => {
+    oauthProvider('due', 20 * MINUTE);
     const refresh = vi.fn(async () => ({ status: 'not_due' as const }));
-
     await containerRunner.refreshLaunchOAuthCredentials(
       'launch-pool',
       null,
       null,
       refresh,
     );
-    expect(refresh.mock.calls).toEqual([[due.id]]);
+    expect(refresh.mock.calls).toEqual([]);
   });
 
   test('renews only the pinned model configuration', async () => {
@@ -110,7 +101,7 @@ describe('launch-time Claude OAuth renewal', () => {
     expect(refresh.mock.calls).toEqual([[pinned.id]]);
   });
 
-  test('skips the pool when the workspace overrides provider auth', async () => {
+  test('skips every connection when the workspace overrides provider auth', async () => {
     oauthProvider('override-a', 20 * MINUTE);
     oauthProvider('override-b', 20 * MINUTE);
     runtimeConfig.saveContainerEnvConfig('launch-override', {

@@ -1,10 +1,50 @@
 import type { StreamEvent, WorkflowRunSnapshot } from './stream-event.types.js';
 
-export interface AdditionalMount {
+/** A host directory, bound into the container (or mounted from its NFS export). */
+export interface HostDirectoryMount {
   hostPath: string; // Absolute canonical path on host
   containerPath: string; // Relative suffix mounted below /workspace/extra
   readonly?: boolean; // Default: true for safety
 }
+
+/** A directory of an allowlisted storage source, mounted by Docker itself. */
+export interface StorageSourceMount {
+  source: string; // StorageSource.id in the mount allowlist
+  subPath?: string; // Relative directory inside the source; empty = its root
+  containerPath: string; // Relative suffix mounted below /workspace/extra
+  readonly?: boolean; // Default: true for safety
+}
+
+export type AdditionalMount = HostDirectoryMount | StorageSourceMount;
+
+interface StorageSourceBase {
+  // Stable identifier referenced by StorageSourceMount.source
+  id: string;
+  // Whether read-write mounts of this source are allowed
+  allowReadWrite: boolean;
+  description?: string;
+}
+
+/** An NFS export, mounted by the Docker daemon's kernel (no credentials). */
+export interface NfsStorageSource extends StorageSourceBase {
+  type: 'nfs';
+  server: string;
+  exportPath: string;
+  nfsVersion?: '3' | '4' | '4.1' | '4.2'; // Default: 3
+}
+
+/** An SMB share. The password lives in a 0600 file, never in this config. */
+export interface CifsStorageSource extends StorageSourceBase {
+  type: 'cifs';
+  server: string;
+  share: string;
+  username?: string; // Omitted = guest
+  domain?: string;
+  passwordFile?: string; // Absolute, or relative to the project root
+  smbVersion?: '2.1' | '3.0' | '3.1.1'; // Default: 3.0
+}
+
+export type StorageSource = NfsStorageSource | CifsStorageSource;
 
 /**
  * Mount Allowlist - Security configuration for additional mounts
@@ -17,6 +57,8 @@ export interface MountAllowlist {
   blockedPatterns: string[];
   // If true, non-main groups can only mount read-only regardless of config
   nonMainReadOnly: boolean;
+  // Network storage that workspaces may mount by id (optional; default none)
+  storageSources: StorageSource[];
 }
 
 export interface AllowedRoot {
@@ -26,6 +68,9 @@ export interface AllowedRoot {
   allowReadWrite: boolean;
   // Optional description for documentation
   description?: string;
+  // Host directories under this root that sit on an NFS mount are mounted by
+  // Docker straight from the export instead of bound (default false)
+  nfsDirectMount?: boolean;
 }
 
 export interface ContainerConfig {
@@ -181,6 +226,15 @@ export interface ChannelMessageMeta {
   text?: string;
   title?: string;
   channelContext?: ChannelTurnContext;
+  /** The sender's provider id (Feishu open_id); team-mode admission reads it. */
+  senderImId?: string;
+  /** The sender is a bot or an app, not a person. */
+  senderIsBot?: boolean;
+  /**
+   * Team mode: the lane the conversation plan chose for this message, or
+   * `reject`. Set by the connector from the plan; absent outside team mode.
+   */
+  teamRoute?: { effectiveJid: string; agentId: string } | 'reject';
 }
 
 /** @deprecated Use ChannelMessageMeta. Kept for connector compatibility. */
@@ -203,13 +257,12 @@ export interface RegisteredGroup {
   /** Channel account that owns this external chat. Null means legacy/default. */
   channel_account_id?: string;
   is_home?: boolean; // 用户主容器标记
-  /** Direct-chat binding target: a specific workspace conversation session. */
+  /** Direct chat or ordinary group binding: one workspace session. */
   target_agent_id?: string;
   /**
-   * Binding target stored as the canonical workspace JID.
-   * Group chats own the workspace main context. Direct chats must not use
-   * this slot — they bind through `target_agent_id` so they do not share
-   * the workspace main channel-owner key with a group.
+   * Topic container binding (`binding_mode = 'thread_map'`): the canonical
+   * workspace JID whose native topics each get their own session. Direct
+   * chats and ordinary groups never use this slot.
    */
   target_main_jid?: string;
   reply_policy?: 'source_only' | 'mirror'; // IM 绑定的回复策略
@@ -330,6 +383,11 @@ export interface AgentProfile {
   avatar_url: string | null;
   /** Null means inherit the system default model configuration. */
   model_config_id: string | null;
+  /**
+   * A model from `model_config_id`'s list; null runs that configuration's
+   * default model. Always null without a configuration.
+   */
+  model: string | null;
   runtime_policy: AgentProfileRuntimePolicy;
   identity_hash: string;
   version: number;
@@ -357,17 +415,6 @@ export interface AgentProfilePrompts {
   prompt_mode: AgentProfilePromptMode;
 }
 
-export interface AgentProfilePromptVersion extends AgentProfilePrompts {
-  id: string;
-  agent_profile_id: string;
-  version: number;
-  name: string;
-  identity_hash: string;
-  change_source: 'create' | 'update' | 'restore' | 'migration';
-  restored_from_version: number | null;
-  created_at: string;
-}
-
 /** Durable Workspace↔AgentProfile binding and its interaction contract. */
 export interface WorkspaceAgentProfileBinding {
   group_folder: string;
@@ -375,6 +422,8 @@ export interface WorkspaceAgentProfileBinding {
   interaction_mode: InteractionMode;
   /** Presentation only: no runtime restart when it changes. */
   process_visibility: ProcessVisibility;
+  /** Multi-task mode: sessions may delegate work to worker sessions. */
+  work_mode: import('./work-items.js').WorkMode;
   created_at: string;
   updated_at: string;
 }
@@ -393,9 +442,9 @@ export interface AgentProfileRuntimePolicy {
     mode: 'inherit' | 'custom' | 'disabled';
     ids: string[];
     /**
-     * Native host ~/.claude/skills selection. Missing is a legacy sentinel:
-     * follow the effective context source (host_claude => inherit, otherwise
-     * disabled). New profiles persist this field explicitly.
+     * Native host ~/.claude/skills selection. Every active profile stores it
+     * since schema v84; a row without it falls back to the effective context
+     * source (host_claude => inherit, otherwise disabled) with a warning.
      */
     host?: {
       mode: 'inherit' | 'custom' | 'disabled';
@@ -455,17 +504,35 @@ export interface NewMessage {
    * Derived when a message is listed or announced; never persisted.
    */
   has_trace?: boolean;
+  /**
+   * Set when an agent reply is announced that the server also sends as a Web
+   * Push (src/web-push.ts): a page on a subscribed device leaves the
+   * background notification to the push. Never persisted or listed.
+   */
+  web_push?: boolean;
   turn_id?: string | null;
   session_id?: string | null;
   sdk_message_uuid?: string | null;
   source_kind?: MessageSourceKind | null;
   finalization_reason?: MessageFinalizationReason | null;
   task_id?: string | null;
+  /** automation_runs.id when source_kind='automation_prompt'. */
+  automation_run_id?: string | null;
+  /**
+   * The automation an automation_prompt input belongs to. Derived when a
+   * message is listed or announced to the Web; never persisted.
+   */
+  automation?: { id: string; name: string; runId: string } | null;
   delivery_mode?: FollowUpMode | null;
   delivery_status?: FollowUpStatus | null;
   delivery_run_id?: string | null;
   delivery_priority?: number | null;
   delivery_updated_at?: string | null;
+  /**
+   * The idempotency key a Web client sent this message with, so it can tell
+   * that a send it saw fail was stored. Announced only; never persisted.
+   */
+  client_message_id?: string;
 }
 
 export type FollowUpMode = 'queue' | 'steer';
@@ -491,6 +558,9 @@ export interface QueuedFollowUp {
   timestamp: string;
   attachments?: string;
   channel_context?: ChannelTurnContext;
+  source_kind?: MessageSourceKind | null;
+  automation_run_id?: string | null;
+  automation?: NewMessage['automation'];
   delivery_mode: FollowUpMode;
   delivery_status: 'queued' | 'promoting';
   delivery_run_id?: string | null;
@@ -534,8 +604,16 @@ export type MessageSourceKind =
   | 'overflow_partial'
   | 'compact_partial'
   | 'user_command'
+  /** Rows of the retired scheduled tasks: rendered in history, never replayed. */
   | 'scheduled_task_prompt'
   | 'scheduled_task_result'
+  /** An automation run's input (messages.automation_run_id is set). */
+  | 'automation_prompt'
+  /**
+   * Team mode: an input the host composed for a router or worker session
+   * (assignment, follow-up copy, report, approval). No person typed it.
+   */
+  | 'work_item_input'
   | 'legacy'
   | 'auto_continue'
   | 'truncation_continue';
@@ -562,155 +640,14 @@ export interface MessageCursor {
   sequence?: number;
 }
 
-export interface ScheduledTask {
-  id: string;
-  group_folder: string;
-  chat_jid: string;
-  prompt: string;
-  schedule_type: 'cron' | 'interval' | 'once';
-  schedule_value: string;
-  context_mode: 'group' | 'isolated';
-  execution_type: 'agent' | 'script';
-  script_command: string | null;
-  execution_mode?: 'host' | 'container' | null;
-  workspace_jid?: string | null;
-  workspace_folder?: string | null;
-  running_until?: string | null;
-  runner_id?: string | null;
-  next_run: string | null;
-  last_run: string | null;
-  last_result: string | null;
-  status: 'active' | 'paused' | 'completed' | 'parsing';
-  created_at: string;
-  created_by?: string;
-  notify_channels?: string[] | null;
-  /**
-   * Concrete delivery route captured when the task was created.
-   *
-   * `chat_jid` is workspace-level, so execution used to re-derive its target and
-   * could fall back to another group in the same folder. This JID carries the
-   * whole binding — provider, external chat, channel account and Feishu
-   * thread/root — so a run either reaches the place it was scheduled from or
-   * fails; it never silently picks somewhere else.
-   */
-  delivery_route_jid?: string | null;
-  /** Optimistic-concurrency revision for edits made through REST/MCP/UI. */
-  revision: number;
-  updated_at: string;
-  /** Soft deletion keeps task history queryable while removing future fires. */
-  deleted_at: string | null;
-}
-
-export type TaskRunTrigger = 'scheduled' | 'manual' | 'backfill';
-
-export type TaskRunStatus =
-  | 'queued'
-  | 'running'
-  | 'retry_wait'
-  | 'success'
-  | 'failed'
-  | 'cancelled'
-  | 'missed'
-  | 'delivered';
-
-export type TaskRunNotificationStatus =
-  | 'pending'
-  | 'success'
-  | 'partial_failed'
-  | 'failed'
-  | 'uncertain'
-  | 'skipped';
-
-export interface TaskRunNotificationSummary {
-  attempted: number;
-  succeeded: number;
-  failed: number;
-  failed_channels: string[];
-  /** Subset of failed attempts whose provider acceptance is unknown. */
-  uncertain?: number;
-  uncertain_channels?: string[];
-}
-
-export interface TaskRunNotificationReceipt {
-  status: Exclude<TaskRunNotificationStatus, 'pending'>;
-  summary: TaskRunNotificationSummary;
-  error?: string | null;
-}
-
-/**
- * Immutable, non-secret definition used by one occurrence. A queued/retried run
- * must never silently switch to a newer task definition.
- */
-export interface TaskRunDefinitionSnapshot {
-  prompt: string;
-  group_folder: string;
-  chat_jid: string;
-  delivery_route_jid: string | null;
-  context_mode: 'group' | 'isolated';
-  execution_type: 'agent' | 'script';
-  execution_mode: 'host' | 'container' | null;
-  script_command: string | null;
-  notify_channels: string[] | null;
-  /**
-   * Delivery contract frozen when a group-mode occurrence crosses the durable
-   * workspace-prompt hand-off.  It is intentionally absent on historical and
-   * isolated runs; consumers fall back to the workspace mode only for those
-   * legacy rows.
-   */
-  interaction_mode?: InteractionMode;
-}
-
-/** Durable state for one scheduled/manual occurrence. */
-export interface TaskRun {
-  id: string;
-  task_id: string;
-  trigger_type: TaskRunTrigger;
-  idempotency_key: string | null;
-  scheduled_for: string;
-  definition_revision: number;
-  definition_snapshot: TaskRunDefinitionSnapshot;
-  status: TaskRunStatus;
-  attempt: number;
-  available_at: string;
-  lease_owner: string | null;
-  lease_token: number;
-  lease_expires_at: string | null;
-  started_at: string | null;
-  completed_at: string | null;
-  created_at: string;
-  updated_at: string;
-  duration_ms: number;
-  result: string | null;
-  error: string | null;
-  notification_status: TaskRunNotificationStatus;
-  notification_error: string | null;
-  notification_summary: TaskRunNotificationSummary | null;
-  notification_attempt: number;
-  notification_available_at: string | null;
-}
-
-export interface ClaimedTaskRun extends TaskRun {
-  status: 'running';
-  lease_owner: string;
-  lease_expires_at: string;
-}
-
-export interface TaskRunLog {
-  id?: number;
-  run_id?: string;
-  task_id: string;
-  run_at: string;
-  duration_ms: number;
-  /** `queued` means a group-mode prompt was delivered to the workspace queue;
-   * it does not claim that the Agent has finished executing it. */
-  status: 'running' | 'queued' | 'success' | 'error';
-  result: string | null;
-  error: string | null;
-}
-
 // --- Auth types ---
 
-export type UserRole = 'admin' | 'member';
+/**
+ * `guest` is a read-only account owned by an admin/member (`guest_owner_id`).
+ * It can only view workspaces its owner explicitly granted; see
+ * src/guest-access.ts and docs/ACL-MATRIX.md.
+ */
+export type UserRole = 'admin' | 'member' | 'guest';
 export type UserStatus = 'active' | 'disabled' | 'deleted';
 
 export interface AuthUser {
@@ -763,6 +700,8 @@ export interface User {
    * Existing groups are not retroactively changed.
    */
   default_require_mention: boolean;
+  /** Owner account of a guest; null for admin/member. */
+  guest_owner_id: string | null;
   created_at: string;
   updated_at: string;
   last_login_at: string | null;
@@ -787,6 +726,9 @@ export interface UserPublic {
   ai_avatar_color: string | null;
   ai_avatar_url: string | null;
   default_require_mention: boolean;
+  guest_owner_id: string | null;
+  /** Populated by the admin users list for guest rows. */
+  guest_owner_username?: string | null;
   created_at: string;
   last_login_at: string | null;
   last_active_at: string | null;
@@ -810,6 +752,7 @@ export interface UserSessionWithUser extends UserSession {
   display_name: string;
   permissions: Permission[];
   must_change_password: boolean;
+  guest_owner_id: string | null;
 }
 
 export interface InviteCode {
@@ -848,7 +791,9 @@ export type AuthEventType =
   | 'recovery_reset'
   | 'register_success'
   | 'system_settings_updated'
-  | 'host_integration_updated';
+  | 'host_integration_updated'
+  | 'storage_source_saved'
+  | 'storage_source_deleted';
 
 export interface AuthAuditLog {
   id: number;
@@ -887,7 +832,17 @@ export interface SubAgent {
     | 'feishu_thread'
     | 'auto_im'
     | 'channel_direct'
+    /** Run session of an automation (fresh or persistent mode). */
+    | 'automation'
+    /** Team mode: the session that routes one group's requests. */
+    | 'team_router'
+    /** Team mode: the session that does one work item. */
+    | 'work_item'
+    /** The former implicit main session of a workspace, made a session by the v88 migration. */
+    | 'legacy_main'
     | null;
+  /** automations.id when source_kind='automation'. */
+  automation_id?: string | null;
   thread_id?: string | null;
   root_message_id?: string | null;
   title_source?:
@@ -898,6 +853,32 @@ export interface SubAgent {
     | 'auto_pending'
     | null;
   last_active_at?: string | null;
+}
+
+/** A session's own git worktree as the API and `agent_status` show it. */
+export interface SessionWorktreeInfo {
+  branch: string;
+  base_commit: string;
+  status: 'active' | 'broken';
+  broken_reason: string | null;
+  /** Creation response only: what `.worktreeinclude` could not copy. */
+  include_incomplete?: WorktreeIncludeIncomplete | null;
+}
+
+/**
+ * `.worktreeinclude` matched more than its caps let through. Nothing was
+ * copied when the include file is over 64 KB or the matched list over 256 KB;
+ * otherwise the 100-file or size caps stopped the copy.
+ */
+export interface WorktreeIncludeIncomplete {
+  reason:
+    | 'include_file_too_large'
+    | 'list_truncated'
+    | 'file_limit'
+    | 'size_limit';
+  copied_files: number;
+  /** Up to five matched paths that were not copied (file and size caps). */
+  skipped_files: string[];
 }
 
 export interface ImContextBinding {
@@ -930,7 +911,32 @@ export type RunFinishReason =
   | 'stopped';
 
 // WebSocket message types
+/** One Session waiting for a usage-limit reset, in a reconnect snapshot. */
+export interface UsageLimitWaitSnapshot {
+  chatJid: string;
+  agentId?: string;
+  resumeAt: string;
+  waitCount: number;
+}
+
 export type WsMessageOut =
+  | import('./automation-contract.js').AutomationWsEvent
+  | import('./work-items.js').WorkItemWsEvent
+  | {
+      /**
+       * How full a conversation's context is: after each completed turn, and
+       * all null when the conversation is cleared (see session-context-usage).
+       */
+      type: 'context_usage';
+      /** A Web chat of the conversation's workspace. */
+      chatJid: string;
+      agentId?: string;
+      usedTokens: number | null;
+      contextWindow: number | null;
+      percentage: number | null;
+      model: string | null;
+      updatedAt: string | null;
+    }
   | {
       type: 'new_message';
       chatJid: string;
@@ -989,6 +995,8 @@ export type WsMessageOut =
       prompt: string;
       resultSummary?: string;
       titleGenerating?: boolean;
+      /** Present for a session that owns a git worktree. */
+      worktree?: SessionWorktreeInfo;
     }
   | {
       type: 'runner_state';
@@ -1019,6 +1027,18 @@ export type WsMessageOut =
        * an idle composer and sends the same message twice.
        */
       queuedChatJids: string[];
+      /** Sessions whose input waits for a usage-limit reset. */
+      usageLimitWaits?: UsageLimitWaitSnapshot[];
+    }
+  | {
+      type: 'usage_limit_wait';
+      /** Normalized workspace JID, routed like follow_up_update. */
+      chatJid: string;
+      agentId?: string;
+      /** ISO time the parked input resumes; null clears the wait. */
+      resumeAt: string | null;
+      /** 1-based count of consecutive waits for this input (max 3). */
+      waitCount?: number;
     }
   | {
       type: 'follow_up_update';
@@ -1071,7 +1091,14 @@ export type WsMessageOut =
       userId: string;
       usage: BillingAccessResult;
     }
-  | { type: 'ws_error'; error: string; chatJid?: string }
+  | {
+      type: 'ws_error';
+      error: string;
+      chatJid?: string;
+      /** `session_required`: a workspace JID was sent without a session. */
+      code?: 'session_required';
+    }
+  | { type: 'pong' }
   | {
       type: 'stream_snapshot';
       chatJid: string;
@@ -1141,6 +1168,12 @@ export type WsMessageOut =
         phaseStartedAt?: number;
         /** A tool returned and the model has produced nothing since. */
         awaitingModel?: boolean;
+        /**
+         * The progress statements the Agent sent in this proactive Web turn,
+         * in order, with when each was sent (epoch ms): a tab that joins the
+         * turn rebuilds them as steps at every process visibility.
+         */
+        progress?: Array<{ at: number; text: string }>;
         activeHook?: { hookName: string; hookEvent: string } | null;
         turnId?: string;
       };
@@ -1158,7 +1191,20 @@ export type WsMessageIn =
   | { type: 'terminal_start'; chatJid: string; cols: number; rows: number }
   | { type: 'terminal_input'; chatJid: string; data: string }
   | { type: 'terminal_resize'; chatJid: string; cols: number; rows: number }
-  | { type: 'terminal_stop'; chatJid: string };
+  | { type: 'terminal_stop'; chatJid: string }
+  /**
+   * A page saying whether it is visible and which conversation it shows. Sent
+   * on every change and periodically while visible; Web Push uses it to stay
+   * quiet for a conversation the user is looking at.
+   */
+  | {
+      type: 'presence';
+      visible: boolean;
+      chatJid: string | null;
+      agentId: string | null;
+    }
+  /** A page checking that its socket still reaches the server. */
+  | { type: 'ping' };
 
 // --- Streaming event types (canonical source: shared/stream-event.ts) ---
 export type { StreamEventType } from './stream-event.types.js';

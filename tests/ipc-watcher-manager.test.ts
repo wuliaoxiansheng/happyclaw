@@ -37,11 +37,6 @@ describe('IpcWatcherManager runtime namespaces', () => {
       namespace: { agentId: 'agent-1' },
       relativeDir: path.join('agents', 'agent-1', 'tasks'),
     },
-    {
-      name: 'isolated task messages',
-      namespace: { taskRunId: 'run-1' },
-      relativeDir: path.join('tasks-run', 'run-1', 'messages'),
-    },
   ])('processes $name without waiting for the full scan', async (fixture) => {
     const ipcBaseDir = temporaryIpcRoot();
     const processGroup = vi.fn(async () => {});
@@ -66,12 +61,7 @@ describe('IpcWatcherManager runtime namespaces', () => {
     await vi.waitFor(() => {
       expect(processGroup).toHaveBeenCalledWith('workspace', {
         all: false,
-        namespaces: [
-          {
-            agentId: fixture.namespace.agentId ?? null,
-            taskRunId: fixture.namespace.taskRunId ?? null,
-          },
-        ],
+        namespaces: [{ agentId: fixture.namespace.agentId ?? null }],
       });
     });
     expect(processFull).not.toHaveBeenCalled();
@@ -140,7 +130,7 @@ describe('IpcWatcherManager runtime namespaces', () => {
     await vi.waitFor(() =>
       expect(processGroup).toHaveBeenCalledWith('workspace', {
         all: false,
-        namespaces: [{ agentId: 'agent-race', taskRunId: null }],
+        namespaces: [{ agentId: 'agent-race' }],
       }),
     );
     manager.closeAll();
@@ -179,7 +169,7 @@ describe('IpcWatcherManager runtime namespaces', () => {
     await vi.waitFor(() =>
       expect(processGroup).toHaveBeenCalledWith('workspace', {
         all: false,
-        namespaces: [{ agentId: 'agent-fallback', taskRunId: null }],
+        namespaces: [{ agentId: 'agent-fallback' }],
       }),
     );
     expect(processFull).not.toHaveBeenCalled();
@@ -222,12 +212,12 @@ describe('IpcWatcherManager runtime namespaces', () => {
       async () => {},
     );
     manager.triggerProcess('workspace', { agentId: 'a' });
-    manager.triggerProcess('workspace', { taskRunId: 't' });
+    manager.triggerProcess('workspace', { agentId: 'b' });
     manager.triggerProcess('workspace', { agentId: 'a' });
     await vi.waitFor(() => expect(scopes).toHaveLength(1));
     expect(scopes[0]).toEqual({
       all: false,
-      namespaces: [{ agentId: 'a' }, { taskRunId: 't' }],
+      namespaces: [{ agentId: 'a' }, { agentId: 'b' }],
     });
 
     manager.triggerProcess('workspace', { agentId: 'a' });
@@ -300,7 +290,7 @@ describe('IpcWatcherManager runtime namespaces', () => {
       'workspace',
       {
         all: false,
-        namespaces: [{ agentId: 'exiting', taskRunId: null }],
+        namespaces: [{ agentId: 'exiting' }],
       },
     ]);
     expect(manager.isWatched('workspace', { agentId: 'exiting' })).toBe(false);
@@ -309,24 +299,20 @@ describe('IpcWatcherManager runtime namespaces', () => {
 });
 
 describe('resolveScopedIpcRoots', () => {
-  test('returns only the requested roots, main first, without duplicates', () => {
+  test('returns only the requested session roots, without duplicates', () => {
     const roots = resolveScopedIpcRoots('/ipc/ws', [
-      { taskRunId: 'run-1' },
       { agentId: 'agent-1' },
-      {},
+      { agentId: 'agent-2' },
       { agentId: 'agent-1' },
     ]);
     expect(roots).toEqual([
-      { path: '/ipc/ws', agentId: null, taskId: null },
       {
         path: path.join('/ipc/ws', 'agents', 'agent-1'),
         agentId: 'agent-1',
-        taskId: null,
       },
       {
-        path: path.join('/ipc/ws', 'tasks-run', 'run-1'),
-        agentId: null,
-        taskId: 'run-1',
+        path: path.join('/ipc/ws', 'agents', 'agent-2'),
+        agentId: 'agent-2',
       },
     ]);
   });
@@ -336,8 +322,7 @@ describe('resolveScopedIpcRoots', () => {
       resolveScopedIpcRoots('/ipc/ws', [
         { agentId: '../other' },
         { agentId: 'a/b' },
-        { taskRunId: '..' },
-        { agentId: 'x', taskRunId: 'y' },
+        { agentId: '..' },
       ]),
     ).toEqual([]);
   });

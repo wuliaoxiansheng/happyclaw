@@ -7,140 +7,13 @@ import {
   decideAssistantPrimaryProjection,
   isGenuineReplyResult,
   occupiesPrimaryReplyDeliverySlot,
-  resolveScheduledGroupDeliveryContract,
-  resolveScheduledGroupCompletion,
-  resolveScheduledProactiveArchiveCandidate,
   resolveHeldReplyDbText,
   setIpcReplyInputTurn,
-  shouldFinalizeScheduledGroupPrimaryResult,
   shouldSkipRetryAfterLateError,
   wasGenuineReplyDeliveredForInput,
 } from '../src/reply-delivery.js';
 import { resolveContainerOutputInputTurnId } from '../src/channel-output-correlation.js';
 import { TurnOutputCoordinator } from '../src/turn-output-coordinator.js';
-
-describe('scheduled group physical delivery contract', () => {
-  test.each([
-    ['assistant', 0, 1],
-    ['proactive', 1, 0],
-  ] as const)(
-    '%s mode has exactly one physical IM delivery lane',
-    (mode, expectedNativeSends, expectedFrameworkSends) => {
-      const nativeSend = vi.fn();
-      const frameworkFinalSend = vi.fn();
-      const archiveSdkFinal = vi.fn();
-      const contract = resolveScheduledGroupDeliveryContract(mode);
-
-      // Model the two independently executing halves of the real pipeline:
-      // the Agent follows framing and may call send_message, then the host
-      // consumes/archives the SDK final and may publish it to IM.
-      if (contract.agentDeliversWithSendMessage) nativeSend();
-      archiveSdkFinal();
-      if (contract.frameworkDeliversFinalText) frameworkFinalSend();
-
-      expect(nativeSend).toHaveBeenCalledTimes(expectedNativeSends);
-      expect(frameworkFinalSend).toHaveBeenCalledTimes(expectedFrameworkSends);
-      expect(archiveSdkFinal).toHaveBeenCalledOnce();
-      expect(
-        nativeSend.mock.calls.length + frameworkFinalSend.mock.calls.length,
-      ).toBe(1);
-    },
-  );
-});
-
-describe('scheduled Proactive archive candidate', () => {
-  test('accepts both task-output and interactive Proactive result lanes', () => {
-    expect(
-      resolveScheduledProactiveArchiveCandidate({
-        status: 'success',
-        inputTurnCompleted: true,
-        hasScheduledGroupRuns: true,
-        result: ' archived task result ',
-      }),
-    ).toBe('archived task result');
-    expect(
-      resolveScheduledProactiveArchiveCandidate({
-        status: 'success',
-        inputTurnCompleted: true,
-        hasScheduledGroupRuns: true,
-        proactiveFinalCandidate: 'diagnostic final',
-        result: null,
-      }),
-    ).toBe('diagnostic final');
-  });
-
-  test('rejects non-terminal, failed, and non-scheduled output', () => {
-    const base = {
-      status: 'success' as const,
-      inputTurnCompleted: true,
-      hasScheduledGroupRuns: true,
-      result: 'must not archive',
-    };
-    expect(
-      resolveScheduledProactiveArchiveCandidate({
-        ...base,
-        inputTurnCompleted: false,
-      }),
-    ).toBe('');
-    expect(
-      resolveScheduledProactiveArchiveCandidate({
-        ...base,
-        status: 'error',
-      }),
-    ).toBe('');
-    expect(
-      resolveScheduledProactiveArchiveCandidate({
-        ...base,
-        hasScheduledGroupRuns: false,
-      }),
-    ).toBe('');
-  });
-});
-
-describe('scheduled group completion text', () => {
-  test('keeps the visible final and strips internal blocks', () => {
-    expect(
-      resolveScheduledGroupCompletion(
-        '<internal>checked inputs</internal>\nDaily report ready.',
-      ),
-    ).toEqual({ text: 'Daily report ready.', internalOnly: false });
-  });
-
-  test('settles a deliberate <internal>-only final with the silent notice', () => {
-    for (const final of [
-      '<internal>Stage 3 done</internal>',
-      ' <process>step 1</process>\n<internal>done</internal> ',
-      '<internal><process>done</process></internal>',
-    ]) {
-      expect(resolveScheduledGroupCompletion(final)).toEqual({
-        text: expect.stringContaining('以内部确认静默完成'),
-        internalOnly: true,
-      });
-    }
-  });
-
-  test('treats empty and empty-block finals as no business result', () => {
-    for (const final of [
-      '',
-      '   ',
-      '<internal></internal>',
-      '<internal> </internal><internal>\n</internal>',
-      '<internal><process></process></internal>',
-    ]) {
-      expect(resolveScheduledGroupCompletion(final)).toEqual({
-        text: '',
-        internalOnly: false,
-      });
-    }
-  });
-
-  test('never treats an unclosed internal tag as a silent completion', () => {
-    expect(resolveScheduledGroupCompletion('<internal>unclosed')).toEqual({
-      text: '<internal>unclosed',
-      internalOnly: false,
-    });
-  });
-});
 
 describe('isGenuineReplyResult', () => {
   test('a normal completed SDK final result is genuine', () => {
@@ -227,105 +100,7 @@ describe('isGenuineReplyResult', () => {
   });
 });
 
-describe('shouldFinalizeScheduledGroupPrimaryResult', () => {
-  test('finalizes the first substantive primary before a lifecycle completion frame', () => {
-    expect(
-      shouldFinalizeScheduledGroupPrimaryResult({
-        status: 'success',
-        providerFailure: false,
-        hasScheduledGroupRuns: true,
-        holdReason: null,
-        sourceKind: 'sdk_final',
-        finalizationReason: 'completed',
-      }),
-    ).toBe(true);
-  });
-
-  test('finalizes a healthy continuation that completes a truncated scheduled answer', () => {
-    expect(
-      shouldFinalizeScheduledGroupPrimaryResult({
-        status: 'success',
-        providerFailure: false,
-        hasScheduledGroupRuns: true,
-        holdReason: null,
-        sourceKind: 'truncation_continue',
-        finalizationReason: 'completed',
-      }),
-    ).toBe(true);
-  });
-
-  test.each([
-    {
-      label: 'unrelated',
-      status: 'success' as const,
-      providerFailure: false,
-      hasScheduledGroupRuns: false,
-      holdReason: null,
-      sourceKind: 'sdk_final',
-    },
-    {
-      label: 'provider failure',
-      status: 'success' as const,
-      providerFailure: true,
-      hasScheduledGroupRuns: true,
-      holdReason: null,
-      sourceKind: 'sdk_final',
-    },
-    {
-      label: 'input rejection warning without a primary source',
-      status: 'success' as const,
-      providerFailure: false,
-      hasScheduledGroupRuns: true,
-      holdReason: null,
-      sourceKind: 'input_rejection_warning',
-    },
-    {
-      label: 'internal continuation output',
-      status: 'success' as const,
-      providerFailure: false,
-      hasScheduledGroupRuns: true,
-      holdReason: null,
-      sourceKind: 'auto_continue',
-    },
-    {
-      label: 'background checkpoint',
-      status: 'success' as const,
-      providerFailure: false,
-      hasScheduledGroupRuns: true,
-      holdReason: 'bg_tasks' as const,
-      sourceKind: 'sdk_final',
-    },
-    {
-      label: 'partial continuation',
-      status: 'success' as const,
-      providerFailure: false,
-      hasScheduledGroupRuns: true,
-      holdReason: null,
-      sourceKind: 'overflow_partial',
-    },
-    {
-      label: 'still-truncated continuation',
-      status: 'success' as const,
-      providerFailure: false,
-      hasScheduledGroupRuns: true,
-      holdReason: 'truncated' as const,
-      sourceKind: 'truncation_continue',
-      finalizationReason: 'truncated',
-    },
-    {
-      label: 'stream event',
-      status: 'stream' as const,
-      providerFailure: false,
-      hasScheduledGroupRuns: true,
-      holdReason: null,
-      sourceKind: 'sdk_final',
-    },
-  ])('rejects $label output', (input) => {
-    expect(shouldFinalizeScheduledGroupPrimaryResult(input)).toBe(false);
-  });
-});
-
-describe('scheduled result presentation boundaries', () => {
+describe('result presentation boundaries', () => {
   test('an input rejection warning remains auxiliary and does not occupy the primary delivery slot', () => {
     expect(occupiesPrimaryReplyDeliverySlot('input_rejection_warning')).toBe(
       false,
@@ -594,18 +369,13 @@ describe('Assistant primary projection boundary', () => {
     });
   });
 
-  test('wires the strict boundary and canonical turn identity into main and conversation paths', () => {
+  test('wires the strict boundary and canonical turn identity into the session path', () => {
     const source = fs.readFileSync(
       path.join(process.cwd(), 'src/index.ts'),
       'utf8',
     );
 
-    expect(
-      source.match(/decideAssistantPrimaryProjection\(\{/g)?.length,
-    ).toBeGreaterThanOrEqual(2);
-    expect(source).toContain(
-      'const effectiveTurnId = outputChannelScope.inputId;',
-    );
+    expect(source).toContain('decideAssistantPrimaryProjection({');
     expect(source).toContain('? heldAgentDbTurnId || outputAgentScope.inputId');
     expect(source).toContain(
       'const agentAnyReplyProjectedByInput = new Map<string, boolean>',
@@ -616,18 +386,13 @@ describe('Assistant primary projection boundary', () => {
     expect(source).toContain(
       'agentAnyReplyProjectedByInput.set(outputAgentScope.inputId, true);',
     );
-    expect(source).toMatch(
-      /activeRouteAdmissions\.set\(\s+mainAdmissionKey,\s+\(newSourceJid, inputTurnId, inputCursor, coveredInputs, receipt\) => \{/,
+    expect(source).toContain(
+      'automationTurns.remember(inputTurnId, admittedMessages);',
     );
+    expect(source).toContain('automationTurns.forget(inputTurnId);');
     expect(source).toMatch(
-      /beforePublish hook,[\s\S]{0,500}if \(receipt\?\.deliveryId === inputTurnId\) \{\s+rememberScheduledGroupRuns\(\{\s+inputTurnId,\s+ipcReceipts: \[receipt\],/,
+      /finalizeChannelCardAfterDelivery\(\s+pendingAgentCardCompletion,\s+dbText,/,
     );
-    expect(source).toContain('scheduledGroupRunsByInput.delete(inputTurnId);');
-    expect(
-      source.match(
-        /finalizeChannelCardAfterDelivery\(\s+pending(?:StreamingCard|AgentCard)Completion,\s+dbText,/g,
-      ),
-    ).toHaveLength(2);
     expect(source).not.toContain(
       'outputAlreadySent && effectiveTurnId === lastSavedTurnId',
     );

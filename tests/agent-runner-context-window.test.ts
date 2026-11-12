@@ -75,11 +75,12 @@ describe('auto-compact policy to Claude Code environment', () => {
 });
 
 describe('Claude runtime environment', () => {
-  test('always enables transcript GC and startup failure results alongside the compact policy', () => {
+  test('always enables transcript GC and startup failure results and disables native cron alongside the compact policy', () => {
     expect(buildClaudeRuntimeEnv({ AUTO_COMPACT_PERCENTAGE: '70' })).toEqual({
       CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '70',
       CLAUDE_CODE_TRANSCRIPT_LOCAL_GC: '1',
       CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '1',
+      CLAUDE_CODE_DISABLE_CRON: '1',
     });
   });
 });

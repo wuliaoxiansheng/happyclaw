@@ -15,7 +15,7 @@ const ownerWebInput: AgentBuilderPersistedInput = {
   source_jid: 'web:home',
   is_from_me: 0,
   source_kind: null,
-  task_id: null,
+  automation_run_id: null,
 };
 
 describe('HappyClaw Owner Profile exact active-turn authorization', () => {
@@ -26,7 +26,7 @@ describe('HappyClaw Owner Profile exact active-turn authorization', () => {
         chatJid: 'feishu:shared-home',
         messageId: 'member-active',
         runtimeTurnId: 'runtime-active',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
     ]);
     registry.enqueueBatch('home', [
@@ -34,7 +34,7 @@ describe('HappyClaw Owner Profile exact active-turn authorization', () => {
         chatJid: 'web:home',
         messageId: 'owner-future',
         runtimeTurnId: 'runtime-future',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
     ]);
     const load = vi.fn((_chatJid: string, messageId: string) =>
@@ -71,7 +71,7 @@ describe('HappyClaw Owner Profile exact active-turn authorization', () => {
         chatJid: 'web:home',
         messageId: 'owner-active',
         runtimeTurnId: 'runtime-active',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
     ]);
     registry.enqueueBatch('home', [
@@ -79,7 +79,7 @@ describe('HappyClaw Owner Profile exact active-turn authorization', () => {
         chatJid: 'web:home',
         messageId: 'owner-queued',
         runtimeTurnId: 'runtime-queued',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
     ]);
     const load = vi.fn((_chatJid: string, messageId: string) => ({
@@ -119,7 +119,7 @@ describe('HappyClaw Owner Profile exact active-turn authorization', () => {
         chatJid: 'web:home',
         messageId: 'owner-active',
         runtimeTurnId: 'runtime-active',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
     ]);
     registry.enqueueBatch('home', [
@@ -127,7 +127,7 @@ describe('HappyClaw Owner Profile exact active-turn authorization', () => {
         chatJid: 'feishu:shared-home',
         messageId: 'member-queued',
         runtimeTurnId: 'runtime-member-queued',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
     ]);
 
@@ -151,7 +151,7 @@ describe('HappyClaw Owner Profile exact active-turn authorization', () => {
         chatJid: 'web:home',
         messageId: 'owner-active',
         runtimeTurnId: 'runtime-active',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
     ]);
     registry.enqueueBatch('home', [
@@ -159,7 +159,7 @@ describe('HappyClaw Owner Profile exact active-turn authorization', () => {
         chatJid: 'feishu:shared-home',
         messageId: 'member-future',
         runtimeTurnId: 'runtime-future',
-        scheduledTaskId: null,
+        automationRunId: null,
       },
     ]);
     const load = vi.fn((_chatJid: string, messageId: string) => ({
@@ -184,27 +184,27 @@ describe('HappyClaw Owner Profile exact active-turn authorization', () => {
 
   test.each([
     {
-      name: 'scheduled host turn',
+      name: 'automation host turn',
       turn: {
-        scheduledTaskId: 'task-1',
+        automationRunId: 'run-1',
       },
       input: ownerWebInput,
     },
     {
-      name: 'persisted scheduled input',
+      name: 'persisted automation input',
       turn: {
-        scheduledTaskId: null,
+        automationRunId: null,
       },
       input: {
         ...ownerWebInput,
-        source_kind: 'scheduled_task_prompt',
-        task_id: 'task-1',
+        source_kind: 'automation_prompt',
+        automation_run_id: 'run-1',
       },
     },
     {
       name: 'assistant-authored input',
       turn: {
-        scheduledTaskId: null,
+        automationRunId: null,
       },
       input: { ...ownerWebInput, is_from_me: 1 },
     },
@@ -225,7 +225,7 @@ describe('HappyClaw Owner Profile exact active-turn authorization', () => {
         () => input,
         () => true,
       ),
-    ).toThrow('scheduled or non-human');
+    ).toThrow('automation or non-human');
   });
 });
 
@@ -367,31 +367,20 @@ describe('HappyClaw Owner Profile home-anchored sender identity', () => {
 
 describe('HappyClaw Owner Profile runtime isolation', () => {
   const base = {
-    isScheduledTask: false,
-    isolatedTaskId: null,
-    runtimeAgentId: null,
-    runtimeAgentKind: null,
-    runtimeAgentFolder: null,
+    runtimeAgentKind: 'conversation',
+    runtimeAgentFolder: 'home-folder',
     sourceFolder: 'home-folder',
     sourceProfileIsDefault: true,
   } as const;
 
-  test('allows the default HappyClaw main and same-workspace conversation sessions', () => {
+  test('allows every conversation session of the workspace, each with its own turns', () => {
     expect(getAgentBuilderRuntimeRejection(base)).toBeNull();
-    expect(
-      getAgentBuilderRuntimeRejection({
-        ...base,
-        runtimeAgentId: 'conversation-1',
-        runtimeAgentKind: 'conversation',
-        runtimeAgentFolder: 'home-folder',
-      }),
-    ).toBeNull();
     expect(agentBuilderTurnScope('home-folder', 'conversation-1')).not.toBe(
       agentBuilderTurnScope('home-folder', 'conversation-2'),
     );
   });
 
-  test('rejects custom profiles, SDK/spawn agents, task agents, and scheduled runs', () => {
+  test('rejects custom profiles, SDK/spawn agents and task agents', () => {
     expect(
       getAgentBuilderRuntimeRejection({
         ...base,
@@ -400,25 +389,8 @@ describe('HappyClaw Owner Profile runtime isolation', () => {
     ).not.toBeNull();
     for (const runtimeAgentKind of ['spawn', 'task'] as const) {
       expect(
-        getAgentBuilderRuntimeRejection({
-          ...base,
-          runtimeAgentId: `${runtimeAgentKind}-1`,
-          runtimeAgentKind,
-          runtimeAgentFolder: 'home-folder',
-        }),
+        getAgentBuilderRuntimeRejection({ ...base, runtimeAgentKind }),
       ).not.toBeNull();
     }
-    expect(
-      getAgentBuilderRuntimeRejection({
-        ...base,
-        isScheduledTask: true,
-      }),
-    ).not.toBeNull();
-    expect(
-      getAgentBuilderRuntimeRejection({
-        ...base,
-        isolatedTaskId: 'task-run-1',
-      }),
-    ).not.toBeNull();
   });
 });

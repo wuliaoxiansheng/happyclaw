@@ -134,6 +134,55 @@ describe('ClaudeContextResolver', () => {
     );
   });
 
+  test('the native layer keeps nothing HappyClaw owns', () => {
+    const external = path.join(tmp, 'external-claude');
+    writeFile(
+      path.join(external, 'settings.json'),
+      JSON.stringify({
+        env: {
+          ANTHROPIC_BASE_URL: 'https://admin-gateway.example',
+          ANTHROPIC_AUTH_TOKEN: 'admin-token',
+          CLAUDE_CODE_USE_BEDROCK: '1',
+          AWS_BEARER_TOKEN_BEDROCK: 'admin-bedrock',
+          ANTHROPIC_DEFAULT_FABLE_MODEL: 'admin-fable',
+          CLAUDE_CODE_OAUTH_REFRESH_TOKEN: 'admin-refresh',
+          CLAUDE_CODE_EFFORT_LEVEL: 'low',
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: '120000',
+          CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '60',
+          // Tuning that neither routes nor authenticates stays.
+          API_TIMEOUT_MS: '600000',
+          ANTHROPIC_BETAS: 'context-1m-2025-08-07',
+          HOST_BASE: '1',
+        },
+        apiKeyHelper: '~/bin/admin-key.sh',
+        awsCredentialExport: '~/bin/aws-creds.sh',
+        model: 'opus',
+      }),
+    );
+    writeFile(
+      path.join(external, 'settings.local.json'),
+      JSON.stringify({ env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: '400000' } }),
+    );
+    const plan = buildClaudeContextPlan({
+      executionMode: 'host',
+      group: fakeGroup('main', 'admin', true) as any,
+      ownerHomeFolder: 'main',
+      externalClaudeDir: external,
+      projectRoot: path.join(tmp, 'project'),
+      dataDir: path.join(tmp, 'data'),
+      groupSessionsDir: path.join(tmp, 'sessions', 'main', '.claude'),
+      includeHostClaudeContext: true,
+    });
+    expect(loadHostClaudeSettings(plan)).toEqual({
+      env: {
+        API_TIMEOUT_MS: '600000',
+        ANTHROPIC_BETAS: 'context-1m-2025-08-07',
+        HOST_BASE: '1',
+      },
+      model: 'opus',
+    });
+  });
+
   test('host sync preserves a real session CLAUDE.md and reports shadowed', () => {
     const external = path.join(tmp, 'external-claude');
     const sessionDir = path.join(tmp, 'sessions', 'main', '.claude');

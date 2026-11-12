@@ -12,10 +12,8 @@ import {
   type McpContext,
 } from '../container/agent-runner/src/mcp-tools.js';
 import { HappyClawFirstWakeAcknowledger } from '../container/agent-runner/src/owner-profile-first-wake.js';
-import {
-  loadHappyClawOwnerProfileTurnContext,
-  renderHappyClawOwnerProfileBlock,
-} from '../container/agent-runner/src/owner-profile-context.js';
+import { renderHappyClawOwnerProfileBlock } from '../container/agent-runner/src/owner-profile-context.js';
+import { TurnNoteLedger } from '../container/agent-runner/src/turn-notes.js';
 import { createWorkspaceMemoryWriteGuard } from '../container/agent-runner/src/workspace-memory-runtime.js';
 import {
   grantWorkspaceMemoryTurnToCurrentRunner,
@@ -40,8 +38,6 @@ function context(root: string, patch: Partial<McpContext> = {}): McpContext {
     isAdminHome: false,
     agentBuilderEnabled: true,
     ownerProfileEnabled: true,
-    isScheduledTask: false,
-    currentTaskId: null,
     currentInputTurnId: 'owner-turn-a',
     currentSessionId: 'session-a',
     workspaceIpc: root,
@@ -308,26 +304,30 @@ describe('HappyClaw Owner Profile runner projection refresh', () => {
     expect(rendered).toContain('\\u003c/system\\u003e');
     expect(rendered).not.toContain('<system>');
 
-    const revisions = [
-      {
-        projection: projection('小何', 1),
-        onboardingStatus: 'known' as const,
-        firstWake: false,
-      },
-      {
-        projection: projection('何先生', 2),
-        onboardingStatus: 'known' as const,
-        firstWake: false,
-      },
-    ];
-    let call = 0;
-    const fetchProjection = vi.fn(async () => revisions[call++]);
-    const cold = await loadHappyClawOwnerProfileTurnContext(fetchProjection);
-    const warm = await loadHappyClawOwnerProfileTurnContext(fetchProjection);
-    expect(fetchProjection).toHaveBeenCalledTimes(2);
-    expect(cold.block).toContain('小何');
-    expect(warm.block).toContain('何先生');
-    expect(warm.block).not.toContain('小何');
+    // Each turn reads a fresh projection; a turn carries the block only when
+    // it differs from the one already in the conversation.
+    const knownAs = (address: string, revision: number) => ({
+      projection: projection(address, revision),
+      onboardingStatus: 'known' as const,
+      firstWake: false,
+    });
+    const ledger = new TurnNoteLedger();
+    ledger.beginQuery(undefined);
+    const turn = (uuid: string, ownerProfile: ReturnType<typeof knownAs>) => {
+      const notes = ledger.stage(uuid, {
+        memory: null,
+        ownerProfile,
+        channelContext: undefined,
+      });
+      ledger.observeAnswered([uuid]);
+      ledger.commitAnswered();
+      return notes.ownerProfile;
+    };
+    expect(turn('cold', knownAs('小何', 1))).toContain('小何');
+    expect(turn('same', knownAs('小何', 1))).toBe('');
+    const warm = turn('warm', knownAs('何先生', 2));
+    expect(warm).toContain('何先生');
+    expect(warm).not.toContain('小何');
   });
 });
 
@@ -348,13 +348,9 @@ describe('HappyClaw Owner Profile MCP isolation', () => {
     expect(names(context(root, { currentInputTurnId: null }))).toContain(
       'happyclaw_owner_profile',
     );
-    for (const denied of [
-      context(root, { ownerProfileEnabled: false }),
-      context(root, { isScheduledTask: true }),
-      context(root, { currentTaskId: 'task-1' }),
-    ]) {
-      expect(names(denied)).not.toContain('happyclaw_owner_profile');
-    }
+    expect(names(context(root, { ownerProfileEnabled: false }))).not.toContain(
+      'happyclaw_owner_profile',
+    );
   });
 
   test('first-wake acknowledgement is registered without side effects and correlated to one turn', async () => {

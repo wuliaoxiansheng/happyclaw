@@ -15,13 +15,12 @@ import {
   SquarePen,
 } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
-import { useAuthStore } from '../../stores/auth';
+import { useAuthStore, useIsGuest } from '../../stores/auth';
 import { useBillingStore } from '../../stores/billing';
 import { useShellStore } from '../../stores/shell';
 import { useClearWorkspace } from '../../hooks/useClearWorkspace';
 import { useDeleteWorkspace } from '../../hooks/useDeleteWorkspace';
 import { useNewConversation } from '../../hooks/useNewConversation';
-import { useSessionActions } from '../../hooks/useSessionActions';
 import { useWorkspaceTree } from '../../hooks/useWorkspaceTree';
 import { useStableCallback } from '../../hooks/useStableCallback';
 import { ConfirmDialog } from '@/components/common';
@@ -34,7 +33,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { AccountMenuItems } from './AccountMenu';
+import { AccountMenuItems, GuestBadge } from './AccountMenu';
 import { DeleteWorkspaceDialog } from '../chat/DeleteWorkspaceDialog';
 import { RenameDialog } from '../chat/RenameDialog';
 import {
@@ -45,7 +44,7 @@ import { preloadWhenIdle, useOpenedOnce } from '../../lib/preloaded-component';
 import { SkeletonCardList } from '@/components/common/Skeletons';
 import { cn } from '@/lib/utils';
 import { SHORTCUTS } from '@/lib/shortcuts';
-import { chatHref, openWorkspaceSession } from '../../lib/chat-navigation';
+import { enterWorkspace } from '../../lib/chat-navigation';
 import { filterNavItems } from './nav-items';
 import { withBasePath } from '../../utils/url';
 import { SidebarItem } from './sidebar/SidebarItem';
@@ -55,7 +54,6 @@ import { SidebarResizeHandle } from './sidebar/SidebarResizeHandle';
 import type { GroupEntry } from '../../utils/group-utils';
 
 const BugReportDialog = lazyBugReportDialog.Component;
-const CreateContainerDialog = lazyCreateContainerDialog.Component;
 
 /**
  * Desktop app sidebar: brand/account menu, primary actions, page navigation
@@ -69,6 +67,7 @@ export function UnifiedSidebar() {
   const asideRef = useRef<HTMLElement>(null);
 
   const user = useAuthStore((s) => s.user);
+  const isGuest = useIsGuest();
   const appearance = useAuthStore((s) => s.appearance);
   const billingEnabled = useBillingStore((s) => s.billingEnabled);
   const width = useShellStore((s) => s.sidebarWidth);
@@ -77,12 +76,9 @@ export function UnifiedSidebar() {
   const expandedWorkspaces = useShellStore((s) => s.expandedWorkspaces);
   const setWorkspaceExpanded = useShellStore((s) => s.setWorkspaceExpanded);
   const revealWorkspace = useShellStore((s) => s.revealWorkspace);
-  const createOpen = useShellStore((s) => s.createWorkspaceOpen);
-  const createAgentId = useShellStore((s) => s.createWorkspaceAgentId);
+  // The dialog itself lives in AppLayout, so phones and the palette reach it.
   const setCreateOpen = useShellStore((s) => s.setCreateWorkspaceOpen);
-  const requestComposerFocus = useShellStore((s) => s.requestComposerFocus);
   const setPaletteOpen = useShellStore((s) => s.setPaletteOpen);
-  const createMounted = useOpenedOnce(createOpen);
   useEffect(
     () =>
       preloadWhenIdle(
@@ -92,7 +88,6 @@ export function UnifiedSidebar() {
     [],
   );
   const { startNewConversation, creatingSession } = useNewConversation();
-  const { createSession } = useSessionActions();
   const [showBugReport, setShowBugReport] = useState(false);
   const bugReportMounted = useOpenedOnce(showBugReport);
   const [renameState, setRenameState] = useState({
@@ -106,18 +101,18 @@ export function UnifiedSidebar() {
     user?.username ||
     '?')[0].toUpperCase();
   const navItems = useMemo(
-    () => filterNavItems(billingEnabled),
-    [billingEnabled],
+    () => filterNavItems(billingEnabled, isGuest),
+    [billingEnabled, isGuest],
   );
 
   // 窄 selector：整 store 订阅会让侧边栏跟着流式输出每帧重渲染。
   const currentGroup = useChatStore((s) => s.currentGroup);
-  const selectGroup = useChatStore((s) => s.selectGroup);
   const loading = useChatStore((s) => s.loading);
   const togglePin = useChatStore((s) => s.togglePin);
   const { allGroups, agentSections, agentPartitions } = useWorkspaceTree();
   const {
     clearState,
+    clearMessage,
     clearLoading,
     openClear,
     closeClear,
@@ -145,11 +140,9 @@ export function UnifiedSidebar() {
 
   // The tree and its rows are memoized; hand them stable callbacks. Opening
   // a workspace expands it because it becomes current, without persisting.
-  const selectWorkspace = useStableCallback((group: GroupEntry) => {
-    selectGroup(group.jid);
-    revealWorkspace(group.jid);
-    navigate(chatHref(group.folder));
-  });
+  const selectWorkspace = useStableCallback((group: GroupEntry) =>
+    enterWorkspace(navigate, group),
+  );
   const isExpanded = useCallback(
     (group: GroupEntry) =>
       expandedWorkspaces[group.jid] ?? group.jid === currentGroupJid,
@@ -166,13 +159,18 @@ export function UnifiedSidebar() {
       setWorkspaceExpanded(group.jid, expanded),
   );
   const navigateTo = useStableCallback((to: string) => navigate(to));
+  // "+" on a workspace row: a new conversation there (or the blank one it
+  // already has); 新建独立 worktree 会话 always creates one.
   const createWorkspaceSession = useStableCallback(
-    async (group: GroupEntry) => {
-      const session = await createSession(group.jid);
-      if (!session) return;
+    async (
+      group: GroupEntry,
+      options?: { name?: string; worktree?: boolean },
+    ) => {
       revealWorkspace(group.jid);
-      openWorkspaceSession(navigateTo, group, session.id);
-      requestComposerFocus();
+      return startNewConversation({
+        target: { jid: group.jid },
+        create: options,
+      });
     },
   );
   const createAgentWorkspace = useStableCallback((agentId: string) =>
@@ -270,6 +268,7 @@ export function UnifiedSidebar() {
                   <span className="block truncate text-caption font-normal">
                     @{user?.username}
                   </span>
+                  <GuestBadge className="mt-1" />
                 </span>
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
@@ -306,14 +305,16 @@ export function UnifiedSidebar() {
             onClick={() => setPaletteOpen(true)}
             collapsed={collapsed}
           />
-          <SidebarItem
-            icon={SquarePen}
-            label="新对话"
-            shortcut={SHORTCUTS.newConversation}
-            onClick={() => void startNewConversation()}
-            disabled={creatingSession}
-            collapsed={collapsed}
-          />
+          {!isGuest && (
+            <SidebarItem
+              icon={SquarePen}
+              label="新对话"
+              shortcut={SHORTCUTS.newConversation}
+              onClick={() => void startNewConversation()}
+              disabled={creatingSession}
+              collapsed={collapsed}
+            />
+          )}
           <div className="my-1.5" />
           {navItems.map(({ path, icon, label }) => (
             <SidebarItem
@@ -340,20 +341,24 @@ export function UnifiedSidebar() {
             <span className="text-caption font-medium text-muted-foreground">
               工作区
             </span>
-            <IconButton
-              label="新建工作区"
-              icon={<Plus />}
-              size="icon-xs"
-              onClick={() => setCreateOpen(true)}
-              className="text-muted-foreground"
-            />
+            {isGuest ? (
+              <GuestBadge />
+            ) : (
+              <IconButton
+                label="新建工作区"
+                icon={<Plus />}
+                size="icon-xs"
+                onClick={() => setCreateOpen(true)}
+                className="text-muted-foreground"
+              />
+            )}
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-2 pt-1 pb-3">
             {loading && allGroups.length === 0 ? (
               <SkeletonCardList count={6} compact />
             ) : agentSections.length === 0 ? (
               <p className="px-2 py-6 text-center text-caption text-muted-foreground">
-                暂无智能体工作区
+                {isGuest ? '暂无可查看的工作区' : '暂无智能体工作区'}
               </p>
             ) : (
               <WorkspaceTree
@@ -363,13 +368,15 @@ export function UnifiedSidebar() {
                 currentGroupJid={currentGroupJid}
                 activeSessionId={activeSessionId}
                 onSelect={selectWorkspace}
-                onRename={renameWorkspace}
+                // Guests only browse: no rename, delete, pin, new session,
+                // new workspace or agent links.
+                onRename={isGuest ? undefined : renameWorkspace}
                 onClearHistory={clearWorkspace}
-                onDelete={deleteWorkspace}
-                onTogglePin={pinWorkspace}
-                onCreateSession={createWorkspaceSession}
-                onCreateWorkspace={createAgentWorkspace}
-                onOpenAgent={openAgent}
+                onDelete={isGuest ? undefined : deleteWorkspace}
+                onTogglePin={isGuest ? undefined : pinWorkspace}
+                onCreateSession={isGuest ? undefined : createWorkspaceSession}
+                onCreateWorkspace={isGuest ? undefined : createAgentWorkspace}
+                onOpenAgent={isGuest ? undefined : openAgent}
                 isExpanded={isExpanded}
                 onToggleExpanded={toggleExpanded}
                 renderSessions={renderSessions}
@@ -387,18 +394,6 @@ export function UnifiedSidebar() {
           onClose={() => setShowBugReport(false)}
         />
       )}
-      {createMounted && (
-        <CreateContainerDialog
-          open={createOpen}
-          defaultAgentProfileId={createAgentId}
-          onClose={() => setCreateOpen(false)}
-          onCreated={(jid, folder) => {
-            selectGroup(jid);
-            revealWorkspace(jid);
-            navigate(`/chat/${folder}`);
-          }}
-        />
-      )}
       <RenameDialog
         open={renameState.open}
         jid={renameState.jid}
@@ -410,7 +405,7 @@ export function UnifiedSidebar() {
         onClose={closeClear}
         onConfirm={handleClearConfirm}
         title="重建工作区"
-        message={`确认重建「${clearState.name}」？会永久删除全部聊天记录、上下文、所有子对话及其消息、工作目录文件，以及该工作区的全部 Memory（含版本历史、遗忘记录和 HappyClaw 称呼偏好）；Home 还会重置首次唤醒状态。关联定时任务会停止并移入回收站，运行历史与持久化目录 (data/extra/) 保留。不可撤销。`}
+        message={clearMessage}
         confirmText="确认重建"
         confirmVariant="danger"
         loading={clearLoading}

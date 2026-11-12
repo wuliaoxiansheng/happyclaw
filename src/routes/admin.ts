@@ -19,8 +19,10 @@ import type {
   Permission,
   PermissionTemplateKey,
   AuthEventType,
+  UserSession,
 } from '../types.js';
 import { invalidateUserSessions, getWebDeps } from '../web-context.js';
+import { revokeGuestSessionsForOwner } from '../guest-accounts.js';
 import { imManager } from '../im-manager.js';
 import {
   listUsers,
@@ -31,8 +33,9 @@ import {
   updateUserFieldsAndForceRuntimesToHost,
   deleteUser,
   restoreUser,
+  deleteUserSession,
   deleteUserSessionsByUserId,
-  createUserSession,
+  replaceUserSessions,
   getActiveAdminCount,
   logAuthEvent,
   getAllRegisteredGroups,
@@ -42,6 +45,8 @@ import {
   deleteInviteCode,
   queryAuthAuditLogs,
   getRegisteredGroup,
+  deleteGuestUser,
+  deleteGuestWorkspaceGrantsForGuest,
 } from '../db.js';
 import {
   validateUsername,
@@ -83,8 +88,14 @@ import {
   getPendingAdminHostOnlyCleanupFolders,
   markAdminHostOnlyCleanupPending,
 } from '../admin-host-only-runtime.js';
-import { getSystemSettings } from '../runtime-config.js';
-import { notifyTaskSchedulerChanged } from '../task-scheduler.js';
+import {
+  isAdminHostOnlyEffective,
+  isSingleUserHost,
+} from '../deployment-mode.js';
+import {
+  SingleUserHostConflictError,
+  singleUserHostRefusal,
+} from '../single-user-host-guard.js';
 import { onPasswordHashBusy } from '../password-hash-busy.js';
 
 const adminRoutes = new Hono<{ Variables: Variables }>();
@@ -162,6 +173,8 @@ async function commitActiveAdminHostOnlyGrant(
   userId: string,
   updates: Parameters<typeof updateUserFields>[1],
   reason: string,
+  /** Runs synchronously right before the write; throws to abort it. */
+  beforeWrite: () => void,
 ): Promise<void> {
   const targets = getUserWorkspaceRuntimeTargets(userId);
   const folders = targets.map((target) => target.folder);
@@ -173,6 +186,7 @@ async function commitActiveAdminHostOnlyGrant(
   }
 
   const commit = () => {
+    beforeWrite();
     const migration = updateUserFieldsAndForceRuntimesToHost(userId, updates);
     if (deps) {
       const liveGroups = deps.getRegisteredGroups();
@@ -180,10 +194,6 @@ async function commitActiveAdminHostOnlyGrant(
         const fresh = getRegisteredGroup(jid);
         if (fresh) liveGroups[jid] = fresh;
       }
-      for (const folder of folders) delete deps.sessions[folder];
-    }
-    if (migration.migratedTaskIds.length > 0) {
-      notifyTaskSchedulerChanged();
     }
   };
 
@@ -230,11 +240,25 @@ const ISO_DATE_RE =
 function denyEscalationToTarget(
   c: any,
   actor: AuthUser,
-  target: { role: string; permissions?: readonly Permission[] },
+  target: {
+    role: string;
+    permissions?: readonly Permission[];
+    guest_owner_id?: string | null;
+  },
   action: string,
 ): Response | null {
   if (actor.role === 'admin') return null;
   if (target.role === 'admin') return null;
+  // A guest holds no permissions but reads its owner's granted workspaces:
+  // resetting its password or re-enabling it would hand those over. Owners
+  // manage their own guests through /api/guests, which keeps an admin's
+  // disable in force; here only an admin may.
+  if (target.role === 'guest') {
+    return c.json(
+      { error: `Forbidden: only admin can ${action} a guest account` },
+      403,
+    );
+  }
   const actorPerms = new Set<Permission>(actor.permissions);
   const extra = (target.permissions ?? []).filter((p) => !actorPerms.has(p));
   if (extra.length === 0) return null;
@@ -255,7 +279,10 @@ adminRoutes.get('/users', authMiddleware, usersManageMiddleware, (c) => {
   const statusRaw = c.req.query('status') || 'all';
   const page = parseInt(c.req.query('page') || '1', 10);
   const pageSize = parseInt(c.req.query('pageSize') || '50', 10);
-  const role = roleRaw === 'admin' || roleRaw === 'member' ? roleRaw : 'all';
+  const role =
+    roleRaw === 'admin' || roleRaw === 'member' || roleRaw === 'guest'
+      ? roleRaw
+      : 'all';
   const status =
     statusRaw === 'active' ||
     statusRaw === 'disabled' ||
@@ -295,6 +322,7 @@ adminRoutes.get('/permission-templates', authMiddleware, (c) => {
 
 // POST /api/admin/users - 创建用户
 adminRoutes.post('/users', authMiddleware, usersManageMiddleware, async (c) => {
+  if (isSingleUserHost()) return singleUserHostRefusal(c);
   const body = await c.req.json().catch(() => ({}));
   const validation = AdminCreateUserSchema.safeParse(body);
   if (!validation.success) {
@@ -330,6 +358,8 @@ adminRoutes.post('/users', authMiddleware, usersManageMiddleware, async (c) => {
   const now = new Date().toISOString();
   const userId = generateUserId();
   const passwordHash = await hashPassword(password);
+  // The mode may have switched while the password was hashing.
+  if (isSingleUserHost()) return singleUserHostRefusal(c);
 
   const finalRole = role || 'member';
   const finalPermissions = normalizePermissions(
@@ -413,6 +443,15 @@ adminRoutes.patch(
       async () => {
         const target = getUserById(id);
         if (!target) return c.json({ error: 'User not found' }, 404);
+        // Reactivating or promoting would add a second active user (or
+        // admin); disabling, deleting and editing stay allowed. Checked
+        // again right before each write, after the awaits below.
+        const addsActiveUser =
+          (validation.data.status === 'active' && target.status !== 'active') ||
+          (validation.data.role === 'admin' && target.role !== 'admin');
+        const refusedBySingleUserHost = () =>
+          addsActiveUser && isSingleUserHost();
+        if (refusedBySingleUserHost()) return singleUserHostRefusal(c);
 
         const actor = c.get('user') as AuthUser;
         if (actor.role !== 'admin' && target.role === 'admin') {
@@ -432,10 +471,25 @@ adminRoutes.patch(
         const triggersPrivCheck =
           validation.data.password !== undefined ||
           validation.data.status !== undefined ||
+          validation.data.disable_reason !== undefined ||
           validation.data.permissions !== undefined;
         if (triggersPrivCheck) {
           const denial = denyEscalationToTarget(c, actor, target, 'modify');
           if (denial) return denial;
+        }
+        // Guest accounts are owned by their creator (POST /api/guests). Admin
+        // user management may rename, disable, delete or reset them, but a
+        // guest can never be promoted, nor a member/admin demoted to guest.
+        if (
+          target.role === 'guest' &&
+          (validation.data.role !== undefined ||
+            (validation.data.permissions !== undefined &&
+              validation.data.permissions.length > 0))
+        ) {
+          return c.json(
+            { error: 'Guest accounts cannot change role or permissions' },
+            400,
+          );
         }
         if (
           actor.role !== 'admin' &&
@@ -583,6 +637,10 @@ adminRoutes.patch(
             postCommitActions.push(() => {
               invalidateUserSessions(id);
               deleteUserSessionsByUserId(id);
+              revokeGuestSessionsForOwner(id);
+              if (target.role === 'guest') {
+                deleteGuestWorkspaceGrantsForGuest(id);
+              }
               void imManager
                 .disconnectAllUserChannels(id)
                 .catch(() => undefined);
@@ -600,6 +658,7 @@ adminRoutes.patch(
             postCommitActions.push(() => {
               invalidateUserSessions(id);
               deleteUserSessionsByUserId(id);
+              revokeGuestSessionsForOwner(id);
               void imManager
                 .disconnectAllUserChannels(id)
                 .catch(() => undefined);
@@ -657,6 +716,20 @@ adminRoutes.patch(
 
         const isSelfPasswordReset =
           validation.data.password !== undefined && id === actor.id;
+        // An admin resetting their own password stays signed in on this
+        // device under a new session, which keeps its Web Push subscription.
+        const issuedAt = new Date().toISOString();
+        const selfSession: UserSession | null = isSelfPasswordReset
+          ? {
+              id: generateSessionToken(),
+              user_id: actor.id,
+              ip_address: getClientIp(c),
+              user_agent: c.req.header('user-agent') || null,
+              created_at: issuedAt,
+              expires_at: sessionExpiresAt(),
+              last_active_at: issuedAt,
+            }
+          : null;
         if (validation.data.password !== undefined) {
           updates.password_hash = await hashPassword(validation.data.password);
           // Only force password change when resetting OTHER user's password
@@ -666,7 +739,11 @@ adminRoutes.patch(
           }
           postCommitActions.push(() => {
             invalidateUserSessions(id);
-            deleteUserSessionsByUserId(id);
+            if (selfSession) {
+              replaceUserSessions(id, c.get('sessionId'), selfSession);
+            } else {
+              deleteUserSessionsByUserId(id);
+            }
             logAuthEvent({
               event_type: 'password_changed',
               username: target.username,
@@ -696,6 +773,7 @@ adminRoutes.patch(
           });
         }
 
+        if (refusedBySingleUserHost()) return singleUserHostRefusal(c);
         let updateAlreadyCommitted = false;
         const revokesHostPrivilege =
           targetIsActiveAdmin && !targetRemainsActiveAdmin;
@@ -708,7 +786,7 @@ adminRoutes.patch(
           );
         const grantsHostOnlyAdminRuntime =
           targetRemainsActiveAdmin &&
-          getSystemSettings().adminHostOnlyMode &&
+          isAdminHostOnlyEffective() &&
           (!targetIsActiveAdmin || hasPendingHostOnlyCleanup);
         if (grantsHostOnlyAdminRuntime) {
           try {
@@ -716,15 +794,25 @@ adminRoutes.patch(
               id,
               updates,
               `Administrator ${id} gained active host-only privileges`,
+              () => {
+                if (refusedBySingleUserHost()) {
+                  throw new SingleUserHostConflictError();
+                }
+              },
             );
             updateAlreadyCommitted = true;
           } catch (err) {
+            if (err instanceof SingleUserHostConflictError) {
+              return singleUserHostRefusal(c);
+            }
             if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
             logger.error(
               { err, userId: id, persisted: err.persisted },
               'Failed to apply active administrator host-only runtime policy',
             );
             if (err.persisted) runPostCommitActions();
+            // No cookie goes out: end the session it would have been.
+            if (selfSession) deleteUserSession(selfSession.id);
             return c.json(
               {
                 error: err.persisted
@@ -751,6 +839,8 @@ adminRoutes.patch(
               'Failed to revoke active administrator host privileges',
             );
             if (err.persisted) runPostCommitActions();
+            // No cookie goes out: end the session it would have been.
+            if (selfSession) deleteUserSession(selfSession.id);
             return c.json(
               {
                 error: err.persisted
@@ -767,26 +857,13 @@ adminRoutes.patch(
         runPostCommitActions();
         const updated = getUserById(id)!;
 
-        // When admin resets their own password, recreate session to avoid logout
-        if (isSelfPasswordReset) {
-          const now = new Date().toISOString();
-          const ip = getClientIp(c);
-          const ua = c.req.header('user-agent') || null;
-          const newToken = generateSessionToken();
-          createUserSession({
-            id: newToken,
-            user_id: actor.id,
-            ip_address: ip,
-            user_agent: ua,
-            created_at: now,
-            expires_at: sessionExpiresAt(),
-            last_active_at: now,
-          });
+        // When admin resets their own password, hand over the new session
+        if (selfSession) {
           return new Response(
             JSON.stringify({ success: true, user: toUserPublic(updated) }),
             {
               status: 200,
-              headers: sessionCookieHeaders(c, newToken, {
+              headers: sessionCookieHeaders(c, selfSession.id, {
                 'Content-Type': 'application/json',
               }),
             },
@@ -837,6 +914,9 @@ adminRoutes.delete(
           `Administrator ${id} was deleted`,
           () => deleteUser(id),
         );
+      } else if (target.role === 'guest') {
+        // Also drops the guest's grants and pinned rows.
+        deleteGuestUser(id);
       } else {
         deleteUser(id);
       }
@@ -845,6 +925,7 @@ adminRoutes.delete(
       if (err.persisted) {
         invalidateUserSessions(id);
         deleteUserSessionsByUserId(id);
+        revokeGuestSessionsForOwner(id);
         void imManager.disconnectAllUserChannels(id).catch(() => undefined);
       }
       return c.json(
@@ -861,6 +942,7 @@ adminRoutes.delete(
     // 与 PATCH status='deleted' 路径对齐：清缓存 + 断 IM 连接，否则前端调
     // DELETE 之后 sessionCache 仍是 active 状态、IM bot 持续响应群消息直到重启。
     invalidateUserSessions(id);
+    revokeGuestSessionsForOwner(id);
     void imManager.disconnectAllUserChannels(id).catch(() => undefined);
 
     // Cleanup avatar files for deleted user
@@ -979,6 +1061,7 @@ adminRoutes.post(
   authMiddleware,
   inviteManageMiddleware,
   async (c) => {
+    if (isSingleUserHost()) return singleUserHostRefusal(c);
     const body = await c.req.json().catch(() => ({}));
     const validation = InviteCreateSchema.safeParse(body);
     if (!validation.success) {

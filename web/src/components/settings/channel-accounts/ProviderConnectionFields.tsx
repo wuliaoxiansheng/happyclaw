@@ -1,9 +1,16 @@
-import { ExternalLink } from 'lucide-react';
+import { ChevronRight, ExternalLink } from 'lucide-react';
+import { SegmentedControl } from '@/components/common/SegmentedControl';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
-import type { ChannelProvider } from '../../../stores/channel-accounts';
+import type {
+  ChannelProvider,
+  FeishuBrand,
+} from '../../../stores/channel-accounts';
 import {
+  FEISHU_BRAND_OPTIONS,
+  feishuBrandOf,
+  feishuSetupGuide,
   providerDefinition,
   type ChannelSetupGuide,
 } from '../../../utils/channel-accounts';
@@ -62,13 +69,23 @@ export function ProviderConnectionFields({
     );
   }
 
+  const feishuBrand = feishuBrandOf(values.domain);
+  const guide =
+    provider === 'feishu'
+      ? feishuSetupGuide(feishuBrand)
+      : definition.setupGuide;
+
   return (
     <div className="space-y-4">
-      {shouldShowGuide && (
-        <ProviderSetupGuide
-          id={`${idPrefix}-setup-guide`}
-          guide={definition.setupGuide}
+      {showOptions && provider === 'feishu' && (
+        <FeishuBrandField
+          value={feishuBrand}
+          disabled={disabled}
+          onChange={(brand) => onChange('domain', brand)}
         />
+      )}
+      {shouldShowGuide && (
+        <ProviderSetupGuide id={`${idPrefix}-setup-guide`} guide={guide} />
       )}
       {showSecrets && (
         <div className="grid gap-4 sm:grid-cols-2">
@@ -91,6 +108,7 @@ export function ProviderConnectionFields({
                   )}
                 </Label>
                 <Input
+                  variant="code"
                   id={id}
                   type={field.secret ? 'password' : 'text'}
                   value={values[field.key] ?? ''}
@@ -124,6 +142,19 @@ export function ProviderConnectionFields({
           disabled={disabled}
           onCheckedChange={(checked) =>
             onChange('streamingMode', checked ? 'card' : 'text')
+          }
+        />
+      )}
+
+      {showOptions && provider === 'telegram' && (
+        <OptionSwitch
+          id={`${idPrefix}-streaming-edit`}
+          label="流式编辑"
+          description="开启后回复期间持续编辑一条进度消息，完成后另发最终答复；关闭后完成生成再发送。"
+          checked={(values.streamingMode ?? 'edit') === 'edit'}
+          disabled={disabled}
+          onCheckedChange={(checked) =>
+            onChange('streamingMode', checked ? 'edit' : 'off')
           }
         />
       )}
@@ -188,11 +219,78 @@ function ProviderSetupGuide({
           </li>
         ))}
       </ol>
+      {guide.checklists?.map((checklist) => (
+        <SetupChecklist
+          key={checklist.title}
+          title={checklist.title}
+          items={checklist.items}
+        />
+      ))}
       <p className="mt-2.5 border-t border-surface-border pt-2.5 text-caption leading-5 text-muted-foreground">
         <span className="font-medium text-foreground">创建后：</span>
         {guide.nextStep}
       </p>
     </section>
+  );
+}
+
+function SetupChecklist({
+  title,
+  items,
+}: {
+  title: string;
+  items: NonNullable<ChannelSetupGuide['checklists']>[number]['items'];
+}) {
+  return (
+    <details className="group mt-2 rounded-md bg-background/60 ring-1 ring-surface-border">
+      <summary className="flex cursor-pointer list-none items-center gap-1.5 px-2.5 py-1.5 text-caption font-medium text-foreground select-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none pointer-coarse:min-h-11 [&::-webkit-details-marker]:hidden">
+        <ChevronRight
+          aria-hidden="true"
+          className="size-3.5 text-muted-foreground transition-transform group-open:rotate-90 motion-reduce:transition-none"
+        />
+        {title}
+        <span className="text-faint-foreground tabular-nums">
+          {items.length}
+        </span>
+      </summary>
+      <ul className="space-y-2 border-t border-surface-border px-2.5 py-2">
+        {items.map((item) => (
+          <li key={item.name} className="text-caption leading-5">
+            <code className="rounded bg-muted px-1 py-0.5 font-mono text-micro text-foreground">
+              {item.name}
+            </code>{' '}
+            <span className="text-foreground">{item.label}</span>
+            <span className="block text-muted-foreground">{item.effect}</span>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+export function FeishuBrandField({
+  value,
+  disabled,
+  onChange,
+}: {
+  value: FeishuBrand;
+  disabled?: boolean;
+  onChange: (brand: FeishuBrand) => void;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <p className="text-label font-medium text-foreground">平台</p>
+      <SegmentedControl
+        label="平台"
+        value={value}
+        options={FEISHU_BRAND_OPTIONS}
+        onChange={(next) => !disabled && onChange(next)}
+      />
+      <p className="text-caption leading-5 text-muted-foreground">
+        国际版租户（larksuite.com）请选择
+        Lark；连接、测试和开发者后台链接都会使用对应域名。
+      </p>
+    </div>
   );
 }
 

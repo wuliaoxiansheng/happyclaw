@@ -8,7 +8,9 @@ import { loadManagedMcpLayers } from './mcp-utils.js';
 import { scanSkillDirectory } from './skill-utils.js';
 import {
   commitAgentBuilderDraft,
+  AgentProfileNameTakenError,
   createAgentProfile,
+  findAgentProfileNameConflict,
   discardAgentBuilderDraft,
   getAgentBuilderDraftForUser,
   getAgentProfileForUser,
@@ -284,6 +286,17 @@ export function prepareAgentBuilderDraft(
     throw new Error(
       'The main HappyClaw cannot edit itself through Agent Builder',
     );
+  }
+  // Tell the model now rather than at publication (which checks again).
+  if (!target || definition.name !== target.name) {
+    const conflict = findAgentProfileNameConflict(
+      actor.user.id,
+      definition.name,
+      target?.id,
+    );
+    if (conflict) {
+      throw new AgentProfileNameTakenError(definition.name, conflict);
+    }
   }
   if (
     currentDraft &&

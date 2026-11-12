@@ -17,7 +17,7 @@ import { promisify } from 'util';
 import type { Variables } from '../web-context.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
-import { GROUPS_DIR } from '../config.js';
+import { resolveWorkspaceProjectRoot } from '../session-worktree.js';
 import { canAccessGroup, canModifyGroup } from '../group-acl.js';
 import { getRegisteredGroup } from '../db.js';
 import {
@@ -38,15 +38,11 @@ const workspaceConfigRoutes = new Hono<{ Variables: Variables }>();
 // --- Path Resolution ---
 
 /**
- * Resolve the workspace root directory for a registered group.
- * Host mode with customCwd uses the real project directory;
- * otherwise falls back to data/groups/{folder}/.
+ * The workspace's project root, shared with the runner and the capability
+ * preview: a Host workspace's custom directory, else data/groups/{folder}/.
  */
 function getWorkspaceRoot(group: RegisteredGroup & { jid: string }): string {
-  if (group.executionMode === 'host' && group.customCwd) {
-    return group.customCwd;
-  }
-  return path.join(GROUPS_DIR, group.folder);
+  return resolveWorkspaceProjectRoot(group);
 }
 
 function getWorkspaceClaudeDir(

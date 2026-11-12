@@ -34,7 +34,10 @@ const { getContainerClaudeJsonPath } =
 const hostJson = path.join(homeDir, '.claude.json');
 const target = path.join(dataDir, 'config', 'container-claude-json.json');
 
-/** Expected sanitized content, including noninteractive container onboarding. */
+/**
+ * Restates the derivation for cases where the exact host bytes vary. It follows
+ * the implementation, so one case below pins a literal copy as the baseline.
+ */
 function expectedContent(): string {
   try {
     const parsed = JSON.parse(fs.readFileSync(hostJson, 'utf-8'));
@@ -138,6 +141,31 @@ describe('container .claude.json copy', () => {
     writeHost(value);
     expect(getContainerClaudeJsonPath()).toBe(target);
     expect(fs.readFileSync(target, 'utf8')).toBe(expectedContent());
+  });
+
+  test('writes a normal host file as these exact bytes', () => {
+    getContainerClaudeJsonPath();
+    expect(fs.readFileSync(target, 'utf8')).toBe(
+      [
+        '{',
+        '  "userID": "fake-user-id",',
+        '  "numStartups": 3,',
+        '  "projects": {',
+        '    "/tmp/p": {',
+        '      "allowedTools": [],',
+        '      "history": [',
+        '        {',
+        '          "display": "héllo ✓"',
+        '        }',
+        '      ]',
+        '    }',
+        '  },',
+        '  "hasCompletedOnboarding": true,',
+        '  "autoUpdates": false',
+        '}',
+        '',
+      ].join('\n'),
+    );
   });
 
   test('a missing host file yields the onboarding stub', () => {

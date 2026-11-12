@@ -87,26 +87,61 @@ describe('explicit channel binding routes', () => {
     expect(f.createTopic).not.toHaveBeenCalled();
   });
 
-  test.each(['p2p', 'group'])(
-    '%s can use an explicit main session without allocating topic sessions',
-    (mode) => {
+  test.each([
+    ['p2p', 'single_context'],
+    ['group', 'single_context'],
+    ['group', 'thread_map'],
+  ] as const)(
+    'a %s bound to a workspace (%s) routes nowhere, never to the workspace',
+    (mode, bindingMode) => {
       const f = fixture();
       f.bind('feishu:chat', {
         feishu_chat_mode: mode,
         target_main_jid: 'web:workspace',
-        binding_mode: 'thread_map',
+        binding_mode: bindingMode,
         native_context_type: 'thread',
         activation_mode: 'when_mentioned',
       });
-      expect(hasExplicitChannelBinding('feishu:chat', f.deps)).toBe(true);
-      expect(f.route('feishu:chat', topicMessage('ordinary-reply'))).toEqual({
-        effectiveJid: 'web:workspace',
-        agentId: null,
-      });
+      expect(hasExplicitChannelBinding('feishu:chat', f.deps)).toBe(false);
+      expect(f.route('feishu:chat', topicMessage('ordinary-reply'))).toBeNull();
+      expect(f.route('feishu:chat')).toBeNull();
       expect(f.createTopic).not.toHaveBeenCalled();
       expect(f.upgrade).not.toHaveBeenCalled();
     },
   );
+
+  test('a single-session mount without its session routes nowhere', () => {
+    const f = fixture();
+    f.bind('feishu:chat', { feishu_chat_mode: 'group' });
+    f.sessions.set('chosen', {
+      id: 'chosen',
+      chat_jid: 'web:workspace',
+      kind: 'conversation',
+    } as SubAgent);
+    f.groups.set('feishu:chat', {
+      ...f.groups.get('feishu:chat')!,
+      target_agent_id: 'chosen',
+    });
+    const route = createChannelInboundRouter({
+      ...f.deps,
+      getChannelMount: () => ({
+        channel_jid: 'feishu:chat',
+        channel_account_id: null,
+        channel_type: 'feishu',
+        workspace_jid: 'web:workspace',
+        session_id: null,
+        routing_mode: 'single_session',
+        reply_policy: 'source_only',
+        activation_mode: 'auto',
+        audience_mode: 'everyone',
+        owner_im_id: null,
+        interaction_mode_override: null,
+        created_at: '2026-09-06',
+        updated_at: '2026-09-06',
+      }),
+    });
+    expect(route('feishu:chat')).toBeNull();
+  });
 
   test('a fixed conversation session remains selected and its deletion closes the route', () => {
     const f = fixture();
@@ -180,5 +215,70 @@ describe('explicit channel binding routes', () => {
     expect(f.route('feishu:cross-user')).toBeNull();
     expect(f.route('feishu:invalid-topic', topicMessage('a'))).toBeNull();
     expect(f.createTopic).not.toHaveBeenCalled();
+  });
+});
+
+describe('team mode routes', () => {
+  const mount = {
+    channel_jid: 'feishu:oc_team',
+    channel_type: 'feishu',
+    workspace_jid: 'web:workspace',
+    session_id: 'bound',
+    routing_mode: 'single_session' as const,
+    reply_policy: 'source_only' as const,
+    activation_mode: 'when_mentioned' as const,
+    audience_mode: 'everyone' as const,
+    created_at: '2026-11-01',
+    updated_at: '2026-11-01',
+  };
+  const message = {
+    provider: 'feishu' as const,
+    chatType: 'group' as const,
+    messageId: 'om_1',
+  };
+
+  function teamFixture(
+    teamRoute: ChannelInboundRoutingDeps['resolveTeamRoute'],
+  ) {
+    const f = fixture();
+    f.sessions.set('bound', {
+      id: 'bound',
+      chat_jid: 'web:workspace',
+      kind: 'conversation',
+    } as SubAgent);
+    f.bind('feishu:oc_team', {
+      feishu_chat_mode: 'group',
+      target_agent_id: 'bound',
+    });
+    return createChannelInboundRouter({
+      ...f.deps,
+      getChannelMount: (jid) => (jid === mount.channel_jid ? mount : undefined),
+      resolveTeamRoute: teamRoute,
+    });
+  }
+
+  test('the lane the team decision chose wins over the bound session', () => {
+    const resolveTeamRoute = vi.fn(() => ({
+      effectiveJid: 'web:workspace#agent:router-1',
+      agentId: 'router-1',
+    }));
+    expect(teamFixture(resolveTeamRoute)('feishu:oc_team', message)).toEqual({
+      effectiveJid: 'web:workspace#agent:router-1',
+      agentId: 'router-1',
+    });
+    expect(resolveTeamRoute).toHaveBeenCalledWith('feishu:oc_team', message);
+  });
+
+  test('a message no team lane takes is dropped, not given to the bound session', () => {
+    expect(teamFixture(() => 'reject')('feishu:oc_team', message)).toBeNull();
+  });
+
+  test('without team mode the group reaches the session it is bound to', () => {
+    for (const teamRoute of [() => null, undefined]) {
+      expect(teamFixture(teamRoute)('feishu:oc_team', message)).toEqual({
+        effectiveJid: 'web:workspace#agent:bound',
+        agentId: 'bound',
+      });
+    }
   });
 });

@@ -995,4 +995,85 @@ describe('Workspace Memory v2 page', () => {
     expect(container!.textContent).toContain('Store revision 2');
     expect(mocks.toastSuccess).not.toHaveBeenCalled();
   });
+
+  test('answers a proposal once per click burst, retrying with the same idempotency key', async () => {
+    const proposal = {
+      ...memoryItem('proposal-1', 'workspace:alpha', '部署端口提议'),
+      status: 'proposed',
+      revision: 1,
+    };
+    const base = '/api/memory/workspaces/workspace%3Aalpha/items';
+    mocks.get.mockImplementation(async (path: string) => {
+      if (path === '/api/workspaces') return { workspaces: [alphaWorkspace] };
+      if (path === `${base}?status=active&limit=100`) {
+        return { storeRevision: 3, items: [], nextCursor: null };
+      }
+      if (path === `${base}?status=proposed&limit=100`) {
+        return { storeRevision: 3, items: [proposal], nextCursor: null };
+      }
+      if (path === `${base}/proposal-1`) {
+        return { storeRevision: 3, item: proposal };
+      }
+      if (path === `${base}/proposal-1/versions?limit=20`) {
+        return {
+          storeRevision: 3,
+          itemId: proposal.id,
+          versions: [],
+          nextCursor: null,
+        };
+      }
+      throw new Error(`Unexpected GET ${path}`);
+    });
+    // "待确认" (the list switch) also contains the word: match it whole.
+    const confirmButton = () => {
+      const button = Array.from(
+        container!.querySelectorAll<HTMLButtonElement>('button'),
+      ).find((candidate) => candidate.textContent?.trim() === '确认');
+      expect(button).toBeDefined();
+      return button!;
+    };
+    const pendingConfirm = deferred<unknown>();
+    mocks.post
+      .mockRejectedValueOnce({ status: 0, message: 'Network error' })
+      .mockReturnValueOnce(pendingConfirm.promise);
+    await renderPage({
+      configure: false,
+      initialEntry: '/memory?workspace=workspace%3Aalpha&item=proposal-1',
+      waitForText: '待确认',
+    });
+    await vi.waitFor(() => confirmButton());
+
+    // A failed answer can be sent again, under the same key.
+    await act(async () => {
+      confirmButton().click();
+    });
+    await vi.waitFor(() => expect(mocks.toastError).toHaveBeenCalled());
+    await act(async () => {
+      confirmButton().click();
+      confirmButton().click();
+    });
+    await vi.waitFor(() => expect(mocks.post).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      confirmButton().click();
+    });
+    expect(mocks.post).toHaveBeenCalledTimes(2);
+    const [first, second] = mocks.post.mock.calls;
+    expect(first[0]).toBe(`${base}/proposal-1/confirm`);
+    expect(first[1]).toMatchObject({
+      expectedRevision: 1,
+      idempotencyKey: expect.any(String),
+    });
+    expect(second[1].idempotencyKey).toBe(first[1].idempotencyKey);
+    expect(confirmButton().disabled).toBe(true);
+
+    await act(async () => {
+      pendingConfirm.resolve({
+        storeRevision: 4,
+        item: { ...proposal, status: 'active', revision: 2 },
+        replayed: false,
+      });
+      await pendingConfirm.promise;
+    });
+    await vi.waitFor(() => expect(mocks.toastSuccess).toHaveBeenCalled());
+  });
 });

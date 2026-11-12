@@ -359,6 +359,13 @@ export interface StreamEvent {
   /** UI priority: primary is surfaced inline, detail in trace panels, debug in developer trace. */
   displayLevel?: StreamDisplayLevel;
   text?: string;
+  /**
+   * `commentary` only: the passage is a progress statement the Agent sent with
+   * send_message(delivery_role=progress) in a Web turn, not the narration
+   * before a tool call. A proactive Workspace shows it at every process
+   * visibility; narration only at `full`.
+   */
+  progress?: boolean;
   title?: string;
   summary?: string;
   detail?: string;

@@ -1,3 +1,4 @@
+import { PhoneBarButton } from '../components/layout/PhonePageHeader';
 import { useEffect, useState, useMemo } from 'react';
 import { Plus, RefreshCw, Puzzle, Trash2 } from 'lucide-react';
 import { SearchInput } from '@/components/common';
@@ -7,8 +8,10 @@ import { SegmentedControl } from '@/components/common/SegmentedControl';
 import { Button } from '@/components/ui/button';
 import {
   Sheet,
+  SheetBody,
   SheetContent,
   SheetDescription,
+  SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet';
 import {
@@ -114,7 +117,23 @@ export function SkillsPage() {
 
   return (
     <div className="space-y-4">
-      <CapabilitySectionActions>
+      <CapabilitySectionActions
+        phoneAction={
+          <PhoneBarButton
+            label="安装技能"
+            icon={<Plus className="size-5" />}
+            onClick={() => setShowInstallDialog(true)}
+          />
+        }
+        phoneMenu={[
+          {
+            label: '刷新',
+            icon: RefreshCw,
+            onSelect: () => void loadSkills(),
+            disabled: loading,
+          },
+        ]}
+      >
         <IconButton
           label="刷新"
           icon={<RefreshCw className={loading ? 'animate-spin' : undefined} />}
@@ -167,6 +186,7 @@ export function SkillsPage() {
           ) : filtered.length === 0 ? (
             <EmptyState
               icon={Puzzle}
+              variant={searchQuery ? 'search' : 'empty'}
               title={searchQuery ? '没有找到匹配的技能' : '暂无技能'}
               className="border border-surface-border"
             />
@@ -231,18 +251,25 @@ export function SkillsPage() {
       >
         <SheetContent
           side="bottom"
-          className="max-h-[88dvh] gap-0 overflow-y-auto rounded-t-xl p-0 pt-8 *:data-[slot=detail-panel]:rounded-none *:data-[slot=detail-panel]:ring-0"
+          className="max-h-[88dvh] gap-0 rounded-t-xl p-0"
         >
-          <SheetTitle className="sr-only">技能详情</SheetTitle>
-          <SheetDescription className="sr-only">
-            查看所选技能的说明、来源与文件
-          </SheetDescription>
-          {!isDesktop && (
-            <SkillDetail
-              skillId={selectedId}
-              onDeleted={() => setSelectedId(null)}
-            />
-          )}
+          {/* The header drags the sheet and stays put; only the body scrolls. */}
+          <SheetHeader className="pt-1 pr-14 pb-2">
+            <SheetTitle className="text-label text-muted-foreground">
+              技能详情
+            </SheetTitle>
+            <SheetDescription className="sr-only">
+              查看所选技能的说明、来源与文件
+            </SheetDescription>
+          </SheetHeader>
+          <SheetBody className="*:data-[slot=detail-panel]:rounded-none *:data-[slot=detail-panel]:ring-0">
+            {!isDesktop && (
+              <SkillDetail
+                skillId={selectedId}
+                onDeleted={() => setSelectedId(null)}
+              />
+            )}
+          </SheetBody>
         </SheetContent>
       </Sheet>
 

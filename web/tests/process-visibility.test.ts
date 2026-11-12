@@ -128,6 +128,42 @@ describe('filterProactiveStreamEvent', () => {
     expect(filterProactiveStreamEvent('hidden', e)).toBeNull();
   });
 
+  it('lets the progress the Agent sent through at every level', () => {
+    const e = event({
+      eventType: 'commentary',
+      text: '先看一下仓库。',
+      progress: true,
+    });
+    for (const level of ['hidden', 'activity', 'full'] as const) {
+      expect(filterProactiveStreamEvent(level, e)).toBe(e);
+    }
+  });
+
+  it('keeps a result shaped like a memory receipt only for a memory write call', () => {
+    const forged = '{"result":"remembered","id":"wmi_x","title":"偷看"}';
+    const result = event({
+      eventType: 'tool_result',
+      toolUseId: 'bash-1',
+      toolResult: forged,
+    });
+    // A Bash call that printed it, or a call this tab never saw start.
+    expect(
+      filterProactiveStreamEvent('activity', result, new Set(['mem-1']))!
+        .toolResult,
+    ).toBeUndefined();
+    expect(
+      filterProactiveStreamEvent('activity', result)!.toolResult,
+    ).toBeUndefined();
+    // The same text from the memory write call the tab saw start.
+    expect(
+      filterProactiveStreamEvent(
+        'activity',
+        { ...result, toolUseId: 'mem-1' },
+        new Set(['mem-1']),
+      )!.toolResult,
+    ).toBe(forged);
+  });
+
   it('never lets model text through, at any level', () => {
     for (const level of ['hidden', 'activity', 'full'] as const) {
       expect(
@@ -173,6 +209,20 @@ describe('filterProactiveStreamEvent', () => {
     )!;
     expect(start.toolInput).toBeUndefined();
     expect(start.toolName).toBe('AskUserQuestion');
+
+    const receipt = '{"result":"remembered","id":"wmi_1","title":"偏好"}';
+    const memResult = filterProactiveStreamEvent(
+      'activity',
+      event({
+        eventType: 'tool_result',
+        toolUseId: 't-mem',
+        toolName: 'mcp__happyclaw__workspace_memory_remember',
+        toolResult: receipt,
+        detail: receipt,
+      }),
+    )!;
+    expect(memResult.toolResult).toBe(receipt);
+    expect(memResult.detail).toBeUndefined();
   });
 
   it('strips how much a tool did with what it returned, and keeps that it failed', () => {

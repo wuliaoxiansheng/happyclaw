@@ -27,6 +27,7 @@ import {
   toLocalDateString,
   toLocalMonthString,
 } from './db.js';
+import { isSingleUserHost } from './deployment-mode.js';
 import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
 import type {
@@ -41,7 +42,8 @@ import type {
 // No extra manual cache needed — avoids stale state when settings change.
 
 export function isBillingEnabled(): boolean {
-  return getSystemSettings().billingEnabled === true;
+  // Single-user host mode has no billing; the stored switch is kept as is.
+  return getSystemSettings().billingEnabled === true && !isSingleUserHost();
 }
 
 // --- Plan management ---
@@ -74,6 +76,16 @@ export function getUserEffectivePlan(
   };
 }
 
+/**
+ * Guests cannot start a run or spend quota, so they never hold a plan or a
+ * balance; refusing here keeps billing admin tools from creating either.
+ */
+function assertBillableUser(userId: string): void {
+  if (getUserById(userId)?.role === 'guest') {
+    throw new Error('Guest accounts cannot be billed');
+  }
+}
+
 export function assignPlan(
   userId: string,
   planId: string,
@@ -81,6 +93,7 @@ export function assignPlan(
   durationDays?: number,
   opts?: { trialDays?: number; notes?: string; autoRenew?: boolean },
 ): void {
+  assertBillableUser(userId);
   const plan = getBillingPlan(planId);
   if (!plan) throw new Error(`Plan not found: ${planId}`);
 
@@ -575,6 +588,7 @@ export function applyAdminBalanceAdjustment(
   actorId: string,
   idempotencyKey?: string,
 ) {
+  assertBillableUser(userId);
   const user = getUserById(userId);
   const userRole = user?.role ?? 'member';
   const before = checkBillingAccess(userId, userRole);
@@ -616,6 +630,7 @@ export function batchAssignPlans(
   actorId: string,
   durationDays?: number,
 ): number {
+  for (const userId of userIds) assertBillableUser(userId);
   const count = dbBatchAssignPlan(userIds, planId, actorId, durationDays);
   for (const userId of userIds) invalidateUserBillingCache(userId);
   return count;
@@ -823,6 +838,16 @@ export function checkAndExpireSubscriptions(): void {
   } catch (err) {
     logger.error({ err }, 'Failed to check subscription expiry');
   }
+}
+
+/**
+ * The hourly expiry pass (index.ts). It runs whether billing is on or not,
+ * so subscriptions that ran out while billing was off are already expired
+ * when it is turned back on; single-user host mode has none and skips it.
+ */
+export function runScheduledSubscriptionExpiry(): void {
+  if (isSingleUserHost()) return;
+  checkAndExpireSubscriptions();
 }
 
 /**

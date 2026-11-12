@@ -11,7 +11,6 @@ export function resolveSourceInteractionMode(
     workspaceMode: InteractionMode;
     sourceJid?: string | null;
     agentKind: PublicAgentKind;
-    scheduledTask?: boolean;
   },
   deps: {
     getMount: (sourceJid: string) => ChannelMount | undefined;

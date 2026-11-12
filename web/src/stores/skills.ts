@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api, apiFetch, computeUploadTimeoutMs } from '../api/client';
+import { extractErrorMessage } from '../utils/error';
 
 export interface Skill {
   id: string;
@@ -100,7 +101,7 @@ export const useSkillsStore = create<SkillsState>((set, get) => ({
     } catch (err) {
       set({
         loading: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
   },
@@ -111,7 +112,7 @@ export const useSkillsStore = create<SkillsState>((set, get) => ({
       set({ error: null });
       await get().loadSkills();
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
     }
   },
 
@@ -121,7 +122,7 @@ export const useSkillsStore = create<SkillsState>((set, get) => ({
       set({ error: null });
       await get().loadSkills();
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
       throw err;
     }
   },

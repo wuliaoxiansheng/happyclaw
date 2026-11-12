@@ -211,22 +211,21 @@ describe('StreamingCardController Feishu thread reply', () => {
 
     const internals = controller as unknown as {
       derivePhase(): string;
-      buildRichPanelPatches(): { askContent?: string; statusBanner: string };
+      buildRichPanelPatches(): { statusBanner: string };
+      openQuestions(): { questions: Array<{ question: string }> } | undefined;
     };
     expect(internals.derivePhase()).toBe('waiting');
     expect(internals.buildRichPanelPatches().statusBanner).toContain(
       '等待输入',
     );
-    expect(internals.buildRichPanelPatches().askContent).toContain(
-      '等待你的回复',
-    );
-    expect(internals.buildRichPanelPatches().askContent).toContain(
-      '请选择投递方式',
+    expect(internals.openQuestions()?.questions[0].question).toBe(
+      '请选择投递方式？',
     );
 
+    // The call ends at once, but the question stays open for the reply.
     controller.endTool('ask-1', false);
     expect(internals.derivePhase()).toBe('idle');
-    expect(internals.buildRichPanelPatches().askContent).toBeUndefined();
+    expect(internals.openQuestions()?.questions).toHaveLength(1);
   });
 
   test('preserves trace link when usage patch updates a legacy completed card', async () => {

@@ -14,7 +14,10 @@ import {
   openTextStep,
   openThinkingStep,
   patchToolStep,
+  progressToolStep,
+  QUESTION_DEFERRED_MARK,
   railSteps,
+  readStepQuestions,
   rebuildSteps,
   setTaskStepStatus,
   startToolStep,
@@ -189,6 +192,7 @@ describe('tool steps', () => {
     expect(list.steps[0]).toMatchObject({
       status: 'error',
       resultPreview: '被权限策略拒绝',
+      outcome: 'denied',
     });
   });
 
@@ -242,6 +246,25 @@ describe('sub-agent steps', () => {
   it('adds a workflow that has no tool call of its own', () => {
     const list = ensureTaskStep(empty(), { taskId: 'wf-1', title: '审查' }, 0);
     expect(list.steps[0]).toMatchObject({ kind: 'task', taskId: 'wf-1' });
+  });
+
+  it('keeps why a stop ended a sub-agent, until it runs or finishes again', () => {
+    let list = ensureTaskStep(empty(), { taskId: 'task-1' }, 0);
+    list = setTaskStepStatus(list, 'task-1', 'error', 50, undefined, 'stopped');
+    expect(list.steps[0]).toMatchObject({
+      status: 'error',
+      endedAt: 50,
+      outcome: 'stopped',
+    });
+    // A failure that reports no outcome of its own leaves the stop's.
+    list = setTaskStepStatus(list, 'task-1', 'error', 60);
+    expect(list.steps[0].outcome).toBe('stopped');
+    list = setTaskStepStatus(list, 'task-1', 'running', 70);
+    expect(list.steps[0]).not.toHaveProperty('outcome');
+    list = setTaskStepStatus(list, 'task-1', 'error', 80, undefined, 'stopped');
+    list = setTaskStepStatus(list, 'task-1', 'done', 90);
+    expect(list.steps[0].status).toBe('done');
+    expect(list.steps[0]).not.toHaveProperty('outcome');
   });
 
   it('marks a failed Task tool result as an error', () => {
@@ -396,7 +419,28 @@ describe('the end of a reply', () => {
     expect(list.steps[0]).toMatchObject({
       status: 'error',
       resultPreview: '已停止',
+      outcome: 'stopped',
     });
+  });
+
+  it('says a stop, not a failure, cut short a call that had output already', () => {
+    const started = startToolStep(
+      empty(),
+      { toolUseId: 't1', toolName: 'Bash' },
+      0,
+    );
+    const withOutput = {
+      ...started,
+      steps: [{ ...started.steps[0], resultPreview: 'half' }],
+    };
+    const list = finishSteps(withOutput, 9, true);
+    expect(list.steps[0]).toMatchObject({
+      status: 'error',
+      resultPreview: 'half',
+      outcome: 'stopped',
+    });
+    // A run that ends by itself closes what runs, with no outcome.
+    expect(finishSteps(started, 9, false).steps[0].outcome).toBeUndefined();
   });
 
   it('returns the same list when nothing runs', () => {
@@ -491,5 +535,175 @@ describe('rebuilding after a reconnect', () => {
     expect(list.steps[2].status).toBe('running');
     expect(list.steps[0].title).toBe('计划');
     expect(answerStart(list.steps, 0)).toBe(0);
+  });
+
+  it('keeps a stopped sub-agent stopped, not failed', () => {
+    const list = rebuildSteps({
+      thinkingText: '',
+      isThinking: false,
+      partialText: '',
+      activeTools: [],
+      tasks: [{ id: 'task-1', status: 'stopped', title: '检查' }],
+      tracedTools: [],
+      now: 1000,
+    });
+    expect(list.steps[0]).toMatchObject({
+      kind: 'task',
+      status: 'error',
+      outcome: 'stopped',
+    });
+  });
+});
+
+describe('question steps', () => {
+  const input = {
+    questions: [
+      {
+        question: '午饭吃什么？',
+        header: '午饭',
+        multiSelect: false,
+        options: [
+          { label: '面条', description: '汤面' },
+          { label: '米饭', description: '盖饭' },
+        ],
+      },
+    ],
+  };
+
+  it('reads both input shapes and bounds what the model streamed', () => {
+    expect(readStepQuestions(input)).toEqual([
+      {
+        question: '午饭吃什么？',
+        options: ['面条', '米饭'],
+        descriptions: ['汤面', '盖饭'],
+      },
+    ]);
+    expect(
+      readStepQuestions({
+        question: '用哪个方案？',
+        options: [{ value: '窄 selector' }, '宽 selector', { label: ' ' }],
+      }),
+    ).toEqual([
+      { question: '用哪个方案？', options: ['窄 selector', '宽 selector'] },
+    ]);
+    const many = readStepQuestions({
+      questions: Array.from({ length: 6 }, (_, i) => ({
+        question: `问题 ${i}`,
+        multiSelect: true,
+        options: Array.from({ length: 12 }, (_, j) => `选项 ${j}`),
+      })),
+    });
+    expect(many).toHaveLength(4);
+    expect(many?.[0]).toMatchObject({ multiSelect: true });
+    expect(many?.[0].options).toHaveLength(10);
+    expect(readStepQuestions({ questions: [{ question: '  ' }] })).toBe(
+      undefined,
+    );
+    expect(readStepQuestions(undefined)).toBe(undefined);
+  });
+
+  it('keeps what each option means, beside its label', () => {
+    const asked = readStepQuestions({
+      questions: [
+        {
+          question: '用哪个方案？',
+          options: [
+            { label: '窄 selector', description: '只改动这一处' },
+            { label: ' ', description: '没有名字的选项连同说明一起丢掉' },
+            { label: '宽 selector' },
+            { label: '重写', description: 'x'.repeat(300) },
+          ],
+        },
+      ],
+    });
+    expect(asked?.[0].options).toEqual(['窄 selector', '宽 selector', '重写']);
+    expect(asked?.[0].descriptions?.slice(0, 2)).toEqual(['只改动这一处', '']);
+    expect(Array.from(asked?.[0].descriptions?.[2] ?? '')).toHaveLength(200);
+    // Without any description there is no field at all.
+    expect(
+      readStepQuestions({ question: '午饭？', options: [{ label: '面条' }] }),
+    ).toEqual([{ question: '午饭？', options: ['面条'] }]);
+  });
+
+  it('reads stored questions again, with or without descriptions', () => {
+    // A trace stored before descriptions were kept.
+    expect(
+      readStepQuestions({
+        questions: [{ question: '午饭？', options: ['面条', '米饭'] }],
+      }),
+    ).toEqual([{ question: '午饭？', options: ['面条', '米饭'] }]);
+    // One stored with them: labels and descriptions stay paired.
+    const stored = [
+      {
+        question: '午饭？',
+        options: ['面条', ' ', '米饭'],
+        descriptions: ['汤面', '空', ''],
+      },
+    ];
+    expect(readStepQuestions({ questions: stored })).toEqual([
+      {
+        question: '午饭？',
+        options: ['面条', '米饭'],
+        descriptions: ['汤面', ''],
+      },
+    ]);
+  });
+
+  it('keeps the questions after the deferred call returns, which is no failure', () => {
+    let list = startToolStep(
+      empty(),
+      { toolUseId: 'q', toolName: 'AskUserQuestion' },
+      10,
+    );
+    list = progressToolStep(
+      list,
+      { toolUseId: 'q', questions: readStepQuestions(input) },
+      20,
+    );
+    list = endToolStep(
+      list,
+      'q',
+      30,
+      `${QUESTION_DEFERRED_MARK} The answer is the next message.`,
+      { isError: true },
+    );
+    expect(list.steps[0]).toMatchObject({
+      status: 'done',
+      endedAt: 30,
+      questions: [{ question: '午饭吃什么？', options: ['面条', '米饭'] }],
+    });
+    expect(list.steps[0].resultPreview).toBeUndefined();
+    expect(summarizeSteps(list.steps).failed).toBe(0);
+  });
+
+  it('drops the questions of a call refused for another reason', () => {
+    let list = startToolStep(
+      empty(),
+      {
+        toolUseId: 'q',
+        toolName: 'AskUserQuestion',
+        questions: readStepQuestions(input),
+      },
+      10,
+    );
+    list = endToolStep(list, 'q', 30, 'InputValidationError: too few options', {
+      isError: true,
+    });
+    expect(list.steps[0]).toMatchObject({
+      status: 'error',
+      resultPreview: 'InputValidationError: too few options',
+    });
+    expect(list.steps[0].questions).toBeUndefined();
+  });
+
+  it('keeps questions only on an AskUserQuestion step', () => {
+    const questions = readStepQuestions(input);
+    let list = startToolStep(
+      empty(),
+      { toolUseId: 'b', toolName: 'Bash', questions },
+      10,
+    );
+    list = patchToolStep(list, 'b', { questions });
+    expect(list.steps[0].questions).toBeUndefined();
   });
 });

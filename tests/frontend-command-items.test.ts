@@ -137,4 +137,24 @@ describe('command palette items', () => {
       settings.find((item) => item.id === 'settings:security')?.keywords,
     ).toContain('密码');
   });
+
+  test('offers 新建自动化, and 从此会话创建自动化 on a session', () => {
+    const actions = (input: Parameters<typeof buildCommandGroups>[0]) =>
+      buildCommandGroups(input).find((g) => g.heading === '操作')!.items;
+    expect(actions(base).map((item) => item.label)).toContain('新建自动化');
+    expect(actions(base).map((item) => item.label)).not.toContain(
+      '从此会话创建自动化',
+    );
+    const fromSession = actions({
+      ...base,
+      currentSession: {
+        workspaceJid: 'web:main',
+        sessionJid: 'web:main#agent:new',
+      },
+    }).find((item) => item.label === '从此会话创建自动化');
+    expect(fromSession?.action).toEqual({
+      type: 'createAutomation',
+      from: { workspaceJid: 'web:main', sessionJid: 'web:main#agent:new' },
+    });
+  });
 });

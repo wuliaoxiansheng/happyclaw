@@ -201,6 +201,35 @@ describe('schema version head', () => {
     // turn (schema-v81-turn-traces.test.ts).
     // v82: turn_traces.steps_json / steps_dropped, the turn's steps in the
     // order they happened (schema-v82-turn-steps.test.ts).
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(82);
+    // v83: agent_profiles.model, the model an Agent picks within its model
+    // configuration (schema-v83-agent-model.test.ts).
+    // v84: drop agent_profile_prompt_versions; Agents keep no prompt history
+    // (schema-v84-drop-agent-prompt-versions.test.ts). Same step:
+    // workspace_memory_recall_fts, the bigram/word index memory recall ranks
+    // by (schema-v84-memory-recall-index.test.ts); session_worktrees, the git
+    // worktree a Runtime Session runs in (schema-v84-session-worktrees.test.ts);
+    // every Agent's host Skill grant written out explicitly, without resetting
+    // sessions (schema-v84-agent-host-skills.test.ts); usage_limit_waits,
+    // session_history_reinjections, task_failure_notices and
+    // usage_event_connections for the runtime (schema-v84-runtime-state.test.ts).
+    // v85: scheduled tasks become automations (automations, automation_runs,
+    // automation_failure_streaks); scheduled_tasks, task_runs, task_run_logs
+    // and task_failure_notices are dropped (automation-migration.test.ts).
+    // v86: users.guest_owner_id and guest_workspace_grants, read-only guest
+    // accounts (schema-v86-guest-accounts.test.ts).
+    // v87: team mode (team_mounts, work_items, work_item_subscriptions,
+    // work_item_events, work_decisions, work_item_replies), created by
+    // work-item-store.ts (schema-v87-work-items.test.ts).
+    // v88: each workspace's main session becomes a legacy_main conversation
+    // session; its state moves to the session's address
+    // (legacy-main-session-migration.test.ts).
+    // v89: multi-task mode, workspace_agent_profiles.work_mode and
+    // work_items.origin / origin_agent_id / origin_input_id
+    // (schema-v89-multitask-mode.test.ts).
+    // v90: workspace_workdirs, the recorded directory of a Host workspace in
+    // the workspace root (schema-v90-workspace-workdirs.test.ts).
+    // v91: Web Push subscriptions, web_push_subscriptions, created by
+    // web-push-store.ts (schema-v91-web-push.test.ts).
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(91);
   });
 });

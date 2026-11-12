@@ -57,7 +57,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<
     supports_thread_map: true,
     supports_activation_modes: false,
     supports_owner_mention: true,
-    supports_streaming_updates: false,
+    supports_streaming_updates: true,
     supports_file_send: true,
   },
   qq: {
@@ -80,7 +80,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<
     supports_activation_modes: false,
     supports_owner_mention: false,
     supports_streaming_updates: false,
-    supports_file_send: false,
+    supports_file_send: true,
   },
   wecom: {
     channel_type: 'wecom',
@@ -91,7 +91,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<
     supports_activation_modes: true,
     supports_owner_mention: true,
     supports_streaming_updates: true,
-    supports_file_send: false,
+    supports_file_send: true,
   },
   discord: {
     channel_type: 'discord',

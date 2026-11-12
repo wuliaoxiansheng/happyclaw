@@ -29,7 +29,6 @@ import {
   createInitialAdminUser,
   createUserSession,
   deleteUserSession,
-  deleteUserSessionsByUserId,
   updateUserFields,
   getSessionWithUser,
   getUserSessions,
@@ -38,10 +37,11 @@ import {
   registerUserWithoutInvite,
   logAuthEvent,
   ensureUserHomeGroup,
+  replaceUserSessions,
 } from '../db.js';
 import {
   getRegistrationConfig,
-  getEnabledProviders,
+  getProviders,
   getFeishuProviderConfigWithSource,
   getAppearanceConfig,
 } from '../runtime-config.js';
@@ -66,11 +66,18 @@ import {
 } from '../password-hash-busy.js';
 import type { AuthUser, User, UserPublic } from '../types.js';
 import { logger } from '../logger.js';
+import { getGuestAccountState } from '../guest-accounts.js';
 import {
   invalidateSessionCache,
   invalidateUserSessions,
 } from '../web-context.js';
-import { getSystemSettings } from '../runtime-config.js';
+import { getSystemSettings, saveSystemSettingKeys } from '../runtime-config.js';
+import {
+  getDeploymentMode,
+  getDeploymentModeResolution,
+  isSingleUserHost,
+  parseDeploymentMode,
+} from '../deployment-mode.js';
 import {
   AvatarImageError,
   normalizeAvatarImage,
@@ -117,6 +124,7 @@ export function toUserPublic(u: User): UserPublic {
     ai_avatar_color: u.ai_avatar_color ?? null,
     ai_avatar_url: u.ai_avatar_url ?? null,
     default_require_mention: u.default_require_mention,
+    guest_owner_id: u.guest_owner_id,
     created_at: u.created_at,
     last_login_at: u.last_login_at,
     last_active_at: null,
@@ -125,10 +133,9 @@ export function toUserPublic(u: User): UserPublic {
 }
 
 function buildSetupStatus() {
-  // Check ALL enabled providers, not just the first one.
-  // V3→V4 migration can produce empty providers that sort before real ones,
-  // causing getClaudeProviderConfig() (first-match) to return an unconfigured provider.
-  const providers = getEnabledProviders();
+  // Check every connection, not just the first one: V3→V4 migration can
+  // produce empty providers that sort before real ones.
+  const providers = getProviders();
   const claudeConfigured = providers.some((p) => {
     const hasOfficial =
       !!p.claudeCodeOauthToken?.trim() ||
@@ -151,22 +158,41 @@ function buildSetupStatus() {
 
 // --- Routes ---
 
-// Public: check if system is initialized (any user exists)
+// Public: check if system is initialized (any user exists). The mode's
+// source lets the setup wizard keep a mode the environment already chose.
 authRoutes.get('/status', (c) => {
   const initialized = getUserCount(true) > 0;
-  return c.json({ initialized });
+  const mode = getDeploymentModeResolution();
+  return c.json({
+    initialized,
+    deploymentMode: mode.mode,
+    deploymentModeSource: mode.source,
+  });
 });
 
 // Public: initial admin setup (only when no users exist)
 authRoutes.post('/setup', authJsonBodyLimit, async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  const { username: rawUsername, password } = body as {
+  const {
+    username: rawUsername,
+    password,
+    deployment_mode: rawDeploymentMode,
+  } = body as {
     username?: string;
     password?: string;
+    deployment_mode?: unknown;
   };
 
   if (!rawUsername || !password) {
     return c.json({ error: 'Username and password are required' }, 400);
+  }
+  // Absent keeps today's behaviour: nothing is stored.
+  const deploymentMode =
+    rawDeploymentMode === undefined
+      ? null
+      : parseDeploymentMode(rawDeploymentMode);
+  if (rawDeploymentMode !== undefined && !deploymentMode) {
+    return c.json({ error: 'Invalid deployment_mode' }, 400);
   }
 
   const usernameError = validateUsername(rawUsername);
@@ -210,6 +236,11 @@ authRoutes.post('/setup', authJsonBodyLimit, async (c) => {
     user_agent: ua,
     details: { source: 'setup_wizard', role: 'admin' },
   });
+
+  // Saved before the home workspace exists, so a single-user host install
+  // creates it under that mode. Only this key: every other setting keeps
+  // following its environment variable.
+  if (deploymentMode) saveSystemSettingKeys({ deploymentMode });
 
   // Create admin home group (web:main, folder=main, host mode)
   try {
@@ -310,7 +341,19 @@ authRoutes.post('/login', authJsonBodyLimit, async (c) => {
     passwordMatch = false;
   }
 
-  if (!user || user.status !== 'active' || !passwordMatch) {
+  // A guest whose owner is disabled/deleted cannot log in (same answer as a
+  // wrong password, so the owner's state is not revealed).
+  const guestOwnerInvalid =
+    !!user &&
+    user.role === 'guest' &&
+    !getGuestAccountState(user.id).valid &&
+    user.status === 'active';
+  if (
+    !user ||
+    user.status !== 'active' ||
+    !passwordMatch ||
+    guestOwnerInvalid
+  ) {
     // Already counted by reserveLoginAttempt.
     logAuthEvent({
       event_type: 'login_failed',
@@ -322,7 +365,9 @@ authRoutes.post('/login', authJsonBodyLimit, async (c) => {
           ? 'user_not_found'
           : user.status !== 'active'
             ? 'account_inactive'
-            : 'wrong_password',
+            : !passwordMatch
+              ? 'wrong_password'
+              : 'guest_owner_inactive',
       },
     });
     return c.json({ error: 'Invalid credentials' }, 401);
@@ -344,9 +389,12 @@ authRoutes.post('/login', authJsonBodyLimit, async (c) => {
   settleLoginAttempt(username, ip, 'success');
   updateUserFields(user.id, { last_login_at: now });
 
-  // Ensure user has a home group (backfill for existing users)
+  // Ensure user has a home group (backfill for existing users). Guests are
+  // read-only viewers and never get a workspace of their own.
   try {
-    ensureUserHomeGroup(user.id, user.role, user.username);
+    if (user.role !== 'guest') {
+      ensureUserHomeGroup(user.id, user.role, user.username);
+    }
   } catch (err) {
     // Don't block login if home group creation fails
     logger.warn(
@@ -388,6 +436,10 @@ authRoutes.get('/register/status', (c) => {
       requireInviteCode: true,
     });
   }
+  // Single-user host mode never opens registration; the stored switch stays.
+  if (isSingleUserHost()) {
+    return c.json({ allowRegistration: false, requireInviteCode: true });
+  }
 
   const config = getRegistrationConfig();
   return c.json({
@@ -399,6 +451,9 @@ authRoutes.get('/register/status', (c) => {
 authRoutes.post('/register', authJsonBodyLimit, async (c) => {
   if (getUserCount(true) === 0) {
     return c.json({ error: '系统尚未初始化，请先完成管理员设置。' }, 403);
+  }
+  if (isSingleUserHost()) {
+    return c.json({ error: '单人宿主机模式不开放注册。' }, 403);
   }
 
   // Check registration switch
@@ -487,6 +542,11 @@ authRoutes.post('/register', authJsonBodyLimit, async (c) => {
       settleLoginAttempt(registerKey, ip, 'not_evaluated', { perIp: false });
     }
     throw err;
+  }
+
+  // The mode may have switched while the password was hashing.
+  if (isSingleUserHost()) {
+    return c.json({ error: '单人宿主机模式不开放注册。' }, 403);
   }
 
   // Branch: with invite code or without
@@ -615,16 +675,19 @@ authRoutes.get('/me', authMiddleware, (c) => {
   // own cache strategy (NetworkFirst + auth-store delete on login/logout).
   c.header('Cache-Control', 'private, no-store');
 
+  const deploymentMode = getDeploymentMode();
+
   // Admin users get setup status for the onboarding wizard
   if (fullUser.role === 'admin') {
     return c.json({
       user: userPublic,
       appearance,
+      deploymentMode,
       setupStatus: buildSetupStatus(),
     });
   }
 
-  return c.json({ user: userPublic, appearance });
+  return c.json({ user: userPublic, appearance, deploymentMode });
 });
 
 authRoutes.put('/profile', authMiddleware, async (c) => {
@@ -740,16 +803,14 @@ authRoutes.put('/password', authMiddleware, async (c) => {
     must_change_password: false,
   });
 
-  // Revoke all existing sessions for this user
+  // Revoke all existing sessions for this user and give the current request
+  // a fresh one; this device keeps its Web Push subscription.
   invalidateUserSessions(user.id);
-  deleteUserSessionsByUserId(user.id);
-
-  // Create a fresh session for the current request
   const now = new Date().toISOString();
   const ip = getClientIp(c);
   const ua = c.req.header('user-agent') || null;
   const newToken = generateSessionToken();
-  createUserSession({
+  replaceUserSessions(user.id, c.get('sessionId'), {
     id: newToken,
     user_id: user.id,
     ip_address: ip,

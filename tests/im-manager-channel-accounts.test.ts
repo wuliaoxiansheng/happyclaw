@@ -636,6 +636,41 @@ describe('IM manager account lifecycle', () => {
     await manager.disconnectAll();
   });
 
+  test('scopes the route lookup, which reports no route instead of rejecting', async () => {
+    const manager = new IMConnectionManager();
+    const channel = fakeChannel('telegram');
+    const lookup = vi
+      .fn()
+      .mockReturnValueOnce({
+        effectiveJid: 'web:workspace#agent:topic',
+        agentId: 'topic',
+        sourceJid: 'telegram:-1#thread:7#root:7',
+      })
+      .mockReturnValueOnce(null);
+    await manager.connectChannel(
+      'route-owner',
+      'telegram',
+      channel.channel,
+      { ...callbacks(), lookupEffectiveChatJid: lookup },
+      'bot-a',
+    );
+    const scoped = channel.getOpts()!.lookupEffectiveChatJid!;
+    const meta = { provider: 'telegram' as const, threadId: '7' };
+    expect(scoped('telegram:-1', meta)).toEqual({
+      effectiveJid: 'web:workspace#agent:topic',
+      agentId: 'topic',
+      sourceJid: 'telegram:-1#account:bot-a#thread:7#root:7',
+    });
+    expect(lookup).toHaveBeenLastCalledWith('telegram:-1#account:bot-a', meta);
+    expect(scoped('telegram:-1')).toBeNull();
+
+    manager.pauseInbound();
+    expect(scoped('telegram:-1')).toBeNull();
+    expect(lookup).toHaveBeenCalledTimes(2);
+    manager.resumeInbound();
+    await manager.disconnectAll();
+  });
+
   test('scopes explicit source routes without replacing connector-native fallbacks', async () => {
     const manager = new IMConnectionManager();
     const channel = fakeChannel('feishu');

@@ -65,7 +65,6 @@ describe('Agent profile frontend write contract', () => {
       governanceByProfile: {},
       governanceLoading: {},
       governanceErrors: {},
-      promptVersionsByProfile: {},
       loading: false,
       profilesError: null,
       error: null,
@@ -111,7 +110,7 @@ describe('Agent profile frontend write contract', () => {
     );
   });
 
-  test('supports a minimal host Skills policy PATCH for immediate apply', async () => {
+  test('sends a partial runtime policy PATCH as given', async () => {
     useAgentProfilesStore.setState({ profiles: [profile] });
     const updated = {
       ...profile,
@@ -228,5 +227,63 @@ describe('Agent profile frontend write contract', () => {
       useAgentProfilesStore.getState().governanceByProfile[profile.id]
         ?.runtime_cleanup_pending,
     ).toBe(false);
+  });
+
+  test('migrates and deletes in one request, then refreshes navigation', async () => {
+    useAgentProfilesStore.setState({
+      profiles: [profile, { ...profile, id: 'target' }],
+    });
+    vi.mocked(api.post).mockResolvedValue({ success: true });
+
+    await useAgentProfilesStore
+      .getState()
+      .migrateAndDeleteProfile(profile.id, 'target');
+
+    expect(api.post).toHaveBeenCalledOnce();
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/agent-profiles/profile-1/migrate-and-delete',
+      { target_agent_profile_id: 'target' },
+      120_000,
+    );
+    expect(api.patch).not.toHaveBeenCalled();
+    expect(
+      useAgentProfilesStore.getState().profiles.map((item) => item.id),
+    ).toEqual(['target']);
+    expect(storeDeps.loadChatGroups).toHaveBeenCalled();
+  });
+
+  test('a failed migrate-and-delete keeps the Agent listed', async () => {
+    useAgentProfilesStore.setState({ profiles: [profile] });
+    vi.mocked(api.post).mockRejectedValue({ status: 409, message: 'refused' });
+    await expect(
+      useAgentProfilesStore
+        .getState()
+        .migrateAndDeleteProfile(profile.id, 'target'),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(useAgentProfilesStore.getState().profiles).toEqual([profile]);
+  });
+
+  test('duplicates, exports and imports through their endpoints', async () => {
+    vi.mocked(api.get).mockResolvedValue({ profiles: [profile] });
+    vi.mocked(api.post).mockResolvedValue({ profile, stripped: [] });
+    await useAgentProfilesStore.getState().duplicateProfile(profile.id);
+    expect(api.post).toHaveBeenLastCalledWith(
+      '/api/agent-profiles/profile-1/duplicate',
+    );
+
+    await useAgentProfilesStore.getState().importProfile({
+      data: { format: 'happyclaw-agent' },
+      drop_missing: true,
+    });
+    expect(api.post).toHaveBeenLastCalledWith('/api/agent-profiles/import', {
+      data: { format: 'happyclaw-agent' },
+      drop_missing: true,
+    });
+
+    vi.mocked(api.get).mockResolvedValue({ format: 'happyclaw-agent' });
+    await useAgentProfilesStore.getState().exportProfile(profile.id);
+    expect(api.get).toHaveBeenLastCalledWith(
+      '/api/agent-profiles/profile-1/export',
+    );
   });
 });

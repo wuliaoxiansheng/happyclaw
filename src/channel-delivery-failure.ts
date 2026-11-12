@@ -137,11 +137,6 @@ export function channelOutboxFailureDetail(
   return outboxItemId ? rememberedFailures.get(outboxItemId) : undefined;
 }
 
-/** Test seam. */
-export function resetChannelOutboxFailuresForTests(): void {
-  rememberedFailures.clear();
-}
-
 // ─── Wording ─────────────────────────────────────────────────────────────
 
 /** Append the provider's reason to a user-facing rejection notice. */

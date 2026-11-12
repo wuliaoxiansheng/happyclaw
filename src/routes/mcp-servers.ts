@@ -27,12 +27,11 @@ import {
   withCapabilityScopeLocks,
 } from '../capability-lock.js';
 import {
-  CapabilityRuntimeCommitError,
+  capabilityRuntimeMutationFailure,
   mutateCapabilityAroundRuntimeQuiesce,
   repairCapabilityRuntimeSafetyBlock,
   type CapabilityMutationImpact,
 } from '../capability-runtime-mutation.js';
-import { WorkspaceRuntimeQuiesceError } from '../agent-profile-runtime.js';
 
 // --- Types ---
 
@@ -194,26 +193,6 @@ function mcpMutationImpact(
   ids?: string[],
 ): CapabilityMutationImpact {
   return { kind: 'mcp', ownerUserId: userId, scope, ids };
-}
-
-function runtimeMutationFailure(error: unknown, action: string) {
-  if (error instanceof WorkspaceRuntimeQuiesceError) {
-    return {
-      error: error.persisted
-        ? `${action} was saved, but runtime cleanup failed; retry the request`
-        : `Failed to stop affected workspaces; ${action} was not saved`,
-      persisted: error.persisted,
-      retryable: true,
-    };
-  }
-  if (error instanceof CapabilityRuntimeCommitError) {
-    return {
-      error: `${action} has an uncertain commit outcome; retry the request to finish fail-closed cleanup`,
-      persisted: 'unknown',
-      retryable: true,
-    };
-  }
-  return null;
 }
 
 async function repairPreviousMcpCleanup(
@@ -421,7 +400,10 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
   try {
     await repairPreviousMcpCleanup(authUser.id, scope, [id], 'Create MCP');
   } catch (error) {
-    const failure = runtimeMutationFailure(error, 'MCP creation cleanup');
+    const failure = capabilityRuntimeMutationFailure(
+      error,
+      'MCP creation cleanup',
+    );
     if (failure) return c.json(failure, 503);
     throw error;
   }
@@ -521,7 +503,7 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
       )
     ).invalidatedRuntimeJids;
   } catch (error) {
-    const failure = runtimeMutationFailure(error, 'MCP creation');
+    const failure = capabilityRuntimeMutationFailure(error, 'MCP creation');
     if (failure) return c.json(failure, 503);
     throw error;
   }
@@ -594,7 +576,10 @@ mcpServersRoutes.patch('/:id', authMiddleware, async (c) => {
   try {
     await repairPreviousMcpCleanup(authUser.id, scope, [id], 'Update MCP');
   } catch (error) {
-    const failure = runtimeMutationFailure(error, 'MCP update cleanup');
+    const failure = capabilityRuntimeMutationFailure(
+      error,
+      'MCP update cleanup',
+    );
     if (failure) return c.json(failure, 503);
     throw error;
   }
@@ -719,7 +704,7 @@ mcpServersRoutes.patch('/:id', authMiddleware, async (c) => {
       )
     ).invalidatedRuntimeJids;
   } catch (error) {
-    const failure = runtimeMutationFailure(error, 'MCP update');
+    const failure = capabilityRuntimeMutationFailure(error, 'MCP update');
     if (failure) return c.json(failure, 503);
     throw error;
   }
@@ -754,7 +739,10 @@ mcpServersRoutes.delete('/:id', authMiddleware, async (c) => {
       'Delete MCP',
     );
   } catch (error) {
-    const failure = runtimeMutationFailure(error, 'MCP deletion cleanup');
+    const failure = capabilityRuntimeMutationFailure(
+      error,
+      'MCP deletion cleanup',
+    );
     if (failure) return c.json(failure, 503);
     throw error;
   }
@@ -799,7 +787,7 @@ mcpServersRoutes.delete('/:id', authMiddleware, async (c) => {
       invalidated_runtime_jids: result.invalidatedRuntimeJids,
     });
   } catch (error) {
-    const failure = runtimeMutationFailure(error, 'MCP deletion');
+    const failure = capabilityRuntimeMutationFailure(error, 'MCP deletion');
     if (failure) return c.json(failure, 503);
     throw error;
   }
@@ -822,7 +810,10 @@ mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
       'Import host MCP',
     );
   } catch (error) {
-    const failure = runtimeMutationFailure(error, 'Host MCP import cleanup');
+    const failure = capabilityRuntimeMutationFailure(
+      error,
+      'Host MCP import cleanup',
+    );
     if (failure) return c.json(failure, 503);
     throw error;
   }
@@ -935,7 +926,7 @@ mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
       invalidated_runtime_jids: result.invalidatedRuntimeJids,
     });
   } catch (error) {
-    const failure = runtimeMutationFailure(error, 'Host MCP import');
+    const failure = capabilityRuntimeMutationFailure(error, 'Host MCP import');
     if (failure) return c.json(failure, 503);
     throw error;
   }

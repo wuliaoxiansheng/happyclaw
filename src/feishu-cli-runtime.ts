@@ -1,5 +1,10 @@
 import { loadChannelAccountSecret } from './channel-account-secrets.js';
 import { getChannelAccount } from './db.js';
+import {
+  feishuOpenBaseUrl,
+  normalizeFeishuBrand,
+  type FeishuBrand,
+} from './feishu-domain.js';
 import type { ChannelAccount, ChannelTurnContext } from './types.js';
 
 const FEISHU_CLI_CREDENTIAL_ENV_KEYS = [
@@ -10,6 +15,12 @@ const FEISHU_CLI_CREDENTIAL_ENV_KEYS = [
   // not survive an exact container Bot binding.
   'FEISHU_USER_ACCESS_TOKEN',
 ] as const;
+/**
+ * feishu-cli reads its OpenAPI host from FEISHU_BASE_URL (default
+ * open.feishu.cn). A Lark Bot's credentials only work on open.larksuite.com,
+ * so a Lark binding pins the host and drops any inherited value.
+ */
+const FEISHU_CLI_BASE_URL_ENV_KEY = 'FEISHU_BASE_URL';
 
 export class FeishuCliCredentialBindingError extends Error {
   constructor(message: string) {
@@ -23,6 +34,7 @@ export interface FeishuCliRuntimeBinding {
   accountId: string;
   appId: string;
   appSecret: string;
+  brand: FeishuBrand;
 }
 
 interface FeishuCliBindingDependencies {
@@ -143,6 +155,7 @@ export function resolveFeishuCliRuntimeBinding(
     accountId: account.id,
     appId,
     appSecret,
+    brand: normalizeFeishuBrand(secret?.domain),
   };
 }
 
@@ -152,6 +165,9 @@ function bindingEnvironment(
   return {
     FEISHU_APP_ID: binding.appId,
     FEISHU_APP_SECRET: binding.appSecret,
+    ...(binding.brand === 'lark'
+      ? { [FEISHU_CLI_BASE_URL_ENV_KEY]: feishuOpenBaseUrl('lark') }
+      : {}),
   };
 }
 
@@ -160,16 +176,17 @@ export function applyFeishuCliBindingToEnvLines(
   binding: FeishuCliRuntimeBinding | null,
 ): void {
   if (!binding) return;
+  const environment = bindingEnvironment(binding);
+  const replacedKeys = [
+    ...FEISHU_CLI_CREDENTIAL_ENV_KEYS,
+    ...Object.keys(environment),
+  ];
   for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (
-      FEISHU_CLI_CREDENTIAL_ENV_KEYS.some((key) =>
-        lines[index]?.startsWith(`${key}=`),
-      )
-    ) {
+    if (replacedKeys.some((key) => lines[index]?.startsWith(`${key}=`))) {
       lines.splice(index, 1);
     }
   }
-  for (const [key, value] of Object.entries(bindingEnvironment(binding))) {
+  for (const [key, value] of Object.entries(environment)) {
     lines.push(`${key}=${value}`);
   }
 }

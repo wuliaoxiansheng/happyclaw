@@ -140,28 +140,44 @@ describe('third-party model tiers', () => {
     expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('glm-5.3[1m]');
   });
 
-  test('per-tier overrides win and a blank override means the default', () => {
+  test('roles win per tier; env model keys never do', () => {
     const env = envOf(
-      runtimeConfig.buildClaudeEnvLines(config({}), {
-        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5.3-flash',
-        CLAUDE_CODE_SUBAGENT_MODEL: '   ',
-      }),
+      runtimeConfig.buildClaudeEnvLines(
+        config({
+          anthropicModel: 'glm-5.3',
+          models: [
+            { id: 'glm-5.3', contextWindow: 1_000_000 },
+            { id: 'glm-5.3-flash', contextWindow: 200_000 },
+          ],
+          roles: { smallFast: 'glm-5.3-flash' },
+        }),
+        {
+          ANTHROPIC_DEFAULT_OPUS_MODEL: 'stale',
+          CLAUDE_CODE_SUBAGENT_MODEL: '',
+        },
+      ),
     );
     expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.3-flash');
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.3[1m]');
     expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('glm-5.3[1m]');
   });
 
-  test('a pass-through relay without a model emits only explicit mappings', () => {
+  test('a pass-through relay without a model emits only the roles it names', () => {
     const env = envOf(
-      runtimeConfig.buildClaudeEnvLines(config({ anthropicModel: '' }), {
-        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-5-5',
-      }),
+      runtimeConfig.buildClaudeEnvLines(
+        config({
+          anthropicModel: '',
+          models: [{ id: 'claude-haiku-5-5', contextWindow: 200_000 }],
+          roles: { smallFast: 'claude-haiku-5-5' },
+        }),
+        {},
+      ),
     );
     expect(env.ANTHROPIC_MODEL).toBeUndefined();
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBeUndefined();
     expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBeUndefined();
     expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-haiku-5-5');
-    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('200000');
+    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined();
   });
 
   test('a host process launched from an alias does not leak its tiers', () => {
@@ -187,24 +203,36 @@ describe('validateProviderCustomEnv', () => {
     ).toContain('对应字段');
   });
 
-  test('checks numeric and effort values but accepts blanks', () => {
+  test('checks numeric values but accepts blanks', () => {
     expect(
       runtimeConfig.validateProviderCustomEnv({
-        CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1e6',
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1e6',
       }),
     ).toContain('正整数');
     expect(
       runtimeConfig.validateProviderCustomEnv({
-        CLAUDE_CODE_EFFORT_LEVEL: 'ultra',
-      }),
-    ).toContain('CLAUDE_CODE_EFFORT_LEVEL');
-    expect(
-      runtimeConfig.validateProviderCustomEnv({
-        CLAUDE_CODE_AUTO_COMPACT_WINDOW: '786432',
+        API_TIMEOUT_MS: '3000000',
         CLAUDE_CODE_MAX_CONTEXT_TOKENS: '',
         ANTHROPIC_CUSTOM_HEADERS: 'X-Upstream-Format: responses',
       }),
     ).toBeNull();
+  });
+
+  test('model keys belong to the model settings', () => {
+    for (const key of [
+      'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+      'CLAUDE_CODE_EFFORT_LEVEL',
+      'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+      'CLAUDE_CODE_SUBAGENT_MODEL',
+    ]) {
+      expect(
+        runtimeConfig.reservedConnectionEnvError({ [key]: 'x', OTHER: 'y' }),
+      ).toEqual({
+        error: expect.stringContaining('由模型设置决定'),
+        code: 'RESERVED_ENV_KEY',
+        keys: [key],
+      });
+    }
   });
 });
 
@@ -238,8 +266,9 @@ describe('provider storage', () => {
       anthropicBaseUrl: 'https://open.bigmodel.cn/api/anthropic',
       anthropicAuthToken: 'glm-secret',
       anthropicModel: 'glm-5.3',
-      customEnv: { ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5.3-flash' },
-      enabled: true,
+      models: [{ id: 'glm-5.3' }, { id: 'glm-5.3-flash' }],
+      roles: { smallFast: 'glm-5.3-flash' },
+      customEnv: { API_TIMEOUT_MS: '600000' },
     });
     const tail = runtimeConfig.createProvider({
       name: 'Tail',
@@ -251,9 +280,9 @@ describe('provider storage', () => {
     expect(copy.name).toHaveLength(64);
     expect(copy.name.endsWith(' (副本)')).toBe(true);
     expect(copy).toMatchObject({
-      enabled: false,
       anthropicAuthToken: 'glm-secret',
-      customEnv: { ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5.3-flash' },
+      roles: { smallFast: 'glm-5.3-flash' },
+      customEnv: { API_TIMEOUT_MS: '600000' },
     });
     expect(runtimeConfig.getProviders().map((p) => p.id)).toEqual([
       source.id,
@@ -274,22 +303,6 @@ describe('provider storage', () => {
       },
     });
     expect(() => runtimeConfig.duplicateProvider(oauth.id)).toThrow('不能复制');
-  });
-
-  test('a provider without credentials cannot join the pool', () => {
-    const empty = runtimeConfig.createProvider({
-      name: 'Relay',
-      type: 'third_party',
-      anthropicBaseUrl: 'https://relay.test',
-    });
-    expect(runtimeConfig.providerHasCredentials(empty)).toBe(false);
-    expect(() => runtimeConfig.setProviderEnabled(empty.id, true)).toThrow(
-      '凭据',
-    );
-    runtimeConfig.updateProviderSecrets(empty.id, {
-      anthropicAuthToken: 'now-set',
-    });
-    expect(runtimeConfig.setProviderEnabled(empty.id, true).enabled).toBe(true);
   });
 });
 

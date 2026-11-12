@@ -1,18 +1,20 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({
+  events: [] as string[],
   deletedFolders: [] as string[],
   blocked: [] as string[][],
   unblocked: [] as string[][],
   safetyBlocked: false,
   profiles: new Map<string, any[]>(),
   workspaces: new Map<string, any[]>(),
-  sessions: { 'u1-inherit-folder': 'old-session' } as Record<string, string>,
 }));
 
 vi.mock('../src/db.js', () => ({
-  deleteWorkspaceSessions: (folder: string) =>
-    state.deletedFolders.push(folder),
+  deleteWorkspaceSessions: (folder: string) => {
+    state.events.push(`delete:${folder}`);
+    state.deletedFolders.push(folder);
+  },
   getAllUsers: () => [
     { id: 'u1', status: 'active' },
     { id: 'u2', status: 'active' },
@@ -22,9 +24,14 @@ vi.mock('../src/db.js', () => ({
     state.profiles.get(userId) ?? [],
 }));
 
+vi.mock('../src/runtime-state-store.js', () => ({
+  markFolderSessionsForHistoryReinjection: (folder: string) =>
+    state.events.push(`mark:${folder}`),
+  markSessionForHistoryReinjection: () => {},
+}));
+
 vi.mock('../src/web-context.js', () => ({
   getWebDeps: () => ({
-    sessions: state.sessions,
     queue: {
       blockGroupsForRuntimeSafety: (jids: string[]) => state.blocked.push(jids),
       unblockGroupsForRuntimeSafety: (jids: string[]) =>
@@ -40,6 +47,10 @@ vi.mock('../src/agent-profile-runtime.js', () => ({
   getWorkspaceRuntimeJids: (_deps: unknown, folder: string) => [
     `web:${folder}`,
   ],
+  collectWorkspaceRuntimeJids: (
+    _deps: unknown,
+    targets: Array<{ folder: string }>,
+  ) => Array.from(new Set(targets.map((target) => `web:${target.folder}`))),
   quiesceWorkspaceRunnersAroundCommit: async (
     _deps: unknown,
     targets: Array<{ folder: string }>,
@@ -68,13 +79,13 @@ function workspace(folder: string) {
 }
 
 beforeEach(() => {
+  state.events.length = 0;
   state.deletedFolders.length = 0;
   state.blocked.length = 0;
   state.unblocked.length = 0;
   state.safetyBlocked = false;
   state.profiles.clear();
   state.workspaces.clear();
-  state.sessions = { 'u1-inherit-folder': 'old-session' };
 });
 
 describe('capability runtime mutation invalidation', () => {
@@ -111,7 +122,19 @@ describe('capability runtime mutation invalidation', () => {
       'u1-inherit-folder',
       'u2-custom-folder',
     ]);
-    expect(state.sessions).not.toHaveProperty('u1-inherit-folder');
+    // Each reset session is owed the history hand-off, marked before the
+    // session rows it reads from are deleted.
+    expect(state.events).toEqual(
+      expect.arrayContaining([
+        'mark:u1-inherit-folder',
+        'mark:u2-custom-folder',
+      ]),
+    );
+    for (const folder of ['u1-inherit-folder', 'u2-custom-folder']) {
+      expect(state.events.indexOf(`mark:${folder}`)).toBeLessThan(
+        state.events.indexOf(`delete:${folder}`),
+      );
+    }
     expect(state.unblocked).toEqual([
       ['web:u1-inherit-folder', 'web:u2-custom-folder'],
     ]);

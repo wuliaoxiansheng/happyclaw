@@ -1,40 +1,68 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useMemo, useState, type ReactNode } from 'react';
 import { AnimatePresence, m } from 'motion/react';
-import { Link2, Pencil, Search, Trash2 } from 'lucide-react';
-import { DropdownMenuItem } from '@/components/ui/dropdown-menu';
-import { Spinner } from '@/components/ui/spinner';
-import { PromptDialog } from '@/components/common/PromptDialog';
-import { cn } from '@/lib/utils';
-import { isLiveStream, useChatStore } from '../../../stores/chat';
-import { useShellStore } from '../../../stores/shell';
-import { useSessionActions } from '../../../hooks/useSessionActions';
 import {
-  chatHref,
+  ChevronRight,
+  Link2,
+  Pin,
+  Play,
+  Search,
+  Timer,
+  Trash2,
+} from 'lucide-react';
+import { Spinner } from '@/components/ui/spinner';
+import { cn } from '@/lib/utils';
+import { TeamSessionTag } from '../../team/TeamSessionTag';
+import { isTeamSession } from '../../../lib/team-mode';
+import { useShellStore } from '../../../stores/shell';
+import { useAutomationsStore } from '../../../stores/automations';
+import { useIsGuest } from '../../../stores/auth';
+import {
   openWorkspaceSession,
   type NavigateToPath,
 } from '../../../lib/chat-navigation';
 import {
-  buildConversationSessions,
   formatSessionTime,
-  isNativeManagedSession,
   messagePreview,
   sessionActivityAt,
+  sessionDisplayName,
+  sessionListItems,
+  type AutomationSessionGroup,
 } from '../../../lib/session-presentation';
-import type { AgentInfo } from '../../../types';
+import type { Automation } from '../../../lib/automation';
+import type { AgentInfo, SessionWorktreeInfo } from '../../../types';
+import { WorktreeBranchTag } from '../../chat/WorktreeBranchTag';
+import {
+  AutomationMenuItems,
+  BoundAutomationMark,
+  UnreadDot,
+  useAutomationGroup,
+  useBoundAutomations,
+} from '../../automations/AutomationSessionBits';
+import { runAutomationNow } from '../../automations/automation-actions';
 import type { GroupEntry } from '../../../utils/group-utils';
 import { sidebarRowClass } from './SidebarItem';
-import { RowMenu, revealOnRowHover, rowIconButtonClass } from './WorkspaceTree';
+import {
+  MenuActionItems,
+  RowMenu,
+  revealOnRowHover,
+  rowIconButtonClass,
+} from './WorkspaceTree';
+import {
+  RenameSessionDialog,
+  useSessionDelete,
+  useSessionRowActions,
+  useWorkspaceSessions,
+} from './workspace-sessions';
 
-const EMPTY_AGENTS: AgentInfo[] = [];
 const INITIAL_VISIBLE = 8;
 const SEARCH_THRESHOLD = 8;
-const MAIN_BINDING = '__main__';
+const NO_AUTOMATIONS: Automation[] = [];
 
 interface SessionTreeListProps {
   group: GroupEntry;
   /** Whether this workspace is the one open in the canvas. */
   isCurrent: boolean;
-  /** Session open in the canvas (null = main conversation). */
+  /** Session open in the canvas, if any. */
   activeSessionId: string | null;
   /** Nesting depth of the workspace row, so sessions align with its name. */
   depth?: number;
@@ -53,53 +81,16 @@ export const SessionTreeList = memo(function SessionTreeList({
   depth = 0,
   navigate,
 }: SessionTreeListProps) {
-  const loadAgents = useChatStore((s) => s.loadAgents);
-  const renameConversation = useChatStore((s) => s.renameConversation);
-  const agents = useChatStore((s) => s.agents[group.jid] ?? EMPTY_AGENTS);
-  // A joined id string keeps streaming deltas from re-rendering the tree:
-  // it only changes when a session starts or stops answering.
-  // A card frozen by a stop is not a running query.
-  const activeQueryIds = useChatStore((s) =>
-    (s.agents[group.jid] ?? EMPTY_AGENTS)
-      .filter(
-        (a) => s.agentWaiting[a.id] || isLiveStream(s.agentStreaming[a.id]),
-      )
-      .map((a) => a.id)
-      .join(','),
+  const { containerRef, sessions } = useWorkspaceSessions<HTMLDivElement>(
+    group.jid,
   );
   const requestBinding = useShellStore((s) => s.requestBinding);
-  const { deleteSession } = useSessionActions();
+  const boundTo = useBoundAutomations(group.jid);
+  const deleteSession = useSessionDelete(group);
   const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE);
   const [query, setQuery] = useState('');
   const [renameTarget, setRenameTarget] = useState<AgentInfo | null>(null);
 
-  // Fetch the session list once the subtree scrolls into view: an expanded
-  // workspace far down the tree should not cost a request on every load.
-  const containerRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const node = containerRef.current;
-    if (!node || typeof IntersectionObserver === 'undefined') {
-      void loadAgents(group.jid);
-      return;
-    }
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (!entries.some((entry) => entry.isIntersecting)) return;
-        observer.disconnect();
-        void loadAgents(group.jid);
-      },
-      { rootMargin: '200px' },
-    );
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, [group.jid, loadAgents]);
-
-  const sessions = useMemo(() => {
-    const active = new Set(activeQueryIds ? activeQueryIds.split(',') : []);
-    return buildConversationSessions(agents, (id) => active.has(id));
-  }, [agents, activeQueryIds]);
-
-  const canModify = !!group.can_modify;
   const normalizedQuery = query.trim().toLocaleLowerCase();
   // Lowercased name and preview per session, built once per list while
   // searching instead of for every session on every keystroke.
@@ -116,18 +107,58 @@ export const SessionTreeList = memo(function SessionTreeList({
         : null,
     [sessions, searching],
   );
-  const filtered = searchText
-    ? sessions.filter((session) =>
-        searchText.get(session.id)?.includes(normalizedQuery),
-      )
-    : sessions;
-  const visible = filtered.slice(0, visibleCount);
-  const mainLabel = group.is_my_home ? '直接对话' : '当前对话';
+  const filtered = useMemo(
+    () =>
+      searchText
+        ? sessions.filter((session) =>
+            searchText.get(session.id)?.includes(normalizedQuery),
+          )
+        : sessions,
+    [sessions, searchText, normalizedQuery],
+  );
+  // Sessions an automation opened fold into its row, where its newest is.
+  const items = useMemo(() => sessionListItems(filtered), [filtered]);
+  const visible = items.slice(0, visibleCount);
 
-  // Binding lives in ChatView; open the workspace first so it can react.
-  const openBinding = (target: string) => {
-    if (!isCurrent) navigate(chatHref(group.folder));
-    requestBinding(group.jid, target);
+  // Binding lives in ChatView: open the session so it can react.
+  const openBinding = useCallback(
+    (session: AgentInfo) => {
+      openWorkspaceSession(navigate, group, session.id);
+      requestBinding(group.jid, session.id);
+    },
+    [navigate, group, requestBinding],
+  );
+  const menuFor = useSessionRowActions(group, {
+    onBind: openBinding,
+    onRename: setRenameTarget,
+  });
+
+  const renderSession = (session: AgentInfo) => {
+    const menu = menuFor(session);
+    const name = sessionDisplayName(session);
+    return (
+      <SessionRow
+        name={name}
+        active={isCurrent && activeSessionId === session.id}
+        running={session.status === 'running'}
+        titleGenerating={session.title_generating}
+        pinned={!!session.pinned_at}
+        linked={(session.linked_im_groups?.length ?? 0) > 0}
+        worktree={session.worktree}
+        automations={boundTo(session)}
+        tag={
+          isTeamSession(session) && (
+            <TeamSessionTag workspaceJid={group.jid} session={session} />
+          )
+        }
+        time={formatSessionTime(sessionActivityAt(session))}
+        onSelect={() => openWorkspaceSession(navigate, group, session.id)}
+        onDelete={deleteSession && (() => deleteSession(session))}
+        deleteLabel={`删除${name}`}
+        menuLabel={`${name}的更多操作`}
+        menu={menu ? <MenuActionItems groups={menu} /> : undefined}
+      />
+    );
   };
 
   return (
@@ -150,32 +181,38 @@ export const SessionTreeList = memo(function SessionTreeList({
           <input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder={`搜索 ${sessions.length + 1} 个会话…`}
-            className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-faint-foreground"
+            placeholder={`搜索 ${sessions.length} 个会话…`}
+            enterKeyHint="search"
+            className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-faint-foreground phone:text-base"
           />
         </label>
       )}
       <ul>
-        <SessionRow
-          name={mainLabel}
-          active={isCurrent && activeSessionId === null}
-          onSelect={() => openWorkspaceSession(navigate, group, null)}
-          menu={
-            canModify ? (
-              <DropdownMenuItem onClick={() => openBinding(MAIN_BINDING)}>
-                <Link2 />
-                会话绑定
-              </DropdownMenuItem>
-            ) : undefined
-          }
-          menuLabel={`${mainLabel}的更多操作`}
-        />
         <AnimatePresence initial={false}>
-          {visible.map((session) => {
-            const nativeManaged = isNativeManagedSession(session);
-            return (
+          {visible.map((item) =>
+            item.kind === 'automation' ? (
+              <AutomationGroupRow
+                key={`automation:${item.group.automationId}`}
+                group={item.group}
+                // A search shows its matches without a click.
+                forceExpanded={searching}
+                containsActive={
+                  isCurrent &&
+                  item.group.sessions.some(
+                    (session) => session.id === activeSessionId,
+                  )
+                }
+                navigate={navigate}
+              >
+                {item.group.sessions.map((session) => (
+                  <li key={session.id} className="list-none">
+                    {renderSession(session)}
+                  </li>
+                ))}
+              </AutomationGroupRow>
+            ) : (
               <m.li
-                key={session.id}
+                key={item.session.id}
                 // Search results appear and disappear instantly: animating
                 // dozens of rows in and out on every keystroke was a third of
                 // the per-key cost in long lists.
@@ -184,64 +221,19 @@ export const SessionTreeList = memo(function SessionTreeList({
                 exit={searching ? undefined : { opacity: 0, height: 0 }}
                 className="list-none overflow-hidden"
               >
-                <SessionRow
-                  asListItem={false}
-                  name={session.name || '新会话'}
-                  active={isCurrent && activeSessionId === session.id}
-                  running={session.status === 'running'}
-                  titleGenerating={session.title_generating}
-                  linked={(session.linked_im_groups?.length ?? 0) > 0}
-                  time={formatSessionTime(sessionActivityAt(session))}
-                  onSelect={() =>
-                    openWorkspaceSession(navigate, group, session.id)
-                  }
-                  onDelete={
-                    canModify && !nativeManaged
-                      ? () => deleteSession(group.jid, session.id, openBinding)
-                      : undefined
-                  }
-                  deleteLabel={`删除${session.name || '新会话'}`}
-                  menuLabel={`${session.name}的更多操作`}
-                  menu={
-                    canModify && !nativeManaged ? (
-                      <>
-                        <DropdownMenuItem
-                          onClick={() => openBinding(session.id)}
-                        >
-                          <Link2 />
-                          会话绑定
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={() => setRenameTarget(session)}
-                        >
-                          <Pencil />
-                          重命名
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          variant="destructive"
-                          onClick={() =>
-                            deleteSession(group.jid, session.id, openBinding)
-                          }
-                        >
-                          <Trash2 />
-                          删除
-                        </DropdownMenuItem>
-                      </>
-                    ) : undefined
-                  }
-                />
+                {renderSession(item.session)}
               </m.li>
-            );
-          })}
+            ),
+          )}
         </AnimatePresence>
       </ul>
-      {filtered.length > visibleCount && (
+      {items.length > visibleCount && (
         <button
           type="button"
           onClick={() => setVisibleCount((n) => n + 30)}
           className={cn(sidebarRowClass, 'ml-2 h-7 w-auto text-caption')}
         >
-          显示更多（{filtered.length - visibleCount}）
+          显示更多（{items.length - visibleCount}）
         </button>
       )}
       {normalizedQuery && filtered.length === 0 && (
@@ -249,41 +241,145 @@ export const SessionTreeList = memo(function SessionTreeList({
           没有匹配的会话
         </p>
       )}
-      <PromptDialog
-        open={renameTarget !== null}
-        title="重命名对话"
-        label="对话名称"
-        placeholder="输入新名称"
-        defaultValue={renameTarget?.name ?? ''}
-        onConfirm={(name) => {
-          if (renameTarget)
-            void renameConversation(group.jid, renameTarget.id, name);
-        }}
+      {!normalizedQuery && sessions.length === 0 && (
+        <p className="px-4 py-1.5 text-caption text-faint-foreground">
+          暂无会话
+        </p>
+      )}
+      <RenameSessionDialog
+        groupJid={group.jid}
+        session={renameTarget}
         onClose={() => setRenameTarget(null)}
       />
     </div>
   );
 });
 
+/**
+ * One automation's sessions under a collapsible row: its name, whether a
+ * run goes or results wait unread, and 立即运行 / ⋯ on hover.
+ */
+function AutomationGroupRow({
+  group,
+  forceExpanded,
+  containsActive,
+  navigate,
+  children,
+}: {
+  group: AutomationSessionGroup;
+  forceExpanded: boolean;
+  containsActive: boolean;
+  navigate: NavigateToPath;
+  children: ReactNode;
+}) {
+  const {
+    automation,
+    name,
+    running,
+    expanded: stored,
+    toggle,
+  } = useAutomationGroup(group);
+  const busy = useAutomationsStore((s) => !!s.runBusy[group.automationId]);
+  const isGuest = useIsGuest();
+  const expanded = forceExpanded || stored;
+
+  return (
+    <li className="list-none">
+      <div
+        data-active={(!expanded && containsActive) || undefined}
+        className={cn(
+          sidebarRowClass,
+          'ml-2 h-7 w-[calc(100%-0.5rem)] gap-1.5 pr-1',
+        )}
+      >
+        <button
+          type="button"
+          aria-expanded={expanded}
+          onClick={toggle}
+          className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left outline-none"
+        >
+          <Timer
+            className="size-3.5 shrink-0 text-muted-foreground"
+            aria-hidden="true"
+          />
+          <span className="truncate">{name}</span>
+          <span className="shrink-0 text-micro text-faint-foreground tabular-nums">
+            {group.sessions.length}
+          </span>
+          <ChevronRight
+            aria-hidden="true"
+            className={cn(
+              'size-3 shrink-0 text-faint-foreground transition-transform duration-150 motion-reduce:transition-none',
+              expanded && 'rotate-90',
+            )}
+          />
+        </button>
+        {running ? (
+          <Spinner
+            className="size-3 shrink-0 text-muted-foreground"
+            aria-label="自动化运行中"
+          />
+        ) : (
+          automation && <UnreadDot automation={automation} />
+        )}
+        {automation && (
+          <span className="flex shrink-0 items-center">
+            {!isGuest && (
+              <button
+                type="button"
+                aria-label={`立即运行「${name}」`}
+                disabled={busy}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void runAutomationNow(automation.id);
+                }}
+                className={cn(rowIconButtonClass, revealOnRowHover)}
+              >
+                <Play className="size-3.5" />
+              </button>
+            )}
+            <RowMenu label={`${name}的更多操作`}>
+              <AutomationMenuItems
+                automation={automation}
+                navigate={navigate}
+              />
+            </RowMenu>
+          </span>
+        )}
+      </div>
+      {expanded && <ul className="pl-3">{children}</ul>}
+    </li>
+  );
+}
+
 function SessionRow({
   name,
   active,
   running = false,
   titleGenerating = false,
+  pinned = false,
   linked = false,
+  worktree,
+  automations = NO_AUTOMATIONS,
+  tag,
   time,
   onSelect,
   onDelete,
   deleteLabel,
   menu,
   menuLabel,
-  asListItem = true,
 }: {
   name: string;
   active: boolean;
   running?: boolean;
   titleGenerating?: boolean;
+  pinned?: boolean;
   linked?: boolean;
+  worktree?: SessionWorktreeInfo | null;
+  /** Automations bound to this session, shown as a timer mark. */
+  automations?: Automation[];
+  /** Team mode's 团队路由 / #N 工作项 tag. */
+  tag?: React.ReactNode;
   time?: string;
   onSelect: () => void;
   /** Shown next to the menu on hover; the handler asks for confirmation. */
@@ -291,10 +387,9 @@ function SessionRow({
   deleteLabel?: string;
   menu?: React.ReactNode;
   menuLabel: string;
-  asListItem?: boolean;
 }) {
   const hasActions = !!menu || !!onDelete;
-  const row = (
+  return (
     <div
       data-active={active || undefined}
       className={cn(
@@ -309,6 +404,15 @@ function SessionRow({
         className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left outline-none"
       >
         <span className="truncate">{name}</span>
+        {pinned && (
+          <Pin
+            className="size-3 shrink-0 text-faint-foreground"
+            aria-label="已置顶"
+          />
+        )}
+        {worktree && (
+          <WorktreeBranchTag worktree={worktree} compact className="max-w-24" />
+        )}
         {linked && (
           <Link2
             className="size-3 shrink-0 text-faint-foreground"
@@ -316,6 +420,8 @@ function SessionRow({
           />
         )}
       </button>
+      {tag}
+      <BoundAutomationMark automations={automations} />
       {running || titleGenerating ? (
         <Spinner
           className="size-3 shrink-0 text-muted-foreground"
@@ -366,5 +472,4 @@ function SessionRow({
       )}
     </div>
   );
-  return asListItem ? <li className="list-none">{row}</li> : row;
 }

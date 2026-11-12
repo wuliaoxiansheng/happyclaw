@@ -3,6 +3,9 @@
 @plugin "tailwindcss-animate";
 
 @custom-variant dark (&:is(.dark *));
+/* A phone: below the desktop layout and driven by touch. useIsPhone
+   (components/layout/phone.ts) tests the same query in JS. */
+@custom-variant phone (@media (max-width: 1023px) and (pointer: coarse));
 
 /* Inter (UI) and Geist Mono (code) are self-hosted via @fontsource-variable,
    imported in main.tsx so Vite fingerprints the files under the app base path. */
@@ -63,6 +66,8 @@
   --color-success: var(--success);
   --color-success-bg: var(--success-bg);
   --color-warning: var(--warning);
+  /* A run at work (RunStatusBar), after cindy's status orange. */
+  --color-status-accent: var(--warning);
   --color-warning-bg: var(--warning-bg);
   --color-error: var(--error);
   --color-error-bg: var(--error-bg);
@@ -78,6 +83,7 @@
   --color-surface-selected: var(--surface-selected);
   --color-surface-border: var(--surface-border);
   --color-faint-foreground: var(--faint-foreground);
+  --color-qr-quiet-zone: var(--qr-quiet-zone);
   --shadow-canvas: var(--canvas-shadow);
   --shadow-menu: var(--menu-shadow);
   --shadow-floating: var(--floating-shadow);
@@ -118,6 +124,9 @@
   --text-body--line-height: 1.25rem;
   --text-body-lg: 0.9375rem;
   --text-body-lg--line-height: 1.625rem;
+  /* A reply's text on a phone (17/26, cindy's reading size). */
+  --text-reply: 1.0625rem;
+  --text-reply--line-height: 1.625rem;
   --text-title-sm: 0.875rem;
   --text-title-sm--line-height: 1.25rem;
   --text-title-sm--font-weight: 600;
@@ -147,6 +156,8 @@
 :root {
   /* shadcn/ui semantic tokens */
   --background: #ffffff;
+  /* QR codes keep a white quiet zone in every scheme so phones can scan them. */
+  --qr-quiet-zone: #ffffff;
   --foreground: #0f172a;
   --card: #ffffff;
   --card-foreground: #0f172a;
@@ -212,10 +223,18 @@
   /* AI message card shadow */
   --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
 
-  /* iOS keyboard height */
-  --keyboard-height: 0px;
+  /* Keyboard occlusion, published inline on <html> by useVisualViewportVars.
+     --keyboard-height is a legacy alias for callers not yet switched over. */
+  --keyboard-inset: 0px;
+  --keyboard-height: var(--keyboard-inset);
+  /* The bottom safe area, gone while a keyboard covers the home indicator. */
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
 
   /* Liquid Glass design tokens */
+}
+
+:root[data-keyboard='open'] {
+  --safe-bottom: 0px;
 }
 
 /* =====================================================
@@ -224,6 +243,7 @@
    ===================================================== */
 html.theme-neutral {
   --background: #ffffff;
+  --qr-quiet-zone: #ffffff;
   --foreground: #18181b;
   --card: #f4f4f5;
   --card-foreground: #18181b;
@@ -260,6 +280,7 @@ html.theme-neutral {
 
 html.dark.theme-neutral {
   --background: #09090b;
+  --qr-quiet-zone: #ffffff;
   --foreground: #fafafa;
   --card: #18181b;
   --card-foreground: #fafafa;
@@ -300,6 +321,7 @@ html.dark.theme-neutral {
    ===================================================== */
 html.theme-orange {
   --background: #faf9f5;
+  --qr-quiet-zone: #ffffff;
   --foreground: #141413;
   --card: #f0eee6;
   --card-foreground: #141413;
@@ -346,6 +368,7 @@ html.theme-orange {
 
 html.dark.theme-orange {
   --background: oklch(0.145 0 0);
+  --qr-quiet-zone: #ffffff;
   --foreground: oklch(0.985 0 0);
   /* --primary below is a fill color (≈2.4:1 as text); text uses chart-2. */
   --primary-text: oklch(0.705 0.213 47.604);
@@ -428,6 +451,7 @@ html.font-anthropic .font-mono {
    ===================================================== */
 .dark {
   --background: #0f172a;
+  --qr-quiet-zone: #ffffff;
   --foreground: #e2e8f0;
   --card: #1e293b;
   --card-foreground: #e2e8f0;
@@ -536,9 +560,8 @@ html.font-anthropic .font-mono {
 html {
   height: 100%;
   overflow: hidden;
-  /* 声明式禁双指缩放（替代全局非 passive touchmove 监听）：
-     允许单指平移滚动，pinch-zoom 不在允许列表内即被浏览器拦截。 */
-  touch-action: pan-x pan-y;
+  /* 允许平移和双指缩放，只去掉双击缩放带来的点击延迟。 */
+  touch-action: manipulation;
 }
 
 body {
@@ -565,36 +588,101 @@ body {
   animation-timing-function: steps(40);
 }
 
-/* A quiet dot after the last streamed text while a reply is being written
- * (StreamingMarkdown `caret`): the text itself shows where the reply goes on,
- * not only the status row. Pseudo-element, so it never enters a copy. */
-[data-streaming-caret='true']
-  > :last-child
-  > :is(p, h1, h2, h3, h4, h5, h6):last-child::after,
-[data-streaming-caret='true']
-  > :last-child
-  > [data-markdown-root]
-  > :is(p, h1, h2, h3, h4, h5, h6):last-child::after,
-[data-streaming-caret='true']
-  > :last-child
-  > :is(ul, ol):last-child
-  > li:last-child::after {
-  content: '';
-  display: inline-block;
-  width: 0.5em;
-  height: 0.5em;
-  margin-left: 0.3em;
-  border-radius: 9999px;
-  background: currentColor;
-  vertical-align: 0.05em;
-  opacity: 0.45;
-  animation: hc-caret-pulse 1.2s ease-in-out infinite;
+/* Words of a streamed block fade in as they arrive (rehype-stream-fade).
+ * Opacity only, delayed to the start time the renderer gave the word
+ * (`--hc-fade-delay`, negative for a word remounted part-way), so no
+ * re-render restarts one. Not mounted at all when less motion is asked for;
+ * this rule covers the OS setting changing mid-stream. */
+.hc-stream-word {
+  animation: hc-stream-word-in 150ms var(--ease-snappy)
+    var(--hc-fade-delay, 0ms) both;
 }
 
-@keyframes hc-caret-pulse {
-  50% {
-    opacity: 0.15;
+@keyframes hc-stream-word-in {
+  from {
+    opacity: 0;
   }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hc-stream-word {
+    animation: none;
+  }
+}
+
+/* Chat composer (Tiptap). Placeholder, structured lists, chips and command
+ * pills, adapted from cindy's composer styles. The Placeholder extension marks
+ * the empty first paragraph; after a cleared document it may only carry
+ * `is-empty`, so the sole-empty-paragraph selector covers that too. */
+[data-hc-composer] .ProseMirror > p.is-editor-empty:first-child::before,
+[data-hc-composer] .ProseMirror > p.is-empty:first-child:only-child::before {
+  content: attr(data-placeholder);
+  color: var(--faint-foreground);
+  float: left;
+  height: 0;
+  pointer-events: none;
+}
+
+[data-hc-composer] .ProseMirror p {
+  margin: 0;
+}
+
+/* Markers and body text share one layout tree, so wrapped lines follow the
+ * item's content edge. Wider ordinals get a wider marker column. */
+[data-hc-composer] .ProseMirror :is(ul, ol) {
+  margin: 0;
+  --composer-list-padding: 1.5em;
+  --composer-list-marker-extra: 0em;
+  padding-inline-start: calc(
+    var(--composer-list-padding) + var(--composer-list-marker-extra)
+  );
+}
+[data-hc-composer] .ProseMirror ol[data-marker='、'] {
+  --composer-list-marker-extra: 0.7em;
+}
+[data-hc-composer] .ProseMirror ol[data-marker-digits='2'] {
+  --composer-list-padding: 2.2em;
+}
+[data-hc-composer] .ProseMirror ol[data-marker-digits='3'] {
+  --composer-list-padding: 2.8em;
+}
+[data-hc-composer] .ProseMirror ol[data-marker-digits='4'] {
+  --composer-list-padding: 3.4em;
+}
+[data-hc-composer] .ProseMirror ul {
+  list-style-type: disc;
+}
+[data-hc-composer] .ProseMirror ol {
+  list-style-type: decimal;
+}
+[data-hc-composer] .ProseMirror ol[data-marker=')'] > li::marker {
+  content: counter(list-item) ') ';
+}
+[data-hc-composer] .ProseMirror ol[data-marker='、'] > li::marker {
+  content: counter(list-item) '、';
+}
+[data-hc-composer] .ProseMirror li {
+  padding-inline-start: 0.15em;
+  overflow-wrap: anywhere;
+}
+[data-hc-composer] .ProseMirror li > p {
+  margin: 0;
+}
+
+/* Atomic chips are selected and removed as a whole. */
+[data-hc-composer] .ProseMirror .composer-chip {
+  -webkit-user-drag: element;
+}
+[data-hc-composer] .ProseMirror .composer-chip.ProseMirror-selectednode {
+  border-color: var(--ring);
+  outline: none;
+}
+
+/* A typed `/command` that names a known command or Skill. */
+[data-hc-composer] .ProseMirror .slash-cmd-pill {
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--primary-text, var(--primary));
 }
 
 /* Native scrollbar styling is deliberately scoped to the chat context panes.
@@ -644,6 +732,10 @@ pre code.hljs {
   background: transparent !important;
   border-radius: 0;
   padding: 0 !important;
+  /* highlight.js makes the code element its own x-scroller; hand scrolling
+     back to the <pre> (HorizontalScroll) so its edge fades see the overflow.
+     Its stylesheet loads later with the renderer chunk, hence !important. */
+  overflow: visible !important;
 }
 
 /* Dark mode syntax highlighting — GitHub Dark Dimmed */
@@ -798,6 +890,27 @@ pre code.language-diff .hljs-deletion {
   -webkit-mask-image: linear-gradient(to bottom, transparent, #000 1.75rem);
   mask-image: linear-gradient(to bottom, transparent, #000 1.75rem);
 }
+/* A phone pins a reply table's first column (MarkdownTable), so the start
+   edge hides nothing and fading it would only wash out that column. The
+   query is the `phone` variant's. */
+@media (max-width: 1023px) and (pointer: coarse) {
+  [data-md-table] [data-scroll-fade='start'] {
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+  [data-md-table] [data-scroll-fade='both'] {
+    -webkit-mask-image: linear-gradient(
+      to right,
+      #000 calc(100% - 2.5rem),
+      transparent
+    );
+    mask-image: linear-gradient(
+      to right,
+      #000 calc(100% - 2.5rem),
+      transparent
+    );
+  }
+}
 /* Share images show tables and code in full, nothing to hint at. */
 .share-card-content [data-scroll-fade] {
   -webkit-mask-image: none;
@@ -866,13 +979,43 @@ pre code.language-diff .hljs-deletion {
   }
 }
 
+/* Room a page leaves under its content for the bottom navigation: the
+   floating capsule of narrow windows, or only the home indicator on phones,
+   which navigate from a drawer. `--nav-cover` is how much of it a sticky
+   footer (SettingsStickySaveBar) covers so nothing scrolls through below. */
+:root {
+  --nav-clearance: calc(7rem + env(safe-area-inset-bottom, 0px));
+  --nav-cover: calc(
+    max(24px, env(safe-area-inset-bottom, 0px)) + 58px + 0.5rem
+  );
+}
+@media (max-width: 1023px) and (pointer: coarse) {
+  :root {
+    --nav-clearance: calc(1.5rem + env(safe-area-inset-bottom, 0px));
+    --nav-cover: env(safe-area-inset-bottom, 0px);
+  }
+}
+
+/* Long-press on an image opens the system menu (Save Image, Copy, Share)
+   even in the installed PWA, whose body turns the callout off. */
+@utility touch-callout-default {
+  -webkit-touch-callout: default;
+}
+
+/* The same for an image inside a long-pressable element: the marker also
+   tells useLongPress to leave the press to the system menu. */
+[data-native-image-menu] {
+  -webkit-touch-callout: default;
+}
+
 /* Bottom padding for content above floating nav — accounts for safe area */
 /* A utility (not a bare class) so responsive overrides such as lg:pb-0 win. */
 @utility pb-nav-safe {
-  padding-bottom: calc(7rem + env(safe-area-inset-bottom, 0px));
+  padding-bottom: var(--nav-clearance);
 }
 
-/* Floating mobile navigation capsule */
+/* Floating navigation capsule of narrow desktop windows (phones use the
+   drawer instead). */
 .floating-nav-container {
   position: fixed;
   bottom: 24px;
@@ -894,6 +1037,7 @@ pre code.language-diff .hljs-deletion {
 }
 
 .floating-nav {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 2px;
@@ -909,6 +1053,7 @@ pre code.language-diff .hljs-deletion {
 
 .floating-nav-item {
   position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -928,10 +1073,32 @@ pre code.language-diff .hljs-deletion {
   transform: scale(0.94);
 }
 
-/* Neutral selected state, same language as the desktop sidebar rows. */
+/* Neutral selected state, same language as the desktop sidebar rows. The
+   fill is one pill under the tabs that slides to the selected one. */
 .floating-nav-item.active {
-  background: var(--surface-selected);
   color: var(--foreground);
+}
+
+.floating-nav-indicator {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border-radius: 9999px;
+  background: var(--surface-selected);
+  pointer-events: none;
+}
+
+.floating-nav-indicator.slide {
+  transition:
+    transform 320ms cubic-bezier(0.25, 1, 0.5, 1),
+    width 320ms cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+/* With reduced motion the pill jumps to the new tab. */
+@media (prefers-reduced-motion: reduce) {
+  .floating-nav-indicator.slide {
+    transition: none;
+  }
 }
 
 @media (min-width: 1024px) {

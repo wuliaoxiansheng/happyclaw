@@ -1,10 +1,20 @@
 // Interaction harness for the chat composer: ChatView over mocked stores with
 // a main conversation and two Web sessions in one workspace. Sends, uploads,
 // stops and queue actions are recorded on `window.composerHarness`.
-import { useEffect } from 'react';
+//   ?empty=1   the first session (m0) starts with no messages
+//   ?statusbar=1  the composer alone over a stub list, with a status bar
+//                 that shows while setStatusRunning(true)
+//   ?readonly=1   the user may not change the workspace's configuration
+//   ?ask=1     the composer alone under two AskUserQuestion cards
+import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { MemoryRouter, useSearchParams } from 'react-router-dom';
+import { wsManager } from '../../src/api/ws';
+import { AskUserQuestionCard } from '../../src/components/chat/AskUserQuestionCard';
 import { ChatView } from '../../src/components/chat/ChatView';
+import { MessageInput } from '../../src/components/chat/MessageInput';
+import { Toaster } from '../../src/components/ui/sonner';
+import { useVisualViewportVars } from '../../src/hooks/useVisualViewport';
 import { useAuthStore, type UserPublic } from '../../src/stores/auth';
 import {
   useChatStore,
@@ -16,6 +26,12 @@ import type { AgentInfo } from '../../src/types';
 import '../../src/styles/globals.css';
 
 const groupJid = 'web:e2e-composer';
+/** The session the harness opens first (others: a1, a2). */
+const FIRST = 'm0';
+const startsEmpty =
+  new URLSearchParams(window.location.search).get('empty') === '1';
+const readOnly =
+  new URLSearchParams(window.location.search).get('readonly') === '1';
 const userId = 'composer-user';
 
 const user: UserPublic = {
@@ -85,19 +101,23 @@ const harness = {
   sent: [] as SentRecord[],
   uploads: [] as string[][],
   stops: [] as string[],
+  resets: [] as Array<{ jid: string; agentId: string }>,
+  /** Times ChatView handed back to the page (ChatPage's list). */
+  backs: 0,
   queueActions: [] as Array<{ id: string; action: string; content?: string }>,
   sendDelayMs: 0,
+  /** Open a session; null opens the first one (m0). */
   switchTo: (_id: string | null) => {},
+  /** The bare composer's run state (?statusbar=1). */
+  setStatusRunning: (_running: boolean) => {},
   /** Mark the visible conversation as running (or idle). */
   setRunning(running: boolean, agentId: string | null = null) {
-    useChatStore.setState((s) =>
-      agentId
-        ? { agentWaiting: { ...s.agentWaiting, [agentId]: running } }
-        : { waiting: { ...s.waiting, [groupJid]: running } },
-    );
+    useChatStore.setState((s) => ({
+      agentWaiting: { ...s.agentWaiting, [agentId ?? FIRST]: running },
+    }));
   },
   setQueue(count: number, agentId: string | null = null, imageOnly = false) {
-    const chatJid = agentId ? `${groupJid}#agent:${agentId}` : groupJid;
+    const chatJid = `${groupJid}#agent:${agentId ?? FIRST}`;
     const items: QueuedFollowUp[] = Array.from({ length: count }, (_, i) => ({
       id: `q${i + 1}`,
       chat_jid: chatJid,
@@ -130,6 +150,33 @@ const harness = {
     }));
   },
   drafts: () => useChatStore.getState().drafts,
+  /** The server's `context_usage` push after a turn. */
+  pushContextUsage(data: Record<string, unknown>) {
+    (wsManager as unknown as { emit(t: string, d: unknown): void }).emit(
+      'context_usage',
+      { type: 'context_usage', chatJid: groupJid, agentId: FIRST, ...data },
+    );
+  },
+  /** Adds a message from this user to the first session. */
+  pushMessage(content: string) {
+    useChatStore.setState((s) => ({
+      agentMessages: {
+        ...s.agentMessages,
+        [FIRST]: [
+          ...(s.agentMessages[FIRST] ?? []),
+          {
+            id: `pushed-${Date.now()}`,
+            chat_jid: `${groupJid}#agent:${FIRST}`,
+            sender: userId,
+            sender_name: '测试用户',
+            content,
+            timestamp: new Date().toISOString(),
+            is_from_me: false,
+          } as Message,
+        ],
+      },
+    }));
+  },
 };
 
 const record = async (entry: SentRecord) => {
@@ -159,28 +206,30 @@ useChatStore.setState({
       kind: 'web',
       is_home: false,
       is_my_home: false,
-      can_modify: true,
+      can_modify: !readOnly,
       execution_mode: 'container',
       agent_profile_name: '测试智能体',
     },
   },
   currentGroup: groupJid,
-  messages: { [groupJid]: history(groupJid, 'main') },
-  waiting: {},
-  hasMore: { [groupJid]: false },
-  agents: { [groupJid]: [session('a1', '会话 A'), session('a2', '会话 B')] },
-  activeAgentTab: { [groupJid]: null },
+  agents: {
+    [groupJid]: [
+      session(FIRST, '会话 M'),
+      session('a1', '会话 A'),
+      session('a2', '会话 B'),
+    ],
+  },
+  activeAgentTab: { [groupJid]: FIRST },
   agentMessages: {
+    [FIRST]: startsEmpty ? [] : history(`${groupJid}#agent:${FIRST}`, FIRST),
     a1: history(`${groupJid}#agent:a1`, 'a1'),
     a2: history(`${groupJid}#agent:a2`, 'a2'),
   },
   agentWaiting: {},
   agentHasMore: {},
-  followUps: { [groupJid]: [] },
+  followUps: {},
   drafts: {},
   loading: false,
-  loadMessages: async () => undefined,
-  refreshMessages: async () => undefined,
   restoreActiveState: async () => undefined,
   loadAgents: async () => undefined,
   loadFollowUps: async () => undefined,
@@ -188,14 +237,15 @@ useChatStore.setState({
   hydrateAgentMessages: async () => undefined,
   refreshAgentMessages: async () => undefined,
   markChatRead: () => undefined,
-  sendMessage: async (_jid, content, attachments, mode) =>
-    record({ to: 'main', content, images: attachments?.length ?? 0, mode }),
   sendAgentMessage: async (_jid, agentId, content, attachments, mode) =>
     record({ to: agentId, content, images: attachments?.length ?? 0, mode }),
   interruptQuery: async (jid) => {
     harness.stops.push(jid);
-    const agentId = jid.includes('#agent:') ? jid.split('#agent:')[1] : null;
-    harness.setRunning(false, agentId);
+    harness.setRunning(false, jid.split('#agent:')[1]);
+    return true;
+  },
+  resetSession: async (jid, agentId) => {
+    harness.resets.push({ jid, agentId });
     return true;
   },
   actOnFollowUp: async (_chatJid, id, action, _runId, content) => {
@@ -220,13 +270,13 @@ useFileStore.setState({
 /** Switches sessions through `?agent=`, the way the sidebar does. */
 function SessionSwitcher() {
   const [, setSearchParams] = useSearchParams();
+  useVisualViewportVars(); // AppLayout publishes the keyboard vars in the app
   useEffect(() => {
     harness.switchTo = (id) =>
       setSearchParams(
         (prev) => {
           const next = new URLSearchParams(prev);
-          if (id) next.set('agent', id);
-          else next.delete('agent');
+          next.set('agent', id ?? FIRST);
           return next;
         },
         { replace: true },
@@ -235,12 +285,96 @@ function SessionSwitcher() {
   return null;
 }
 
+/**
+ * The composer over a stub list, as ChatView hosts it, with a status bar
+ * for the run. ChatView does not pass one yet.
+ */
+function BareComposer() {
+  const [running, setRunning] = useState(false);
+  useEffect(() => {
+    harness.setStatusRunning = setRunning;
+  }, []);
+  return (
+    <div
+      data-composer-dock-host
+      className="relative flex h-full min-w-0 flex-col overflow-x-hidden"
+    >
+      <div className="min-h-0 flex-1 overflow-y-auto px-4">
+        {askCards && (
+          <div className="mx-auto max-w-3xl pt-4">
+            <AskUserQuestionCard
+              toolUseId="ask-single"
+              questions={[
+                {
+                  question: '用哪个方案？',
+                  options: ['窄 selector', '宽 selector'],
+                },
+              ]}
+            />
+            <AskUserQuestionCard
+              toolUseId="ask-steps"
+              questions={[
+                { question: '周末去哪？', options: ['爬山', '看展', '在家'] },
+                {
+                  question: '带什么？',
+                  multiSelect: true,
+                  options: ['水', '相机', '伞', '充电宝'],
+                },
+                { question: '几点出发？', options: ['8 点', '10 点'] },
+              ]}
+            />
+          </div>
+        )}
+      </div>
+      <MessageInput
+        groupJid={groupJid}
+        onSend={(content) => record({ to: 'composer', content, images: 0 })}
+        isRunning={running}
+        onStop={() => {
+          setRunning(false);
+          return true;
+        }}
+        statusBar={<StatusProbe running={running} />}
+      />
+    </div>
+  );
+}
+
+/** Like RunStatusBar: pills while a run is active, nothing when idle. */
+function StatusProbe({ running }: { running: boolean }) {
+  if (!running) return null;
+  return (
+    <div
+      data-testid="status-bar-probe"
+      className="flex h-7 items-center justify-between rounded-full border border-surface-border px-3 text-caption"
+    >
+      <span>思考中</span>
+      <span>12s</span>
+    </div>
+  );
+}
+
+const params = new URLSearchParams(window.location.search);
+const askCards = params.get('ask') === '1';
+const bareComposer = params.get('statusbar') === '1' || askCards;
+
 createRoot(document.getElementById('root')!).render(
-  <MemoryRouter initialEntries={['/chat/e2e-composer']}>
+  <MemoryRouter initialEntries={[`/chat/e2e-composer?agent=${FIRST}`]}>
     <SessionSwitcher />
+    {/* showToast renders through the app's sonner Toaster. */}
+    <Toaster position="top-center" />
     <main className="h-[100dvh] overflow-hidden bg-background">
-      {/* onBack renders the phone header's back button. */}
-      <ChatView groupJid={groupJid} onBack={() => undefined} />
+      {bareComposer ? (
+        <BareComposer />
+      ) : (
+        // onBack renders the phone header's back button.
+        <ChatView
+          groupJid={groupJid}
+          onBack={() => {
+            harness.backs += 1;
+          }}
+        />
+      )}
     </main>
   </MemoryRouter>,
 );

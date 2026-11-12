@@ -155,6 +155,11 @@ export class ChannelTurnRuntime {
     return runtime;
   }
 
+  /** The run's status when this attempt opened it (terminal for skip_terminal). */
+  get openedStatus(): ChannelTurnRunStatus {
+    return this.initialStatus;
+  }
+
   get isClaimed(): boolean {
     return this.claim !== null && !this.terminal;
   }

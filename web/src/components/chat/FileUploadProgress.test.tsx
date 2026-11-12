@@ -6,14 +6,18 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 vi.mock('../../stores/chat', () => {
   const state = {
+    groups: {},
+    messages: {},
+    agentMessages: {},
     drafts: {},
     saveDraft: vi.fn(),
     clearDraft: vi.fn(),
   };
-  return {
-    useChatStore: (selector: (value: typeof state) => unknown) =>
-      selector(state),
-  };
+  const useChatStore = (selector: (value: typeof state) => unknown) =>
+    selector(state);
+  useChatStore.getState = () => state;
+  useChatStore.subscribe = () => () => undefined;
+  return { useChatStore };
 });
 
 vi.mock('../../hooks/useDisplayMode', () => ({

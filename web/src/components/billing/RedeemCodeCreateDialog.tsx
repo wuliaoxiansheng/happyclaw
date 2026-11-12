@@ -17,6 +17,7 @@ import {
 import { IconButton, SegmentedControl } from '@/components/common';
 import { SettingsField } from '@/components/settings/SettingsLayout';
 import { useBillingStore, type RedeemCode } from '../../stores/billing';
+import { copyToClipboard } from '../../utils/clipboard';
 import { useCurrency } from './utils';
 
 interface RedeemCodeCreateDialogProps {
@@ -112,14 +113,14 @@ export default function RedeemCodeCreateDialog({
   };
 
   const handleCopy = (code: string, idx: number) => {
-    navigator.clipboard.writeText(code);
+    copyToClipboard(code);
     setCopiedIdx(idx);
     setTimeout(() => setCopiedIdx(null), 2000);
   };
 
   const handleCopyAll = () => {
     const text = generatedCodes.map((c) => c.code).join('\n');
-    navigator.clipboard.writeText(text);
+    copyToClipboard(text);
     setCopiedIdx(-1);
     setTimeout(() => setCopiedIdx(null), 2000);
   };

@@ -7,7 +7,11 @@ import { pathToFileURL } from 'node:url';
 import { afterAll, describe, expect, test } from 'vitest';
 
 import { createMcpTools } from '../container/agent-runner/src/mcp-tools.js';
-import { RUNNER_DISALLOWED_BUILTIN_TOOLS } from '../container/agent-runner/src/builtin-tool-policy.js';
+import {
+  RUNNER_DISALLOWED_BUILTIN_TOOLS,
+  runnerCanUseTool,
+} from '../container/agent-runner/src/builtin-tool-policy.js';
+import { buildClaudeRuntimeEnv } from '../container/agent-runner/src/claude-runtime-env.js';
 import { hasBackgroundTaskTools } from '../container/agent-runner/src/prompt-plan.js';
 
 const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-tool-init-'));
@@ -34,11 +38,7 @@ function cleanEnv(): Record<string, string> {
 
 function toolNames(
   isHome: boolean,
-  options: {
-    isScheduledTask?: boolean;
-    currentTaskId?: string | null;
-    agentBuilderEnabled?: boolean;
-  } = {},
+  options: { agentBuilderEnabled?: boolean } = {},
 ): string[] {
   return createMcpTools({
     chatJid: 'web:tool-init',
@@ -46,8 +46,6 @@ function toolNames(
     isHome,
     isAdminHome: true,
     agentBuilderEnabled: options.agentBuilderEnabled ?? isHome,
-    isScheduledTask: options.isScheduledTask ?? false,
-    currentTaskId: options.currentTaskId ?? null,
     currentInputTurnId: 'turn-1',
     workspaceIpc: '/tmp/tool-init-ipc',
     workspaceGroup: '/tmp/tool-init-group',
@@ -121,7 +119,7 @@ describe('HappyClaw tool initialization', () => {
     const names = toolNames(true);
     expect(names).toEqual(
       expect.arrayContaining([
-        'schedule_task',
+        'automation_create',
         'install_skill',
         'workspace_memory_search',
         'workspace_memory_get',
@@ -147,7 +145,7 @@ describe('HappyClaw tool initialization', () => {
 
   test('custom Agent runtime keeps ordinary tools but does not advertise Agent Builder', () => {
     const names = toolNames(false, { agentBuilderEnabled: false });
-    expect(names).toContain('schedule_task');
+    expect(names).toContain('automation_create');
     expect(names).toEqual(
       expect.arrayContaining([
         'workspace_memory_search',
@@ -161,28 +159,6 @@ describe('HappyClaw tool initialization', () => {
     expect(names).not.toContain('agent_profile_prepare');
   });
 
-  test('home tool registration stays stable across scheduled and human turns', () => {
-    expect(toolNames(true, { isScheduledTask: true })).toContain(
-      'agent_profile_prepare',
-    );
-    expect(
-      toolNames(true, { currentTaskId: 'scheduled-group-task' }),
-    ).toContain('agent_profile_publish');
-  });
-
-  test('scheduled and task-triggered turns expose Workspace Memory read-only', () => {
-    for (const names of [
-      toolNames(false, { isScheduledTask: true }),
-      toolNames(false, { currentTaskId: 'scheduled-group-task' }),
-    ]) {
-      expect(names).toContain('workspace_memory_search');
-      expect(names).toContain('workspace_memory_get');
-      expect(names).not.toContain('workspace_memory_remember');
-      expect(names).not.toContain('workspace_memory_update');
-      expect(names).not.toContain('workspace_memory_forget');
-    }
-  });
-
   test('real Claude CLI initializes unrestricted builtins and Agent Builder tools', async () => {
     const tools = createMcpTools({
       chatJid: 'web:tool-init-real',
@@ -190,8 +166,6 @@ describe('HappyClaw tool initialization', () => {
       isHome: true,
       isAdminHome: true,
       agentBuilderEnabled: true,
-      isScheduledTask: false,
-      currentTaskId: null,
       currentInputTurnId: 'turn-real',
       workspaceIpc: path.join(cwd, 'ipc'),
       workspaceGroup: cwd,
@@ -238,6 +212,10 @@ describe('HappyClaw tool initialization', () => {
         'Task',
         'mcp__happyclaw__agent_profile_prepare',
         'mcp__happyclaw__agent_profile_publish',
+        // Strict object schemas are accepted by the real CLI.
+        'mcp__happyclaw__automation_create',
+        'mcp__happyclaw__automation_update',
+        'mcp__happyclaw__automation_list',
       ]),
     );
   }, 20_000);
@@ -276,16 +254,28 @@ describe('HappyClaw tool initialization', () => {
     expect(hasBackgroundTaskTools(initializedTools ?? [])).toBe(true);
   }, 20_000);
 
-  test('the runner deny list names real CLI tools and keeps Workflow', async () => {
-    const initTools = async (disallowedTools: string[]) => {
+  test('the runner deny list names real CLI tools and keeps Workflow and AskUserQuestion, and its environment drops native cron', async () => {
+    const initTools = async (
+      disallowedTools: string[],
+      runtimeEnv: Record<string, string> = {},
+    ) => {
       const stream = runnerSdk.query({
-        prompt: 'Reply with OK.',
+        // canUseTool needs streaming input, as the runner uses.
+        prompt: (async function* () {
+          yield {
+            type: 'user' as const,
+            message: { role: 'user' as const, content: 'Reply with OK.' },
+            parent_tool_use_id: null,
+            session_id: '',
+          };
+        })(),
         options: {
           pathToClaudeCodeExecutable: runnerClaudeExecutable,
           cwd,
           model: 'claude-sonnet-4-5-20250929',
           env: {
             ...cleanEnv(),
+            ...runtimeEnv,
             ANTHROPIC_BASE_URL: 'http://127.0.0.1:9',
             ANTHROPIC_AUTH_TOKEN: 'happyclaw-init-test',
             ANTHROPIC_API_KEY: '',
@@ -295,6 +285,7 @@ describe('HappyClaw tool initialization', () => {
           disallowedTools,
           permissionMode: 'bypassPermissions',
           allowDangerouslySkipPermissions: true,
+          canUseTool: runnerCanUseTool,
           settingSources: [],
         },
       });
@@ -307,7 +298,8 @@ describe('HappyClaw tool initialization', () => {
       return [];
     };
     // A deny list naming tools the CLI no longer ships would silently stop
-    // applying, so every entry must exist without it.
+    // applying, so every entry must exist without it (with the runner's
+    // permission handler, which is what registers the plan-mode tools).
     const unrestricted = await initTools([]);
     expect(unrestricted).toEqual(
       expect.arrayContaining([...RUNNER_DISALLOWED_BUILTIN_TOOLS]),
@@ -317,5 +309,14 @@ describe('HappyClaw tool initialization', () => {
       expect(restricted).not.toContain(tool);
     }
     expect(restricted).toContain('Workflow');
+    // Registered only because the runner answers permission requests.
+    expect(restricted).toContain('AskUserQuestion');
+    // The runner's environment also turns off the CLI's own cron
+    // (CLAUDE_CODE_DISABLE_CRON), which the deny list alone would leave on.
+    const runnerEnvTools = await initTools([], buildClaudeRuntimeEnv({}));
+    expect(runnerEnvTools.length).toBeGreaterThan(0);
+    expect(runnerEnvTools.filter((tool) => tool.startsWith('Cron'))).toEqual(
+      [],
+    );
   }, 30_000);
 });

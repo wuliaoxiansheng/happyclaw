@@ -1,20 +1,19 @@
 import type { InteractionMode, ProcessVisibility } from './types.js';
 import type { StreamEvent } from './stream-event.types.js';
 
-export type PublicAgentKind = 'main' | 'conversation' | 'spawn';
+export type PublicAgentKind = 'conversation' | 'spawn';
 
 /**
  * Workspace interaction mode applies only to public, user-facing Agent loops.
- * Scheduled work and fire-and-forget spawn Agents retain the legacy contract.
+ * Fire-and-forget spawn Agents retain the legacy contract.
  */
 export function resolveRuntimeInteractionMode(
   workspaceMode: InteractionMode | null | undefined,
   input: {
     agentKind: PublicAgentKind;
-    scheduledTask?: boolean;
   },
 ): InteractionMode {
-  if (input.scheduledTask || input.agentKind === 'spawn') return 'assistant';
+  if (input.agentKind === 'spawn') return 'assistant';
   return workspaceMode === 'proactive' ? 'proactive' : 'assistant';
 }
 
@@ -115,12 +114,11 @@ export interface FrozenIpcInteractionMode {
  * IPC delivery must use the contract frozen by the runner when the file was
  * written. A later workspace setting change cannot reinterpret an old side
  * effect. Missing values are legacy assistant payloads; malformed values fail
- * validation. Scheduled and spawn outputs are always assistant semantics.
+ * validation. Spawn outputs are always assistant semantics.
  */
 export function resolveFrozenIpcInteractionMode(
   value: unknown,
   input: {
-    scheduledTask: boolean;
     spawnAgent: boolean;
   },
 ): FrozenIpcInteractionMode {
@@ -133,7 +131,7 @@ export function resolveFrozenIpcInteractionMode(
   const payloadMode: InteractionMode =
     value === 'proactive' || value === 'persona' ? 'proactive' : 'assistant';
   return {
-    mode: input.scheduledTask || input.spawnAgent ? 'assistant' : payloadMode,
+    mode: input.spawnAgent ? 'assistant' : payloadMode,
     valid,
     legacyDefaulted,
   };
@@ -181,6 +179,40 @@ const MESSAGE_DELIVERY_TOOL_NAMES: ReadonlySet<string> = new Set([
   'mcp__happyclaw__send_message',
 ]);
 
+/**
+ * Tools whose structured result is a workspace-memory receipt (`{ result, id, title }`)
+ * rather than arbitrary tool output or model prose.
+ */
+export const MEMORY_WRITE_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'mcp__happyclaw__workspace_memory_remember',
+  'mcp__happyclaw__workspace_memory_update',
+]);
+
+/**
+ * The ids of memory write calls seen starting, newest last. A tool's result
+ * does not name its tool, only its call, so this is how a result is known to
+ * be a memory receipt: what any other tool returned, whatever it looks like,
+ * is withheld. Call ids are unique, so one bounded set serves every run.
+ */
+const memoryWriteCalls = new Set<string>();
+const MAX_MEMORY_WRITE_CALLS = 256;
+
+function noteMemoryWriteCall(event: StreamEvent): void {
+  if (
+    event.eventType !== 'tool_use_start' ||
+    !event.toolUseId ||
+    !isMemoryWriteTool(event.toolName) ||
+    memoryWriteCalls.has(event.toolUseId)
+  ) {
+    return;
+  }
+  if (memoryWriteCalls.size >= MAX_MEMORY_WRITE_CALLS) {
+    const oldest = memoryWriteCalls.values().next().value;
+    if (oldest !== undefined) memoryWriteCalls.delete(oldest);
+  }
+  memoryWriteCalls.add(event.toolUseId);
+}
+
 function isLifecycleStatus(statusText: string | null | undefined): boolean {
   return statusText != null && LIFECYCLE_STATUS_TEXTS.has(statusText);
 }
@@ -188,6 +220,17 @@ function isLifecycleStatus(statusText: string | null | undefined): boolean {
 /** Whether `toolName` is the tool a proactive Agent speaks to the user through. */
 export function isMessageDeliveryTool(toolName: string | undefined): boolean {
   return !!toolName && MESSAGE_DELIVERY_TOOL_NAMES.has(toolName);
+}
+
+/** Whether `toolName` is a workspace memory write tool that leaves a receipt. */
+export function isMemoryWriteTool(toolName: string | undefined): boolean {
+  return !!toolName && MEMORY_WRITE_TOOL_NAMES.has(toolName);
+}
+
+function keepsMemoryWriteReceipt(event: StreamEvent): boolean {
+  if (event.eventType !== 'tool_result' || event.toolIsError) return false;
+  if (event.toolName) return isMemoryWriteTool(event.toolName);
+  return !!event.toolUseId && memoryWriteCalls.has(event.toolUseId);
 }
 
 /**
@@ -206,8 +249,11 @@ function withoutModelText(event: StreamEvent): StreamEvent {
     }
   };
   // What a tool returned, what a sub-agent finally answered and the questions
-  // an AskUserQuestion call would put to the user.
-  drop('toolResult');
+  // an AskUserQuestion call would put to the user. Memory write receipts stay
+  // so `memoryReceipts(steps)` can link to the written/proposed item.
+  if (!keepsMemoryWriteReceipt(event)) {
+    drop('toolResult');
+  }
   drop('taskResult');
   drop('toolInput');
   // How much a tool did (lines, files, exit code) is read from the same
@@ -250,14 +296,17 @@ function withoutModelText(event: StreamEvent): StreamEvent {
  *   `full` also streams the main Agent's and sub-Agents' reasoning summary and
  *   the narration the model wrote before a tool call (`commentary`, which the
  *   host composes from the Runner's text_delta; see process-commentary.ts).
+ *   A progress statement the Agent sent the user in a Web turn (a
+ *   `commentary` marked `progress`) shows at every level, but only the host
+ *   writes one (projectProgressForWeb): here the mark is dropped.
  * - Never, at any level: text_delta itself (the model's own answer text, which
  *   reaches the user only through send_message), usage, memory_recall,
  *   prompt_suggestion, raw_sdk_event, notification and unknown event types.
  *
  * Status events in this stream are written by the SDK, the Runner or the host,
- * never by the model (model-authored progress text is announced by
- * TurnOutputCoordinator, which does not pass through here), so beyond the
- * lifecycle ones they are plain phase information and follow `activity`.
+ * never by the model (a proactive turn's progress statement is a `commentary`),
+ * so beyond the lifecycle ones they are plain phase information and follow
+ * `activity`.
  *
  * `context_audit` passes through at every level: broadcastStreamEvent records
  * it for the Agent's context explainability and never forwards it to a
@@ -269,11 +318,19 @@ export function projectSdkStreamEventForWeb(
   event: StreamEvent,
 ): StreamEvent | null {
   if (mode === 'assistant') return event;
+  noteMemoryWriteCall(event);
   const type = event.eventType;
   if (type === 'context_audit') return event;
   if (type === 'status') {
     if (isLifecycleStatus(event.statusText)) return event;
     return visibility === 'hidden' ? null : event;
+  }
+  // Only the host writes a progress statement (projectProgressForWeb, which
+  // does not come through here). A Runner event that claims to be one is
+  // narration like any other.
+  if (type === 'commentary' && event.progress !== undefined) {
+    const { progress: _progress, ...narration } = event;
+    event = narration;
   }
   if (visibility === 'hidden') return null;
   // The reasoning summary and the narration before a tool call (written by the
@@ -285,47 +342,82 @@ export function projectSdkStreamEventForWeb(
   return withoutModelText(event);
 }
 
-/**
- * The status line announcing a progress statement the Agent wrote
- * (`send_message` with `delivery_role=progress`), or null when the Workspace
- * keeps its process private.
- *
- * Unlike the status events the SDK, the Runner and the host write, this one
- * carries the model's own sentence. It therefore goes through the same gate as
- * every other event instead of relying on the output router never staging
- * progress for a proactive Workspace, which would silently stop being true the
- * day that router changes. And because `activity` promises the structure of
- * the work without any text the model produced, a proactive Workspace shows the
- * sentence only at `full`, the level that shows the model's reasoning too.
- */
-export function projectProgressStatusForWeb(
-  mode: InteractionMode,
-  visibility: ProcessVisibility,
-  text: string,
-  turn: { turnId?: string; sessionId?: string },
-): StreamEvent | null {
-  if (mode === 'proactive' && visibility !== 'full') return null;
-  return projectSdkStreamEventForWeb(mode, visibility, {
-    eventType: 'status',
-    agentScope: 'system',
-    statusText: text.slice(0, 160),
-    summary: text.slice(0, 500),
-    isSynthetic: true,
-    displayLevel: 'primary',
-    turnId: turn.turnId,
-    sessionId: turn.sessionId,
-  });
-}
+/** Most of a progress statement kept on its step, as for narration. */
+const MAX_PROGRESS_CHARS = 4000;
 
 /**
- * Whether the Web is told about sub-agent task lifecycle (agent_status) so its
- * Task tabs match the task events it receives.
+ * What a progress statement the Agent wrote becomes once its own turn takes
+ * it in (`send_message` with `delivery_role=progress`, staged by the output
+ * router): `step` is the commentary the turn's trace records (the tracker
+ * applies the Workspace's limits), `web` the events the Web is sent now.
+ *
+ * An Assistant turn shows the statement as a commentary step and as the run's
+ * status line. A proactive turn shows it as a commentary step marked
+ * `progress` at every process visibility: it is the Agent speaking to the
+ * user, not detail of the process, and the Web folds it into the process once
+ * the final lands.
+ *
+ * `turn.turnId` is the id the turn's Runner events carry (a warm turn's own,
+ * not its input's): the Web starts a new card on a change of it, so a
+ * proactive step carries the same one to land on the card it belongs to.
  */
-export function shouldBroadcastTaskAgentStatus(
+export function projectProgressForWeb(
   mode: InteractionMode,
-  visibility: ProcessVisibility,
-): boolean {
-  return mode === 'assistant' || visibility !== 'hidden';
+  text: string,
+  turn: { inputTurnId: string; turnId?: string; sessionId?: string },
+): { step: StreamEvent; web: StreamEvent[] } {
+  const step: StreamEvent = {
+    eventType: 'commentary',
+    agentScope: 'main',
+    text: text.slice(0, MAX_PROGRESS_CHARS),
+    // An Assistant turn keeps the input's id it always had.
+    turnId:
+      mode === 'proactive'
+        ? (turn.turnId ?? turn.inputTurnId)
+        : turn.inputTurnId,
+    inputTurnId: turn.inputTurnId,
+    sessionId: turn.sessionId,
+    ...(mode === 'proactive' ? { progress: true } : {}),
+  };
+  if (mode === 'proactive') return { step, web: [step] };
+  // An Assistant turn shows everything (the gate passes it unchanged).
+  return {
+    step,
+    web: [
+      step,
+      {
+        eventType: 'status',
+        agentScope: 'system',
+        statusText: text.slice(0, 160),
+        summary: text.slice(0, 500),
+        isSynthetic: true,
+        displayLevel: 'primary',
+        turnId: step.turnId,
+        inputTurnId: turn.inputTurnId,
+        sessionId: turn.sessionId,
+      },
+    ],
+  };
+}
+
+/** How a proactive turn that sent progress ended without a reply. */
+export type ProactiveTurnEnding = 'stopped' | 'steered' | 'failed';
+
+/**
+ * The reply a proactive Web turn that sent progress is given when it ends
+ * without one of its own: the turn's process, with that progress, hangs on it
+ * as on any reply, so the progress stays with the turn after a refresh (an IM
+ * turn's progress is a message of its own already).
+ */
+export function proactiveClosingNote(ending: ProactiveTurnEnding): string {
+  switch (ending) {
+    case 'stopped':
+      return '已停止。';
+    case 'steered':
+      return '已转向新的消息。';
+    case 'failed':
+      return '⚠️ 本轮在给出最终回复前中断，已发出的进展在“处理过程”里。';
+  }
 }
 
 export const PROACTIVE_TAIL_INTERRUPTION_NOTICE =

@@ -1,3 +1,8 @@
+import {
+  isOwnerProfileOwnerInput,
+  OWNER_PROFILE_TRUSTED_CLAIM_SOURCES,
+  type AgentBuilderPersistedInput,
+} from './agent-builder-turn-auth.js';
 import type { WorkspaceMemoryActor } from './memory-service.js';
 import type { WorkspaceMemorySourceType } from './memory-store.js';
 
@@ -18,6 +23,8 @@ export interface WorkspaceMemoryAuthoritativePrincipal {
     sessionId?: string | null;
     observedAt?: string | null;
   };
+  /** The turn only proposes: it may revise proposals, nothing else. */
+  proposal?: boolean;
 }
 
 const MUTATIONS = new Set<WorkspaceMemoryIpcOperation>([
@@ -39,14 +46,89 @@ const UPDATE_FIELDS = [
   'expiresAt',
 ] as const;
 
+export function isWorkspaceMemoryMutation(
+  operation: string | undefined,
+): boolean {
+  return MUTATIONS.has(operation as WorkspaceMemoryIpcOperation);
+}
+
+/**
+ * The IM ids the workspace's own registrations on `provider` vouch for as
+ * the owner: chats the owner registered whose owner was recorded by the host
+ * (configured, a trusted direct chat, or the Feishu API), never by a claim
+ * any group member could make.
+ */
+interface WorkspaceRegistration {
+  created_by?: string;
+  owner_im_id?: string;
+  owner_claim_source?: string;
+}
+
+interface WorkspaceOwnerLookup {
+  ownerUserId: string;
+  /** Every chat JID registered to the workspace folder. */
+  workspaceJids: readonly string[];
+  channelType: (jid: string) => string | null;
+  registration: (jid: string) => WorkspaceRegistration | undefined;
+}
+
+export function workspaceOwnerImIds(
+  input: WorkspaceOwnerLookup & { provider: string },
+): string[] {
+  const ids = new Set<string>();
+  for (const jid of input.workspaceJids) {
+    if (input.channelType(jid) !== input.provider) continue;
+    const row = input.registration(jid);
+    if (
+      row?.created_by === input.ownerUserId &&
+      row.owner_im_id &&
+      row.owner_claim_source &&
+      OWNER_PROFILE_TRUSTED_CLAIM_SOURCES.includes(row.owner_claim_source)
+    ) {
+      ids.add(row.owner_im_id);
+    }
+  }
+  return [...ids];
+}
+
+/**
+ * Whether the active batch is the owner's alone: `requireActiveOwnerTurn`
+ * throws unless every input in it is a human message `isOwnerInput` accepts.
+ * A Web input is the owner's by user id; an IM input by the sender's IM id.
+ * Only such a turn writes memory directly; any other turn (a group member's,
+ * a batch with anyone but the owner in it, an automation run) only proposes,
+ * and the owner confirms or rejects the proposal on the Memory page.
+ */
+export function isWorkspaceMemoryOwnerTurn(
+  input: WorkspaceOwnerLookup & {
+    requireActiveOwnerTurn: (
+      isOwnerInput: (persisted: AgentBuilderPersistedInput) => boolean,
+    ) => unknown;
+  },
+): boolean {
+  try {
+    input.requireActiveOwnerTurn((persisted) =>
+      isOwnerProfileOwnerInput(
+        persisted,
+        input.ownerUserId,
+        input.registration,
+        (provider) => workspaceOwnerImIds({ ...input, provider }),
+      ),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function workspaceMemoryWriteRejection(input: {
   operation: string | undefined;
-  hostTurnKind: 'interactive' | 'scheduled' | 'unknown';
+  hostTurnKind: 'interactive' | 'automation' | 'unknown';
   runtimeAgentId: string | null;
   runtimeAgentKind: 'task' | 'conversation' | 'spawn' | null;
   capabilityValid: boolean;
 }): { code: string; error: string } | null {
-  if (!MUTATIONS.has(input.operation as WorkspaceMemoryIpcOperation)) {
+  if (!isWorkspaceMemoryMutation(input.operation)) {
     return null;
   }
   if (input.runtimeAgentId && input.runtimeAgentKind !== 'conversation') {
@@ -56,18 +138,13 @@ export function workspaceMemoryWriteRejection(input: {
         'Spawned and task Agents have read-only Workspace Memory access; return candidate learnings to an interactive conversation session.',
     };
   }
-  if (input.hostTurnKind === 'scheduled') {
-    return {
-      code: 'scheduled_memory_read_only',
-      error:
-        'Scheduled runs currently have read-only Workspace Memory access; return candidate learnings to an interactive top-level session.',
-    };
-  }
-  if (input.hostTurnKind !== 'interactive') {
+  if (
+    input.hostTurnKind !== 'interactive' &&
+    input.hostTurnKind !== 'automation'
+  ) {
     return {
       code: 'workspace_memory_no_active_turn',
-      error:
-        'Workspace Memory mutations require a host-admitted active interactive turn.',
+      error: 'Workspace Memory mutations require a host-admitted active turn.',
     };
   }
   if (!input.capabilityValid) {
@@ -109,5 +186,6 @@ export function buildWorkspaceMemoryUpdateInput(
     workspaceJid: principal.workspaceJid,
     sourceType: principal.sourceType,
     provenance: principal.provenance,
+    proposal: principal.proposal === true,
   };
 }

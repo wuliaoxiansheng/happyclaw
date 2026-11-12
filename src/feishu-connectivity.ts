@@ -4,9 +4,13 @@
 //  - appId 格式对但凭据错配(复制错应用、appSecret 被废),schema 挡不住,只能靠
 //    实际 API 响应识别。
 // 飞书 token API 失败时返回非零 code + msg,我们把 code/msg 透传给前端做提示。
+// Lark(国际版)账号的 token 接口在 open.larksuite.com,按品牌取 host。
 
-const FEISHU_TENANT_TOKEN_ENDPOINT =
-  'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal';
+import { feishuOpenBaseUrl, type FeishuBrand } from './feishu-domain.js';
+
+function tenantTokenEndpoint(brand: FeishuBrand): string {
+  return `${feishuOpenBaseUrl(brand)}/open-apis/auth/v3/tenant_access_token/internal`;
+}
 
 export interface FeishuConnectivityResult {
   ok: boolean;
@@ -17,10 +21,11 @@ export interface FeishuConnectivityResult {
 export async function testFeishuCredentials(
   appId: string,
   appSecret: string,
-  options: { timeoutMs?: number; endpoint?: string } = {},
+  options: { timeoutMs?: number; endpoint?: string; brand?: FeishuBrand } = {},
 ): Promise<FeishuConnectivityResult> {
   const timeoutMs = options.timeoutMs ?? 8000;
-  const endpoint = options.endpoint ?? FEISHU_TENANT_TOKEN_ENDPOINT;
+  const endpoint =
+    options.endpoint ?? tenantTokenEndpoint(options.brand ?? 'feishu');
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -40,9 +45,11 @@ export async function testFeishuCredentials(
       };
     }
 
-    const data = (await res.json().catch(() => null)) as
-      | { code?: number; msg?: string; tenant_access_token?: string }
-      | null;
+    const data = (await res.json().catch(() => null)) as {
+      code?: number;
+      msg?: string;
+      tenant_access_token?: string;
+    } | null;
 
     if (!data) {
       return { ok: false, errorMessage: 'Feishu API returned non-JSON body' };

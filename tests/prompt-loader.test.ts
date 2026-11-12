@@ -16,7 +16,6 @@ const REQUIRED_FILES = [
   'interaction.md',
   'output.assistant.md',
   'output.proactive.md',
-  'output.task.md',
   'web-fetch.md',
   'background-tasks.md',
   'delivery-contract.assistant.md',
@@ -107,8 +106,9 @@ describe('prompts/ files', () => {
       'workspace is the only durable continuity boundary',
     );
     expect(workspaceMemory).toContain(
-      'Scheduled/task runs and sub-agents are read-only',
+      'a write is saved as a proposal that the owner confirms or rejects',
     );
+    expect(workspaceMemory).toContain('Sub-agents are read-only');
   });
 
   test('built-in HappyClaw identity and one-shot owner bootstrap are explicit', () => {
@@ -148,10 +148,6 @@ describe('prompts/ files', () => {
       path.join(PROMPTS_DIR, 'output.proactive.md'),
       'utf-8',
     );
-    const taskOutput = fs.readFileSync(
-      path.join(PROMPTS_DIR, 'output.task.md'),
-      'utf-8',
-    );
     expect(assistant).toContain('Assistant reply mode');
     expect(assistant).toContain('automatically publishes');
     expect(proactive).toContain('Proactive reply mode');
@@ -169,11 +165,6 @@ describe('prompts/ files', () => {
       '<!--HAPPYCLAW_PROACTIVE_FINAL_DELIVERED-->',
     );
     expect(proactiveOutput).not.toContain('最终回复必须自包含');
-    expect(taskOutput).toContain(
-      '最终 SDK Assistant 文本会自动作为正式任务结果归档',
-    );
-    expect(taskOutput).toContain('完整、可独立阅读的业务结果');
-    expect(taskOutput).toContain('`feishu-cli` 等其他工具');
     for (const delivery of [assistant, proactive]) {
       expect(delivery).toContain('not an identity or personality instruction');
       expect(delivery).not.toContain('person-like');
@@ -189,15 +180,11 @@ describe('rules that must survive prompt-variant splits', () => {
     fs.readFileSync(path.join(PROMPTS_DIR, name), 'utf-8');
 
   test('every output variant forbids absolute image paths', () => {
-    // Splitting output.md into three mutually exclusive variants left this
-    // rule in the assistant one only, so tasks and proactive turns emitted
+    // Splitting output.md into mutually exclusive variants once left this
+    // rule in the assistant one only, so proactive turns emitted
     // /workspace/... references that render as broken images. The rule has to
     // hold wherever an agent can write Markdown, not just in one variant.
-    for (const name of [
-      'output.assistant.md',
-      'output.proactive.md',
-      'output.task.md',
-    ]) {
+    for (const name of ['output.assistant.md', 'output.proactive.md']) {
       const body = readPrompt(name);
       expect(body, `${name} must forbid absolute image paths`).toContain(
         '绝对路径',
@@ -222,16 +209,24 @@ describe('rules that must survive prompt-variant splits', () => {
         `${name} must forbid target-id guessing`,
       ).toMatch(/never guess or rewrite the target id/i);
     }
-    // Task runs get no delivery contract — output.task.md carries the rule.
-    expect(readPrompt('output.task.md')).toContain('不要猜测或改写目标 ID');
+  });
+
+  test('prompts name automations, not the removed scheduled tasks', () => {
+    // Automation runs are ordinary turns: they get the same output and
+    // delivery prompts as any other turn, so no task-only variant remains.
+    expect(fs.existsSync(path.join(PROMPTS_DIR, 'output.task.md'))).toBe(false);
+    for (const name of fs.readdirSync(PROMPTS_DIR)) {
+      if (!name.endsWith('.md')) continue;
+      const body = readPrompt(name);
+      expect(body, name).not.toContain('schedule_task');
+      expect(body, name).not.toContain('定时任务');
+      expect(body, name).not.toMatch(/scheduled (run|task)/i);
+    }
+    expect(readPrompt('identity.happyclaw.md')).toContain('automation_*');
   });
 
   test('every output variant separates image inspection from delivery', () => {
-    for (const name of [
-      'output.assistant.md',
-      'output.proactive.md',
-      'output.task.md',
-    ]) {
+    for (const name of ['output.assistant.md', 'output.proactive.md']) {
       const body = readPrompt(name);
       expect(body).toContain('`Read` 图片只让模型看到图片');
       expect(body).toContain('`[image]`');
@@ -250,7 +245,6 @@ describe('rules that must survive prompt-variant splits', () => {
     expect(readPrompt('output.proactive.md')).toContain(
       '`send_message(delivery_role=final)` 正文',
     );
-    expect(readPrompt('output.task.md')).toContain('最终 SDK Assistant 正文');
     const delivery = readPrompt('delivery-contract.assistant.md');
     expect(delivery).toContain('workspace-relative Markdown image');
     expect(delivery).toContain('its `[image]` tool result does not publish');

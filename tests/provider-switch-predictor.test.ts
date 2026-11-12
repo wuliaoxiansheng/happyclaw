@@ -1,16 +1,18 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
-// container-runner.willClearSessionOnProviderSwitch reads enabled providers,
-// the group env override, and the balancing config from runtime-config, the
-// sticky binding from db, and provider health from the shared providerPool
-// singleton. We mock the config/db reads and drive the real pool's health so
-// the test exercises the actual decision branches.
+// willClearSessionOnProviderSwitch reads the connections and the Workspace
+// environment from runtime-config, and the session's bound connection and
+// model from db. Both are mocked so the real decision runs.
 
 const mocks = vi.hoisted(() => ({
-  enabledProviders: [] as Array<{
+  providers: [] as Array<{
     id: string;
-    enabled: boolean;
-    weight: number;
+    type: 'third_party';
+    anthropicBaseUrl: string;
+    anthropicModel: string;
+    anthropicAuthToken: string;
+    models?: Array<{ id: string }>;
+    customEnv: Record<string, string>;
   }>,
   envOverride: {} as {
     anthropicApiKey?: string;
@@ -18,7 +20,7 @@ const mocks = vi.hoisted(() => ({
     anthropicBaseUrl?: string;
   },
   boundId: undefined as string | undefined,
-  strategy: 'failover' as 'round-robin' | 'weighted-round-robin' | 'failover',
+  sessionModel: null as string | null,
 }));
 
 vi.mock('../src/logger.js', () => ({
@@ -31,13 +33,8 @@ vi.mock('../src/runtime-config.js', async () => {
   >('../src/runtime-config.js');
   return {
     ...actual,
-    getEnabledProviders: () => mocks.enabledProviders,
+    getProviders: () => mocks.providers,
     getContainerEnvConfig: () => mocks.envOverride,
-    getBalancingConfig: () => ({
-      strategy: mocks.strategy,
-      unhealthyThreshold: 3,
-      recoveryIntervalMs: 300_000,
-    }),
   };
 });
 
@@ -47,138 +44,88 @@ vi.mock('../src/db.js', async () => {
   return {
     ...actual,
     getSessionProviderId: () => mocks.boundId,
+    getSessionModel: () => mocks.sessionModel,
+    getSession: () => (mocks.boundId ? 'sdk-session' : undefined),
+    getSessionModelSelection: () => null,
+    getSessionModelSelectionDetail: () => null,
   };
 });
 
 const { willClearSessionOnProviderSwitch } =
   await import('../src/container-runner.ts');
-const { providerPool } = await import('../src/provider-pool.ts');
 
 function setProviders(...ids: string[]) {
-  mocks.enabledProviders = ids.map((id) => ({ id, enabled: true, weight: 1 }));
-  providerPool.refreshFromConfig(mocks.enabledProviders, {
-    strategy: mocks.strategy,
-    unhealthyThreshold: 3,
-    recoveryIntervalMs: 300_000,
-  });
-  for (const id of ids) providerPool.resetHealth(id);
+  mocks.providers = ids.map((id) => ({
+    id,
+    type: 'third_party',
+    anthropicBaseUrl: `https://${id}.example`,
+    anthropicModel: `${id}-model`,
+    anthropicAuthToken: `${id}-token`,
+    models: [{ id: `${id}-model` }, { id: `${id}-other` }],
+    customEnv: {},
+  }));
 }
 
 beforeEach(() => {
-  mocks.enabledProviders = [];
+  setProviders('A', 'B');
   mocks.envOverride = {};
   mocks.boundId = undefined;
-  // Stickiness is a property of the failover strategy. The round-robin
-  // strategies rotate on every request, so they are asserted separately.
-  mocks.strategy = 'failover';
+  mocks.sessionModel = null;
 });
 
 /**
- * Story (PR #549, ACCEPTANCE #3): a proactive provider switch clears the SDK
- * session inside the runner, so the orchestration layer must inject recent
- * history beforehand. willClearSessionOnProviderSwitch is the trigger; it must
- * fire exactly when trySelectPoolProvider would set resetSession.
+ * A switch clears the SDK session inside the runner, so the orchestration
+ * layer injects recent history beforehand. The prediction must fire exactly
+ * when trySelectPoolProvider would set resetSession.
  */
 describe('willClearSessionOnProviderSwitch', () => {
-  test('false when there is no bound provider (fresh session)', () => {
-    setProviders('A', 'B');
-    mocks.boundId = undefined;
-    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
-  });
-
-  test('false when the bound provider is still healthy and enabled', () => {
-    setProviders('A', 'B');
-    mocks.boundId = 'A';
-    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
-  });
-
-  test('rotating strategies predict a switch even on a healthy binding', () => {
-    // round-robin/weighted-round-robin move accounts on every request, so the
-    // bound session will be cleared next turn and needs its history injected.
-    for (const strategy of ['round-robin', 'weighted-round-robin'] as const) {
-      mocks.strategy = strategy;
-      setProviders('A', 'B');
-      mocks.boundId = 'A';
-      expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
-    }
-  });
-
-  test('true when the bound provider is unhealthy (will switch away)', () => {
-    setProviders('A', 'B');
-    mocks.boundId = 'A';
-    providerPool.reportFailure('A', true); // force unhealthy immediately
-    expect(providerPool.getHealthStatus('A').healthy).toBe(false);
-    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
-  });
-
-  test('true when the bound provider was removed/disabled', () => {
-    setProviders('B', 'C'); // A no longer enabled
-    mocks.boundId = 'A';
-    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
-  });
-
-  test('false when an env-level override bypasses the pool entirely', () => {
-    setProviders('B', 'C');
-    mocks.boundId = 'A'; // would otherwise be a switch
-    mocks.envOverride = { anthropicApiKey: 'sk-xxx' };
-    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
-  });
-
-  test('false for a single enabled provider equal to the binding', () => {
-    setProviders('A');
-    mocks.boundId = 'A';
-    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
-  });
-
-  test('true for a single enabled provider different from the binding', () => {
-    setProviders('B');
-    mocks.boundId = 'A';
-    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
-  });
-
-  test('false when no providers are enabled', () => {
-    mocks.enabledProviders = [];
-    mocks.boundId = 'A';
-    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
-  });
-
-  test('uses the Agent model configuration instead of pool health', () => {
-    setProviders('A', 'B');
-    mocks.boundId = 'A';
-    providerPool.reportFailure('A', true);
-
+  test('false for a fresh session', () => {
     expect(willClearSessionOnProviderSwitch('grp', null, 'A')).toBe(false);
+  });
+
+  test('false when the session stays on its connection and model', () => {
+    mocks.boundId = 'A';
+    mocks.sessionModel = 'A-model';
+    expect(willClearSessionOnProviderSwitch('grp', null, 'A')).toBe(false);
+  });
+
+  test('true when the Agent now binds another connection', () => {
+    mocks.boundId = 'A';
     expect(willClearSessionOnProviderSwitch('grp', null, 'B')).toBe(true);
   });
 
-  test('multiple enabled configurations remain an automatic pool', () => {
-    setProviders('A', 'B');
+  test('true when the Agent runs another model of the same connection', () => {
     mocks.boundId = 'A';
-
-    // With no Agent-level modelConfigId, selection goes through the pool, which
-    // keeps a healthy sticky binding under failover.
-    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
-
-    // The pool still switches away — and clears — once the binding is unhealthy.
-    providerPool.reportFailure('A', true);
-    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
+    mocks.sessionModel = 'A-model';
+    expect(willClearSessionOnProviderSwitch('grp', null, 'A', 'A-other')).toBe(
+      true,
+    );
   });
 
-  test('a quarantine that outlived the recovery interval no longer predicts a switch', () => {
-    // Incident shape (2026-08-07 14:06): binding quarantined at 12:39, group
-    // idle for 87 minutes, next turn still read the stale unhealthy flag and
-    // cleared the session even though the 5-minute recovery had long expired.
-    vi.useFakeTimers();
-    try {
-      setProviders('A', 'B');
-      mocks.boundId = 'A';
-      providerPool.reportFailure('A', true);
-      expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
+  test('a window change alone is not a model change', () => {
+    mocks.boundId = 'A';
+    mocks.sessionModel = 'A-model[1m]';
+    expect(willClearSessionOnProviderSwitch('grp', null, 'A')).toBe(false);
+  });
 
-      vi.setSystemTime(Date.now() + 300_000 + 1);
-      expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
+  test('leaving a connection for the Workspace environment is a switch', () => {
+    mocks.boundId = 'A';
+    mocks.envOverride = { anthropicBaseUrl: 'https://own.example' };
+    expect(willClearSessionOnProviderSwitch('grp', null, null)).toBe(true);
+    mocks.boundId = undefined;
+    expect(willClearSessionOnProviderSwitch('grp', null, null)).toBe(false);
+  });
+
+  test('a launch that fails predicts nothing', () => {
+    mocks.boundId = 'A';
+    // Connections exist but nothing is bound: the launch fails.
+    expect(willClearSessionOnProviderSwitch('grp', null, null)).toBe(false);
+  });
+
+  test('a binding to a deleted connection fails the launch, not a switch', () => {
+    mocks.boundId = 'A';
+    mocks.sessionModel = 'A-model';
+    setProviders('A');
+    expect(willClearSessionOnProviderSwitch('grp', null, 'B')).toBe(false);
   });
 });

@@ -41,6 +41,7 @@ vi.mock('../src/config.js', async (importOriginal) => ({
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   AppType: { SelfBuild: 'SelfBuild' },
+  Domain: { Feishu: 0, Lark: 1 },
   LoggerLevel: { info: 'info' },
   defaultHttpInstance: { defaults: { timeout: 0 } },
   Client: class {
@@ -109,6 +110,8 @@ const {
 } = await import('../src/channel-reliability-store.js');
 const { deliverChannelOutboxItem } =
   await import('../src/channel-outbox-delivery.js');
+const { resolveFeishuConversationPlan } =
+  await import('../src/feishu-conversation-policy.js');
 
 const openConnections: Array<{ stop(): Promise<void> }> = [];
 
@@ -507,6 +510,109 @@ describe('Feishu durable Inbox and cursor integration', () => {
     expect(controls.messageCreate).not.toHaveBeenCalled();
     expect(controls.messageReply).not.toHaveBeenCalled();
   });
+
+  for (const scenario of [
+    {
+      // Quoting an earlier message in a non-topic group: root_id = parent_id, no thread_id.
+      name: 'a quote-reply in an ordinary group is answered in the main chat',
+      chatId: 'oc_quote_group',
+      chatType: 'group',
+      chatMode: 'group',
+      ids: { root_id: 'om_quoted_answer', parent_id: 'om_quoted_answer' },
+      sourceJid: 'feishu:oc_quote_group',
+      rootId: undefined,
+    },
+    {
+      name: 'a quote-reply in a private chat is answered in the main chat',
+      chatId: 'oc_quote_p2p',
+      chatType: 'p2p',
+      chatMode: 'p2p',
+      ids: { root_id: 'om_quoted_answer', parent_id: 'om_quoted_answer' },
+      sourceJid: 'feishu:oc_quote_p2p',
+      rootId: undefined,
+    },
+    {
+      name: 'a reply inside a thread of an ordinary group stays in that thread',
+      chatId: 'oc_thread_group',
+      chatType: 'group',
+      chatMode: 'group',
+      ids: {
+        root_id: 'om_thread_root',
+        parent_id: 'om_thread_root',
+        thread_id: 'omt_ordinary',
+      },
+      sourceJid:
+        'feishu:oc_thread_group#thread:omt_ordinary#root:om_thread_root',
+      rootId: 'om_thread_root',
+    },
+    {
+      name: 'a reply in a topic group is answered inside the topic',
+      chatId: 'oc_topic_group',
+      chatType: 'group',
+      chatMode: 'topic',
+      ids: {
+        root_id: 'om_topic_root',
+        parent_id: 'om_topic_root',
+        thread_id: 'omt_topic',
+      },
+      sourceJid: 'feishu:oc_topic_group#thread:omt_topic#root:om_topic_root',
+      rootId: 'om_topic_root',
+    },
+  ] as const) {
+    test(scenario.name, async () => {
+      const accountId = `account-reply-route-${scenario.chatId}-${Date.now()}`;
+      const followUp = vi.fn(() => ({ disposition: 'started' as const }));
+      const connected = await connect(accountId, vi.fn(), {
+        shouldProcessGroupMessage: () => true,
+        // No sourceJid override: the route target decides where the answer goes.
+        resolveEffectiveChatJid: () => ({
+          effectiveJid: 'web:durable-feishu-test',
+          agentId: null,
+        }),
+        resolveFeishuConversationPlan: (_jid, meta) =>
+          resolveFeishuConversationPlan({
+            chatType: meta.chatType,
+            chatMode: scenario.chatMode,
+            mentionedBot: meta.mentionedBot === true,
+            messageId: meta.messageId || '',
+            threadId: meta.threadId,
+            rootId: meta.rootId,
+          }),
+        onFollowUpMessage: followUp,
+      });
+      const messageId = `om_reply_${scenario.chatId}`;
+      const createTime = Date.now();
+
+      await connected.handler({
+        ...event(messageId, createTime, ''),
+        message: {
+          ...event(messageId, createTime, '').message,
+          chat_id: scenario.chatId,
+          chat_type: scenario.chatType,
+          ...scenario.ids,
+          content: JSON.stringify({ text: '@_user_1 能再说详细点吗' }),
+          mentions: [
+            {
+              key: '@_user_1',
+              name: 'Inbox Test Bot',
+              id: { open_id: 'ou_bot' },
+            },
+          ],
+        },
+      });
+
+      expect(followUp).toHaveBeenCalledWith(
+        expect.objectContaining({ sourceJid: scenario.sourceJid, messageId }),
+      );
+      const stored = db
+        .getMessagesSince('web:durable-feishu-test', { timestamp: '', id: '' })
+        .find((message) => message.id === messageId);
+      expect(stored?.channel_context?.message.rootId).toBe(scenario.rootId);
+      expect(stored?.channel_context?.message.parentId).toBe(
+        scenario.ids.parent_id,
+      );
+    });
+  }
 
   test('only a real Bot mention can execute the exact lowercase /break command in a group', async () => {
     const accountId = `account-break-command-${Date.now()}`;

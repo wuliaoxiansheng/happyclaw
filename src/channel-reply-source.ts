@@ -1,8 +1,10 @@
+import { automationRunIdOf } from './automation-run-ledger.js';
 import { getChannelType } from './im-channel.js';
 import {
   resolveCompatibleChannelBatchAnchor,
   resolveForwardBundleBatchAnchor,
 } from './forward-bundle-batch.js';
+import { readTeamInput } from './team-gate.js';
 import type { NewMessage } from './types.js';
 
 /** Reply transport belongs to an input, never to a workspace or old session. */
@@ -12,9 +14,19 @@ export function resolveInputChannelReplySource(
   return sourceJid && getChannelType(sourceJid) ? sourceJid : null;
 }
 
+/**
+ * Inputs share a turn only on the same reply route. An automation run's input
+ * is its own route: it never shares a turn with user messages or another run.
+ * A team input the host composed belongs to its work item: reports of
+ * different items reach the router in turns of their own.
+ */
 function messageRouteKey(message: NewMessage): string {
   const context = message.channel_context;
   return [
+    automationRunIdOf(message) ?? '',
+    message.source_kind === 'work_item_input'
+      ? (readTeamInput(message.attachments)?.facts?.workItemId ?? '')
+      : '',
     message.source_jid || message.chat_jid,
     context?.provider || '',
     context?.channelAccountId || '',

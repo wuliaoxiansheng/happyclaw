@@ -13,6 +13,7 @@ import type {
   WorkflowAgentSnapshot,
   WorkflowRunSnapshot,
 } from '../../stream-event.types';
+import { ClampedDetail } from './ClampedDetail';
 
 function compactNumber(value: number | undefined): string | null {
   if (value === undefined || !Number.isFinite(value) || value <= 0) return null;
@@ -144,17 +145,25 @@ function AgentRow({ agent }: { agent: WorkflowAgentSnapshot }) {
         {agent.promptPreview && (
           <div>
             <div className="mb-0.5 font-medium text-foreground">任务摘要</div>
-            <p className="max-h-28 overflow-y-auto whitespace-pre-wrap break-words">
+            <ClampedDetail
+              title="任务摘要"
+              maxHeightClass="max-h-28"
+              className="whitespace-pre-wrap break-words"
+            >
               {agent.promptPreview}
-            </p>
+            </ClampedDetail>
           </div>
         )}
         {agent.resultPreview && (
           <div>
             <div className="mb-0.5 font-medium text-foreground">结果摘要</div>
-            <p className="max-h-32 overflow-y-auto whitespace-pre-wrap break-words">
+            <ClampedDetail
+              title="结果摘要"
+              maxHeightClass="max-h-32"
+              className="whitespace-pre-wrap break-words"
+            >
               {agent.resultPreview}
-            </p>
+            </ClampedDetail>
           </div>
         )}
       </div>

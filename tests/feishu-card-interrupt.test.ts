@@ -7,6 +7,7 @@ const controls = vi.hoisted(() => ({
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   AppType: { SelfBuild: 'SelfBuild' },
+  Domain: { Feishu: 0, Lark: 1 },
   LoggerLevel: { info: 'info' },
   defaultHttpInstance: { defaults: { timeout: 0 } },
   Client: class {
@@ -45,7 +46,6 @@ const { registerMessageIdMapping, unregisterMessageId } =
 const targetJid = 'feishu:oc_group#thread:omt_topic';
 const cardMessageId = 'om_streaming_stop_test';
 const interrupt = vi.fn();
-const followUp = vi.fn();
 let connection: ReturnType<typeof createFeishuConnection>;
 
 beforeEach(async () => {
@@ -60,7 +60,6 @@ beforeEach(async () => {
     await connection.connect({
       onReady: vi.fn(),
       onCardInterrupt: interrupt,
-      onFollowUpCardAction: followUp,
     }),
   ).toBe(true);
 });
@@ -94,7 +93,6 @@ describe('Feishu streaming stop callback', () => {
     expect(interrupt).toHaveBeenCalledExactlyOnceWith(targetJid, 'ou_operator');
     expect(pendingAbort).toHaveBeenCalledTimes(1);
     expect(controls.patch).not.toHaveBeenCalled();
-    expect(followUp).not.toHaveBeenCalled();
   });
 
   test('keeps permission rejection as a warning without mutating the card', async () => {
@@ -115,35 +113,22 @@ describe('Feishu streaming stop callback', () => {
     expect(controls.patch).not.toHaveBeenCalled();
   });
 
-  test.each([
-    ['steer_queued', 'steer'],
-    ['cancel_queued', 'cancel'],
-    ['interrupt_and_run', 'interrupt_and_run'],
-  ])('preserves legacy queued-card handling for %s', async (action, mapped) => {
-    followUp.mockResolvedValue({ ok: true, message: '排队消息已处理。' });
-    await trigger({
-      action,
-      sourceJid: 'feishu:oc_group',
-      targetJid,
-      messageId: 'om_queued_source',
-      expectedRunId: 'run_original',
-    });
-
-    expect(followUp).toHaveBeenCalledExactlyOnceWith({
-      sourceJid: 'feishu:oc_group',
-      targetJid,
-      messageId: 'om_queued_source',
-      expectedRunId: 'run_original',
-      operatorImId: 'ou_operator',
-      action: mapped,
-    });
-    expect(interrupt).not.toHaveBeenCalled();
-    expect(controls.patch).toHaveBeenCalledTimes(1);
-    expect(controls.patch.mock.calls[0][0].path).toEqual({
-      message_id: cardMessageId,
-    });
-    expect(controls.patch.mock.calls[0][0].data.content).toContain(
-      '排队消息已处理。',
-    );
-  });
+  test.each(['steer_queued', 'cancel_queued', 'interrupt_and_run'])(
+    'answers a %s button left on an old queued-message card as expired',
+    async (action) => {
+      await expect(
+        trigger({
+          action,
+          sourceJid: 'feishu:oc_group',
+          targetJid,
+          messageId: 'om_queued_source',
+          expectedRunId: 'run_original',
+        }),
+      ).resolves.toEqual({
+        toast: { type: 'info', content: '这张卡片上的按钮已失效。' },
+      });
+      expect(interrupt).not.toHaveBeenCalled();
+      expect(controls.patch).not.toHaveBeenCalled();
+    },
+  );
 });

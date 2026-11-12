@@ -29,18 +29,26 @@ import { capabilitySourceLabel } from '@/utils/capability-sources';
 import { SettingsGroup } from '@/components/settings/SettingsLayout';
 import { cn } from '@/lib/utils';
 import { AgentSection } from './AgentSection';
+import {
+  ModelResolutionRow,
+  readModelResolution,
+  type ModelBinding,
+} from './ModelResolutionRow';
 
 export function EffectiveCapabilitiesPreview({
   profileId,
   runtimePolicy,
   workspaces,
+  modelBinding,
 }: {
   profileId: string;
   runtimePolicy: AgentProfileRuntimePolicy;
   workspaces: AgentProfileWorkspace[];
+  modelBinding?: ModelBinding;
 }) {
   const [workspaceJid, setWorkspaceJid] = useState('none');
   const [preview, setPreview] = useState<AgentCapabilityPreview | null>(null);
+  const [resolution, setResolution] = useState(readModelResolution(null));
   const [runContext, setRunContext] = useState<RunContextSnapshot | null>(null);
   const [runContextStatus, setRunContextStatus] =
     useState<RunContextStatus>('none');
@@ -74,11 +82,13 @@ export function EffectiveCapabilitiesPreview({
         `/api/agent-profiles/${encodeURIComponent(profileId)}/effective-capabilities`,
         {
           runtime_policy: runtimePolicy,
+          ...modelBinding,
           workspace_jid: workspaceJid === 'none' ? undefined : workspaceJid,
         },
       );
       if (sequence === requestSequence.current) {
         setPreview(result.preview);
+        setResolution(readModelResolution(result));
         setRunContext(result.run_context);
         setRunContextStatus(result.run_context_status);
       }
@@ -91,7 +101,7 @@ export function EffectiveCapabilitiesPreview({
     } finally {
       if (sequence === requestSequence.current) setLoading(false);
     }
-  }, [profileId, runtimePolicy, workspaceJid]);
+  }, [modelBinding, profileId, runtimePolicy, workspaceJid]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void loadPreview(), 250);
@@ -160,6 +170,7 @@ export function EffectiveCapabilitiesPreview({
                 </span>
               )}
             </PreviewRow>
+            <ModelResolutionRow resolution={resolution} />
             <CapabilityEntriesRow
               label="HappyClaw Skills"
               entries={preview.skills.entries.filter(

@@ -146,6 +146,22 @@ describe('retry_wait is never a dead state (prod P1-2)', () => {
     runtime.dispose();
   });
 
+  test('a Turn whose input waits for a usage-limit reset outlives the sweep', () => {
+    const r = route('usage-wait');
+    const runtime = ChannelTurnRuntime.start({
+      ...r,
+      externalMessageId: 'om_usage_wait_1',
+    });
+    expect(runtime.retry('usage limit')).toBe(true);
+    store.cancelStaleRetryWaitChannelTurns({
+      updatedBefore: new Date(Date.now() + 1000).toISOString(),
+      reason: 'expired',
+      keepCorrelationIds: ['om_usage_wait_1'],
+    });
+    expect(store.getChannelTurnRun(runtime.runId)?.status).toBe('retry_wait');
+    runtime.dispose();
+  });
+
   test('withdrawn inputs close their retry_wait Turns', () => {
     const r = route('withdrawn');
     const runtime = ChannelTurnRuntime.start({

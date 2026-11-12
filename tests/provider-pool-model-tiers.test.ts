@@ -6,14 +6,9 @@ import {
   SDK_DEFAULT_MODEL_TIER,
 } from '../src/provider-pool.js';
 
-const ACCOUNTS = [
-  { id: 'acct-1', enabled: true, weight: 1 },
-  { id: 'acct-2', enabled: true, weight: 1 },
-  { id: 'acct-3', enabled: true, weight: 1 },
-];
+const ACCOUNTS = [{ id: 'acct-1' }, { id: 'acct-2' }, { id: 'acct-3' }];
 
 const BALANCING = {
-  strategy: 'round-robin' as const,
   unhealthyThreshold: 1,
   recoveryIntervalMs: 300_000,
 };
@@ -28,8 +23,17 @@ function makePool(balancing: Partial<typeof BALANCING> = {}): ProviderPool {
   return pool;
 }
 
+/** The accounts that can still serve `model`: healthy and not walled on it. */
+function servable(pool: ProviderPool, model: string): string[] {
+  pool.refreshRecoveryState();
+  return ACCOUNTS.map((a) => a.id).filter(
+    (id) =>
+      pool.getHealthStatus(id).healthy && !pool.isModelQuarantined(id, model),
+  );
+}
+
 describe('per-account model tier quarantine', () => {
-  test('a walled model tier does not take the account out of rotation', () => {
+  test('a walled model tier leaves the account healthy', () => {
     const pool = makePool();
     pool.reportModelFailure('acct-1', 'fable');
 
@@ -49,7 +53,7 @@ describe('per-account model tier quarantine', () => {
 
     expect(pool.getHealthStatus('acct-1').healthy).toBe(true);
     expect(pool.isModelQuarantined('acct-1', defaultTier)).toBe(true);
-    expect(pool.selectProvider(primaryTier(defaultTier))).not.toBe('acct-1');
+    expect(servable(pool, defaultTier)).not.toContain('acct-1');
     // The same OAuth account remains eligible for a configured fallback model.
     expect(pool.isModelQuarantined('acct-1', 'claude-opus-5')).toBe(false);
     expect(pool.hasCandidateForTier('claude-opus-5')).toBe(true);
@@ -62,7 +66,7 @@ describe('per-account model tier quarantine', () => {
     pool.reportModelFailure('acct-1', 'fable');
     pool.reportModelFailure('acct-2', 'fable');
     expect(pool.hasCandidateForTier(primaryTier())).toBe(true);
-    expect(pool.selectProvider(primaryTier())).toBe('acct-3');
+    expect(servable(pool, 'fable')).toEqual(['acct-3']);
 
     // Only once every account is walled does the primary tier count as gone.
     pool.reportModelFailure('acct-3', 'fable');
@@ -70,18 +74,18 @@ describe('per-account model tier quarantine', () => {
     expect(pool.hasCandidateForTier('claude-opus-5')).toBe(true);
   });
 
-  test('an account walled on one tier is still selectable on another', () => {
+  test('an account walled on one tier can still serve another', () => {
     const pool = makePool();
     for (const a of ACCOUNTS) pool.reportModelFailure(a.id, 'fable');
 
     expect(pool.hasCandidateForTier(primaryTier())).toBe(false);
-    // Every account remains eligible for the escalated tier.
-    const picked = new Set([
-      pool.selectProvider('claude-opus-5'),
-      pool.selectProvider('claude-opus-5'),
-      pool.selectProvider('claude-opus-5'),
+    // The accounts remain eligible for the escalated tier.
+    expect(pool.hasCandidateForTier('claude-opus-5')).toBe(true);
+    expect(servable(pool, 'claude-opus-5')).toEqual([
+      'acct-1',
+      'acct-2',
+      'acct-3',
     ]);
-    expect(picked).toEqual(new Set(['acct-1', 'acct-2', 'acct-3']));
   });
 
   test('an account-scope wall removes the account from every tier', () => {
@@ -89,8 +93,8 @@ describe('per-account model tier quarantine', () => {
     pool.reportFailure('acct-1', true);
 
     expect(pool.hasCandidateForTier(primaryTier())).toBe(true);
-    expect(pool.selectProvider(primaryTier())).not.toBe('acct-1');
-    expect(pool.selectProvider('claude-opus-5')).not.toBe('acct-1');
+    expect(servable(pool, 'fable')).not.toContain('acct-1');
+    expect(servable(pool, 'claude-opus-5')).not.toContain('acct-1');
   });
 
   test('a tier quarantine honours the upstream reset over the interval', () => {
@@ -129,7 +133,7 @@ describe('per-account model tier quarantine', () => {
 
     pool.refreshFromConfig(ACCOUNTS, BALANCING);
     expect(pool.isModelQuarantined('acct-1', 'fable')).toBe(true);
-    expect(pool.selectProvider(primaryTier())).not.toBe('acct-1');
+    expect(servable(pool, 'fable')).not.toContain('acct-1');
   });
 
   test('a config refresh drops quarantines for removed members', () => {
@@ -150,56 +154,5 @@ describe('per-account model tier quarantine', () => {
     pool.resetModelQuarantine('acct-1');
     expect(pool.isModelQuarantined('acct-1', 'fable')).toBe(false);
     expect(pool.isModelQuarantined('acct-2', 'fable')).toBe(true);
-  });
-});
-
-describe('rotation strategy', () => {
-  test('round-robin strategies rotate per request', () => {
-    for (const strategy of ['round-robin', 'weighted-round-robin'] as const) {
-      const pool = makePool({ strategy });
-      expect(pool.rotatesPerRequest).toBe(true);
-      expect([
-        pool.selectProvider(),
-        pool.selectProvider(),
-        pool.selectProvider(),
-      ]).toEqual(['acct-1', 'acct-2', 'acct-3']);
-    }
-  });
-
-  test('failover stays on one account until it fails', () => {
-    const pool = makePool({ strategy: 'failover' });
-    expect(pool.rotatesPerRequest).toBe(false);
-    expect([pool.selectProvider(), pool.selectProvider()]).toEqual([
-      'acct-1',
-      'acct-1',
-    ]);
-
-    pool.reportFailure('acct-1', true);
-    expect(pool.selectProvider()).toBe('acct-2');
-  });
-
-  /**
-   * trySelectPoolProvider re-reads config before every selection, so the two
-   * strategies must stay distinguishable *across* refreshes: rotation state
-   * cannot be reset by a refresh, and failover cannot start drifting.
-   */
-  test('the strategies stay distinct across config refreshes', () => {
-    const rotating = makePool();
-    const sticky = makePool({ strategy: 'failover' });
-    const rotatingPicks: string[] = [];
-    const stickyPicks: string[] = [];
-
-    for (let i = 0; i < ACCOUNTS.length; i += 1) {
-      rotating.refreshFromConfig(ACCOUNTS, BALANCING);
-      sticky.refreshFromConfig(ACCOUNTS, {
-        ...BALANCING,
-        strategy: 'failover',
-      });
-      rotatingPicks.push(rotating.selectProvider(primaryTier()));
-      stickyPicks.push(sticky.selectProvider(primaryTier()));
-    }
-
-    expect(new Set(rotatingPicks).size).toBe(ACCOUNTS.length);
-    expect(new Set(stickyPicks)).toEqual(new Set(['acct-1']));
   });
 });

@@ -9,6 +9,10 @@ import { WebSocketServer, WebSocket } from 'ws';
 import crypto from 'crypto';
 import { TerminalManager } from './terminal-manager.js';
 import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
+import {
+  getWebMessageDedup,
+  recordWebMessageDedup,
+} from './runtime-state-store.js';
 
 // Web context and shared utilities
 import {
@@ -41,13 +45,24 @@ import {
   getAllCookieValues,
   tryVerifyAny,
 } from './middleware/auth.js';
+import { guestGuardMiddleware } from './middleware/guest-guard.js';
+import {
+  GUEST_READ_ONLY_ERROR,
+  canViewGroup,
+  redactAutomationRunForGuest,
+  withoutUsageForGuest,
+} from './guest-access.js';
+import { getGuestAccountState } from './guest-accounts.js';
 
 // Route modules
 import authRoutes from './routes/auth.js';
 import groupRoutes from './routes/groups.js';
 import memoryRoutes from './routes/memory.js';
 import configRoutes, { injectConfigDeps } from './routes/config.js';
+import type { AutomationWsEvent } from './automation-contract.js';
+import type { WorkItemWsEvent } from './work-items.js';
 import tasksRoutes from './routes/tasks.js';
+import automationRoutes from './routes/automations.js';
 import adminRoutes from './routes/admin.js';
 import fileRoutes from './routes/files.js';
 import monitorRoutes, { injectMonitorDeps } from './routes/monitor.js';
@@ -60,9 +75,18 @@ import workspaceConfigRoutes from './routes/workspace-config.js';
 import agentProfileRoutes from './routes/agent-profiles.js';
 import workspaceRoutes from './routes/workspaces.js';
 import turnTraceRoutes from './routes/turn-traces.js';
+import pushRoutes from './routes/push.js';
+import gitReviewRoutes from './routes/git-review.js';
+import {
+  resolveWorkspaceProjectRoot,
+  toSessionWorktreePayload,
+} from './session-worktree.js';
+import { getSessionWorktree } from './session-worktree-store.js';
 import { usage as usageRoutes } from './routes/usage.js';
 import billingRoutes from './routes/billing.js';
 import bugReportRoutes from './routes/bug-report.js';
+import guestRoutes from './routes/guests.js';
+import workItemRoutes from './routes/work-items.js';
 import { codexGatewayApp } from './codex-gateway/gateway.js';
 import { initCodexCatalogSync } from './codex-gateway/model-catalog-sync.js';
 import { CODEX_GATEWAY_ROUTE } from './codex-gateway/types.js';
@@ -81,6 +105,8 @@ import {
   getChannelMount,
   getJidsByFolder,
   getMessageCursor,
+  getMessagesSince,
+  getQueuedFollowUp,
   storeMessageDirect,
   deleteUserSession,
   updateSessionLastActive,
@@ -91,13 +117,23 @@ import {
   listQueuedFollowUps,
   setMessageFollowUp,
 } from './db.js';
-import { getGroupAllowedUserIds } from './group-broadcast-acl.js';
+import {
+  getGroupAllowedUserIds,
+  getGroupAudience,
+  listViewingGuestIds,
+} from './group-broadcast-acl.js';
+import { onConversationContextCleared } from './context-usage-events.js';
+import {
+  NO_CONTEXT_USAGE,
+  readSessionContextUsage,
+  type SessionContextUsage,
+} from './session-context-usage.js';
 import {
   hasBoundWorkspaceReference,
   resolveBoundWorkspaceJid,
 } from './workspace-attribution.js';
-import { markdownToPlainText } from './im-utils.js';
-import { stripVirtualJidSuffix } from './utils.js';
+import { generateAutoTitle } from './session-title.js';
+import { agentIdOfJid, stripVirtualJidSuffix } from './utils.js';
 import { isSessionExpired } from './auth.js';
 import type {
   AgentStatus,
@@ -111,19 +147,23 @@ import type {
   UserRole,
   MessageCursor,
   RunFinishReason,
+  RegisteredGroup,
 } from './types.js';
+import type { SessionLiveActivity } from './session-inspect-service.js';
 import {
   WEB_PORT,
   SESSION_COOKIE_NAME_SECURE,
   SESSION_COOKIE_NAME_PLAIN,
   ASSISTANT_NAME,
-  GROUPS_DIR,
 } from './config.js';
+import { isSingleUserHost } from './deployment-mode.js';
+import { workspaceDirOf } from './workspace-dir.js';
 import { expandPluginSlashCommandIfNeeded } from './plugin-expander-core.js';
 import { makeExpandContext } from './plugin-expander-context.js';
 import type { ExpandContext } from './plugin-expander-context.js';
 import { PLUGIN_EXPANSION_ATTACHMENT_TYPE } from './plugin-expander-sentinel.js';
 import { persistPluginExpansion } from './plugin-expander-store.js';
+import { presentAutomationMessage } from './automation-run-ledger.js';
 import { logger } from './logger.js';
 import { buildPresentedAttachments } from './attachment-thumbnails.js';
 import { createOrderedDispatcher } from './ordered-dispatch.js';
@@ -163,6 +203,7 @@ import {
   normalizeImageAttachments,
   toAgentImages,
 } from './message-attachments.js';
+import { listPendingUsageLimitWaits } from './usage-limit-wait.js';
 
 // --- App Setup ---
 
@@ -189,8 +230,8 @@ function normalizeTerminalSize(
  * group. Returns null when the group has no resolvable owner (no plugins to
  * resolve in that case).
  *
- * Host mode honors `group.customCwd` so inline `!` commands run against the
- * user's real repo (#18 P2-bug-4).
+ * Host mode honors `resolveWorkspaceProjectRoot(group, { agentId })` so inline
+ * `!` commands run against the session's worktree or the user's real repo.
  */
 function buildWebExpandContext(
   groupJid: string,
@@ -198,19 +239,36 @@ function buildWebExpandContext(
     folder: string;
     created_by?: string | null;
     executionMode?: string | null;
+    execution_mode?: string | null;
     customCwd?: string | null;
     is_home?: boolean;
   },
+  agentId?: string | null,
 ): ExpandContext | null {
   const deps = getWebDeps();
-  const containerName = deps?.queue.getActiveContainerName(groupJid) ?? null;
+  // Single-user host mode never runs `docker exec` (see index.ts).
+  const containerName = isSingleUserHost()
+    ? null
+    : (deps?.queue.getActiveContainerName(groupJid) ?? null);
+  const rawMode = group.executionMode ?? group.execution_mode;
+  const customCwd =
+    rawMode === 'host'
+      ? resolveWorkspaceProjectRoot(
+          {
+            folder: group.folder,
+            executionMode: 'host',
+            customCwd: group.customCwd ?? undefined,
+          },
+          { agentId },
+        )
+      : group.customCwd;
   return makeExpandContext({
     chatJid: groupJid,
     groupFolder: group.folder,
     ownerId: group.created_by,
-    executionMode: group.executionMode,
-    customCwd: group.customCwd,
-    groupsDir: GROUPS_DIR,
+    executionMode: rawMode,
+    customCwd,
+    workspaceDir: workspaceDirOf(group.folder),
     containerName,
   });
 }
@@ -292,6 +350,10 @@ app.use(
   }),
 );
 
+// Read-only guest accounts: default-deny allowlist ahead of every route
+// module (see src/middleware/guest-guard.ts). Non-guest requests pass through.
+app.use('/api/*', guestGuardMiddleware);
+
 // --- Global State ---
 
 let deps: WebDeps | null = null;
@@ -304,6 +366,7 @@ app.route('/api/groups', fileRoutes); // File routes also under /api/groups
 app.route('/api/memory', memoryRoutes);
 app.route('/api/config', configRoutes);
 app.route('/api/tasks', tasksRoutes);
+app.route('/api/automations', automationRoutes);
 app.route('/api/skills', skillsRoutes);
 app.route('/api/admin', adminRoutes);
 app.route('/api/browse', browseRoutes);
@@ -314,11 +377,15 @@ app.route('/api/workspaces', workspaceRoutes);
 app.route('/api/groups', agentRoutes); // Workspace session routes; /agents paths remain compatibility aliases
 app.route('/api/groups', workspaceConfigRoutes); // Workspace config under /api/groups/:jid/workspace-config
 app.route('/api/groups', turnTraceRoutes); // Stored thinking/trace of a finished turn
+app.route('/api/groups', gitReviewRoutes); // Read-only git status/diff, worktree support
 app.route('/api', monitorRoutes);
 app.route('/api/usage', usageRoutes);
 app.route('/api/billing', billingRoutes);
 app.route('/api/bug-report', bugReportRoutes);
 app.route('/api/channel-accounts', channelAccountRoutes);
+app.route('/api/guests', guestRoutes);
+app.route('/api/push', pushRoutes); // Web Push subscriptions of the signed-in account
+app.route('/api', workItemRoutes); // Team mode: /api/workspaces/:jid/team-mounts|work-items|work-decisions, /api/work-items
 // 不挂在 /api/* 下：网关用 provider gateway token 鉴权（x-api-key），
 // 不是浏览器 Cookie 会话，不需要也不应该套用 /api/* 的 CORS/Cookie 中间件。
 app.route(CODEX_GATEWAY_ROUTE, codexGatewayApp);
@@ -351,173 +418,375 @@ app.post('/api/messages', authMiddleware, async (c) => {
     );
   }
 
-  if (agentId) {
-    const agent = getAgent(agentId);
-    if (!agent || agent.kind !== 'conversation' || agent.chat_jid !== chatJid) {
-      return c.json({ error: 'Agent not found' }, 404);
-    }
+  // Every input belongs to a session; a workspace JID alone names none.
+  if (!agentId) {
+    return c.json({ error: 'Session required', code: 'session_required' }, 400);
+  }
+  const agent = getAgent(agentId);
+  if (!agent || agent.kind !== 'conversation' || agent.chat_jid !== chatJid) {
+    return c.json({ error: 'Agent not found' }, 404);
   }
 
-  // /clear: reset session without entering message pipeline.
-  // Permission: owner-only (canModifyGroup) — aligned with `reset-session`
-  // route, since /clear has the same destructive effect (clears agent
-  // session files, stops sibling containers, drops conversation history).
-  if (isClearCommand(content)) {
-    if (
-      !canModifyGroup(
-        { id: authUser.id, role: authUser.role },
-        { ...group, jid: chatJid },
-      )
-    ) {
-      return c.json({ error: 'Only the workspace owner can run /clear' }, 403);
-    }
-    if (!deps) return c.json({ error: 'Server not initialized' }, 500);
-    try {
-      await executeSessionReset(
+  // /clear and /fresh: reset the session without entering the message
+  // pipeline. Owner-only (canModifyGroup), aligned with `reset-session`,
+  // since both clear agent session files and stop sibling containers.
+  const isClear = isClearCommand(content);
+  const freshCommand = isClear ? null : parseFreshCommand(content);
+  if (
+    (isClear || freshCommand) &&
+    !canModifyGroup(
+      { id: authUser.id, role: authUser.role },
+      { ...group, jid: chatJid },
+    )
+  ) {
+    return c.json(
+      {
+        error: `Only the workspace owner can run ${isClear ? '/clear' : '/fresh'}`,
+      },
+      403,
+    );
+  }
+
+  const trimmedContent = content.trim();
+  const send = async (
+    idempotency?: WebSendIdempotency,
+  ): Promise<WebSendOutcome> => {
+    if (isClear || freshCommand) {
+      return runSessionResetCommand(
         chatJid,
-        group.folder,
-        {
-          queue: deps.queue,
-          sessions: deps.getSessions(),
-          broadcast: broadcastNewMessage,
-          setLastAgentTimestamp: deps.setLastAgentTimestamp,
-        },
+        group,
         agentId,
+        freshCommand,
+        idempotency?.clientMessageId,
       );
-      return c.json({ success: true, cleared: true });
-    } catch (err) {
-      logger.error({ chatJid, err }, '/clear command failed');
-      const errId = crypto.randomUUID();
-      const errTs = new Date().toISOString();
-      ensureChatExists(chatJid);
-      storeMessageDirect(
-        errId,
-        chatJid,
-        '__system__',
-        'system',
-        SESSION_RESET_FAILURE_MESSAGE,
-        errTs,
-        true,
-      );
-      broadcastNewMessage(chatJid, {
-        id: errId,
-        chat_jid: chatJid,
-        sender: '__system__',
-        sender_name: 'system',
-        content: SESSION_RESET_FAILURE_MESSAGE,
-        timestamp: errTs,
-        is_from_me: true,
-      });
-      return c.json({ error: '清除上下文失败' }, 500);
     }
-  }
-
-  // /fresh [notes]: zero-summary window switch. Same owner gate as /clear.
-  const freshCommand = parseFreshCommand(content);
-  if (freshCommand) {
-    if (
-      !canModifyGroup(
-        { id: authUser.id, role: authUser.role },
-        { ...group, jid: chatJid },
-      )
-    ) {
-      return c.json({ error: 'Only the workspace owner can run /fresh' }, 403);
-    }
-    if (!deps) return c.json({ error: 'Server not initialized' }, 500);
-    try {
-      const snapshot = await captureWorkspaceSnapshot(
-        group.customCwd || path.join(GROUPS_DIR, group.folder),
-      );
-      const handoff = formatFreshWindowHandoff({
-        notes: freshCommand.notes,
-        snapshot,
-      });
-      await executeFreshWindowReset(
-        chatJid,
-        group.folder,
-        {
-          queue: deps.queue,
-          sessions: deps.getSessions(),
-          broadcast: broadcastNewMessage,
-          setLastAgentTimestamp: deps.setLastAgentTimestamp,
-        },
-        { agentId, handoff },
-      );
-      return c.json({ success: true, cleared: true, fresh: true });
-    } catch (err) {
-      logger.error({ chatJid, err }, '/fresh command failed');
-      const errId = crypto.randomUUID();
-      const errTs = new Date().toISOString();
-      ensureChatExists(chatJid);
-      storeMessageDirect(
-        errId,
-        chatJid,
-        '__system__',
-        'system',
-        SESSION_FRESH_WINDOW_FAILURE_MESSAGE,
-        errTs,
-        true,
-      );
-      broadcastNewMessage(chatJid, {
-        id: errId,
-        chat_jid: chatJid,
-        sender: '__system__',
-        sender_name: 'system',
-        content: SESSION_FRESH_WINDOW_FAILURE_MESSAGE,
-        timestamp: errTs,
-        is_from_me: true,
-      });
-      return c.json({ error: '零摘要换窗失败' }, 500);
-    }
-  }
-
-  if (agentId) {
     const result = await handleAgentConversationMessage(
       chatJid,
       agentId,
-      content.trim(),
+      trimmedContent,
       authUser.id,
       authUser.display_name || authUser.username,
       attachments,
       followUpBehavior,
+      idempotency,
     );
-    if (!result.ok) return c.json({ error: result.error }, result.status);
-    return c.json({ success: true, ...result });
+    if (!result.ok) {
+      return { status: result.status, body: { error: result.error } };
+    }
+    const { ok: _ok, ...accepted } = result;
+    return { status: 200, body: { success: true, ...accepted } };
+  };
+
+  const { clientMessageId } = validation.data;
+  const outcome = clientMessageId
+    ? await sendOnce(
+        {
+          userId: authUser.id,
+          chatJid,
+          clientMessageId,
+          fingerprint: webSendFingerprint(
+            agentId,
+            trimmedContent,
+            attachments,
+            followUpBehavior,
+          ),
+        },
+        send,
+        (messageId) => requeueStoredWebInput(chatJid, agentId, messageId),
+      )
+    : await send();
+  return c.json(outcome.body, outcome.status);
+});
+
+/**
+ * Hand a stored Web input whose request failed before it was queued to the
+ * queue again, if its session still exists and the input still waits.
+ *
+ * - A durable follow-up (sent while a run was active) waits for its lane's
+ *   dispatcher, which the failed step may never have reached; dispatching is
+ *   a no-op while the lane runs, and the run drains the queue when it ends.
+ * - Any other input waits behind its lane's pull cursor and the session is
+ *   processed again. That only reads what is still pending, and a running
+ *   lane is left to finish first.
+ */
+function requeueStoredWebInput(
+  chatJid: string,
+  agentId: string,
+  messageId: string,
+): void {
+  if (!deps) return;
+  const laneJid = `${chatJid}#agent:${agentId}`;
+  const agent = getAgent(agentId);
+  if (!agent || agent.kind !== 'conversation' || agent.chat_jid !== chatJid) {
+    return;
+  }
+  if (getQueuedFollowUp(laneJid, messageId)) {
+    deps.dispatchQueuedFollowUps?.(laneJid);
+    return;
+  }
+  const pullCursor = deps.getLastAgentTimestamp()[laneJid] ?? {
+    timestamp: '',
+    id: '',
+  };
+  const pending = getMessagesSince(laneJid, pullCursor).some(
+    (message) => message.id === messageId,
+  );
+  if (!pending || deps.queue.getActiveQueryId(laneJid)) return;
+  deps.queue.enqueueTask(laneJid, `agent-conv:${agentId}:${Date.now()}`, () =>
+    deps!.processAgentConversation(chatJid, agentId),
+  );
+}
+
+/** Run `/clear` or `/fresh [notes]`; failures post a system message. */
+async function runSessionResetCommand(
+  chatJid: string,
+  group: RegisteredGroup,
+  agentId: string,
+  freshCommand: ReturnType<typeof parseFreshCommand>,
+  clientMessageId: string | undefined,
+): Promise<WebSendOutcome> {
+  if (!deps) return { status: 500, body: { error: 'Server not initialized' } };
+  const resetDeps = {
+    queue: deps.queue,
+    // The divider and reset notices carry the command's key, like a message.
+    broadcast: (
+      jid: string,
+      msg: Parameters<typeof broadcastNewMessage>[1],
+      ...rest: [agentId?: string, source?: string]
+    ) =>
+      broadcastNewMessage(
+        jid,
+        clientMessageId ? { ...msg, client_message_id: clientMessageId } : msg,
+        ...rest,
+      ),
+    setLastAgentTimestamp: deps.setLastAgentTimestamp,
+  };
+  try {
+    if (!freshCommand) {
+      await executeSessionReset(chatJid, group.folder, resetDeps, agentId);
+      return { status: 200, body: { success: true, cleared: true } };
+    }
+    const snapshot = await captureWorkspaceSnapshot(
+      resolveWorkspaceProjectRoot(group, { agentId }),
+    );
+    const handoff = formatFreshWindowHandoff({
+      notes: freshCommand.notes,
+      snapshot,
+    });
+    await executeFreshWindowReset(chatJid, group.folder, resetDeps, {
+      agentId,
+      handoff,
+    });
+    return { status: 200, body: { success: true, cleared: true, fresh: true } };
+  } catch (err) {
+    logger.error(
+      { chatJid, err },
+      freshCommand ? '/fresh command failed' : '/clear command failed',
+    );
+    const failure = freshCommand
+      ? SESSION_FRESH_WINDOW_FAILURE_MESSAGE
+      : SESSION_RESET_FAILURE_MESSAGE;
+    const errId = crypto.randomUUID();
+    const errTs = new Date().toISOString();
+    ensureChatExists(chatJid);
+    storeMessageDirect(
+      errId,
+      chatJid,
+      '__system__',
+      'system',
+      failure,
+      errTs,
+      true,
+    );
+    broadcastNewMessage(chatJid, {
+      id: errId,
+      chat_jid: chatJid,
+      sender: '__system__',
+      sender_name: 'system',
+      content: failure,
+      timestamp: errTs,
+      is_from_me: true,
+    });
+    return {
+      status: 500,
+      body: { error: freshCommand ? '零摘要换窗失败' : '清除上下文失败' },
+    };
+  }
+}
+
+type WebSendOutcome = {
+  status: 200 | 404 | 409 | 500;
+  body: Record<string, unknown>;
+};
+
+/** Handed to the message handlers when a send carries a clientMessageId. */
+interface WebSendIdempotency {
+  clientMessageId: string;
+  /**
+   * Called as soon as the message is stored, before anything that can still
+   * fail: from then on a resend must not store it again, even if this
+   * request ends in an error.
+   */
+  onStored(accepted: {
+    messageId: string;
+    timestamp: string;
+    ingestSequence?: number;
+  }): void;
+}
+
+/** Sends being processed, by idempotency key; a concurrent resend joins it. */
+const inFlightWebSends = new Map<
+  string,
+  { fingerprint: string; done: Promise<unknown> }
+>();
+
+/** What a resend must repeat to count as the same send. */
+function webSendFingerprint(
+  agentId: string | undefined,
+  content: string,
+  attachments: Array<{ data: string; mimeType?: string }> | undefined,
+  followUpBehavior: FollowUpMode,
+): string {
+  // Field by field with length prefixes: unambiguous, and the (possibly
+  // tens of MB of) attachment data is hashed without being copied.
+  const hash = crypto.createHash('sha256');
+  const field = (value: string) =>
+    hash.update(`${value.length}:`).update(value);
+  field(agentId ?? '');
+  field(followUpBehavior);
+  field(content);
+  for (const att of attachments ?? []) {
+    field(att.mimeType ?? '');
+    field(att.data);
+  }
+  return hash.digest('hex');
+}
+
+const DEDUP_CONFLICT: WebSendOutcome = {
+  status: 409,
+  body: { error: 'clientMessageId was already used for a different message' },
+};
+
+/**
+ * Run `send` at most once per (user, chat, clientMessageId). A resend of a
+ * send that stored its message, or finished, gets the first answer back
+ * without doing anything; one that arrives while the first is still running
+ * waits for it. A send that failed before storing anything is not
+ * remembered, so its resend is processed normally; one that failed after
+ * storing answers 500 with `stored: true`, and it and its replays `requeue`
+ * the stored input. Callers check access before this, and the user is part
+ * of the key.
+ */
+async function sendOnce(
+  key: {
+    userId: string;
+    chatJid: string;
+    clientMessageId: string;
+    fingerprint: string;
+  },
+  send: (idempotency: WebSendIdempotency) => Promise<WebSendOutcome>,
+  requeue: (messageId: string) => void,
+): Promise<WebSendOutcome> {
+  const { userId, chatJid, clientMessageId, fingerprint } = key;
+  const mapKey = JSON.stringify([userId, chatJid, clientMessageId]);
+  for (;;) {
+    const inFlight = inFlightWebSends.get(mapKey);
+    if (!inFlight) break;
+    if (inFlight.fingerprint !== fingerprint) return DEDUP_CONFLICT;
+    // Whatever the first attempt did, look again: it either left a record
+    // to answer from or failed, and then this resend is processed.
+    await inFlight.done.catch(() => undefined);
+  }
+  const stored = getWebMessageDedup(userId, chatJid, clientMessageId);
+  if (stored) {
+    if (stored.fingerprint !== fingerprint) return DEDUP_CONFLICT;
+    const { partial, ...response } = stored.response;
+    // Stored, but the first attempt failed before finishing: queue it again.
+    if (partial && typeof response.messageId === 'string') {
+      requeueSafely(() => requeue(response.messageId as string), chatJid);
+    }
+    return { status: 200, body: { ...response, deduplicated: true } };
   }
 
-  const result = await handleWebUserMessage(
-    chatJid,
-    content.trim(),
-    attachments,
-    authUser.id,
-    authUser.display_name || authUser.username,
-    followUpBehavior,
-  );
-  if (!result.ok) return c.json({ error: result.error }, result.status);
-  return c.json({
-    success: true,
-    messageId: result.messageId,
-    timestamp: result.timestamp,
-    ingestSequence: result.ingestSequence,
-    disposition: result.disposition,
-    runId: result.runId,
+  const remember = (response: Record<string, unknown>) => {
+    try {
+      recordWebMessageDedup({
+        userId,
+        chatJid,
+        clientMessageId,
+        fingerprint,
+        response,
+      });
+    } catch (err) {
+      // The send went through; failing the request now would only make the
+      // client resend it.
+      logger.warn(
+        { chatJid, clientMessageId, err },
+        'Failed to record Web send idempotency key',
+      );
+    }
+  };
+  let storedMessageId: string | undefined;
+  // Registered before the first await, so no concurrent resend can slip in.
+  const done = send({
+    clientMessageId,
+    onStored: (accepted) => {
+      storedMessageId = accepted.messageId;
+      remember({ success: true, ...accepted, partial: true });
+    },
   });
-});
+  inFlightWebSends.set(mapKey, { fingerprint, done });
+  try {
+    const outcome = await done;
+    if (outcome.status === 200) remember(outcome.body);
+    return outcome;
+  } catch (err) {
+    if (storedMessageId === undefined) throw err;
+    // The message is stored: tell the client so, and make sure it runs.
+    logger.error(
+      { chatJid, clientMessageId, messageId: storedMessageId, err },
+      'Web send failed after its message was stored',
+    );
+    const messageId = storedMessageId;
+    requeueSafely(() => requeue(messageId), chatJid);
+    return {
+      status: 500,
+      body: {
+        error: '消息已保存，但处理失败',
+        stored: true,
+        messageId: storedMessageId,
+      },
+    };
+  } finally {
+    inFlightWebSends.delete(mapKey);
+  }
+}
+
+function requeueSafely(requeue: () => void, chatJid: string): void {
+  try {
+    requeue();
+  } catch (err) {
+    logger.warn({ chatJid, err }, 'Failed to requeue a stored Web input');
+  }
+}
 
 app.get('/api/follow-ups', authMiddleware, async (c) => {
   if (!deps) return c.json({ error: 'Server not initialized' }, 500);
   const chatJid = c.req.query('chatJid')?.trim();
   if (!chatJid) return c.json({ error: 'chatJid is required' }, 400);
-  const baseJid = chatJid.includes('#agent:')
-    ? chatJid.slice(0, chatJid.indexOf('#agent:'))
-    : chatJid;
+  const baseJid = stripVirtualJidSuffix(chatJid);
   const group = getRegisteredGroup(baseJid);
   if (!group) return c.json({ error: 'Group not found' }, 404);
   const authUser = c.get('user') as AuthUser;
-  if (!canAccessGroup(authUser, group)) {
-    return c.json({ error: 'Access denied' }, 403);
+  // Read-only: granted guests may see the visible queue, never act on it.
+  if (!canViewGroup(authUser, group)) {
+    return authUser.role === 'guest'
+      ? c.json({ error: 'Group not found' }, 404)
+      : c.json({ error: 'Access denied' }, 403);
   }
-  return c.json({ items: listQueuedFollowUps(chatJid) });
+  return c.json({
+    items: listQueuedFollowUps(chatJid).map(presentAutomationMessage),
+  });
 });
 
 app.post('/api/follow-ups/:messageId/action', authMiddleware, async (c) => {
@@ -539,9 +808,7 @@ app.post('/api/follow-ups/:messageId/action', authMiddleware, async (c) => {
   if (!chatJid || !body.action) {
     return c.json({ error: 'chatJid and action are required' }, 400);
   }
-  const baseJid = chatJid.includes('#agent:')
-    ? chatJid.slice(0, chatJid.indexOf('#agent:'))
-    : chatJid;
+  const baseJid = stripVirtualJidSuffix(chatJid);
   const group = getRegisteredGroup(baseJid);
   if (!group) return c.json({ error: 'Group not found' }, 404);
   const authUser = c.get('user') as AuthUser;
@@ -600,417 +867,6 @@ app.post('/api/follow-ups/:messageId/action', authMiddleware, async (c) => {
   return c.json(result, 200);
 });
 
-// --- handleWebUserMessage ---
-
-async function handleWebUserMessage(
-  chatJid: string,
-  content: string,
-  attachments?: Array<{ type: 'image'; data: string; mimeType?: string }>,
-  userId = 'web-user',
-  displayName = 'Web',
-  followUpBehavior: FollowUpMode = 'queue',
-): Promise<
-  | {
-      ok: true;
-      messageId: string;
-      timestamp: string;
-      ingestSequence?: number;
-      disposition: 'started' | 'queued' | 'steered';
-      runId?: string;
-    }
-  | {
-      ok: false;
-      status: 404 | 500;
-      error: string;
-    }
-> {
-  if (!deps) return { ok: false, status: 500, error: 'Server not initialized' };
-
-  let group = deps.getRegisteredGroups()[chatJid];
-  if (!group) {
-    // Group may exist in DB but not in memory cache (created via setup/registration after loadState)
-    const dbGroup = getRegisteredGroup(chatJid);
-    if (!dbGroup) return { ok: false, status: 404, error: 'Group not found' };
-    group = dbGroup;
-  }
-  const runtimeGroup = deps.resolveEffectiveGroup
-    ? deps.resolveEffectiveGroup(group).effectiveGroup
-    : group;
-  const requiredFeishuCliAccountId =
-    (runtimeGroup.executionMode || 'container') === 'container'
-      ? resolveFeishuCliBoundAccountId({
-          workspaceChannelAccountId: runtimeGroup.channel_account_id,
-        })
-      : null;
-
-  ensureChatExists(chatJid);
-
-  const messageId = crypto.randomUUID();
-  const timestamp = new Date().toISOString();
-  const normalizedAttachments = normalizeImageAttachments(attachments, {
-    onMimeMismatch: ({ declaredMime, detectedMime }) => {
-      logger.warn(
-        { chatJid, messageId, declaredMime, detectedMime },
-        'Web attachment MIME mismatch detected, using detected MIME',
-      );
-    },
-  });
-  const attachmentsStr =
-    normalizedAttachments.length > 0
-      ? JSON.stringify(normalizedAttachments)
-      : undefined;
-  const activeRunId = deps.queue.getActiveQueryId(chatJid);
-  const effectiveFollowUpBehavior: FollowUpMode = followUpBehavior;
-  // Both queue and steer remain durable until the active query reaches idle.
-  // A steer requests a controlled interrupt below; it must not be released
-  // early and injected into Claude as a best-effort queued_command attachment.
-  const queueForLater = !!activeRunId;
-  const deliveryStatus = activeRunId ? 'queued' : null;
-  storeMessageDirect(
-    messageId,
-    chatJid,
-    userId,
-    displayName,
-    content,
-    timestamp,
-    false,
-    {
-      attachments: attachmentsStr,
-      meta: activeRunId
-        ? {
-            deliveryMode: effectiveFollowUpBehavior,
-            deliveryStatus,
-            deliveryRunId: activeRunId,
-            deliveryUpdatedAt: timestamp,
-          }
-        : undefined,
-    },
-  );
-  const messageCursor = getMessageCursor(chatJid, messageId) ?? {
-    timestamp,
-    id: messageId,
-  };
-
-  broadcastNewMessage(chatJid, {
-    id: messageId,
-    chat_jid: chatJid,
-    sender: userId,
-    sender_name: displayName,
-    content,
-    timestamp,
-    is_from_me: false,
-    attachments: attachmentsStr,
-    delivery_mode: activeRunId ? effectiveFollowUpBehavior : null,
-    delivery_status: deliveryStatus,
-    delivery_run_id: activeRunId,
-    delivery_updated_at: activeRunId ? timestamp : null,
-  });
-
-  if (group.created_by) {
-    const owner = getUserById(group.created_by);
-    if (owner && owner.role !== 'admin') {
-      const accessResult = checkBillingAccess(group.created_by, owner.role);
-      if (!accessResult.allowed) {
-        if (queueForLater) {
-          const deliveryUpdatedAt = new Date().toISOString();
-          setMessageFollowUp(chatJid, messageId, {
-            mode: effectiveFollowUpBehavior,
-            // This input received a terminal billing response, so it belongs
-            // in the transcript immediately before that response rather than
-            // behaving like a user-cancelled queued message.
-            status: 'released',
-            runId: activeRunId,
-          });
-          broadcastFollowUpUpdate(chatJid, {
-            id: messageId,
-            delivery_status: 'released',
-            delivery_run_id: activeRunId,
-            delivery_updated_at: deliveryUpdatedAt,
-          });
-        }
-        const sysMsg = formatBillingAccessDeniedMessage(accessResult);
-        const sysMsgId = `sys_quota_${Date.now()}`;
-        const sysTimestamp = new Date().toISOString();
-        storeMessageDirect(
-          sysMsgId,
-          chatJid,
-          '__billing__',
-          ASSISTANT_NAME,
-          sysMsg,
-          sysTimestamp,
-          true,
-        );
-        broadcastNewMessage(chatJid, {
-          id: sysMsgId,
-          chat_jid: chatJid,
-          sender: '__billing__',
-          sender_name: ASSISTANT_NAME,
-          content: sysMsg,
-          timestamp: sysTimestamp,
-          is_from_me: true,
-        });
-        completeWebOutOfBandMessage(deps, chatJid, {
-          timestamp,
-          id: messageId,
-        });
-        deps.advanceGlobalCursor({ timestamp, id: messageId });
-        return {
-          ok: true,
-          messageId,
-          timestamp,
-          ingestSequence: messageCursor.sequence,
-          disposition: 'started',
-        };
-      }
-    }
-  }
-
-  if (queueForLater) {
-    broadcastFollowUpUpdate(chatJid);
-    deps.advanceGlobalCursor({ timestamp, id: messageId });
-    if (effectiveFollowUpBehavior === 'steer') {
-      const steerResult = await deps.promoteFollowUp?.(
-        chatJid,
-        messageId,
-        activeRunId!,
-      );
-      return {
-        ok: true,
-        messageId,
-        timestamp,
-        ingestSequence: messageCursor.sequence,
-        disposition: steerResult?.ok ? 'steered' : 'queued',
-        runId: activeRunId!,
-      };
-    }
-    return {
-      ok: true,
-      messageId,
-      timestamp,
-      ingestSequence: messageCursor.sequence,
-      disposition: 'queued',
-      runId: activeRunId,
-    };
-  }
-
-  // Plugin command expander (DMI commands).
-  //
-  // Hybrid strategy avoiding the round-11/round-12 P2-4 double-exec while
-  // keeping active-runner DMI working:
-  //   - Active runner: expander runs here. `reply` short-circuits with an
-  //     in-band system message; `expanded` mutates `sendContent` to the
-  //     prompt that's piped via `queue.sendMessage`; `miss` passes through.
-  //   - Idle (no active runner): we DO NOT call the expander at all —
-  //     `expandPluginSlashCommandIfNeeded` itself runs inline `!` as a side
-  //     effect (not pure parse), so calling it then discarding the result
-  //     would still execute inline once here AND again when cold-start
-  //     re-reads the DB row and re-expands → double-fire (#20 P2-4 round 12).
-  //     The `enqueueMessageCheck → cold-start → expandMessagesIfNeeded`
-  //     path handles `reply`/`expanded`/`miss` uniformly with no race.
-  //
-  // Race window between the peek and `queue.sendMessage` is small and benign:
-  // if the runner exits in that gap, sendMessage returns 'no_active' and
-  // cold-start re-reads ORIGINAL from DB (we don't write `sendContent` back),
-  // so cold-start re-expands and inline runs again. Lead-approved tradeoff;
-  // log a warn line so we can confirm rarity in production.
-  let sendContent = content;
-  const eagerExpandActive =
-    !deps.queue.requiresFeishuCliContainerRestart(chatJid, {
-      feishuCliAccountId: requiredFeishuCliAccountId,
-    }) && deps.queue.hasActiveMainRunnerForMessage(chatJid);
-  if (eagerExpandActive) {
-    // Use the effective (sibling-resolved) group so non-home groups bound to a
-    // home sibling inherit executionMode / customCwd / created_by — otherwise
-    // buildWebExpandContext returns null on sibling JIDs and the active runner
-    // ends up receiving the literal `/foo` slash command (#21 round-13 P2-3).
-    const expandCtx = buildWebExpandContext(chatJid, runtimeGroup);
-    if (expandCtx) {
-      const expansion = await expandPluginSlashCommandIfNeeded(
-        expandCtx,
-        content,
-      );
-      if (expansion.kind === 'reply') {
-        const sysMsgId = `sys_plugin_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-        const sysTimestamp = new Date().toISOString();
-        storeMessageDirect(
-          sysMsgId,
-          chatJid,
-          '__plugin__',
-          ASSISTANT_NAME,
-          expansion.text,
-          sysTimestamp,
-          true,
-        );
-        broadcastNewMessage(chatJid, {
-          id: sysMsgId,
-          chat_jid: chatJid,
-          sender: '__plugin__',
-          sender_name: ASSISTANT_NAME,
-          content: expansion.text,
-          timestamp: sysTimestamp,
-          is_from_me: true,
-        });
-        // Plugin reply is out-of-band — it does NOT consume an agent turn.
-        // Mirror the cold-start cursor logic (#22 round-14 P2):
-        //   - earlier pending exists → advanceNextPullCursorOnly so the
-        //     next poll skips this reply but lastCommittedCursor stays put
-        //     and recovery still surfaces the earlier message
-        //   - no earlier pending → advanceCursors fully commits with a
-        //     lex (timestamp, id) max-merge (#27 round-17 P2-2). Direct
-        //     overwrite via setCursors regressed the cursor when a same-
-        //     millisecond batch had a higher-UUID neighbor already
-        //     committed → already-processed messages re-polled and the
-        //     reply re-fired.
-        const replyCursor = { timestamp, id: messageId };
-        completeWebOutOfBandMessage(deps, chatJid, replyCursor);
-        deps.advanceGlobalCursor(replyCursor);
-        return {
-          ok: true,
-          messageId,
-          timestamp,
-          ingestSequence: messageCursor.sequence,
-          disposition: activeRunId ? 'steered' : 'started',
-          runId: activeRunId ?? undefined,
-        };
-      }
-      if (expansion.kind === 'expanded') {
-        sendContent = expansion.prompt;
-        // Crash-safety (#23 round-15 P1-1): the cold-start path persists the
-        // sentinel before the cursor advances; the web eager-expand path was
-        // missing this write, so a runner crash between IPC inject and message
-        // consume left the DB row holding the original `/foo` slash command.
-        // Recovery's expandMessagesIfNeeded would then re-run inline `!` and
-        // fire side effects twice. Mirror the cold-start contract here:
-        // persist BEFORE handing the expanded prompt downstream, only when
-        // every inline succeeded — failed-inline expansions intentionally
-        // skip persistence so recovery legitimately retries.
-        if (expansion.inlineExecuted) {
-          try {
-            persistPluginExpansion(messageId, chatJid, {
-              type: PLUGIN_EXPANSION_ATTACHMENT_TYPE,
-              expanded: true,
-              prompt: expansion.prompt,
-              expandedAt: new Date().toISOString(),
-            });
-          } catch (err) {
-            // Non-fatal: prompt still reaches the agent on this run; recovery
-            // worst-case re-runs inline (the original bug, no regression).
-            logger.warn(
-              { err, chatJid, messageId },
-              'web eager expand: failed to persist expansion sentinel',
-            );
-          }
-        }
-      }
-      // `miss` → sendContent already holds the original.
-    }
-  }
-  // Idle path: skip expander entirely; cold-start will expand once from the
-  // original DB row via `expandMessagesIfNeeded` (handles reply/expanded/miss).
-
-  const formatted = deps.formatMessages([
-    {
-      id: messageId,
-      chat_jid: chatJid,
-      sender: userId,
-      sender_name: displayName,
-      content: sendContent,
-      timestamp,
-    },
-  ]);
-
-  // IPC-inject the message into the running agent process.  For home groups,
-  // the reply route is dynamically updated via activeRouteUpdaters so we no
-  // longer need to kill and restart the process (#99).
-  let pipedToActive = false;
-  const images = toAgentImages(normalizedAttachments);
-  const updateRoute = deps.updateReplyRoute;
-  const preAdmitRoute = deps.preAdmitReplyRoute;
-  const sendResult = deps.queue.sendMessage(
-    chatJid,
-    formatted,
-    images,
-    (receipt) => {
-      // IPC write succeeded — update reply route for home groups.
-      // Web messages have no IM source, so clear the IM route.
-      updateRoute?.(
-        group.folder,
-        null,
-        receipt?.deliveryId,
-        receipt?.cursor,
-        receipt?.chatJid,
-      );
-    },
-    chatJid,
-    undefined,
-    {
-      chatJid,
-      coveredCursors: [messageCursor],
-      cursor: messageCursor,
-    },
-    undefined,
-    (receipt) => preAdmitRoute?.(group.folder, null, receipt) ?? false,
-    { feishuCliAccountId: requiredFeishuCliAccountId },
-  );
-  if (sendResult === 'sent') {
-    pipedToActive = true;
-  } else {
-    if (eagerExpandActive && sendContent !== content) {
-      // Active runner exited between peek and sendMessage → cold-start will
-      // re-expand from the ORIGINAL DB content, so inline `!` runs again.
-      // Rare but possible — flagged so we can quantify in production.
-      logger.warn(
-        {
-          event: 'plugin_expander_race',
-          subtype: 'user_message',
-          chatJid,
-          userId,
-          messageId,
-        },
-        'Race: eager-expanded but runner exited before sendMessage; cold-start will re-expand (inline may run twice)',
-      );
-    }
-    deps.queue.enqueueMessageCheck(chatJid);
-  }
-
-  // Only advance per-group cursor when we piped directly into a running container.
-  //
-  // When piped to active, we also mark the group as having pending IPC-injected
-  // messages. If the agent crashes without processing them, the close handler
-  // resets pendingMessages so drainGroup re-reads from DB.
-  if (pipedToActive) {
-    deps.advanceNextPullCursorOnly(chatJid, { timestamp, id: messageId });
-  }
-  deps.advanceGlobalCursor({ timestamp, id: messageId });
-  const startedRunId = deps.queue.getActiveQueryId(chatJid);
-  return {
-    ok: true,
-    messageId,
-    timestamp,
-    ingestSequence: messageCursor.sequence,
-    disposition: activeRunId ? 'steered' : 'started',
-    runId: activeRunId ?? startedRunId ?? undefined,
-  };
-}
-
-// --- Auto-title for conversations ---
-
-/** Extract a short title from the first user message content. */
-function generateAutoTitle(content: string): string | null {
-  const trimmed = content.trim();
-  if (!trimmed || trimmed.startsWith('/')) return null;
-
-  const text = markdownToPlainText(trimmed).replace(/\n+/g, ' ').trim();
-
-  if (!text) return null;
-
-  const firstLine = text.split('\n')[0].trim();
-  if (!firstLine) return null;
-
-  if (firstLine.length <= 20) return firstLine;
-  return firstLine.slice(0, 20) + '…';
-}
-
 // --- Agent Conversation Message Handler ---
 
 async function handleAgentConversationMessage(
@@ -1021,6 +877,7 @@ async function handleAgentConversationMessage(
   displayName: string,
   attachments?: Array<{ type: 'image'; data: string; mimeType?: string }>,
   followUpBehavior: FollowUpMode = 'queue',
+  idempotency?: WebSendIdempotency,
 ): Promise<
   | {
       ok: true;
@@ -1107,6 +964,11 @@ async function handleAgentConversationMessage(
     timestamp,
     id: messageId,
   };
+  idempotency?.onStored({
+    messageId,
+    timestamp,
+    ingestSequence: agentMessageCursor.sequence,
+  });
   updateAgentContextInfo(agentId, { last_active_at: timestamp });
 
   // Auto-title: show a quick placeholder derived from the first user message.
@@ -1139,6 +1001,7 @@ async function handleAgentConversationMessage(
       timestamp,
       is_from_me: false,
       attachments: attachmentsStr,
+      client_message_id: idempotency?.clientMessageId,
       delivery_mode: activeRunId ? effectiveFollowUpBehavior : null,
       delivery_status: deliveryStatus,
       delivery_run_id: activeRunId,
@@ -1146,6 +1009,59 @@ async function handleAgentConversationMessage(
     },
     agentId,
   );
+
+  const ownerId = parentGroup?.created_by;
+  const owner = ownerId ? getUserById(ownerId) : undefined;
+  const billingAccess =
+    ownerId && owner && owner.role !== 'admin'
+      ? checkBillingAccess(ownerId, owner.role)
+      : null;
+  if (billingAccess && !billingAccess.allowed) {
+    if (queueForLater) {
+      // The input gets its terminal billing answer now: it belongs in the
+      // transcript right before that answer, not in the queue.
+      setMessageFollowUp(virtualChatJid, messageId, {
+        mode: effectiveFollowUpBehavior,
+        status: 'released',
+        runId: activeRunId,
+      });
+      broadcastFollowUpUpdate(virtualChatJid, {
+        id: messageId,
+        delivery_status: 'released',
+        delivery_run_id: activeRunId,
+        delivery_updated_at: new Date().toISOString(),
+      });
+    }
+    const sysMsg = formatBillingAccessDeniedMessage(billingAccess);
+    const sysMsgId = `sys_quota_${Date.now()}`;
+    const sysTimestamp = new Date().toISOString();
+    storeMessageDirect(
+      sysMsgId,
+      virtualChatJid,
+      '__billing__',
+      ASSISTANT_NAME,
+      sysMsg,
+      sysTimestamp,
+      true,
+    );
+    broadcastNewMessage(virtualChatJid, {
+      id: sysMsgId,
+      chat_jid: virtualChatJid,
+      sender: '__billing__',
+      sender_name: ASSISTANT_NAME,
+      content: sysMsg,
+      timestamp: sysTimestamp,
+      is_from_me: true,
+    });
+    completeWebOutOfBandMessage(deps, virtualChatJid, agentMessageCursor);
+    return {
+      ok: true,
+      messageId,
+      timestamp,
+      ingestSequence: agentMessageCursor.sequence,
+      disposition: 'started',
+    };
+  }
 
   if (queueForLater) {
     broadcastFollowUpUpdate(virtualChatJid);
@@ -1187,7 +1103,7 @@ async function handleAgentConversationMessage(
   const eagerExpandAgentActive =
     !deps.queue.requiresFeishuCliContainerRestart(virtualChatJid, {
       feishuCliAccountId: requiredFeishuCliAccountId,
-    }) && deps.queue.hasActiveMainRunnerForMessage(virtualChatJid);
+    }) && deps.queue.hasActiveRunnerForMessage(virtualChatJid);
   if (eagerExpandAgentActive) {
     if (parentGroup) {
       // Use the effective (sibling-resolved) parent group so a non-home parent
@@ -1198,7 +1114,11 @@ async function handleAgentConversationMessage(
       const expandParent = deps.resolveEffectiveGroup
         ? deps.resolveEffectiveGroup(parentGroup).effectiveGroup
         : parentGroup;
-      const expandCtx = buildWebExpandContext(virtualChatJid, expandParent);
+      const expandCtx = buildWebExpandContext(
+        virtualChatJid,
+        expandParent,
+        agentId,
+      );
       if (expandCtx) {
         const expansion = await expandPluginSlashCommandIfNeeded(
           expandCtx,
@@ -1304,21 +1224,12 @@ async function handleAgentConversationMessage(
       // Route update owns both the durable warm turn and card rotation. Older
       // embedders without updateReplyRoute retain the legacy finalizer hook.
       if (updateRoute) {
-        updateRoute(
-          agent.group_folder,
-          null,
-          receipt?.deliveryId,
-          receipt?.cursor,
-          receipt?.chatJid,
-          undefined,
-          agentId,
-        );
+        updateRoute(agent.group_folder, agentId, null, receipt);
       } else {
         finalizeHeld?.(virtualChatJid);
       }
     },
     virtualChatJid,
-    undefined,
     {
       chatJid: virtualChatJid,
       coveredCursors: [agentMessageCursor],
@@ -1326,7 +1237,7 @@ async function handleAgentConversationMessage(
     },
     undefined,
     (receipt) =>
-      preAdmitRoute?.(agent.group_folder, null, receipt, agentId) ?? false,
+      preAdmitRoute?.(agent.group_folder, agentId, null, receipt) ?? false,
     { feishuCliAccountId: requiredFeishuCliAccountId },
   );
   if (agentSendResult === 'sent') {
@@ -1350,15 +1261,17 @@ async function handleAgentConversationMessage(
         'Race: eager-expanded agent conv but runner exited before sendMessage; cold-start will re-expand',
       );
     }
-    // No running process — force close any stale state and start fresh
-    // (#240). Only reached on 'no_active'; a warm runner is never closed.
-    deps.queue.closeStdin(virtualChatJid);
-    if (deps.processAgentConversation) {
-      const taskId = `agent-conv:${agentId}:${Date.now()}`;
-      deps.queue.enqueueTask(virtualChatJid, taskId, async () => {
-        return deps!.processAgentConversation!(chatJid, agentId);
-      });
-    }
+    // A runner still on this lane takes no more input, and the cold start
+    // below runs only once it exits: ask it to exit after its current query
+    // (an idle one now) rather than wait for its idle timeout. Unlike
+    // closeStdin, this never interrupts a turn another channel started while
+    // plugin expansion awaited.
+    deps.queue.retireRunnerAfterQuery(virtualChatJid);
+    deps.queue.enqueueTask(
+      virtualChatJid,
+      `agent-conv:${agentId}:${Date.now()}`,
+      () => deps!.processAgentConversation(chatJid, agentId),
+    );
   }
   // 'sent' needs no further action
   const startedRunId = deps.queue.getActiveQueryId(virtualChatJid);
@@ -1455,6 +1368,7 @@ app.use(
         !p.match(/\.\w+$/) ||
         p === '/index.html' ||
         p === '/sw.js' ||
+        p === '/push-sw.js' ||
         p === '/registerSW.js' ||
         p === '/manifest.webmanifest'
       ) {
@@ -1642,6 +1556,15 @@ function setupWebSocket(server: any): WebSocketServer {
       socket.destroy();
       return;
     }
+    // A guest whose owner is disabled/deleted is cut off like a disabled user.
+    if (
+      session.role === 'guest' &&
+      !getGuestAccountState(session.user_id).valid
+    ) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     request.__happyclawSessionId = token;
 
     wss.handleUpgrade(request, socket, head, (ws) => {
@@ -1679,7 +1602,9 @@ function setupWebSocket(server: any): WebSocketServer {
       }> = [];
       const queuedChatJids: string[] = [];
       for (const g of queueStatus.groups) {
-        const baseJid = stripRuntimeJidSuffix(g.jid);
+        // Idle groups emit nothing below; skip them before the ACL lookup.
+        if (!(g.queryInFlight && g.queryId) && !g.pendingMessages) continue;
+        const baseJid = stripVirtualJidSuffix(g.jid);
         const jid = normalizeRuntimeJid(g.jid);
         const allowed = getGroupAllowedUserIds(baseJid);
         if (allowed === null || !allowed.has(userId)) continue;
@@ -1700,12 +1625,26 @@ function setupWebSocket(server: any): WebSocketServer {
           phase: hasStreamSnapshot ? 'running' : 'preparing',
         });
       }
+      const usageLimitWaits = listPendingUsageLimitWaits()
+        .map((wait) => {
+          const [baseChatJid, agentId] = wait.scopeKey.split('#agent:');
+          const allowed = getGroupAllowedUserIds(baseChatJid);
+          if (allowed === null || !allowed.has(userId)) return null;
+          return {
+            chatJid: normalizeHomeJid(baseChatJid),
+            ...(agentId ? { agentId } : {}),
+            resumeAt: wait.resumeAt,
+            waitCount: wait.waitCount,
+          };
+        })
+        .filter((wait) => wait !== null);
       try {
         ws.send(
           JSON.stringify({
             type: 'active_run_snapshot',
             runs,
             queuedChatJids,
+            usageLimitWaits,
           } satisfies WsMessageOut),
         );
       } catch {
@@ -1730,7 +1669,7 @@ function setupWebSocket(server: any): WebSocketServer {
         const restorable = buildStreamSnapshot(jid);
         if (!restorable) continue;
         // Strip #agent: suffix for ACL lookup (virtual JIDs not in registered_groups)
-        const baseJid = jid.includes('#agent:') ? jid.split('#agent:')[0] : jid;
+        const baseJid = stripVirtualJidSuffix(jid);
         const allowed = getGroupAllowedUserIds(baseJid);
         if (allowed === null || !allowed.has(userId)) continue;
         try {
@@ -1797,10 +1736,58 @@ function setupWebSocket(server: any): WebSocketServer {
 
         const msg: WsMessageIn = JSON.parse(data.toString());
 
-        const sendWsError = (error: string, chatJid?: string) => {
-          const msg: WsMessageOut = { type: 'ws_error', error, chatJid };
+        const sendWsError = (
+          error: string,
+          chatJid?: string,
+          code?: 'session_required',
+        ) => {
+          const msg: WsMessageOut = {
+            type: 'ws_error',
+            error,
+            chatJid,
+            ...(code ? { code } : {}),
+          };
           ws.send(JSON.stringify(msg));
         };
+
+        // A liveness probe changes nothing; every socket gets its pong.
+        if (msg.type === 'ping') {
+          const pong: WsMessageOut = { type: 'pong' };
+          ws.send(JSON.stringify(pong));
+          return;
+        }
+
+        // Where the user is looking; Web Push stays quiet for that
+        // conversation. Guests get no push, so their reports are ignored.
+        if (msg.type === 'presence') {
+          const client = wsClients.get(ws);
+          if (client && session.role !== 'guest') {
+            const asId = (value: unknown): string | null =>
+              typeof value === 'string' && value && value.length <= 256
+                ? value
+                : null;
+            client.presence = {
+              visible: msg.visible === true,
+              chatJid: asId(msg.chatJid),
+              agentId: asId(msg.agentId),
+              at: Date.now(),
+            };
+          }
+          return;
+        }
+
+        // Guest sockets are receive-only. Every other client message type
+        // (send, terminal, and anything added later) is refused before
+        // dispatch.
+        if (session.role === 'guest') {
+          sendWsError(
+            GUEST_READ_ONLY_ERROR,
+            typeof (msg as { chatJid?: unknown })?.chatJid === 'string'
+              ? (msg as { chatJid: string }).chatJid
+              : undefined,
+          );
+          return;
+        }
 
         if (msg.type === 'send_message') {
           const wsValidation = MessageCreateSchema.safeParse({
@@ -1823,36 +1810,51 @@ function setupWebSocket(server: any): WebSocketServer {
           const { chatJid, content, attachments, followUpBehavior } =
             wsValidation.data;
           const agentId = (msg as { agentId?: string }).agentId;
+          // Every input belongs to a session; a workspace JID alone names
+          // none. Nothing is stored for such a send.
+          if (!agentId) {
+            sendWsError('请选择会话', chatJid, 'session_required');
+            return;
+          }
 
           // 群组访问权限检查
           const targetGroup = getRegisteredGroup(chatJid);
-          if (targetGroup) {
-            if (
-              !canAccessGroup(
-                { id: session.user_id, role: session.role },
-                targetGroup,
-              )
-            ) {
-              sendWsError('无权访问该群组', chatJid);
-              logger.warn(
-                { chatJid, userId: session.user_id },
-                'WebSocket send_message blocked: access denied',
-              );
-              return;
-            }
-            if (isHostExecutionGroup(targetGroup)) {
-              if (session.role !== 'admin') {
-                sendWsError('宿主机模式需要管理员权限', chatJid);
-                logger.warn(
-                  { chatJid, userId: session.user_id },
-                  'WebSocket send_message blocked: host mode requires admin',
-                );
-                return;
-              }
-            }
+          if (!targetGroup) {
+            sendWsError('群组不存在', chatJid);
+            return;
           }
+          if (
+            !canAccessGroup(
+              { id: session.user_id, role: session.role },
+              targetGroup,
+            )
+          ) {
+            sendWsError('无权访问该群组', chatJid);
+            logger.warn(
+              { chatJid, userId: session.user_id },
+              'WebSocket send_message blocked: access denied',
+            );
+            return;
+          }
+          if (isHostExecutionGroup(targetGroup) && session.role !== 'admin') {
+            sendWsError('宿主机模式需要管理员权限', chatJid);
+            logger.warn(
+              { chatJid, userId: session.user_id },
+              'WebSocket send_message blocked: host mode requires admin',
+            );
+            return;
+          }
+          const targetSession = getAgent(agentId);
+          if (
+            targetSession?.kind !== 'conversation' ||
+            targetSession.chat_jid !== chatJid
+          ) {
+            sendWsError('Agent not found', chatJid);
+            return;
+          }
+          const sessionJid = `${chatJid}#agent:${agentId}`;
 
-          // ── /sw or /spawn command: spawn parallel task (checked before agent routing) ──
+          // ── /sw or /spawn command: a parallel task reporting back to this session ──
           const swMatch = content.trim().match(/^\/(sw|spawn)\s+([\s\S]+)$/i);
           if (swMatch && deps?.handleSpawnCommand) {
             const spawnAccess = evaluateWsSpawnCommandAccess(
@@ -1867,11 +1869,8 @@ function setupWebSocket(server: any): WebSocketServer {
             const spawnMessage = swMatch[2].trim();
             if (spawnMessage) {
               try {
-                // For agent tab, include agentId in chatJid so spawn resolves the right workspace
-                const effectiveChatJid = agentId
-                  ? `${chatJid}#agent:${agentId}`
-                  : chatJid;
-                // Store user's /sw message in the current chat so it's visible
+                const effectiveChatJid = sessionJid;
+                // Store user's /sw message in the session so it's visible
                 const userMsgId = crypto.randomUUID();
                 const userMsgTs = new Date().toISOString();
                 ensureChatExists(effectiveChatJid);
@@ -1894,6 +1893,15 @@ function setupWebSocket(server: any): WebSocketServer {
                   timestamp: userMsgTs,
                   is_from_me: false,
                 });
+                // The echo is a record, not the session's next input.
+                completeWebOutOfBandMessage(
+                  deps,
+                  effectiveChatJid,
+                  getMessageCursor(effectiveChatJid, userMsgId) ?? {
+                    timestamp: userMsgTs,
+                    id: userMsgId,
+                  },
+                );
 
                 await deps.handleSpawnCommand(effectiveChatJid, spawnMessage);
               } catch (err) {
@@ -1903,15 +1911,13 @@ function setupWebSocket(server: any): WebSocketServer {
             return;
           }
 
-          // ── /clear command: reset session without entering message pipeline ──
-          // Must run before the agentId early return so /clear in a sub-agent tab
-          // resets the agent session (passing agentId) instead of being delivered
-          // to the agent as plain text.
+          // ── /clear command: reset the session without entering the message
+          // pipeline, instead of delivering it to the agent as plain text.
           // Permission: owner-only (canModifyGroup) — aligned with HTTP /clear
           // and `reset-session` route. /clear has the same destructive effect.
           // Success has no explicit ws_error/ack — the client sees the reset
           // through the broadcastNewMessage(context_reset) push from executeSessionReset.
-          if (isClearCommand(content) && deps && targetGroup) {
+          if (isClearCommand(content) && deps) {
             if (
               !canModifyGroup(
                 { id: session.user_id, role: session.role },
@@ -1921,26 +1927,13 @@ function setupWebSocket(server: any): WebSocketServer {
               sendWsError('Only the workspace owner can run /clear', chatJid);
               return;
             }
-            // Validate agentId before passing to executeSessionReset →
-            // clearSessionFiles, which interpolates agentId into a filesystem
-            // path. Mirrors the reset-session route's check (routes/groups.ts).
-            if (agentId) {
-              const agent = getAgent(agentId);
-              if (!agent || agent.chat_jid !== chatJid) {
-                sendWsError('Agent not found', chatJid);
-                return;
-              }
-            }
-            const errorTargetJid = agentId
-              ? `${chatJid}#agent:${agentId}`
-              : chatJid;
+            const errorTargetJid = sessionJid;
             try {
               await executeSessionReset(
                 chatJid,
                 targetGroup.folder,
                 {
                   queue: deps.queue,
-                  sessions: deps.getSessions(),
                   broadcast: broadcastNewMessage,
                   setLastAgentTimestamp: deps.setLastAgentTimestamp,
                 },
@@ -1975,7 +1968,7 @@ function setupWebSocket(server: any): WebSocketServer {
 
           // ── /fresh [notes]: zero-summary window switch ──
           const wsFreshCommand = parseFreshCommand(content);
-          if (wsFreshCommand && deps && targetGroup) {
+          if (wsFreshCommand && deps) {
             if (
               !canModifyGroup(
                 { id: session.user_id, role: session.role },
@@ -1985,20 +1978,10 @@ function setupWebSocket(server: any): WebSocketServer {
               sendWsError('Only the workspace owner can run /fresh', chatJid);
               return;
             }
-            if (agentId) {
-              const agent = getAgent(agentId);
-              if (!agent || agent.chat_jid !== chatJid) {
-                sendWsError('Agent not found', chatJid);
-                return;
-              }
-            }
-            const errorTargetJid = agentId
-              ? `${chatJid}#agent:${agentId}`
-              : chatJid;
+            const errorTargetJid = sessionJid;
             try {
               const snapshot = await captureWorkspaceSnapshot(
-                targetGroup.customCwd ||
-                  path.join(GROUPS_DIR, targetGroup.folder),
+                resolveWorkspaceProjectRoot(targetGroup, { agentId }),
               );
               const handoff = formatFreshWindowHandoff({
                 notes: wsFreshCommand.notes,
@@ -2009,7 +1992,6 @@ function setupWebSocket(server: any): WebSocketServer {
                 targetGroup.folder,
                 {
                   queue: deps.queue,
-                  sessions: deps.getSessions(),
                   broadcast: broadcastNewMessage,
                   setLastAgentTimestamp: deps.setLastAgentTimestamp,
                 },
@@ -2042,31 +2024,18 @@ function setupWebSocket(server: any): WebSocketServer {
             return;
           }
 
-          // Route to agent conversation handler if agentId is present
-          if (agentId && deps) {
-            await handleAgentConversationMessage(
-              chatJid,
-              agentId,
-              content.trim(),
-              session.user_id,
-              session.display_name || session.username,
-              attachments,
-              followUpBehavior,
-            );
-            return;
-          }
-
-          const result = await handleWebUserMessage(
+          const result = await handleAgentConversationMessage(
             chatJid,
+            agentId,
             content.trim(),
-            attachments,
             session.user_id,
             session.display_name || session.username,
+            attachments,
             followUpBehavior,
           );
           if (!result.ok) {
             logger.warn(
-              { chatJid, status: result.status, error: result.error },
+              { chatJid, agentId, status: result.status, error: result.error },
               'WebSocket message rejected',
             );
           }
@@ -2095,19 +2064,39 @@ function setupWebSocket(server: any): WebSocketServer {
               );
               return;
             }
-            const group = deps.getRegisteredGroups()[chatJid];
+            // A terminal attaches to one session's container: chatJid is the
+            // session's runtime JID `<workspaceJid>#agent:<sessionId>`.
+            const workspaceJid = stripVirtualJidSuffix(chatJid);
+            const sessionId = agentIdOfJid(chatJid);
+            const terminalSession = sessionId ? getAgent(sessionId) : undefined;
+            if (
+              terminalSession?.kind !== 'conversation' ||
+              terminalSession.chat_jid !== workspaceJid
+            ) {
+              ws.send(
+                JSON.stringify({
+                  type: 'terminal_error',
+                  chatJid,
+                  error: '请选择会话',
+                }),
+              );
+              return;
+            }
+            const group =
+              deps.getRegisteredGroups()[workspaceJid] ??
+              getRegisteredGroup(workspaceJid);
             if (!group) {
               ws.send(
                 JSON.stringify({
                   type: 'terminal_error',
                   chatJid,
-                  error: '群组不存在',
+                  error: '工作区不存在',
                 }),
               );
               return;
             }
-            // Permission: user must be able to access the group
-            const groupWithJid = { ...group, jid: chatJid };
+            // Permission: user must be able to access the workspace
+            const groupWithJid = { ...group, jid: workspaceJid };
             if (
               !canAccessGroup(
                 { id: session.user_id, role: session.role },
@@ -2123,12 +2112,20 @@ function setupWebSocket(server: any): WebSocketServer {
               );
               return;
             }
-            if ((group.executionMode || 'container') === 'host') {
+            // Single-user host mode never starts a container, whatever mode
+            // a leftover row still has.
+            const singleUserHost = isSingleUserHost();
+            if (
+              singleUserHost ||
+              (group.executionMode || 'container') === 'host'
+            ) {
               ws.send(
                 JSON.stringify({
                   type: 'terminal_error',
                   chatJid,
-                  error: '宿主机模式不支持终端',
+                  error: singleUserHost
+                    ? '单人宿主机模式暂不支持 Web 终端。'
+                    : '宿主机模式不支持终端',
                 }),
               );
               return;
@@ -2427,7 +2424,13 @@ function safeBroadcast(
       continue;
     }
 
-    if (adminOnly && session.role !== 'admin') {
+    // Host-mode workspace events are admin-only, except for a guest whose
+    // active grant on this workspace already put it in allowedUserIds.
+    if (
+      adminOnly &&
+      session.role !== 'admin' &&
+      !(session.role === 'guest' && allowedUserIds?.has(session.user_id))
+    ) {
       continue;
     }
 
@@ -2507,11 +2510,6 @@ function normalizeHomeJid(chatJid: string): string {
   return chatJid;
 }
 
-function stripRuntimeJidSuffix(chatJid: string): string {
-  const markerIndex = chatJid.indexOf('#agent:');
-  return markerIndex >= 0 ? chatJid.slice(0, markerIndex) : chatJid;
-}
-
 /** Normalize the workspace part of a virtual conversation JID without losing
  * its #agent suffix. */
 function normalizeRuntimeJid(chatJid: string): string {
@@ -2519,6 +2517,32 @@ function normalizeRuntimeJid(chatJid: string): string {
   if (markerIndex < 0) return normalizeHomeJid(chatJid);
   const baseJid = chatJid.slice(0, markerIndex);
   return `${normalizeHomeJid(baseJid)}${chatJid.slice(markerIndex)}`;
+}
+
+/**
+ * Send a chat's event to its owner and, as `guestMsg`, to the guests watching
+ * it: the same message by default, a trimmed copy, or nothing (null) for
+ * data REST also withholds from guests (token usage and cost, worktree
+ * details).
+ */
+function broadcastToGroupAudience(
+  aclJid: string,
+  msg: WsMessageOut,
+  adminOnly: boolean,
+  guestMsg: WsMessageOut | null = msg,
+): void {
+  const audience = getGroupAudience(aclJid);
+  // Unresolvable ownership: nobody, admins included.
+  if (!audience) return;
+  const { ownerId, guestIds } = audience;
+  if (guestMsg === msg) {
+    safeBroadcast(msg, adminOnly, new Set([ownerId, ...guestIds]));
+    return;
+  }
+  safeBroadcast(msg, adminOnly, new Set([ownerId]));
+  if (guestMsg && guestIds.length > 0) {
+    safeBroadcast(guestMsg, adminOnly, new Set(guestIds));
+  }
 }
 
 export function broadcastToWebClients(chatJid: string, text: string): void {
@@ -2603,18 +2627,24 @@ function deliverNewMessage(
     if (!effectiveAgentId) effectiveAgentId = parts[1];
   }
   const jid = normalizeHomeJid(baseChatJid);
-  const allowedUserIds = getGroupAllowedUserIds(baseChatJid);
+  const message = {
+    ...sequencedMessage,
+    is_from_me: sequencedMessage.is_from_me ?? false,
+  };
   const wsMsg: WsMessageOut = {
     type: 'new_message',
     chatJid: jid,
-    message: {
-      ...sequencedMessage,
-      is_from_me: sequencedMessage.is_from_me ?? false,
-    },
+    message,
     ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
     ...(source ? { source } : {}),
   };
-  safeBroadcast(wsMsg, isHostGroupJid(baseChatJid), allowedUserIds);
+  const guestMessage = withoutUsageForGuest(message);
+  broadcastToGroupAudience(
+    baseChatJid,
+    wsMsg,
+    isHostGroupJid(baseChatJid),
+    guestMessage === message ? wsMsg : { ...wsMsg, message: guestMessage },
+  );
 }
 
 /** Broadcast one committed message-row deletion by its full composite key. */
@@ -2683,7 +2713,7 @@ export function broadcastFollowUpUpdate(
   }
   const jid = normalizeHomeJid(baseChatJid);
   const allowedUserIds = getGroupAllowedUserIds(baseChatJid);
-  const items = listQueuedFollowUps(chatJid);
+  const items = listQueuedFollowUps(chatJid).map(presentAutomationMessage);
   const msg: WsMessageOut = {
     type: 'follow_up_update',
     chatJid: jid,
@@ -2692,6 +2722,26 @@ export function broadcastFollowUpUpdate(
     ...(transition ? { transition } : {}),
   };
   safeBroadcast(msg, isHostGroupJid(baseChatJid), allowedUserIds);
+}
+
+/** Tell clients a Session's usage-limit wait started (resumeAt) or ended. */
+export function broadcastUsageLimitWait(
+  laneJid: string,
+  wait: { resumeAt: string; waitCount: number } | null,
+): void {
+  const [baseChatJid, agentId] = laneJid.split('#agent:');
+  const msg: WsMessageOut = {
+    type: 'usage_limit_wait',
+    chatJid: normalizeHomeJid(baseChatJid),
+    ...(agentId ? { agentId } : {}),
+    resumeAt: wait?.resumeAt ?? null,
+    ...(wait ? { waitCount: wait.waitCount } : {}),
+  };
+  safeBroadcast(
+    msg,
+    isHostGroupJid(baseChatJid),
+    getGroupAllowedUserIds(baseChatJid),
+  );
 }
 
 export function broadcastTyping(chatJid: string, isTyping: boolean): void {
@@ -2750,7 +2800,7 @@ interface StreamingSnapshotEntry {
     {
       id: string;
       title: string;
-      status: 'running' | 'completed' | 'error' | 'backgrounded';
+      status: 'running' | 'completed' | 'error' | 'stopped' | 'backgrounded';
       subagentType?: string;
       taskType?: string;
       workflowName?: string;
@@ -2774,6 +2824,8 @@ interface StreamingSnapshotEntry {
   /** Currently-running hook, if any — restored on reconnect so the hook spinner
    *  survives the reconnect instead of silently disappearing. */
   activeHook?: { hookName: string; hookEvent: string } | null;
+  /** The progress statements the Agent sent in this turn, in order. */
+  progress?: Array<{ at: number; text: string }>;
   turnId?: string;
   /** Exact GroupQueue attempt that owns this projection. */
   runId?: string;
@@ -2781,6 +2833,8 @@ interface StreamingSnapshotEntry {
 }
 
 const streamingSnapshots = new Map<string, StreamingSnapshotEntry>();
+/** Progress statements a snapshot keeps; the newest win. */
+const MAX_SNAPSHOT_PROGRESS = 20;
 /** Exact query attempt currently projected for each runtime JID. This is
  * deliberately separate from process lifecycle: a conversation process may
  * stay warm while no query is active. */
@@ -3028,24 +3082,32 @@ function updateSnapshotTask(
   } else if (event.eventType === 'task_updated') {
     const patch = event.taskPatch;
     if (patch?.status === 'completed') task.status = 'completed';
-    else if (
-      patch?.status === 'failed' ||
-      patch?.status === 'killed' ||
-      patch?.status === 'stopped' ||
-      patch?.status === 'aborted'
-    )
+    // A stop (the CLI's interrupt kills running sub-agents) is no failure.
+    else if (patch?.status === 'killed' || patch?.status === 'stopped')
+      task.status = 'stopped';
+    else if (patch?.status === 'failed' || patch?.status === 'aborted')
       task.status = 'error';
     else if (patch?.is_backgrounded) task.status = 'backgrounded';
     task.latestSummary =
       event.summary || patch?.description || patch?.error || task.latestSummary;
   } else if (event.eventType === 'task_notification') {
-    task.status = event.taskStatus === 'completed' ? 'completed' : 'error';
+    task.status =
+      event.taskStatus === 'completed'
+        ? 'completed'
+        : event.taskStatus === 'stopped' || event.taskStatus === 'killed'
+          ? 'stopped'
+          : 'error';
     task.latestSummary =
       event.taskSummary || event.summary || task.latestSummary;
     if (task.workflowRun) {
       task.workflowRun = {
         ...task.workflowRun,
-        status: event.taskStatus === 'completed' ? 'completed' : 'failed',
+        status:
+          task.status === 'completed'
+            ? 'completed'
+            : task.status === 'stopped'
+              ? 'stopped'
+              : 'failed',
         completedAt: task.workflowRun.completedAt ?? Date.now(),
       };
     }
@@ -3116,6 +3178,7 @@ export function buildStreamSnapshot(
       snap.activeTools.length === 0 &&
       snap.recentEvents.length === 0 &&
       snap.traceEvents.length === 0 &&
+      !snap.progress?.length &&
       Object.keys(snap.taskStates).length === 0)
   ) {
     return null;
@@ -3138,7 +3201,44 @@ export function buildStreamSnapshot(
       awaitingModel: snap.clock.awaitingModel || undefined,
       activeHook: snap.activeHook,
       turnId: snap.turnId,
+      ...(snap.progress?.length ? { progress: snap.progress } : {}),
     },
+  };
+}
+
+/**
+ * What a running session is doing right now, read from its stream snapshot for
+ * the session inspection tools: the tools in flight, the sub-agents still
+ * running, whether it is compacting, and its latest progress statement. Names
+ * and short summaries only; no reasoning or reply text. Null when no run owns
+ * a snapshot for this runtime JID.
+ */
+export function getSessionLiveActivity(
+  jid: string,
+): SessionLiveActivity | null {
+  const snap = streamingSnapshots.get(jid);
+  if (!snap?.runId) return null;
+  const tail = snap.progress?.at(-1);
+  return {
+    activeTools: snap.activeTools
+      .filter((tool) => !tool.isNested)
+      .map((tool) => ({
+        name: tool.toolName,
+        elapsedSeconds: tool.elapsedSeconds ?? null,
+        summary: tool.toolInputSummary ?? null,
+      })),
+    activeSubagents: Object.values(snap.taskStates)
+      .filter(
+        (task) => task.status === 'running' || task.status === 'backgrounded',
+      )
+      .map((task) => ({
+        title: task.title,
+        status: task.status,
+        type: task.subagentType ?? task.taskType ?? null,
+      })),
+    compacting: snap.systemStatus === 'compacting',
+    latestProgress: tail ? { at: tail.at, text: tail.text } : null,
+    updatedAt: snap.updatedAt,
   };
 }
 
@@ -3171,7 +3271,7 @@ function updateStreamingSnapshot(
   //
   // 键必须用完整 normalizedJid（含 #agent: 后缀），与 runner/快照同粒度：
   // 主 runner idle 只 tombstone `web:folder`，不会误杀并发 sub-agent /
-  // 定时任务（虚拟 jid）的快照；agent runner idle tombstone 自己的
+  // 会话（虚拟 jid）的快照；agent runner idle tombstone 自己的
   // `web:folder#agent:id`，其迟到事件才能被自己的 tombstone 拦住。
   if (snapshotTombstones.has(normalizedJid)) return;
 
@@ -3219,6 +3319,17 @@ function updateStreamingSnapshot(
   snap.isThinking = snap.clock.isThinking;
 
   switch (event.eventType) {
+    case 'commentary':
+      // Only the host writes a progress statement, and only what the Web was
+      // sent reaches here: a joining tab gets it back at every level.
+      if (event.progress && event.text) {
+        snap.progress = [
+          ...(snap.progress ?? []),
+          { at: Date.now(), text: event.text.slice(0, MAX_SNAPSHOT_TEXT) },
+        ].slice(-MAX_SNAPSHOT_PROGRESS);
+      }
+      break;
+
     case 'text_delta':
       if (event.text && !event.parentToolUseId) {
         snap.partialText += event.text;
@@ -3457,7 +3568,6 @@ export function broadcastStreamEvent(
   }
 
   const jid = normalizeHomeJid(chatJid);
-  const allowedUserIds = getGroupAllowedUserIds(chatJid);
   // Agent streams use virtual JID format (jid#agent:agentId) as the exact
   // query-lifecycle key. turnId ownership survives an A→B replacement so a
   // delayed callback from A cannot be relabelled as B.
@@ -3490,7 +3600,13 @@ export function broadcastStreamEvent(
         event,
         runId: decision.runId,
       };
-  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+  // Token usage and cost (the run's `usage` event) stay with the owner.
+  broadcastToGroupAudience(
+    chatJid,
+    msg,
+    isHostGroupJid(chatJid),
+    event.eventType === 'usage' ? null : msg,
+  );
 
   // Accumulate snapshot for both main and agent streams.
   updateStreamingSnapshot(snapshotJid, event, decision.runId);
@@ -3522,6 +3638,34 @@ export function broadcastBillingUpdate(
   // Send only to the specific user
   const allowedUserIds = new Set([userId]);
   safeBroadcast(msg, false, allowedUserIds);
+}
+
+/**
+ * Automation changes go to the owner's clients and to guests granted the
+ * workspace, the latter without pre-run check output (as over REST).
+ */
+export function broadcastAutomationEvent(event: AutomationWsEvent): void {
+  safeBroadcast(event, false, new Set([event.ownerId]));
+  if (getRegisteredGroup(event.workspaceJid)?.created_by !== event.ownerId) {
+    return;
+  }
+  const guests = listViewingGuestIds(event.workspaceJid, event.ownerId);
+  if (guests.length === 0) return;
+  const guestEvent: AutomationWsEvent =
+    event.type === 'automation_run_updated'
+      ? { ...event, run: redactAutomationRunForGuest(event.run) }
+      : event;
+  safeBroadcast(guestEvent, false, new Set(guests));
+}
+
+/**
+ * A work item changed. Only the workspace owner sees team mode; guests get
+ * nothing (their allowlist does not include the work item routes either).
+ */
+export function broadcastWorkItemEvent(event: WorkItemWsEvent): void {
+  const ownerId = getRegisteredGroup(event.workspaceJid)?.created_by;
+  if (!ownerId) return;
+  safeBroadcast(event, false, new Set([ownerId]));
 }
 
 export function broadcastWhatsAppStatus(
@@ -3578,9 +3722,13 @@ export function broadcastAgentStatus(
   titleGenerating?: boolean,
 ): void {
   const jid = normalizeHomeJid(chatJid);
-  const allowedUserIds = getGroupAllowedUserIds(chatJid);
   // Resolve kind from DB if not provided
   const resolvedKind = kind || getAgent(agentId)?.kind;
+  // Every tab learns a session's worktree branch from its status updates.
+  const worktree =
+    resultSummary === '__removed__'
+      ? null
+      : toSessionWorktreePayload(getSessionWorktree(agentId));
   const msg: WsMessageOut = {
     type: 'agent_status',
     chatJid: jid,
@@ -3591,8 +3739,16 @@ export function broadcastAgentStatus(
     prompt,
     resultSummary,
     titleGenerating,
+    ...(worktree ? { worktree } : {}),
   };
-  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+  // Guests see sessions, not their git worktrees (git review is denied).
+  const { worktree: _worktree, ...forGuests } = msg;
+  broadcastToGroupAudience(
+    chatJid,
+    msg,
+    isHostGroupJid(chatJid),
+    worktree ? (forGuests as WsMessageOut) : msg,
+  );
 }
 
 export function broadcastAgentRemoved(
@@ -3641,7 +3797,7 @@ export function broadcastRunnerState(
   chatJid: string,
   state: 'idle' | 'running',
 ): void {
-  const baseJid = stripRuntimeJidSuffix(chatJid);
+  const baseJid = stripVirtualJidSuffix(chatJid);
   const jid = normalizeRuntimeJid(chatJid);
   const allowedUserIds = getGroupAllowedUserIds(baseJid);
   const msg: WsMessageOut = {
@@ -3683,7 +3839,7 @@ export function broadcastRunStarted(
   runId: string,
   startedAt: number,
 ): void {
-  const baseJid = stripRuntimeJidSuffix(chatJid);
+  const baseJid = stripVirtualJidSuffix(chatJid);
   const jid = normalizeRuntimeJid(chatJid);
   const allowedUserIds = getGroupAllowedUserIds(baseJid);
   activeLogicalRuns.set(jid, { runId, startedAt });
@@ -3703,13 +3859,53 @@ export function broadcastRunStarted(
   );
 }
 
+/**
+ * Tell the Web chats of a workspace how full one conversation's context is
+ * now, read from its transcript unless given (a cleared conversation passes
+ * NO_CONTEXT_USAGE). Never throws: the ring is a display.
+ */
+export async function broadcastContextUsage(
+  groupFolder: string,
+  agentId: string,
+  usage?: SessionContextUsage,
+): Promise<void> {
+  try {
+    const value =
+      usage ?? (await readSessionContextUsage(groupFolder, agentId));
+    for (const jid of getJidsByFolder(groupFolder)) {
+      if (!jid.startsWith('web:')) continue;
+      safeBroadcast(
+        {
+          type: 'context_usage',
+          chatJid: jid,
+          agentId,
+          ...value,
+        },
+        isHostGroupJid(jid),
+        // Token usage; REST denies guests context-usage too.
+        getGroupAllowedUserIds(jid, { includeGuests: false }),
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err, groupFolder, agentId },
+      'Failed to publish conversation context usage',
+    );
+  }
+}
+
+// A cleared conversation shows an empty ring until its next turn.
+onConversationContextCleared((groupFolder, agentId) => {
+  void broadcastContextUsage(groupFolder, agentId, NO_CONTEXT_USAGE);
+});
+
 export function broadcastRunFinished(
   chatJid: string,
   runId: string,
   reason: RunFinishReason,
   finishedAt: number,
 ): void {
-  const baseJid = stripRuntimeJidSuffix(chatJid);
+  const baseJid = stripVirtualJidSuffix(chatJid);
   const jid = normalizeRuntimeJid(chatJid);
   const allowedUserIds = getGroupAllowedUserIds(baseJid);
   const current = activeLogicalRuns.get(jid);
@@ -3757,6 +3953,14 @@ export function broadcastDockerPullComplete(
 
 let httpServer: ReturnType<typeof serve> | null = null;
 let wss: WebSocketServer | null = null;
+
+/**
+ * Test-only: attach the WebSocket gateway to a caller-owned HTTP server (bind
+ * it to an ephemeral loopback port). The caller closes the returned server.
+ */
+export function attachWebSocketForTest(server: unknown): WebSocketServer {
+  return setupWebSocket(server);
+}
 
 /**
  * Test-only factory: wires the given `WebDeps` into module + route state and

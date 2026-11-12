@@ -93,34 +93,17 @@ describe('terminal provider failure notices', () => {
 });
 
 describe('host disposition is keyed on the class, not on individual flags', () => {
-  test('only an account verdict may change account health', () => {
-    expect(hostRunner).toContain(
-      "if (resolveProviderFailureClass(output) !== 'account') return;",
-    );
-    // The pre-classification guard checked one concrete flag, so every later
-    // non-account failure would have slipped past it into the quarantine.
-    expect(hostRunner).not.toContain(
-      'if (output.providerLivenessTimeout) return;',
-    );
-  });
-
-  test('transient failures are replayed and never consult the pool', () => {
+  test('transient failures are replayed on the same connection', () => {
     expect(hostRunner).toMatch(
       /if \(failureClass === 'transient'\) \{[\s\S]*?transientRetries\.consume\([\s\S]*?resolveTransientRetryKey\(output\),[\s\S]*?selectedProfileId/,
     );
-    // Ordering matters: refreshFromConfig/poolCanStillServe must stay below the
-    // transient branch, or a 529 would still be answered by a failover.
-    const transientBranch = hostRunner.indexOf(
-      "if (failureClass === 'transient')",
-    );
-    const poolRefresh = hostRunner.indexOf('providerPool.refreshFromConfig(');
-    expect(transientBranch).toBeGreaterThan(-1);
-    expect(poolRefresh).toBeGreaterThan(transientBranch);
+    // A connection is authoritative: nothing fails over to another one.
+    expect(hostRunner).not.toContain('providerPool');
   });
 
-  test('a repeated transient terminates without rewriting or quarantining', () => {
+  test('a repeated transient terminates without rewriting the class', () => {
     expect(hostRunner).toContain(
-      'ending input without quarantining the account',
+      'Transient provider failure repeated after its replay; ending the input',
     );
     expect(hostRunner).not.toContain(
       "output.providerFailureClass = 'account';",
@@ -134,9 +117,9 @@ describe('host disposition is keyed on the class, not on individual flags', () =
     );
   });
 
-  test('config failures are terminal when pinned and model-scoped in an automatic pool', () => {
+  test('config failures are terminal; only a usage limit with a reset waits', () => {
     expect(hostRunner).toMatch(
-      /if \(failureClass === 'config'\) \{[\s\S]*?!allowFailover[\s\S]*?providerPool\.reportModelFailure\(selectedProfileId, model\)/,
+      /const terminal =\s*failureClass === 'config' \|\|\s*!deferUsageLimitFailure\(output, selectedProfileId, waitScope\);/,
     );
   });
 

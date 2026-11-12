@@ -143,7 +143,7 @@ describe('AgentProfile runtime invalidation', () => {
     expect(memberEffective?.identity_hash).not.toBe(adminEffectiveHash);
   });
 
-  test('legacy missing host Skill policy follows the effective context source', () => {
+  test('new profiles persist the host Skill grant they run with', () => {
     const userId = 'agent-profile-runtime-legacy-host-skills';
     const now = new Date().toISOString();
     db.createUser({
@@ -158,19 +158,34 @@ describe('AgentProfile runtime invalidation', () => {
       must_change_password: false,
     });
     runtimeConfig.saveSystemSettings({ mainAgentContextSource: 'host_claude' });
-    const main = runtime.resolveEffectiveAgentProfile(
-      db.getOrCreateDefaultAgentProfile(userId),
-    )!;
-    expect(main.runtime_policy.skills.host).toBeUndefined();
+    // The main HappyClaw of an admin under host_claude has always run with
+    // every host Skill; it is now stored, so the Web form reads the same.
+    const mainProfile = db.getOrCreateDefaultAgentProfile(userId);
+    expect(mainProfile.runtime_policy.skills.host).toEqual({
+      mode: 'inherit',
+      ids: [],
+    });
+    const main = runtime.resolveEffectiveAgentProfile(mainProfile)!;
     expect(policy.resolveHostSkillPolicy(main.runtime_policy)).toEqual({
       mode: 'inherit',
       ids: [],
     });
 
-    const managed = runtime.resolveEffectiveAgentProfile(
-      db.createAgentProfile({ ownerUserId: userId, name: 'Managed legacy' }),
-    )!;
-    expect(policy.resolveHostSkillPolicy(managed.runtime_policy)).toEqual({
+    const custom = db.createAgentProfile({
+      ownerUserId: userId,
+      name: 'Host context without host Skills',
+      runtimePolicy: { context: { source: 'host_claude' } },
+    });
+    expect(custom.runtime_policy.skills.host).toEqual({
+      mode: 'disabled',
+      ids: [],
+    });
+
+    // A row that still lacks the field falls back to the context source.
+    expect(
+      policy.resolveHostSkillPolicy({ context: { source: 'host_claude' } }),
+    ).toEqual({ mode: 'inherit', ids: [] });
+    expect(policy.resolveHostSkillPolicy({ context: {} })).toEqual({
       mode: 'disabled',
       ids: [],
     });
@@ -244,7 +259,7 @@ describe('AgentProfile runtime invalidation', () => {
         listDescendantJids: (jid: string) =>
           jid === 'web:agent-profile-runtime-workspace'
             ? ['web:agent-profile-runtime-workspace#agent:a1']
-            : ['feishu:runtime-channel#task:t1'],
+            : ['feishu:runtime-channel#agent:a2'],
         stopGroup,
       },
     } as unknown as Parameters<
@@ -263,7 +278,7 @@ describe('AgentProfile runtime invalidation', () => {
     expect(stopped.sort()).toEqual(
       [
         'feishu:runtime-channel',
-        'feishu:runtime-channel#task:t1',
+        'feishu:runtime-channel#agent:a2',
         'web:agent-profile-runtime-workspace',
         'web:agent-profile-runtime-workspace#agent:a1',
       ].sort(),
@@ -280,7 +295,7 @@ describe('AgentProfile runtime invalidation', () => {
       'web:agent-profile-runtime-workspace#agent:a1',
       { force: true },
     );
-    expect(stopGroup).toHaveBeenCalledWith('feishu:runtime-channel#task:t1', {
+    expect(stopGroup).toHaveBeenCalledWith('feishu:runtime-channel#agent:a2', {
       force: true,
     });
   });

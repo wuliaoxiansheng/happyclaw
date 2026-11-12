@@ -7,7 +7,19 @@ import {
   estimatePromptTokens,
   totalPromptStats,
 } from '../web/src/utils/agent-prompts';
-import { hostSkillPolicyForMode } from '../web/src/utils/agent-runtime-policy';
+import {
+  AGENT_PROMPT_MAX_CHARS,
+  promptLengthError,
+} from '../web/src/utils/agent-prompts';
+import {
+  getHostSkillPolicy,
+  hostSkillPolicyForMode,
+} from '../web/src/utils/agent-runtime-policy';
+import { AGENT_TEMPLATES } from '../web/src/utils/agent-templates';
+import {
+  capabilityFormFromProfile,
+  capabilityFormPolicy,
+} from '../web/src/components/agents/AgentCapabilityForm';
 
 const root = process.cwd();
 const read = (relativePath: string) =>
@@ -68,27 +80,48 @@ describe('Agent prompt and capability frontend contract', () => {
     });
   });
 
-  test('offers a usable four-part creation wizard, template, and version diff', () => {
-    const page = read('web/src/pages/AgentProfilesPage.tsx');
+  test('offers four ready-to-use templates for a new Agent', () => {
+    expect(AGENT_TEMPLATES.map((template) => template.name)).toEqual([
+      '代码开发助手',
+      '调研分析',
+      '写作编辑',
+      '运维值守',
+    ]);
+    for (const template of AGENT_TEMPLATES) {
+      for (const value of Object.values(template.prompts)) {
+        expect(value.trim().length).toBeGreaterThan(20);
+        expect(value.length).toBeLessThanOrEqual(AGENT_PROMPT_MAX_CHARS);
+      }
+    }
+    const dialog = read('web/src/components/agents/CreateAgentDialog.tsx');
+    expect(dialog).toContain('AGENT_TEMPLATES.map');
+    expect(dialog).toContain('generateProfileDraft');
     const editor = read('web/src/components/agents/AgentPromptEditor.tsx');
-    const history = read(
-      'web/src/components/agents/AgentPromptVersionHistory.tsx',
-    );
-
-    expect(page).toMatch(
-      /基本信息[\s\S]*四段提示词[\s\S]*宿主机配置[\s\S]*Skills \/ MCP[\s\S]*确认创建/,
-    );
-    expect(page).toContain('draftStep');
-    expect(page).toContain('提示词完成度');
     expect(editor).toContain('一键填入推荐模板');
     expect(editor).toContain('DEFAULT_AGENT_PROMPTS');
-    expect(history).toContain('对比当前');
-    expect(history).toContain('changedSections');
-    expect(history).toContain('<PromptSnapshot');
+  });
+
+  test('names the prompt section that is over the limit', () => {
+    const parts = {
+      identity_prompt: '',
+      soul_prompt: '',
+      agents_prompt: 'x'.repeat(AGENT_PROMPT_MAX_CHARS + 1),
+      tools_prompt: '',
+    };
+    expect(promptLengthError(parts)).toBe(
+      `行为规则（AGENTS）超过 ${AGENT_PROMPT_MAX_CHARS} 字上限（当前 ${AGENT_PROMPT_MAX_CHARS + 1} 字）`,
+    );
+    expect(
+      promptLengthError({
+        ...parts,
+        agents_prompt: 'x'.repeat(AGENT_PROMPT_MAX_CHARS),
+      }),
+    ).toBeNull();
   });
 
   test('governs host Skills independently from host Prompt and Rules', () => {
     const profiles = read('web/src/pages/AgentProfilesPage.tsx');
+    const form = read('web/src/components/agents/AgentCapabilityForm.tsx');
     const skillEditor = read(
       'web/src/components/agents/AgentSkillsPolicyEditor.tsx',
     );
@@ -98,20 +131,29 @@ describe('Agent prompt and capability frontend contract', () => {
     const system = read(
       'web/src/components/settings/SystemSettingsSection.tsx',
     );
+    const policy = read('web/src/utils/agent-runtime-policy.ts');
 
-    expect(profiles).toMatch(
-      /HappyClaw MCP[\s\S]*宿主机 Skills[\s\S]*“能力配置”独立控制/,
+    expect(profiles).toContain(
+      'HappyClaw MCP 与宿主机 Skills 由上面的设置独立控制',
     );
-    expect(profiles).toContain("skill.source === 'external' && skill.enabled");
+    // The Agent page and the main HappyClaw settings share one form.
+    expect(profiles).toContain('<AgentCapabilityForm');
+    expect(main).toContain('<AgentCapabilityForm');
+    expect(form).toContain('<AgentSkillsPolicyEditor');
+    expect(form).toContain(
+      'buildHostSkillOptions(skills, value.hostSkills.ids)',
+    );
+    expect(form).toContain(
+      'buildManagedSkillOptions(skills, value.skills.ids)',
+    );
     expect(skillEditor).toMatch(/不使用[\s\S]*选择部分[\s\S]*全部使用/);
     expect(skillEditor).toContain('来自 ~/.claude/skills，可单独启用');
-    expect(main).toContain('<AgentSkillsPolicyEditor');
-    expect(main).toContain("skill.source === 'user' && skill.enabled");
-    expect(main).toContain("skill.source === 'external' && skill.enabled");
+    expect(policy).toContain("skill.source === 'user' && skill.enabled");
+    expect(policy).toContain("skill.source === 'external' && skill.enabled");
     expect(system).toContain('宿主机');
   });
 
-  test('treats all host Skills as symbolic inherit and auto-applies existing-profile changes', () => {
+  test('treats all host Skills as symbolic inherit and saves them with the form', () => {
     expect(
       hostSkillPolicyForMode('inherit', [
         'old-custom-selection',
@@ -123,11 +165,12 @@ describe('Agent prompt and capability frontend contract', () => {
     ).toEqual({ mode: 'custom', ids: ['research', 'docs'] });
 
     const profiles = read('web/src/pages/AgentProfilesPage.tsx');
-    expect(profiles).toContain('onHostModeChange={handleHostSkillsModeChange}');
-    expect(profiles).toContain('void persistHostSkillPolicy(');
-    expect(profiles).toMatch(
-      /runtime_policy:\s*\{\s*skills:\s*\{\s*host: nextPolicy/,
+    const skillEditor = read(
+      'web/src/components/agents/AgentSkillsPolicyEditor.tsx',
     );
+    expect(profiles).not.toContain('persistHostSkillPolicy');
+    expect(skillEditor).not.toContain('hostAutoSave');
+    expect(skillEditor).toContain('修改后点击“保存”生效');
   });
 
   test('isolates capability preview failures instead of blanking the page', () => {
@@ -186,31 +229,56 @@ describe('Agent prompt and capability frontend contract', () => {
   });
 
   test('allows every saved model configuration to be selected by an Agent', () => {
-    const profiles = read('web/src/pages/AgentProfilesPage.tsx');
-    const main = read(
-      'web/src/components/settings/MainAgentCapabilitiesSection.tsx',
-    );
-
-    for (const source of [profiles, main]) {
-      expect(source).not.toContain('disabled={!model.enabled}');
-      expect(source).toContain("!model.enabled ? '（仅显式使用）' : ''");
-    }
+    const form = read('web/src/components/agents/AgentCapabilityForm.tsx');
+    // `enabled` no longer exists: every connection is offered as is.
+    expect(form).not.toContain('config.enabled');
   });
 
-  test('lets the main HappyClaw read and persist its reasoning effort', () => {
-    const main = read(
-      'web/src/components/settings/MainAgentCapabilitiesSection.tsx',
-    );
+  test('reads and saves the reasoning effort through the shared form', () => {
+    const value = capabilityFormFromProfile({
+      model_config_id: null,
+      model: null,
+      runtime_policy: {
+        reasoning: { effort: 'high' },
+        skills: {
+          mode: 'inherit',
+          ids: [],
+          host: { mode: 'inherit', ids: [] },
+        },
+        mcp: { mode: 'custom', ids: ['github'] },
+      },
+    });
+    expect(value).toMatchObject({ effort: 'high', modelConfigId: 'inherit' });
+    expect(capabilityFormPolicy({ ...value, effort: 'max' })).toEqual({
+      reasoning: { effort: 'max' },
+      skills: { mode: 'inherit', ids: [], host: { mode: 'inherit', ids: [] } },
+      mcp: { mode: 'custom', ids: ['user:github'] },
+    });
+    const form = read('web/src/components/agents/AgentCapabilityForm.tsx');
+    expect(form).toContain('aria-label={`${labelPrefix}推理等级`}');
+    // Only the efforts the bound model takes are offered.
+    expect(form).toContain('entry.efforts.includes(effort)');
+  });
 
-    expect(main).toContain('aria-label="主 HappyClaw 推理努力档位"');
-    expect(main).toContain(
-      "setEffort(profile.runtime_policy.reasoning?.effort ?? 'inherit')",
-    );
-    expect(main).toMatch(
-      /runtime_policy:\s*\{[\s\S]*reasoning: \{ effort \}[\s\S]*skills:/,
-    );
-    for (const effort of ['inherit', 'low', 'medium', 'high', 'xhigh', 'max']) {
-      expect(main).toContain(`value: '${effort}'`);
-    }
+  test('a profile from an older server without host Skills follows its effective context', () => {
+    expect(
+      getHostSkillPolicy(
+        { context: { source: 'managed' } },
+        { context: { source: 'host_claude' } },
+      ),
+    ).toEqual({ mode: 'inherit', ids: [] });
+    expect(
+      getHostSkillPolicy(
+        {
+          context: { source: 'managed' },
+          skills: {
+            mode: 'inherit',
+            ids: [],
+            host: { mode: 'disabled', ids: [] },
+          },
+        },
+        { context: { source: 'host_claude' } },
+      ),
+    ).toEqual({ mode: 'disabled', ids: [] });
   });
 });

@@ -310,7 +310,7 @@ export function QrOnboardingPanel({
       {qrImage && !authorized && (
         <div className="flex flex-col items-center gap-3 rounded-lg px-4 py-5 ring-1 ring-surface-border">
           {/* QR codes need a white quiet zone to scan in dark mode too. */}
-          <div className="size-60 max-w-full overflow-hidden rounded-lg bg-white p-2 ring-1 ring-surface-border">
+          <div className="size-60 max-w-full overflow-hidden rounded-lg bg-qr-quiet-zone p-2 ring-1 ring-surface-border">
             <img
               src={qrImage}
               alt={`${account.provider === 'wechat' ? '微信' : 'WhatsApp'} 登录二维码`}

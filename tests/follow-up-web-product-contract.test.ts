@@ -45,7 +45,7 @@ describe('Codex-style Web follow-up product contract', () => {
     const store = read('web/src/stores/chat.ts');
 
     expect(chatView).not.toMatch(/activeAgent\?\.status === 'running'/);
-    expect(chatView).toMatch(/isRunning=\{currentContextWaiting\}/);
+    expect(chatView).toMatch(/isRunning=\{activeAgentWaiting\}/);
     // Session lists downgrade warm-but-idle runners via the shared helper.
     expect(chatView).toContain('buildConversationSessions(');
     expect(sessionPresentation).toMatch(/status: 'idle' as const/);
@@ -56,7 +56,7 @@ describe('Codex-style Web follow-up product contract', () => {
   });
 
   test('exposes every queued message with edit, reorder, send, and delete', () => {
-    const input = read('web/src/components/chat/MessageInput.tsx');
+    const input = read('web/src/components/chat/composer/QueuedFollowUps.tsx');
 
     expect(input).toMatch(/handleFollowUpAction\(item, 'move_up'\)/);
     expect(input).toMatch(/handleFollowUpAction\(item, 'move_down'\)/);
@@ -74,7 +74,7 @@ describe('Codex-style Web follow-up product contract', () => {
     expect(input).toMatch(/未保存的修改已移到输入框/);
     expect(input).toMatch(/editingFollowUpInitialContentRef/);
     expect(input).toMatch(/editingFollowUpContentRef/);
-    expect(input).toMatch(/debouncedSaveDraft\(nextContent\)/);
+    expect(input).toMatch(/appendComposerText\(editor, recovered/);
   });
 
   test('presents steering as a normal direction change instead of a failure', () => {

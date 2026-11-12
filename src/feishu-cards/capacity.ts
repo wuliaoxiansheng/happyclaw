@@ -18,6 +18,14 @@ export const CARDKIT_MAX_ELEMENTS = 200;
  */
 export const CARDKIT_MAX_TABLES = 5;
 export const CARDKIT_MARKDOWN_MAX_TABLES = 4;
+/**
+ * Serialized AskUserQuestion answer buttons per card. Every button carries its
+ * question in the callback value, so long questions cost far more than their
+ * count suggests; this keeps the block well inside the smallest per-card
+ * budget (the v1 transport's ~25KB) next to a full answer page. Options past
+ * the budget are listed as text.
+ */
+export const CARDKIT_ANSWER_BUTTONS_MAX_BYTES = 8_000;
 
 export function unicodeCodePointLength(text: string): number {
   if (!/[\uD800-\uDBFF][\uDC00-\uDFFF]/.test(text)) return text.length;

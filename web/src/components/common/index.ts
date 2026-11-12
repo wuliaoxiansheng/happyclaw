@@ -7,6 +7,7 @@ export { ErrorBoundary } from './ErrorBoundary';
 export { PageContainer, type PageContainerProps } from './PageContainer';
 export { PageTopBar, type PageTopBarProps } from './PageTopBar';
 export { IconButton, type IconButtonProps } from './IconButton';
+export { InfoTip } from './InfoTip';
 export { Shortcut, type ShortcutProps } from './Shortcut';
 export { ListGroup, ListRow, type ListRowProps } from './ListRow';
 export {

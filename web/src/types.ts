@@ -1,3 +1,6 @@
+import type { ResolvedModelCapabilities } from './lib/model-providers';
+import type { WorkMode } from './work-items';
+
 export type InteractionMode = 'assistant' | 'proactive';
 /**
  * How much of a proactive turn's process is shown beside the spinner. Assistant
@@ -13,13 +16,17 @@ export interface GroupInfo {
   added_at: string;
   interaction_mode: InteractionMode;
   process_visibility?: ProcessVisibility;
-  kind?: 'home' | 'main' | 'feishu' | 'web';
+  /** Web workspaces: single-task (default) or multi-task (多任务). */
+  work_mode?: WorkMode;
+  kind?: 'home' | 'feishu' | 'web';
   is_home?: boolean;
   is_my_home?: boolean;
   can_modify?: boolean;
+  /** Granted to a read-only guest: view only, never send or change. */
+  read_only?: boolean;
   editable?: boolean;
   deletable?: boolean;
-  lastMessage?: string;
+  /** Latest activity of any of the workspace's sessions. */
   lastMessageTime?: string;
   execution_mode?: 'container' | 'host';
   custom_cwd?: string;
@@ -42,13 +49,22 @@ export interface GroupInfo {
   agent_profile_avatar_url?: string | null;
 }
 
-export interface AdditionalMountInput {
-  host_path: string;
-  /** Relative suffix mounted below /workspace/extra/. */
-  container_path: string;
-  /** Host directory mounts are read-only in the current product contract. */
-  readonly: true;
-}
+export type AdditionalMountInput =
+  | {
+      host_path: string;
+      /** Relative suffix mounted below /workspace/extra/. */
+      container_path: string;
+      /** Host directory mounts are read-only in the current product contract. */
+      readonly: true;
+    }
+  | {
+      /** A storage source id from the mount allowlist. */
+      source: string;
+      /** Directory inside the export or share; omitted mounts its root. */
+      sub_path?: string;
+      container_path: string;
+      readonly: boolean;
+    };
 
 export interface CreateWorkspaceOptions {
   execution_mode?: 'container' | 'host';
@@ -57,6 +73,7 @@ export interface CreateWorkspaceOptions {
   init_git_url?: string;
   agent_profile_id?: string;
   interaction_mode?: InteractionMode;
+  work_mode?: WorkMode;
   additional_mounts?: AdditionalMountInput[];
 }
 
@@ -76,6 +93,11 @@ export interface AgentProfile {
   avatar_url: string | null;
   /** Null means select automatically from enabled model configurations. */
   model_config_id: string | null;
+  /**
+   * The model within that configuration; null runs the configuration's
+   * default. Older servers do not send it.
+   */
+  model?: string | null;
   runtime_policy: AgentProfileRuntimePolicy;
   /** Policy after applying system defaults and current authorization. */
   effective_runtime_policy?: AgentProfileRuntimePolicy;
@@ -87,14 +109,45 @@ export interface AgentProfile {
   updated_at: string;
 }
 
+/**
+ * One model of a connection as the chat picker and the Agent forms get it:
+ * its resolved capabilities (efforts low to high, empty when none; window
+ * null when unknown) and where the efforts come from.
+ */
+export type ConnectionModel = { id: string } & Pick<
+  ResolvedModelCapabilities,
+  'efforts' | 'defaultEffort' | 'contextWindow'
+> &
+  Partial<Pick<ResolvedModelCapabilities, 'effortsSource'>>;
+
 export interface ModelConfigOption {
   id: string;
   name: string;
   type: 'official' | 'third_party';
-  enabled: boolean;
-  anthropic_model: string;
-  /** The global default: what an Agent without a binding follows. */
-  is_default?: boolean;
+  /** The connection's own model: what a binding without a model runs. */
+  model: string;
+  /** False when the connection holds no credential and would fail. */
+  usable?: boolean;
+  /** Every model an Agent may pin within this connection, its own included. */
+  models: ConnectionModel[];
+}
+
+/** A binding an Agent can follow: who supplies the connection and model. */
+export interface InheritedModelBinding {
+  model_config_id: string;
+  model: string | null;
+  effort: Exclude<AgentEffortLevel, 'inherit'> | null;
+}
+
+/**
+ * What an Agent without its own binding follows, for the caller: their own
+ * main Agent, and the system's main HappyClaw.
+ */
+export interface InheritedModel {
+  owner_main: InheritedModelBinding | null;
+  system_main: InheritedModelBinding | null;
+  /** The system main HappyClaw profile when the caller owns it, else null. */
+  system_main_profile_id: string | null;
 }
 
 export type AgentProfilePromptMode = 'append' | 'replace';
@@ -113,17 +166,6 @@ export interface AgentProfilePrompts {
   agents_prompt: string;
   tools_prompt: string;
   prompt_mode: AgentProfilePromptMode;
-}
-
-export interface AgentProfilePromptVersion extends AgentProfilePrompts {
-  id: string;
-  agent_profile_id: string;
-  version: number;
-  name: string;
-  identity_hash: string;
-  change_source: 'create' | 'update' | 'restore' | 'migration';
-  restored_from_version: number | null;
-  created_at: string;
 }
 
 export interface AgentProfileRuntimePolicy {
@@ -197,6 +239,8 @@ export interface AgentProfileWorkspace {
   is_home: boolean;
   execution_mode: 'container' | 'host';
   added_at: string;
+  /** Runtimes mid-turn or with queued input; older servers do not send it. */
+  active_conversations?: number;
   runtime_sessions: AgentProfileWorkspaceRuntimeSession[];
 }
 
@@ -243,6 +287,25 @@ export interface EffectiveCapabilityEntry {
   overrides: CapabilityLayerSource[];
   available: boolean;
   unavailableReason?: 'system_admin_only';
+}
+
+/**
+ * The connection and model a run uses, and which step of the pinning order
+ * chose it. Older servers do not send it.
+ */
+export interface AgentModelResolution {
+  source:
+    | 'session'
+    | 'agent'
+    | 'owner_main'
+    | 'system_main'
+    | 'workspace_env'
+    | 'none';
+  model_config_id: string | null;
+  model_config_name: string | null;
+  model: string | null;
+  /** The bound connection no longer exists, so every run fails. */
+  connection_missing?: boolean;
 }
 
 export interface AgentCapabilityPreview {
@@ -368,7 +431,16 @@ export interface AgentInfo {
     | 'feishu_thread'
     | 'auto_im'
     | 'channel_direct'
+    | 'automation'
+    /** Team mode: the session that routes a group, and a work item's worker. */
+    | 'team_router'
+    | 'work_item'
+    /** A workspace's conversation from before sessions were all alike. */
+    | 'legacy_main'
     | null;
+  /** Sessions an automation opened (fresh / persistent runs). */
+  automation_id?: string | null;
+  automation_name?: string | null;
   thread_id?: string | null;
   root_message_id?: string | null;
   title_source?:
@@ -380,7 +452,34 @@ export interface AgentInfo {
     | null;
   title_generating?: boolean;
   last_active_at?: string | null;
+  /** When the current user pinned it; null when not pinned. */
+  pinned_at?: string | null;
+  /** A /spawn agent: the session runtime JID that started it. */
+  spawned_from_jid?: string | null;
   latest_message?: { content: string; timestamp: string } | null;
+  /** The session's own git worktree (Host workspaces only), if it has one. */
+  worktree?: SessionWorktreeInfo | null;
+}
+
+export interface SessionWorktreeInfo {
+  branch: string;
+  base_commit: string;
+  /** `broken`: the checkout is missing or damaged; runs fail until deleted. */
+  status: 'active' | 'broken';
+  broken_reason: string | null;
+  /** Creation response only: what `.worktreeinclude` could not copy. */
+  include_incomplete?: WorktreeIncludeIncomplete | null;
+}
+
+export interface WorktreeIncludeIncomplete {
+  reason:
+    | 'include_file_too_large'
+    | 'list_truncated'
+    | 'file_limit'
+    | 'size_limit';
+  copied_files: number;
+  /** Up to five matched paths that were not copied. */
+  skipped_files: string[];
 }
 
 export interface AvailableImGroup {
@@ -436,6 +535,5 @@ export interface WorkspaceDeleteImpact {
   has_channel_bindings: boolean;
   channel_binding_count: number;
   bound_sessions: WorkspaceDeleteBindingSession[];
-  bound_main_im_groups: WorkspaceDeleteBindingGroup[];
   bound_thread_contexts: WorkspaceDeleteThreadContext[];
 }

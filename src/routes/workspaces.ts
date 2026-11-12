@@ -6,6 +6,7 @@ import {
   getWebDeps,
 } from '../web-context.js';
 import { canAccessGroup, canModifyGroup } from '../group-acl.js';
+import { guestHasActiveGrant } from '../guest-access.js';
 import { authMiddleware } from '../middleware/auth.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import {
@@ -16,7 +17,9 @@ import {
   setChannelMountInteractionModeOverride,
   getWorkspaceAgentProfileId,
   getWorkspaceInteractionMode,
+  getWorkspaceModes,
   listAgentChannelMountsByWorkspace,
+  listActiveGuestGrantJids,
   listWorkspaceRecords,
   listWorkspaceRuntimeSessionsByWorkspace,
   type AgentChannelMountRecord,
@@ -49,6 +52,14 @@ function resolveWorkspaceAccess(
   if (!group || !workspace.jid.startsWith('web:')) return null;
 
   const groupWithJid = { ...group, jid: workspace.jid };
+  // Read-only guests see exactly the workspaces they were granted (a host
+  // Home included). Governance fields stay hidden: canInspectGovernance is
+  // owner/admin-only.
+  if (user.role === 'guest') {
+    return guestHasActiveGrant(user, groupWithJid)
+      ? { workspace, group: groupWithJid }
+      : null;
+  }
   const isAdmin = hasHostExecutionPermission(user);
   if (
     isHostExecutionGroup(group) &&
@@ -125,6 +136,7 @@ function serializeWorkspaceSummary(
     ? listAgentChannelMountsByWorkspace(workspace.jid)
     : [];
   const isAdmin = hasHostExecutionPermission(user);
+  const { interaction_mode, work_mode } = getWorkspaceModes(workspace.folder);
   return {
     jid: workspace.jid,
     folder: workspace.folder,
@@ -135,7 +147,8 @@ function serializeWorkspaceSummary(
     execution_mode: inspectGovernance
       ? (group.executionMode ?? 'container')
       : undefined,
-    interaction_mode: getWorkspaceInteractionMode(workspace.folder),
+    interaction_mode,
+    work_mode,
     custom_cwd: isAdmin ? (group.customCwd ?? null) : undefined,
     agent_profile: getAgentProfileSnapshot(workspace, inspectGovernance),
     runtime_session_count: inspectGovernance
@@ -149,7 +162,11 @@ function serializeWorkspaceSummary(
 }
 
 function listVisibleWorkspaces(user: AuthUser): ResolvedWorkspaceAccess[] {
+  // A guest's grants are few; skip every other workspace up front.
+  const granted =
+    user.role === 'guest' ? new Set(listActiveGuestGrantJids(user.id)) : null;
   return listWorkspaceRecords()
+    .filter((workspace) => !granted || granted.has(workspace.jid))
     .map((workspace) => resolveWorkspaceAccess(user, workspace))
     .filter((access): access is ResolvedWorkspaceAccess => access !== null);
 }

@@ -71,5 +71,10 @@ export function buildClaudeRuntimeEnv(
     // instead of ending with stderr alone, so a refused start is not
     // mistaken for a session that cannot be resumed.
     CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '1',
+    // Turn off Claude Code's in-process cron (verified in 2.1.296). The Cron
+    // tools are already disallowed (RUNNER_DISALLOWED_BUILTIN_TOOLS), but a
+    // job that still got in would die with the CLI a few seconds after the
+    // result; HappyClaw schedules only through mcp__happyclaw__automation_create.
+    CLAUDE_CODE_DISABLE_CRON: '1',
   };
 }

@@ -8,7 +8,12 @@ import { neutralizeFeishuMentions } from '../feishu-errors.js';
 import { optimizeMarkdownStyle } from '../feishu-markdown-style.js';
 import { CARDKIT_MARKDOWN_MAX_CHARS } from './capacity.js';
 import { splitCardPages } from './pagination.js';
-import type { AgentCardInput, CardMeta, FeishuCardV2 } from './types.js';
+import type {
+  AgentCardInput,
+  AskCardInput,
+  CardMeta,
+  FeishuCardV2,
+} from './types.js';
 import {
   buildHeader,
   buildMetaRow,
@@ -17,6 +22,7 @@ import {
   buildStreamingDetails,
   buildFooter,
   buildStreamingPanels,
+  buildAskQuestionElements,
   statusHeadline,
   CARD_ELEMENT_IDS,
   type StreamingPanelsInit,
@@ -103,6 +109,7 @@ export function buildAgentReplyCard(input: AgentCardInput): FeishuCardV2 {
   if (body.trim()) {
     elements.push(...buildBodyChunks(body));
   }
+  elements.push(...buildAskQuestionElements(input.ask));
 
   const metaRow = buildMetaRow(input.meta);
   const details = buildFinalDetails(normalizedInput);
@@ -157,6 +164,8 @@ export interface StreamingCardBuildOptions {
   meta?: Pick<CardMeta, 'model'>;
   /** Initial content for structured runtime panels. */
   panels?: StreamingPanelsInit;
+  /** Open AskUserQuestion questions, placed after the answer (rich only). */
+  ask?: AskCardInput;
   /**
    * If true, use the answer-first skeleton with optional execution details.
    * If false, use the legacy flat skeleton (AUX_BEFORE/AUX_AFTER).
@@ -277,21 +286,11 @@ export function buildStreamingAgentCard(
       elements: [
         ...buildStreamingPanels(panelsInit),
         ...mainContentElements,
+        ...buildAskQuestionElements(opts.ask),
         ...buildStreamingDetails(panelsInit),
         interruptBtn,
         footerNote,
       ],
     },
   };
-}
-
-export function buildFollowUpActionResultCard(
-  message: string,
-  ok: boolean,
-): FeishuCardV2 {
-  return buildAgentReplyCard({
-    status: ok ? 'done' : 'warning',
-    title: ok ? '操作已完成' : '操作未执行',
-    text: message,
-  });
 }

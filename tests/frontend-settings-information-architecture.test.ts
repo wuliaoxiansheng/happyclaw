@@ -125,41 +125,47 @@ describe('settings information architecture', () => {
   test('uses accurate channel and provider safety semantics', () => {
     const bindings = read('web/src/components/settings/BindingsSection.tsx');
     const bindingRow = read('web/src/components/settings/ImBindingRow.tsx');
-    const provider = read('web/src/components/settings/ProviderEditor.tsx');
+    const providerEnv = read(
+      'web/src/components/settings/ProviderEnvEditor.tsx',
+    );
     const providerList = read('web/src/components/settings/ProviderList.tsx');
     const providerModel = read('web/src/utils/provider-model.ts');
+    const wizardModels = read('web/src/components/settings/ModelPicker.tsx');
+    const connectionModels = read(
+      'web/src/components/settings/ConnectionModelList.tsx',
+    );
+    const wizard = read('web/src/components/settings/AddModelWizard.tsx');
     const settings = read('web/src/pages/SettingsPage.tsx');
 
     expect(bindings).toMatch(/解除发言者限制|不可恢复|解除绑定/);
     expect(bindingRow).toMatch(
       /消息响应方式|supports_owner_mention|require_mention/,
     );
-    expect(provider).toContain('高级设置 · 环境变量');
-    expect(provider).toContain('系统预填环境变量');
-    expect(provider).toContain('已自定义');
-    expect(provider).toContain('恢复默认值');
-    expect(providerModel).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW');
-    expect(provider).toContain('1M 上下文');
-    expect(provider).toContain('系统预填 Claude Code 运行环境');
-    // The default is a deliberate, clearable choice (按钮「默认」), not the
-    // old always-present "系统默认" pointer.
-    expect(providerList).toContain('onSetDefault');
-    expect(providerList).toContain('aria-pressed={isDefault}');
-    expect(providerList).not.toContain('系统默认');
+    expect(providerEnv).toContain('高级设置 · 环境变量');
+    // Model keys are derived at launch, never typed as env.
+    expect(providerEnv).toContain('CONNECTION_MODEL_ENV_KEYS');
+    expect(providerModel).toContain('CONNECTION_ENV_PREFILL');
+    expect(providerModel).not.toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW');
+    // A context window per model, both when adding and when managing models;
+    // no 1M switch.
+    expect(wizardModels).toContain('<ModelCapabilityFields');
+    expect(connectionModels).toContain('<ModelCapabilityFields');
+    expect(wizardModels).not.toContain('OneMillionToggle');
+    expect(wizard).toContain('<ProviderEnvEditor');
+    // Settings only adds connections: no default, no pool, no weights.
+    expect(providerList).not.toContain('onSetDefault');
+    expect(providerList).not.toContain('<Switch');
     expect(providerList).not.toContain('权重');
     expect(settings).toContain('toast.success(message)');
     expect(settings).toContain('toast.error(message)');
   });
 
   test('offers supported official model aliases', () => {
-    const provider = read('web/src/components/settings/ProviderEditor.tsx');
-    const officialModels = provider.slice(
-      provider.indexOf('/* ─── 官方模型选择 ─── */'),
-      provider.indexOf('/* ─── 环境变量 ─── */'),
-    );
+    const wizard = read('web/src/components/settings/AddModelWizard.tsx');
 
-    expect(officialModels).toMatch(
-      /value="">default（默认）[\s\S]*value="opus">opus[\s\S]*value="sonnet">sonnet[\s\S]*value="haiku">haiku[\s\S]*value="fable">fable/,
+    // What a Claude subscription offers when its model list cannot be read.
+    expect(wizard).toMatch(
+      /CLAUDE_MODEL_ALIASES = \['opus', 'sonnet', 'haiku', 'fable'\]/,
     );
   });
 
@@ -176,9 +182,10 @@ describe('settings information architecture', () => {
     );
 
     expect(settings).toContain('<MainAgentCapabilitiesSection />');
-    expect(mainCapabilities).toMatch(/HappyClaw 用户 Skills|HappyClaw MCP/);
+    // The same capability form and save path as the Agent page.
+    expect(mainCapabilities).toContain('<AgentCapabilityForm');
     expect(mainCapabilities).not.toContain('工具与扩展能力边界');
-    expect(mainCapabilities).toContain('/api/agent-profiles/');
+    expect(mainCapabilities).toContain('updateProfile(profile.id');
     expect(workspaceEnv).toMatch(/Provider\s+地址和凭据由系统管理员统一管理/);
     expect(workspaceEnv).not.toContain('MODEL_PRESETS');
     expect(workspaceEnv).not.toContain('setAuthToken');
@@ -243,7 +250,7 @@ describe('settings information architecture', () => {
     expect(agentRoutes).not.toContain('setRegisteredGroup(imJid, updated)');
   });
 
-  test('exposes main-session binding and complete mobile workspace actions', () => {
+  test('exposes session binding and complete mobile workspace actions', () => {
     const sessions = [
       'web/src/components/chat/SessionSidebar.tsx',
       'web/src/lib/session-presentation.ts',
@@ -259,12 +266,15 @@ describe('settings information architecture', () => {
     );
     const bindingRoute = read('src/routes/config.ts');
 
-    expect(sessions).toContain('? () => onBindSession(null)');
-    expect(chatView).toContain('setBindingAgentId(id ?? MAIN_BINDING)');
+    expect(chatView).toContain(
+      'onBind: (session) => setBindingAgentId(session.id)',
+    );
     expect(chatView).toContain('setBindingAgentId(WORKSPACE_BINDING)');
     expect(chatView).toContain('title="管理工作区话题群绑定"');
     expect(chatView).not.toContain('{!isHome && canModifyWorkspaceConfig && (');
-    expect(chatView).toContain("? 'workspace' : 'session'");
+    expect(chatView).toContain(
+      'agentId={bindingAgentId === WORKSPACE_BINDING ? null : bindingAgentId}',
+    );
     expect(bindingDialog).toContain(
       'resolveBindingTargetType(group) === destination.type',
     );
@@ -273,17 +283,24 @@ describe('settings information architecture', () => {
     expect(bindings).toContain('resolveBindingTargetType(rebindGroup)');
     expect(bindings).toContain("resolveBindingTargetType(item) === 'session'");
     expect(bindings).toContain('解除渠道绑定');
-    expect(mobileChat).toMatch(/onRename=|onTogglePin=|onDelete=/);
+    expect(mobileChat).toMatch(/onRename[:=]|onTogglePin[:=]|onDelete[:=]/);
     expect(createWorkspace).toContain('effective_runtime_policy');
-    expect(bindingRoute).toContain(
+    // A workspace binding is a topic thread map; ordinary chats bind sessions.
+    expect(bindingRoute).not.toContain(
       "threadCapable ? 'thread_map' : 'single_session'",
+    );
+    expect(bindingRoute).toMatch(
+      /conversationBindingPolicyError\(\s*getConversationKind\([^)]*\),\s*'workspace',/,
     );
     expect(bindingRoute).not.toContain(
       'ordinary channels must bind to a session',
     );
     const sessionBindingRoute = read('src/routes/agents.ts');
-    expect(sessionBindingRoute).toContain(
+    expect(sessionBindingRoute).not.toContain(
       "threadCapable ? 'thread_map' : 'single_session'",
+    );
+    expect(sessionBindingRoute).toMatch(
+      /conversationBindingPolicyError\(\s*getConversationKind\([^)]*\),\s*'workspace',/,
     );
     const frontendTypes = read('web/src/types.ts');
     expect(frontendTypes).toContain("'native_thread'");

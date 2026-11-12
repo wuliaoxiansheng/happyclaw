@@ -3,21 +3,20 @@ import path from 'node:path';
 
 import { describe, expect, test } from 'vitest';
 
-import { canDeleteAcknowledgedIpcSource } from '../src/isolated-task-ipc.js';
+import { canDeleteAcknowledgedIpcSource } from '../src/host-ipc-output-router.js';
 
 const root = process.cwd();
 const indexSource = fs.readFileSync(path.join(root, 'src', 'index.ts'), 'utf8');
 
-/** Slice from the invalid-message gate through the first authorised delivery. */
+/** Slice from the invalid-message gate through the frozen-mode early exit. */
 function messageEarlyExitRegion(source: string): string {
   const start = source.indexOf("error: 'Invalid message request.'");
   expect(start).toBeGreaterThanOrEqual(0);
   const end = source.indexOf(
-    'Task run was cancelled before message delivery.',
+    "error: 'Invalid frozen interaction mode.'",
     start,
   );
   expect(end).toBeGreaterThan(start);
-  // Include the cancelled-message early-exit body that follows the error string.
   const after = source.indexOf('continue;', end);
   expect(after).toBeGreaterThan(end);
   return source.slice(start, after + 'continue;'.length);
@@ -33,14 +32,10 @@ function assertGuardedUnlink(region: string, errorLiteral: string): void {
 }
 
 describe('send_message early-exit ACK fence', () => {
-  test('invalid / frozen / cancelled message paths fence unlink like image', () => {
+  test('invalid / frozen message paths fence unlink like image', () => {
     const region = messageEarlyExitRegion(indexSource);
     assertGuardedUnlink(region, "error: 'Invalid message request.'");
     assertGuardedUnlink(region, "error: 'Invalid frozen interaction mode.'");
-    assertGuardedUnlink(
-      region,
-      "error: 'Task run was cancelled before message delivery.'",
-    );
 
     // Image invalid path already had the fence — keep the asymmetry closed.
     const imageInvalid = indexSource.indexOf("error: 'Invalid image request.'");

@@ -10,13 +10,24 @@
     />
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
     />
-    <meta name="theme-color" content="#faf9f5" />
+    <!-- 默认 orange 方案的 --background；首屏脚本按实际主题合并成一条。 -->
+    <meta
+      name="theme-color"
+      media="(prefers-color-scheme: light)"
+      content="#faf9f5"
+    />
+    <meta
+      name="theme-color"
+      media="(prefers-color-scheme: dark)"
+      content="#0a0a0a"
+    />
 
     <!-- PWA iOS Support -->
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
+    <!-- black-translucent 的状态栏文字恒为白色，亮色主题下看不清，保留 default。 -->
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="HappyClaw" />
     <link
@@ -25,9 +36,11 @@
     />
     <link rel="manifest" href="%BASE_URL%manifest.webmanifest" />
 
-    <!-- iOS PWA 优化：保留自动识别控制（页面缩放已允许） -->
-    <meta name="format-detection" content="telephone=no" />
-    <meta name="format-detection" content="email=no" />
+    <!-- 电话、邮箱、日期、地址都不自动识别成链接（自动加链接会改写消息里的文本） -->
+    <meta
+      name="format-detection"
+      content="telephone=no, email=no, date=no, address=no"
+    />
 
     <!-- 预热认证：AuthGuard 放行前整棵已登录子树都不渲染，若等入口 JS 执行后
          才发 /api/auth/me，这个 RTT 会和分片下载串行。这里在 HTML 解析阶段就
@@ -81,13 +94,19 @@
         var c = localStorage.getItem('happyclaw-color-scheme');
         if (c === 'neutral') d.classList.add('theme-neutral');
         else if (c !== 'default') d.classList.add('theme-orange');
-        var m = document.querySelector('meta[name="theme-color"]');
-        if (m)
+        // 主题已确定：两条按系统明暗的 theme-color 合并成一条，useTheme 之后
+        // 只更新这一条。
+        var metas = document.querySelectorAll('meta[name="theme-color"]');
+        var m = metas[0];
+        for (var i = 1; i < metas.length; i++) metas[i].remove();
+        if (m) {
+          m.removeAttribute('media');
           m.setAttribute(
             'content',
             getComputedStyle(d).getPropertyValue('--background').trim() ||
               '#faf9f5',
           );
+        }
         if (localStorage.getItem('happyclaw-font-style') === 'anthropic')
           d.classList.add('font-anthropic');
       })();

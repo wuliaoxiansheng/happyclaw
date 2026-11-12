@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { Badge } from '@/components/ui/badge';
-import { ProviderSwitcher, type SimpleProvider } from './ProviderSwitcher';
+import { ProviderSwitcher } from './ProviderSwitcher';
 
 export interface MonitorGroupStatus {
   jid: string;
@@ -17,7 +17,6 @@ export interface MonitorGroupStatus {
 
 interface GroupStatusCardProps {
   group: MonitorGroupStatus;
-  providers: SimpleProvider[];
 }
 
 export function GroupRunBadge({ active }: { active: boolean }) {
@@ -44,7 +43,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 }
 
 /** Compact list row used for the group table on narrow screens. */
-export function GroupStatusCard({ group, providers }: GroupStatusCardProps) {
+export function GroupStatusCard({ group }: GroupStatusCardProps) {
   return (
     <div role="listitem" className="px-4 py-3">
       <div className="flex items-center justify-between gap-2">
@@ -72,7 +71,6 @@ export function GroupStatusCard({ group, providers }: GroupStatusCardProps) {
             groupFolder={group.groupFolder}
             currentProviderId={group.selectedProviderId}
             currentProviderName={group.selectedProviderName}
-            providers={providers}
           />
         </Field>
       </dl>

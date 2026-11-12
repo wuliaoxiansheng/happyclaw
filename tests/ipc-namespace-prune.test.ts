@@ -115,12 +115,9 @@ describe('pruneIdleIpcNamespaces', () => {
     expect(fs.existsSync(revived)).toBe(true);
   });
 
-  test('never touches the workspace root or isolated task namespaces', async () => {
+  test('never touches the workspace root', async () => {
     const base = setup();
     fs.mkdirSync(path.join(base, 'ws', 'messages'), { recursive: true });
-    fs.mkdirSync(path.join(base, 'ws', 'tasks-run', 'run-1', 'messages'), {
-      recursive: true,
-    });
     const result = await pruneIdleIpcNamespaces({
       ipcBaseDir: base,
       isWatched: () => false,
@@ -129,8 +126,5 @@ describe('pruneIdleIpcNamespaces', () => {
     });
     expect(result).toEqual({ removed: 0, scanned: 0 });
     expect(fs.existsSync(path.join(base, 'ws', 'messages'))).toBe(true);
-    expect(fs.existsSync(path.join(base, 'ws', 'tasks-run', 'run-1'))).toBe(
-      true,
-    );
   });
 });

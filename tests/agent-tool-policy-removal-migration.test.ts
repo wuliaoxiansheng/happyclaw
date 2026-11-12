@@ -70,7 +70,8 @@ describe('retired Agent tool policy migration', () => {
         auto_compact_window: 0,
         auto_compact_percentage: 0,
       },
-      skills: { mode: 'inherit', ids: [] },
+      // v84 also pins the host Skill grant the profile ran with.
+      skills: { mode: 'inherit', ids: [], host: { mode: 'disabled', ids: [] } },
       mcp: { mode: 'inherit', ids: [] },
     });
     expect(migrated.identity_hash).not.toBe('legacy-restricted-hash');

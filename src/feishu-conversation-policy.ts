@@ -1,3 +1,5 @@
+import type { ChannelMessageMeta } from './types.js';
+
 export type FeishuActivationMode =
   | 'auto'
   | 'always'
@@ -23,17 +25,36 @@ export interface FeishuConversationPolicyInput {
   activeContext?: ActiveFeishuContext;
 }
 
+export interface FeishuTeamPlan {
+  outcome: 'subscribed' | 'candidate' | 'ignore';
+  /** The lane the message goes to, or `reject`; carried on the routed meta. */
+  route: NonNullable<ChannelMessageMeta['teamRoute']>;
+  /**
+   * The hidden header item the stored message carries (see team-gate.ts),
+   * as an attachments-JSON entry. Absent for `ignore`.
+   */
+  inputItem?: unknown;
+}
+
 export interface FeishuConversationPlan {
   /** A hard stop that cannot be bypassed by mentioning the bot. */
   disabled: boolean;
   /** Whether a group message may pass without mentioning the bot. */
   allowWithoutMention: boolean;
+  /** Admitted nowhere, whatever its @ (team mode ignored it). */
+  rejectReason?: 'not_admitted';
   /** Whether this message belongs to an isolated conversation agent. */
   independentContext: boolean;
   /** Canonical, durable context identity used by im_context_bindings. */
   contextId?: string;
-  /** Feishu message used as the reply_in_thread anchor. */
+  /** Topic root used as the reply_in_thread anchor of an independent context. */
   rootMessageId?: string;
+  /**
+   * Team mode (团队模式) decided where this group message goes. The decision
+   * replaces the @ requirement (allowWithoutMention / rejectReason). Absent
+   * outside team mode.
+   */
+  team?: FeishuTeamPlan;
   reason:
     | 'disabled'
     | 'direct'
@@ -145,14 +166,14 @@ export function resolveFeishuConversationPlan(
     };
   }
 
-  // Ordinary group threads are reply locations within the bound session.
+  // Ordinary group threads are reply locations within the bound session, and
+  // their anchor comes from the message itself, not from this plan.
   // Neither mentions nor historical topic bindings may allocate a new session
   // or bypass the current mention gate.
   return {
     disabled: false,
     allowWithoutMention: !mentionRequired,
     independentContext: false,
-    ...(input.rootId ? { rootMessageId: input.rootId } : {}),
     reason:
       mentionRequired && !input.mentionedBot
         ? 'mention_required'

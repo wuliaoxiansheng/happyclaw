@@ -28,6 +28,8 @@ export const CLAUDE_OAUTH_PROFILE_URL =
   'https://api.anthropic.com/api/oauth/profile';
 export const CLAUDE_OAUTH_USAGE_URL =
   'https://api.anthropic.com/api/oauth/usage';
+/** The beta header the OAuth-authenticated account endpoints expect. */
+export const CLAUDE_OAUTH_BETA = 'oauth-2025-04-20';
 
 /**
  * The token endpoint sees the CLI's Axios client; the CLI sets no explicit

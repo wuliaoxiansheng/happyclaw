@@ -15,16 +15,28 @@ import path from 'path';
 import { randomUUID } from 'node:crypto';
 
 import {
+  fileSignatureSettled,
+  sameFileSignature,
+  statFileSignature,
+  type FileSignature,
+} from './file-signature.js';
+import {
   CONTAINER_HTTP_PROXY,
   CONTAINER_HTTPS_PROXY,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_HEADROOM,
+  CONTAINER_MEMORY_LIMIT,
   CONTAINER_NO_PROXY,
   DATA_DIR,
-  GROUPS_DIR,
   TIMEZONE,
   type ContainerProxyConfig,
 } from './config.js';
+import type { ContainerMemoryLimit } from './container-memory-limit.js';
+import { workspaceDirOf, workspaceLogsDirOf } from './workspace-dir.js';
+import { isSingleUserHost } from './deployment-mode.js';
+
+export const SINGLE_USER_HOST_CONTAINER_REFUSAL =
+  '单人宿主机模式不运行 Docker 工作区；请把工作区改为宿主机模式或切回多人模式。';
 import { logger } from './logger.js';
 import { isCodexGatewayBaseUrl } from './codex-gateway/resolve-gateway-url.js';
 import {
@@ -49,9 +61,6 @@ import {
   clearInheritedClaudeProviderEnv,
   getClaudeProviderConfig,
   getContainerEnvConfig,
-  getEnabledProviders,
-  getUsableDefaultProvider,
-  getBalancingConfig,
   getProviders,
   providerHasCredentials,
   getSystemSettings,
@@ -70,8 +79,6 @@ import {
   removeClaudeKeychainOAuth,
   syncClaudeKeychainOAuth,
 } from './macos-keychain-credentials.js';
-import { providerModelTier, providerPool } from './provider-pool.js';
-import type { ProviderTier } from './provider-pool.js';
 import {
   issueWorkspaceMemoryWriteCapability,
   revokeWorkspaceMemoryWriteCapability,
@@ -81,23 +88,40 @@ import { releaseHappyClawOwnerIntroductionLease } from './owner-profile-store.js
 import { applyProviderSwitchToInput } from './provider-switch-context.js';
 import {
   getUserById,
-  getTaskRunById,
   isDatabaseInitialized,
   getSessionModelSelection,
   getSessionProviderId,
+  peekDefaultAgentProfile,
+  peekSystemMainAgentProfile,
+  peekWorkspaceOwnerMainAgentProfile,
   setSessionModel,
   setSessionProviderId,
 } from './db.js';
 import {
+  effectiveProviderModels,
+  findModelEntry,
+  launchModelName,
+  windowOf,
+  type ModelEffort,
+} from './model-providers.js';
+import { recordUsageEventConnection } from './runtime-state-store.js';
+import {
+  normalizeUsageLimitResetAt,
+  reserveUsageLimitWaitFor,
+  settleUsageLimitWaitAfterSuccess,
+  usageLimitWaitScopeKey,
+} from './usage-limit-wait.js';
+import {
   chatGptDefaultModel,
   chatGptLaunchModel,
+  resolveAgentLaunchModel,
+  resolveLaunchEffort,
   resolveSessionLaunchOverrides,
   sessionModelHasChanged,
+  type SessionLaunchOverrides,
 } from './session-model-overrides.js';
-import { isApiError } from './agent-output-parser.js';
 import {
   CODEX_REAUTH_REQUIRED_USER_NOTICE,
-  DEFAULT_MAX_TRANSIENT_RETRIES,
   TransientRetryLedger,
   resolveProviderFailureClass,
   resolveTerminalProviderFailureNotice,
@@ -106,7 +130,9 @@ import {
 import type {
   ClaudeOAuthCredentials,
   ClaudeProviderConfig,
+  UnifiedProvider,
 } from './runtime-config.js';
+import { resolveProviderWebFetchPreflightPolicy } from './provider-web-fetch-policy.js';
 import {
   loadManagedMcpLayers,
   resolveManagedMcpPolicy,
@@ -134,13 +160,32 @@ import {
   syncHostClaudeContext,
 } from './claude-context-resolver.js';
 import { pluginSkillLayers } from './effective-skill-resolver.js';
+import {
+  resolveSessionWorkingDirectory,
+  resolveWorkspaceSkillRoots,
+  sessionWorktreeRunError,
+} from './session-worktree.js';
+import { getSessionWorktree } from './session-worktree-store.js';
+import {
+  resolveNfsDirectMounts,
+  type NfsDirectMountResolution,
+} from './host-nfs-mounts.js';
+import {
+  ensureCifsVolume,
+  storageMountArg,
+  type VolumeMountStorage,
+} from './storage-volumes.js';
+import { isStorageSourceMount } from './storage-sources.js';
 import { RegisteredGroup } from './types.js';
 import type {
+  AgentProfile,
   AgentProfileRuntimePolicy,
   ChannelTurnContext,
   InteractionMode,
 } from './types.js';
+import type { TeamRole } from './work-items.js';
 import { validateSkillId, validateSkillPath } from './skill-utils.js';
+import { sessionClaudeDir, sessionIpcDir } from './utils.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 import type { ContainerOutput } from './agent-runtime-contracts.js';
 export type { ContainerOutput } from './agent-runtime-contracts.js';
@@ -182,8 +227,9 @@ import {
 import { assertValidWorkspaceFolderName } from './workspace-folder.js';
 import { resolveRunnerLivenessTimeouts } from './runner-liveness.js';
 import {
-  removeProviderEffortEnv,
+  applyLaunchEffortEnv,
   resolveAgentSdkEffort,
+  type SdkAgentEffort,
 } from './agent-effort.js';
 
 /**
@@ -224,55 +270,6 @@ function deriveContainerClaudeJson(hostJsonPath: string): string {
   } catch {
     return CONTAINER_CLAUDE_JSON_FALLBACK;
   }
-}
-
-/** What stat can tell about a file's contents. */
-interface FileSignature {
-  ino: number;
-  size: number;
-  mtimeMs: number;
-  ctimeMs: number;
-}
-
-function statFileSignature(filePath: string): FileSignature | null {
-  try {
-    const st = fs.statSync(filePath);
-    return {
-      ino: st.ino,
-      size: st.size,
-      mtimeMs: st.mtimeMs,
-      ctimeMs: st.ctimeMs,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function sameFileSignature(
-  a: FileSignature | null,
-  b: FileSignature | null,
-): boolean {
-  if (a === null || b === null) return a === b;
-  return (
-    a.ino === b.ino &&
-    a.size === b.size &&
-    a.mtimeMs === b.mtimeMs &&
-    a.ctimeMs === b.ctimeMs
-  );
-}
-
-/**
- * File timestamps are coarse, so a same-size in-place rewrite in the same
- * tick keeps the signature. Like git's "racily clean" rule, a signature only
- * vouches for the contents once observed this long after the file's mtime.
- */
-const RACY_SIGNATURE_WINDOW_MS = 2_000;
-
-function fileSignatureSettled(
-  sig: FileSignature | null,
-  observedAt: number,
-): boolean {
-  return sig === null || observedAt - sig.mtimeMs >= RACY_SIGNATURE_WINDOW_MS;
 }
 
 let containerClaudeJsonSource: {
@@ -326,14 +323,7 @@ function writeContainerClaudeJsonIfChanged(
 
   // Running containers bind-mount this file read-only. Replacing it by rename
   // leaves them a whole snapshot instead of a truncated, half-written file.
-  const tmp = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    fs.writeFileSync(tmp, content, { mode: 0o644, flag: 'wx' });
-    fs.renameSync(tmp, targetPath);
-  } catch (err) {
-    fs.rmSync(tmp, { force: true });
-    throw err;
-  }
+  writeAtomicFile(targetPath, content, 0o644);
   const writtenSig = statFileSignature(targetPath);
   if (writtenSig) {
     containerClaudeJsonTarget = {
@@ -353,8 +343,11 @@ function writeContainerClaudeJsonIfChanged(
  * 同时剥离 oauthAccount：容器内不走宿主机的 OAuth 登录态，认证完全由
  * ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY 环境变量控制，避免 SDK 误检
  * OAuth 凭据后跳过标准 Bearer header（第三方 provider 返回 404）。
- * 容器认证由 HappyClaw 配置，因此始终完成交互式初始化；宿主机未登录或
- * 尚未完成引导时，也不能把该状态复制进已配置认证的容器。
+ * Runner 进程经 entrypoint 的 CLAUDE_CONFIG_DIR 读写会话目录下的 .claude.json，
+ * 不读取这份副本；它只服务于不继承该变量的容器进程，例如 Web 终端经
+ * docker exec 启动的 shell 里交互运行的 claude。副本以只读挂载，引导结果
+ * 写不回去，所以固定标记为已完成引导，免得这类进程每次都停在 Welcome 页，
+ * 无论宿主机是否登录过。
  *
  * ~/.claude.json can be megabytes, so the copy is re-derived only when the
  * host file's stats change and rewritten only when its bytes would change.
@@ -472,20 +465,11 @@ export function clearSessionClaudeOAuthFiles(
     const hadOauthAccount = 'oauthAccount' in claudeJson;
     delete claudeJson.oauthAccount;
     if (claudeJsonTemplatePath || sourceExists || hadOauthAccount) {
-      const tmpPath = `${sessionClaudeJson}.${process.pid}.${randomUUID()}.tmp`;
-      try {
-        fs.writeFileSync(tmpPath, JSON.stringify(claudeJson, null, 2) + '\n', {
-          flag: 'wx',
-          mode: 0o600,
-        });
-        fs.renameSync(tmpPath, sessionClaudeJson);
-      } finally {
-        try {
-          fs.unlinkSync(tmpPath);
-        } catch {
-          /* already renamed or never created */
-        }
-      }
+      writeAtomicFile(
+        sessionClaudeJson,
+        JSON.stringify(claudeJson, null, 2) + '\n',
+        0o600,
+      );
     }
   }
 
@@ -692,26 +676,33 @@ function ensureSettingsJson(
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
+  /**
+   * The effort the host resolved for this launch: Claude Code runs at it, and
+   * null means none is sent at all, not even the Agent's own effort as the
+   * SDK option. Absent without a connection (the Workspace's own
+   * environment) or on a ChatGPT subscription, whose gateway applies it:
+   * the Agent's effort then goes as before.
+   */
+  launchEffort?: string | null;
   /** Exact GroupQueue query attempt for Web stream fencing. */
   queryRunId?: string;
   groupFolder: string;
   chatJid: string;
   /** Workspace-scoped interaction contract for this public Agent turn. */
   interactionMode?: InteractionMode;
+  /** Set when the selected connection skips WebFetch's domain check; read at launch. */
+  webFetchPreflightPolicy?: 'skip';
   /** Source JID of the latest message that triggered this run (e.g. `discord:123…`).
    * Used by per-channel MCP tools (discord_*, etc.) to identify the current
    * incoming chat. Undefined when chatJid already encodes the IM source. */
   currentSourceJid?: string;
   /** Sanitized provider identity for the exact input turn. */
   channelContext?: ChannelTurnContext;
-  /** @deprecated Use isHome + isAdminHome instead */
-  isMain: boolean;
   turnId?: string;
   /** Persisted message IDs already represented by this cold-run prompt. */
   readonly currentBatchMessageIds?: readonly string[];
   isHome?: boolean;
   isAdminHome?: boolean;
-  isScheduledTask?: boolean;
   /**
    * Internal per-runner HMAC secret delivered only in the stdin bootstrap.
    * Never expose this in environment variables, files, logs, prompts, or IPC.
@@ -719,14 +710,6 @@ export interface ContainerInput {
   workspaceMemoryMutationSigningSecret?: string;
   /** Public identity paired with the runner-private signing secret. */
   workspaceMemoryRunnerInstanceId?: string;
-  /** Isolated task run ID — determines IPC namespace (tasks-run/{taskRunId}/) */
-  taskRunId?: string;
-  /** Claude session/provider namespace. Tasks use task:<id> while IPC still uses taskRunId. */
-  sessionAgentId?: string;
-  /** If the last unprocessed message was emitted by a scheduled task prompt,
-   * this is that task's ID; propagated into agent-runner so MCP send_message
-   * outputs can be attributed back to the task record. */
-  messageTaskId?: string;
   images?: Array<{ data: string; mimeType?: string }>;
   agentProfile?: {
     id: string;
@@ -739,6 +722,11 @@ export interface ContainerInput {
     includeClaudePreset: boolean;
     /** Null means inherit the system default model configuration. */
     modelConfigId?: string | null;
+    /**
+     * A model of `modelConfigId`'s list; null runs that configuration's
+     * default. Applies only when this binding is what pins the launch.
+     */
+    model?: string | null;
     runtimePolicy?: AgentProfileRuntimePolicy;
   };
   /**
@@ -768,7 +756,11 @@ export interface ContainerInput {
   happyClawOwnerProfileEnabled?: boolean;
   /** Host-derived capability flag for main-HappyClaw interactive sessions. */
   agentBuilderEnabled?: boolean;
-  agentId?: string;
+  /**
+   * The session this launch runs: its Claude session, IPC root and
+   * conversation-level choices are all keyed by it.
+   */
+  agentId: string;
   agentName?: string;
   /**
    * Claude Code plugins to inject into the SDK query (via `options.plugins`).
@@ -780,49 +772,18 @@ export interface ContainerInput {
   contextAudit?: ClaudeContextAudit;
   /** Canonical effective Skill set for SDK selection and run provenance. */
   skillManifest?: { hash: string; selectedSkillIds: string[] };
-}
-
-/**
- * Record one provider failure at the right granularity.
- *
- * A model-scope wall must not take the whole account out of rotation: its
- * other tiers, and every other account's budget for the same model, are
- * independent quotas. Only account-scope failures quarantine the profile.
- */
-function quarantineFromOutput(
-  profileId: string,
-  output: Pick<
-    ContainerOutput,
-    | 'providerRateLimitScope'
-    | 'providerRateLimitModel'
-    | 'providerRateLimitResetsAt'
-    | 'providerFailureClass'
-    | 'providerLivenessTimeout'
-  >,
-): void {
-  // Only an account-class verdict may change account health.
-  //
-  // A transient failure says nothing about the account — the stream stalled, or
-  // the upstream returned 529/5xx — and quarantining on it is what turned an
-  // upstream hiccup into a fake "quota exhausted" verdict for single-account
-  // pools. A config failure would fail identically on every account, so
-  // quarantining would drain the whole pool over one unservable model name.
-  if (resolveProviderFailureClass(output) !== 'account') return;
-  // Fail safe: a model-scope report with no model name cannot be recorded as a
-  // tier quarantine, and silently dropping it would let the same failing pair
-  // be selected forever. Degrade to an account-scope quarantine instead.
-  if (
-    output.providerRateLimitScope === 'model' &&
-    output.providerRateLimitModel?.trim()
-  ) {
-    providerPool.reportModelFailure(
-      profileId,
-      output.providerRateLimitModel,
-      output.providerRateLimitResetsAt,
-    );
-    return;
-  }
-  providerPool.reportFailure(profileId, true, output.providerRateLimitResetsAt);
+  /**
+   * Team mode (团队模式): the session routes a group's requests or does one
+   * work item. The Runner picks tools, prompt section and disallowed tools
+   * from it. Absent for every other session.
+   */
+  teamRole?: TeamRole;
+  /**
+   * Multi-task mode (多任务模式): set for an ordinary conversation session
+   * (no team role) of a workspace whose work mode is `multi`. The Runner adds
+   * the delegation tools and their prompt section. Absent otherwise.
+   */
+  workMode?: 'multi';
 }
 
 /**
@@ -845,53 +806,26 @@ export function applyCodexGatewayVerdict(
       break;
     case 'reauth_required':
       output.providerFailureNotice ??= CODEX_REAUTH_REQUIRED_USER_NOTICE;
+      output.providerRateLimitResetsAt = undefined;
       break;
   }
-}
-
-/**
- * Whether any (account, model tier) pair can still serve a turn.
- *
- * This is the terminal boundary for the whole pool. Account health alone is no
- * longer sufficient: an account can be healthy yet quarantined on every tier
- * it could run, and a failing account can still serve its fallback tier.
- */
-function poolCanStillServe(): boolean {
-  const enabled = getEnabledProviders();
-  if (enabled.length === 0) return false;
-  const primaryTier = new Map(
-    enabled.map((p) => [p.id, providerModelTier(p.anthropicModel)]),
-  );
-  if (providerPool.hasCandidateForTier(primaryTier)) return true;
-  const fallbackModel = getSystemSettings().fallbackModel?.trim();
-  return !!fallbackModel && providerPool.hasCandidateForTier(fallbackModel);
 }
 
 /** Host-process replay budget; each transient retry runs a fresh runner. */
 const transientRetries = new TransientRetryLedger();
 
-export function transientRetryProfileForInput(
-  inputTurnId: string | undefined,
-): string | null {
-  return transientRetries.pinnedProfileId(inputTurnId);
-}
-
 /**
- * Exported for tests: the transient escalation spans this function, the
- * host-process retry ledger and the provider pool, so asserting it on source
- * text alone would not prove that a second failure actually quarantines the
- * account or that the pool then decides failover.
+ * Decide whether a provider failure ends the input. A run's connection is
+ * authoritative, so nothing fails over: a transient failure gets its one
+ * same-connection replay, a usage limit with a known reset waits for it, and
+ * everything else ends the input visibly. Exported for tests.
  */
 export function applyProviderFailureDisposition(
   output: ContainerOutput,
   selectedProfileId: string | null,
-  allowFailover = true,
+  waitScope?: UsageLimitWaitScope,
 ): boolean {
   const failureClass = resolveProviderFailureClass(output);
-  // Transient failures never consult the pool: no account was judged, so the
-  // only question is whether this input still has a retry left. This is
-  // identical for single- and multi-account installs by design — a 529 is not a
-  // reason to move the conversation to a different account.
   if (failureClass === 'transient') {
     if (
       transientRetries.consume(
@@ -902,46 +836,113 @@ export function applyProviderFailureDisposition(
       applyKnownProviderFailureDisposition(output, false);
       return false;
     }
-    // The bounded same-provider replay is spent. Repetition does not turn a
-    // 529/5xx or a silent transport stall into evidence about account health:
-    // end this input visibly, but leave every configured account selectable.
+    // Repetition does not turn a 529/5xx or a silent transport stall into
+    // evidence about the account: end this input visibly.
     logger.warn(
       {
         providerId: selectedProfileId,
         livenessTimeout: output.providerLivenessTimeout === true,
       },
-      'Transient provider failure repeated after its replay; ending input without quarantining the account',
+      'Transient provider failure repeated after its replay; ending the input',
     );
     applyKnownProviderFailureDisposition(output, true);
     return true;
   }
-  // A pinned model configuration is authoritative, so model_not_found ends
-  // there. In an automatic multi-provider pool, however, each member may use a
-  // different endpoint and configured model. Quarantine only the rejected
-  // (provider, model) pair and let the pool try another member.
-  if (failureClass === 'config') {
-    const model = output.providerRateLimitModel?.trim();
-    if (!allowFailover || selectedProfileId === null || !model) {
-      applyKnownProviderFailureDisposition(output, true);
-      return true;
-    }
-    providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
-    providerPool.reportModelFailure(selectedProfileId, model);
-    const terminal = !poolCanStillServe();
-    applyKnownProviderFailureDisposition(output, terminal);
-    return terminal;
+  const terminal =
+    failureClass === 'config' ||
+    !deferUsageLimitFailure(output, selectedProfileId, waitScope);
+  applyKnownProviderFailureDisposition(output, terminal);
+  return terminal;
+}
+
+/** The lane and durable input a provider failure belongs to. */
+export interface UsageLimitWaitScope {
+  scopeKey: string;
+  inputKey?: string;
+}
+
+export function usageLimitWaitScopeFor(
+  input: ContainerInput,
+): UsageLimitWaitScope {
+  return {
+    scopeKey: usageLimitWaitScopeKey(input),
+    inputKey: input.turnId,
+  };
+}
+
+/**
+ * When the run's connection hit its usage limit and the upstream named a
+ * reset time, keep the input for after the reset: mark the failure with the
+ * resume time and report it non-terminal. Bounded per lane by
+ * usage-limit-wait.ts.
+ */
+function deferUsageLimitFailure(
+  output: ContainerOutput,
+  selectedProfileId: string | null,
+  waitScope: UsageLimitWaitScope | undefined,
+): boolean {
+  if (!waitScope || !isDatabaseInitialized()) return false;
+  if (output.providerFailureNotice === CODEX_REAUTH_REQUIRED_USER_NOTICE) {
+    return false;
   }
-  providerPool.refreshFromConfig(getEnabledProviders(), getBalancingConfig());
-  providerPool.refreshRecoveryState();
-  // Ask the pool across both dimensions. A model wall leaves the account
-  // healthy but unable to serve that tier, and an account wall leaves other
-  // accounts' tiers untouched — neither is expressible in account health
-  // alone, which is all resolveProviderFailureDisposition() can see.
-  const disposition = allowFailover
-    ? { terminal: !(selectedProfileId !== null && poolCanStillServe()) }
-    : { terminal: true };
-  applyKnownProviderFailureDisposition(output, disposition.terminal);
-  return disposition.terminal;
+  const resetAt = normalizeUsageLimitResetAt(output.providerRateLimitResetsAt);
+  if (resetAt === null) return false;
+  const inputKey = resolveTransientRetryKey(output) || waitScope.inputKey;
+  if (!inputKey) return false;
+  try {
+    const wait = reserveUsageLimitWaitFor({
+      scopeKey: waitScope.scopeKey,
+      inputKey,
+      resetAtMs: resetAt,
+      nowMs: Date.now(),
+    });
+    if (!wait) return false;
+    output.providerUsageLimitResumeAt = Date.parse(wait.resumeAt);
+    logger.warn(
+      {
+        scopeKey: waitScope.scopeKey,
+        providerId: selectedProfileId,
+        resumeAt: wait.resumeAt,
+        waitCount: wait.waitCount,
+      },
+      'Usage limit reached on the connection; input waits for the reset',
+    );
+    return true;
+  } catch (err) {
+    logger.error(
+      { err, scopeKey: waitScope.scopeKey },
+      'Failed to record a usage-limit wait; ending the input instead',
+    );
+    return false;
+  }
+}
+
+/** A healthy turn ends the lane's run of consecutive usage-limit waits. */
+function settleUsageLimitWaitForOutput(
+  output: ContainerOutput,
+  input: ContainerInput,
+): void {
+  if (
+    output.providerFailure ||
+    output.inputTurnCompleted !== true ||
+    !isDatabaseInitialized()
+  ) {
+    return;
+  }
+  try {
+    settleUsageLimitWaitAfterSuccess(usageLimitWaitScopeKey(input));
+  } catch (err) {
+    logger.warn({ err }, 'Failed to settle the usage-limit wait of a lane');
+  }
+}
+
+/** The final output repeats the streamed failure; keep its wait with it. */
+function carryUsageLimitWait(
+  decided: ContainerOutput | undefined,
+  output: ContainerOutput,
+): void {
+  if (decided?.providerUsageLimitResumeAt === undefined) return;
+  output.providerUsageLimitResumeAt = decided.providerUsageLimitResumeAt;
 }
 
 function applyKnownProviderFailureDisposition(
@@ -949,7 +950,7 @@ function applyKnownProviderFailureDisposition(
   terminal: boolean,
 ): void {
   // Provider failures are control-plane signals. Chat/task callers synthesize
-  // their own terminal projection only after the pool is exhausted.
+  // their own terminal projection only once the failure is terminal.
   output.result = null;
   output.providerFailureTerminal = terminal;
   output.inputTurnCompleted = terminal;
@@ -962,41 +963,46 @@ function applyKnownProviderFailureDisposition(
   }
 }
 
-export function hasNonReplayableTaskNotificationEvidence(
-  summary: { succeeded: number; uncertain?: number } | null | undefined,
-): boolean {
-  return Boolean(
-    summary && (summary.succeeded > 0 || (summary.uncertain ?? 0) > 0),
-  );
-}
-
-function scheduledInputHasPhysicalSideEffect(input: ContainerInput): boolean {
-  if (!input.isScheduledTask || !input.taskRunId || !isDatabaseInitialized())
-    return false;
-  return hasNonReplayableTaskNotificationEvidence(
-    getTaskRunById(input.taskRunId)?.notification_summary,
-  );
+/**
+ * Remember which connection served a usage event, so cache hit rates can be
+ * read per connection. The usage row itself is written by the caller under
+ * the same event id. Exported for tests.
+ */
+export function recordUsageConnection(
+  output: ContainerOutput,
+  profileId: string | null,
+): void {
+  const eventId =
+    output.streamEvent?.eventType === 'usage'
+      ? output.streamEvent.usage?.eventId
+      : undefined;
+  if (!profileId || !eventId || !isDatabaseInitialized()) return;
+  try {
+    recordUsageEventConnection(eventId, profileId);
+  } catch (err) {
+    logger.warn({ err, eventId }, 'Failed to record the usage connection');
+  }
 }
 
 function providerFailureDispositionLogMessage(
   output: ContainerOutput,
   terminal: boolean,
 ): string {
-  if (terminal) return 'Provider options exhausted; surfacing terminal failure';
-  switch (resolveProviderFailureClass(output)) {
-    case 'transient':
-      return 'Transient provider failure; preserving input for bounded same-provider replay';
-    case 'config':
-      return 'Provider model tier rejected; preserving input for automatic-pool failover';
-    default:
-      return 'Provider account quarantined; preserving input for failover replay';
-  }
+  if (terminal) return 'Provider failure is terminal; surfacing it';
+  return resolveProviderFailureClass(output) === 'transient'
+    ? 'Transient provider failure; preserving input for bounded same-provider replay'
+    : 'Usage limit reached; preserving input until the reset';
 }
 
 export interface VolumeMount {
+  /** Host path of a bind, or a display label for a storage mount. */
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+  /** Mounted by Docker as a volume (NFS/SMB) instead of bound from the host. */
+  storage?: VolumeMountStorage;
+  /** Allowed root whose `nfsDirectMount` covers this host directory. */
+  nfsDirectMountRoot?: string;
 }
 
 export type AgentRunnerMode = 'image' | 'development';
@@ -1036,6 +1042,15 @@ export function replaceHostMcpServersEnv(
 interface ResolvedProvider {
   config: ClaudeProviderConfig;
   customEnv: Record<string, string>;
+  /**
+   * The effort the launch runs at (resolveModelLaunch), written as
+   * CLAUDE_CODE_EFFORT_LEVEL: Claude Code ranks that variable above the SDK
+   * `effort` option the runner passes for the Agent, so the Agent profile
+   * the runner sees (and hashes) stays as stored.
+   */
+  launchEffort?: string;
+  /** The runner's same-turn fallback model, named for this connection. */
+  fallbackModel?: string;
 }
 
 type RunnerAgentProfile = NonNullable<ContainerInput['agentProfile']>;
@@ -1210,6 +1225,8 @@ function resolveAgentProfileMcpPolicy(
 function resolveRuntimeMcpServers(
   group: RegisteredGroup,
   agentProfile?: RunnerAgentProfile,
+  /** The run's project root; see resolveWorkspaceProjectRoot. */
+  workspaceDir = workspaceDirOf(group.folder),
 ): Record<string, Record<string, unknown>> {
   const managedLayers = group.created_by
     ? loadManagedMcpLayers(group.created_by, {
@@ -1223,7 +1240,7 @@ function resolveRuntimeMcpServers(
     agentProfile,
   ).servers;
   const context = loadClaudeContextMcpServers({
-    workspaceDir: path.join(GROUPS_DIR, group.folder),
+    workspaceDir,
     externalClaudeDir: getEffectiveExternalDir(),
     includeHostClaudeContext: shouldIncludeHostClaudeContext(agentProfile),
   });
@@ -1231,7 +1248,7 @@ function resolveRuntimeMcpServers(
 }
 
 function buildRuntimeMcpManifest(
-  group: RegisteredGroup,
+  servers: Record<string, Record<string, unknown>>,
   agentProfile: RunnerAgentProfile | undefined,
   plugins: SdkPluginConfig[],
 ) {
@@ -1240,7 +1257,7 @@ function buildRuntimeMcpManifest(
       ? loadPluginMcpDefinitions(plugins)
       : {};
   return buildEffectiveMcpManifest({
-    ...resolveRuntimeMcpServers(group, agentProfile),
+    ...servers,
     ...pluginServers,
   });
 }
@@ -1262,103 +1279,188 @@ function getAgentProfileMcpPolicyMode(
   return agentProfile?.runtimePolicy?.mcp.mode ?? 'inherit';
 }
 
-/**
- * Pick the model tier this turn should run on.
- *
- * Per-model quotas are per account, so the pool drains the primary tier —
- * each account's own configured model — across *every* account before any
- * account escalates to the system fallback tier. Returns the model to force
- * for the escalated tier, or null to keep each provider's configured model.
- */
-function resolvePoolTierModel(
-  enabledProviders: Array<{ id: string; anthropicModel: string }>,
-): string | null {
-  const primaryTier = new Map(
-    enabledProviders.map((p) => [p.id, providerModelTier(p.anthropicModel)]),
-  );
-  if (providerPool.hasCandidateForTier(primaryTier)) return null;
+/** Where a run's connection comes from; see resolveModelBinding. */
+export type ModelBindingSource =
+  | 'session'
+  | 'agent'
+  | 'workspace_env'
+  | 'owner_main'
+  | 'system_main'
+  | 'none';
 
-  const fallbackModel = getSystemSettings().fallbackModel?.trim();
-  if (fallbackModel && providerPool.hasCandidateForTier(fallbackModel)) {
-    logger.info(
-      { fallbackModel },
-      'Primary model tier exhausted across every account; escalating the pool to the fallback tier',
+/** The run's own Agent, as far as its model goes. */
+export interface AgentModelBinding {
+  modelConfigId?: string | null;
+  model?: string | null;
+}
+
+export interface ModelBinding {
+  source: ModelBindingSource;
+  /**
+   * The connection the run uses; null for `workspace_env` and `none`, and
+   * for a binding whose connection is gone (connectionMissing).
+   */
+  provider: UnifiedProvider | null;
+  /** The connection the step names, also when it is missing. */
+  modelConfigId: string | null;
+  /**
+   * The step's binding names a connection that was deleted or has no
+   * credential. A set binding is authoritative: the run fails rather than
+   * moving to another connection.
+   */
+  connectionMissing?: boolean;
+  /**
+   * The model the profile that supplied the connection names in it. For a
+   * conversation pick, the Agent's own model when the pick is on the
+   * Agent's connection: it runs when the pick names no model.
+   */
+  model: string | null;
+  /** The explicit effort of the main Agent the connection was inherited from. */
+  inheritedEffort?: SdkAgentEffort;
+}
+
+/** A saved connection that can serve a launch now, or null. */
+export function usableProvider(
+  id: string | null | undefined,
+  providers: readonly UnifiedProvider[] = getProviders(),
+): UnifiedProvider | null {
+  if (!id) return null;
+  const provider = providers.find((item) => item.id === id);
+  return provider && providerHasCredentials(provider) ? provider : null;
+}
+
+/** A set binding: its connection if usable, else marked missing. */
+function boundStep(
+  source: ModelBindingSource,
+  modelConfigId: string,
+  model: string | null,
+  providers: readonly UnifiedProvider[],
+): ModelBinding {
+  const provider = usableProvider(modelConfigId, providers);
+  return provider
+    ? { source, provider, modelConfigId, model }
+    : {
+        source,
+        provider: null,
+        modelConfigId,
+        model: null,
+        connectionMissing: true,
+      };
+}
+
+/**
+ * The binding a main Agent hands down to Agents without their own: its
+ * connection, its model, its explicit effort. Null when it binds nothing.
+ */
+export function bindingFromMainProfile(
+  source: 'owner_main' | 'system_main',
+  profile: AgentProfile | undefined,
+  providers: readonly UnifiedProvider[] = getProviders(),
+): ModelBinding | null {
+  if (!profile?.model_config_id) return null;
+  const binding = boundStep(
+    source,
+    profile.model_config_id,
+    profile.model,
+    providers,
+  );
+  const inheritedEffort = resolveAgentSdkEffort(profile.runtime_policy);
+  return binding.provider && inheritedEffort
+    ? { ...binding, inheritedEffort }
+    : binding;
+}
+
+/**
+ * The connection a run uses, most specific first: the conversation's pick,
+ * the Agent's own binding, the Workspace's own provider environment, the
+ * owner's main Agent, the system main HappyClaw (main Agent of the earliest
+ * admin), none. A step that binds nothing is skipped. A conversation pick
+ * whose connection is gone reads as no pick; any other binding is
+ * authoritative, so a deleted or credential-less connection stops there
+ * (connectionMissing) instead of running on another account. An inherited
+ * connection brings the model its profile names in it.
+ *
+ * Every launch, the chat picker's default and the Agent page call this, so
+ * what they show is what runs. `includeSession: false` asks what runs when
+ * the conversation picks nothing.
+ */
+export function resolveModelBinding(
+  agent: AgentModelBinding | null | undefined,
+  session?: { groupFolder: string; agentId?: string | null } | null,
+  options: { includeSession?: boolean; ownerUserId?: string | null } = {},
+): ModelBinding {
+  const providers = getProviders();
+  if (session && options.includeSession !== false) {
+    const picked = usableProvider(
+      getSessionModelSelection(session.groupFolder, session.agentId),
+      providers,
     );
-    return fallbackModel;
+    if (picked) {
+      return {
+        source: 'session',
+        provider: picked,
+        modelConfigId: picked.id,
+        model:
+          agent?.modelConfigId === picked.id ? (agent.model ?? null) : null,
+      };
+    }
   }
-  // Nothing left anywhere — keep the primary tier so the failure surfaces
-  // against the configured model rather than a surprise substitute.
+  if (agent?.modelConfigId) {
+    return boundStep(
+      'agent',
+      agent.modelConfigId,
+      agent.model ?? null,
+      providers,
+    );
+  }
+  if (session && workspaceHasProviderEnv(session.groupFolder)) {
+    return {
+      source: 'workspace_env',
+      provider: null,
+      modelConfigId: null,
+      model: null,
+    };
+  }
+  if (isDatabaseInitialized()) {
+    const ownerMain = options.ownerUserId
+      ? peekDefaultAgentProfile(options.ownerUserId)
+      : session
+        ? peekWorkspaceOwnerMainAgentProfile(session.groupFolder)
+        : undefined;
+    const inherited =
+      bindingFromMainProfile('owner_main', ownerMain, providers) ??
+      bindingFromMainProfile(
+        'system_main',
+        peekSystemMainAgentProfile(),
+        providers,
+      );
+    if (inherited) return inherited;
+  }
+  return { source: 'none', provider: null, modelConfigId: null, model: null };
+}
+
+/**
+ * Why a launch cannot run, or null: a set binding whose connection is gone,
+ * or no binding anywhere while connections exist. Prefixed so the host
+ * treats it as a deterministic configuration error, not a retry.
+ */
+export function modelBindingError(binding: ModelBinding): string | null {
+  if (binding.connectionMissing) {
+    const whose =
+      binding.source === 'agent'
+        ? '智能体'
+        : binding.source === 'owner_main'
+          ? '主智能体'
+          : '主 HappyClaw';
+    return `agent_profile_unavailable: ${whose}绑定的模型连接已删除或缺少凭据，请在智能体页重新选择`;
+  }
+  if (binding.source === 'none' && getProviders().length > 0) {
+    return 'agent_profile_unavailable: 还没有为主 HappyClaw 选择模型，请在设置或智能体页选择';
+  }
   return null;
 }
 
-/**
- * Whether a sticky binding can still serve the tier this turn runs on.
- *
- * Account health and model-tier quarantine are orthogonal: an account stays
- * healthy while one of its model budgets is walled. `failover` means "stay on
- * this account until it can no longer serve us", and a walled tier is exactly
- * that — so the sticky fast-path must consult both dimensions, or it hands the
- * turn straight back to the walled (account, model) pair every time.
- *
- * Shared by trySelectPoolProvider and willClearSessionOnProviderSwitch so the
- * prediction cannot drift from the selection it mirrors.
- */
-function stickyBindingCanServeTier(
-  boundId: string,
-  enabledProviders: Array<{ id: string; anthropicModel: string }>,
-  tierModel: string | null,
-): boolean {
-  const model =
-    tierModel ??
-    providerModelTier(
-      enabledProviders.find((p) => p.id === boundId)?.anthropicModel,
-    );
-  return !providerPool.isModelQuarantined(boundId, model);
-}
-
-/**
- * Resolve the model configuration that *pins* provider selection, or null when
- * selection should go through the balancing pool.
- *
- * An explicit conversation pick or Agent-level `modelConfigId` is
- * authoritative: a top-level Agent owns exactly one complete model
- * configuration and must never be rerouted to a different gateway or
- * subscription.
- *
- * With neither, the configuration the operator marked as the global default
- * pins (unless the Workspace brings its own provider environment). Only when
- * no default is set does every enabled configuration belong to the automatic
- * pool: a single enabled configuration is treated as pinned to keep the
- * single-provider lifecycle efficient, and multiple enabled configurations
- * fall through to balancing.
- *
- * Every decision derived from "is selection pinned?" must call this, or the
- * sites disagree: selection would rotate while failure handling still treats
- * the provider as pinned (and therefore terminal).
- */
-function resolvePinnedModelConfigId(
-  modelConfigId?: string | null,
-  session?: { groupFolder: string; agentId?: string | null },
-): string | null {
-  const sessionSelection = session
-    ? resolveSessionModelSelection(session.groupFolder, session.agentId)
-    : null;
-  if (sessionSelection) return sessionSelection;
-  if (modelConfigId) return modelConfigId;
-  // The global default is the weakest explicit choice: a Workspace that
-  // carries its own provider environment keeps it.
-  const defaultProvider = getUsableDefaultProvider();
-  if (
-    defaultProvider &&
-    !(session && workspaceHasProviderEnv(session.groupFolder))
-  ) {
-    return defaultProvider.id;
-  }
-  const enabledProviders = getEnabledProviders();
-  return enabledProviders.length === 1 ? enabledProviders[0].id : null;
-}
-
-/** Whether the Workspace brings its own provider environment, bypassing the pool. */
+/** Whether the Workspace brings its own provider environment. */
 function workspaceHasProviderEnv(groupFolder: string): boolean {
   const override = getContainerEnvConfig(groupFolder);
   return !!(
@@ -1370,199 +1472,211 @@ function workspaceHasProviderEnv(groupFolder: string): boolean {
 
 /**
  * The model configuration the user picked for this conversation in the chat
- * composer. It outranks the Agent's binding because it is the more specific
- * choice; like the Agent binding it may name a configuration that is not in
- * the automatic pool. A selection whose configuration has since been deleted
- * or lost its credential degrades to the default instead of failing the turn.
+ * composer. A selection whose configuration has since been deleted or lost
+ * its credential reads as none, so the order moves on instead of failing the
+ * turn.
  */
 export function resolveSessionModelSelection(
   groupFolder: string,
   agentId?: string | null,
 ): string | null {
   const selected = getSessionModelSelection(groupFolder, agentId);
-  if (!selected) return null;
-  const provider = getProviders().find((item) => item.id === selected);
-  return provider && providerHasCredentials(provider) ? selected : null;
+  return usableProvider(selected) ? selected : null;
 }
 
-/** Whether a completed user turn must release its runner for the next pick. */
-export function shouldRotatePoolProviderAfterTurn(
-  groupFolder: string,
-  modelConfigId?: string | null,
-  agentId?: string | null,
-): boolean {
-  if (resolvePinnedModelConfigId(modelConfigId, { groupFolder, agentId })) {
-    return false;
-  }
-  if (workspaceHasProviderEnv(groupFolder)) return false;
-  return (
-    getEnabledProviders().length > 1 &&
-    getBalancingConfig().strategy !== 'failover'
-  );
-}
-
-/** Schedule one runner shutdown after a healthy logical turn under rotation. */
-export function closeRunnerAfterRotatingProviderTurn(
-  rotationEnabled: boolean,
-  rotationAlreadyScheduled: boolean,
-  output: Pick<
-    ContainerOutput,
-    'providerFailure' | 'inputTurnCompleted' | 'pendingBgTasks' | 'queryIdle'
-  >,
-  closeRunner: () => void,
-): boolean {
-  if (
-    !rotationEnabled ||
-    rotationAlreadyScheduled ||
-    output.providerFailure ||
-    output.inputTurnCompleted !== true ||
-    // A runner still holding background Tasks must stay alive: closing stdin
-    // would kill the sub-agents and drop their completion summary. Rotation
-    // is retried on the next healthy completion once they have settled.
-    (output.pendingBgTasks ?? 0) > 0 ||
-    // The result completed turn A while a follow-up IPC turn B was already
-    // piped into the same SDK stream. Closing now strands B without its own
-    // result, so the host treats the close as in-flight and replays/duplicates
-    // A's reply. Rotate on B's completion instead.
-    output.queryIdle === false
-  ) {
-    return false;
-  }
-  closeRunner();
-  return true;
+/** What a launch on a resolved binding runs within its connection. */
+export interface ModelLaunch {
+  /** The model to run instead of the connection's own, never with `[1m]`. */
+  model?: string;
+  /**
+   * The effort Claude Code runs at, or null when the model takes none (and
+   * on a ChatGPT subscription, whose gateway applies the effort).
+   */
+  effort: ModelEffort | null;
+  /** ChatGPT only: the conversation's own effort pick. */
+  sessionEffort?: string;
+  /** ChatGPT only: the Agent's effort, else the inherited main Agent's. */
+  gatewayAgentEffort?: string;
 }
 
 /**
- * Read-only prediction of whether the next provider selection will *clear* the
- * resumable Claude session because it has to switch away from the bound
- * provider (the binding is unhealthy or no longer enabled). Mirrors the
- * `resetSession` conditions in trySelectPoolProvider without mutating sticky
- * bindings.
+ * The model and effort a launch runs on within the binding's connection.
+ * Model: the conversation's pick (or the connection's own when the pick
+ * names none), else the model the supplying profile names, else the
+ * connection's own. Effort: the conversation's pick, the Agent's explicit
+ * effort, the inherited main Agent's, each only if the model takes it, else
+ * the model's default; nothing for a model without efforts. With no model
+ * at all (a pass-through relay) the Agent's explicit effort.
+ */
+export function resolveModelLaunch(
+  binding: ModelBinding & { provider: UnifiedProvider },
+  groupFolder: string,
+  agentId: string | null | undefined,
+  agentEffort: SdkAgentEffort | undefined,
+  options: { warn?: boolean } = {},
+): ModelLaunch {
+  const { provider } = binding;
+  // The profile's model; for a pick without a model on the Agent's own
+  // connection, the Agent's. A name saved with `[1m]` stays as it is: the
+  // launch reads it as 1M.
+  const profileModel = resolveAgentLaunchModel(provider, binding.model, {
+    groupFolder,
+    agentId,
+    // Only when the Agent's own binding decides is a dropped model news.
+    warn: binding.source === 'agent' && options.warn !== false,
+  });
+  const overrides: SessionLaunchOverrides =
+    binding.source === 'session'
+      ? resolveSessionLaunchOverrides(groupFolder, agentId, provider, {
+          ...options,
+          unpickedModel: profileModel ?? provider.anthropicModel,
+        })
+      : {};
+  const model = overrides.model ?? profileModel;
+  if (provider.codexOAuthCredentials) {
+    const gatewayAgentEffort = agentEffort ?? binding.inheritedEffort;
+    return {
+      ...(model ? { model } : {}),
+      effort: null,
+      ...(overrides.effort ? { sessionEffort: overrides.effort } : {}),
+      ...(gatewayAgentEffort ? { gatewayAgentEffort } : {}),
+    };
+  }
+  const runs = model ?? provider.anthropicModel;
+  return {
+    ...(model ? { model } : {}),
+    // A pass-through relay names no model: nothing is known to rule the
+    // Agent's explicit effort out, so it goes as set.
+    effort: runs
+      ? resolveLaunchEffort(provider, runs, [
+          overrides.effort,
+          agentEffort,
+          binding.inheritedEffort,
+        ])
+      : (agentEffort ?? null),
+  };
+}
+
+/** A binding and what it runs, as the picker and the Agent page show it. */
+export interface ModelBindingSummary {
+  source: ModelBindingSource;
+  provider: UnifiedProvider | null;
+  /** The connection the binding names, also when it is missing. */
+  modelConfigId: string | null;
+  /** The binding is set but its connection is gone: the run fails. */
+  connectionMissing: boolean;
+  /** The model a launch runs; null for a pass-through relay or no connection. */
+  model: string | null;
+  /** Null when the model takes no effort or the gateway decides (ChatGPT). */
+  effort: ModelEffort | null;
+}
+
+export function summarizeModelBinding(
+  binding: ModelBinding,
+  groupFolder: string,
+  agentId: string | null | undefined,
+  agentEffort: SdkAgentEffort | undefined,
+): ModelBindingSummary {
+  const { provider, source, modelConfigId } = binding;
+  const connectionMissing = !!binding.connectionMissing;
+  if (!provider) {
+    return {
+      source,
+      provider,
+      modelConfigId,
+      connectionMissing,
+      model: null,
+      effort: null,
+    };
+  }
+  const launch = resolveModelLaunch(
+    { ...binding, provider },
+    groupFolder,
+    agentId,
+    agentEffort,
+    { warn: false },
+  );
+  return {
+    source,
+    provider,
+    modelConfigId,
+    connectionMissing,
+    model: provider.codexOAuthCredentials
+      ? chatGptLaunchModel(launch.model, provider)
+      : launch.model || provider.anthropicModel || null,
+    effort: launch.effort,
+  };
+}
+
+/**
+ * Read-only prediction of whether the next launch will *clear* the resumable
+ * Claude session: it runs on another connection than the session is bound
+ * to, or on another model. Mirrors trySelectPoolProvider without writing.
  *
- * The orchestration layer calls this *before* building the prompt so a
- * proactive provider switch injects recent conversation history into the fresh
- * session — matching the reactive (mid-stream provider-failure) path. Without
- * this, the first turn under the new provider would see an empty conversation.
- *
- * Conservative by design: a false positive only injects redundant history
- * (harmless), never the reverse.
+ * The orchestration layer calls this *before* building the prompt so the
+ * switch injects recent conversation history into the fresh session.
  */
 export function willClearSessionOnProviderSwitch(
   groupFolder: string,
   agentId?: string | null,
   modelConfigId?: string | null,
+  agentModel?: string | null,
 ): boolean {
-  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId, {
-    groupFolder,
-    agentId,
-  });
+  const binding = resolveModelBinding(
+    { modelConfigId, model: agentModel },
+    { groupFolder, agentId },
+  );
   const boundId = getSessionProviderId(groupFolder, agentId);
-  if (selectedModelConfigId) {
-    if (boundId && boundId !== selectedModelConfigId) return true;
-    return boundSessionModelWillChange(
-      groupFolder,
-      agentId,
-      selectedModelConfigId,
-    );
-  }
-
-  // Env-level provider override means the pool is bypassed entirely — no
-  // pool-driven switch, so the session is never cleared on this account.
-  if (workspaceHasProviderEnv(groupFolder)) return false;
-
-  if (!boundId) return false;
-
-  const enabledProviders = getEnabledProviders();
-  if (enabledProviders.length === 0) return false;
-
-  // Bound provider removed/disabled → a fresh one gets picked → reset.
-  const stillEnabled = enabledProviders.some((p) => p.id === boundId);
-  if (!stillEnabled) return true;
-
-  // Single enabled provider equal to the binding → sticky, no reset.
-  if (enabledProviders.length === 1) {
-    return enabledProviders[0].id !== boundId;
-  }
-
-  // Multiple providers: sticky reuse only when the binding is still healthy.
-  // Unhealthy binding falls through to pool selection, which prefers a
-  // different healthy provider → reset.
-  const balancing = getBalancingConfig();
-  providerPool.refreshFromConfig(enabledProviders, balancing);
-  // The round-robin strategies rotate on every request, so a bound session is
-  // very likely to move to a different account next turn. Predicting a switch
-  // is the conservative side of this call: a false positive only injects
-  // recent history the fresh session would otherwise be missing.
-  if (providerPool.rotatesPerRequest) return true;
-  // Keep the prediction in lockstep with trySelectPoolProvider: apply the
-  // time-based recovery rule before reading health, or an expired quarantine
-  // predicts a switch that the actual selection no longer performs.
-  providerPool.refreshRecoveryState();
-  if (!providerPool.getHealthStatus(boundId).healthy) return true;
-  // Same second dimension the sticky path checks: a walled model tier moves
-  // the session off a still-healthy account, and that switch must inject
-  // history like any other.
-  if (
-    !stickyBindingCanServeTier(
-      boundId,
-      enabledProviders,
-      resolvePoolTierModel(enabledProviders),
-    )
-  ) {
-    return true;
-  }
-  // The binding stays, but a conversation that just left its pinned model
-  // returns to the configuration's own, and that is a model change.
-  return boundSessionModelWillChange(groupFolder, agentId, boundId);
+  // Without a connection the launch fails, or runs the Workspace's own
+  // environment, which is another account than a bound session's.
+  if (!binding.provider) return !modelBindingError(binding) && !!boundId;
+  if (boundId && boundId !== binding.provider.id) return true;
+  return launchModelWillChange(groupFolder, agentId, {
+    ...binding,
+    provider: binding.provider,
+  });
 }
 
-/**
- * Whether launching on `providerId` would change the model of a ChatGPT
- * session that is still resumable. Mirrors withSessionModel, read-only.
- */
-function boundSessionModelWillChange(
+/** Whether a launch on `binding` changes the model of a resumable session. */
+function launchModelWillChange(
   groupFolder: string,
   agentId: string | null | undefined,
-  providerId: string,
+  binding: ModelBinding & { provider: UnifiedProvider },
 ): boolean {
-  const provider = getProviders().find((item) => item.id === providerId);
-  if (!provider?.codexOAuthCredentials) return false;
-  const overrides = resolveSessionLaunchOverrides(
-    groupFolder,
-    agentId,
-    provider,
-    { warn: false },
-  );
+  const { provider } = binding;
+  const launch = resolveModelLaunch(binding, groupFolder, agentId, undefined, {
+    warn: false,
+  });
+  if (!provider.codexOAuthCredentials) {
+    return sessionModelHasChanged(
+      groupFolder,
+      agentId,
+      launch.model ?? provider.anthropicModel,
+      provider.anthropicModel,
+    );
+  }
   return sessionModelHasChanged(
     groupFolder,
     agentId,
-    chatGptLaunchModel(overrides.model, provider),
+    chatGptLaunchModel(launch.model, provider),
     chatGptDefaultModel(provider),
   );
 }
 
 /**
- * Providers the next pool selection for this session may return, among those
- * holding Claude OAuth credentials. Mirrors trySelectPoolProvider's branches.
+ * The connections the next launch of this session may use, among those
+ * holding Claude OAuth credentials.
  */
 export function launchOAuthRefreshCandidates(
   groupFolder: string,
   agentId?: string | null,
   modelConfigId?: string | null,
 ): string[] {
-  const pinned = resolvePinnedModelConfigId(modelConfigId, {
-    groupFolder,
-    agentId,
-  });
-  const providers = pinned
-    ? getProviders().filter((provider) => provider.id === pinned)
-    : (() => {
-        if (workspaceHasProviderEnv(groupFolder)) return [];
-        return getEnabledProviders();
-      })();
-  return providers
-    .filter((provider) => !!provider.claudeOAuthCredentials)
-    .map((provider) => provider.id);
+  const { provider } = resolveModelBinding(
+    { modelConfigId },
+    { groupFolder, agentId },
+  );
+  return provider?.claudeOAuthCredentials ? [provider.id] : [];
 }
 
 /**
@@ -1644,30 +1758,68 @@ export async function refreshLaunchOAuthCredentials(
 }
 
 /**
- * Try to select a provider from the pool. Returns profileId + resolved config,
- * or null if no providers are enabled / group has env-level provider override / selection fails.
- * For single-provider setups, returns the provider for display without pool balancing.
- * Session-sticky binding (when groupFolder + agentId identifies a resumable Claude
- * session): if the session has a previously-bound provider that is still enabled,
- * prefer it over load-balancing. This prevents "Invalid signature in thinking
- * block" 400 errors when a conversation that produced thinking blocks under
- * provider A gets resumed in a fresh container that the pool routes to provider B
- * (different OAuth account / API key). Each successful selection updates the
- * binding via setSessionProviderId().
+ * Pick the connection, model and effort for a launch (resolveModelBinding),
+ * or null when none applies (the Workspace's own environment, or nothing
+ * configured). Records the connection and model on the Session so a later
+ * launch can tell that either changed: a Claude SDK session is bound to one
+ * account, and a ChatGPT session's encrypted reasoning to one model, so a
+ * change starts a new session (resetSession) that is seeded with history.
  */
 export function trySelectPoolProvider(
   groupFolder: string,
   agentId?: string | null,
   modelConfigId?: string | null,
-  transientRetryProfileId?: string | null,
+  agentModel?: string | null,
+  agentEffort?: SdkAgentEffort,
 ): PoolProviderSelection | null {
-  const selection = selectPoolProvider(
+  const binding = resolveModelBinding(
+    { modelConfigId, model: agentModel },
+    { groupFolder, agentId },
+  );
+  const error = modelBindingError(binding);
+  if (error) throw new Error(error);
+  const { provider } = binding;
+  if (!provider) return null;
+  const existingBoundId = getSessionProviderId(groupFolder, agentId);
+  const resolved = resolveProviderById(provider.id);
+  setSessionProviderId(groupFolder, agentId, provider.id);
+  // Only the main model is replaced: the tiers, the sub-agent model and the
+  // compaction window follow it when the environment is built.
+  const launch = resolveModelLaunch(
+    { ...binding, provider },
     groupFolder,
     agentId,
-    modelConfigId,
-    transientRetryProfileId,
+    agentEffort,
   );
-  return selection ? withSessionModel(selection, groupFolder, agentId) : null;
+  const fallbackModel = fallbackLaunchModel(
+    getSystemSettings().fallbackModel,
+    provider,
+  );
+  return withSessionModel(
+    {
+      profileId: provider.id,
+      resolved: {
+        config: launch.model
+          ? { ...resolved.config, anthropicModel: launch.model }
+          : resolved.config,
+        customEnv: resolved.customEnv,
+        ...(launch.effort ? { launchEffort: launch.effort } : {}),
+        ...(fallbackModel ? { fallbackModel } : {}),
+      },
+      previousProviderId: existingBoundId,
+      resetSession: !!existingBoundId && existingBoundId !== provider.id,
+      ...(launch.model ? { chosenModel: launch.model } : {}),
+      ...(launch.sessionEffort ? { sessionEffort: launch.sessionEffort } : {}),
+      ...(launch.gatewayAgentEffort
+        ? { gatewayAgentEffort: launch.gatewayAgentEffort }
+        : {}),
+      ...(provider.codexOAuthCredentials
+        ? {}
+        : { launchEffort: launch.effort }),
+    },
+    groupFolder,
+    agentId,
+  );
 }
 
 export interface PoolProviderSelection {
@@ -1676,27 +1828,62 @@ export interface PoolProviderSelection {
   previousProviderId?: string;
   resetSession?: boolean;
   /**
-   * Set when the pool escalated past the primary tier: every account had its
-   * configured model walled, so this turn must run on the fallback model.
+   * The model the conversation's pick or the supplying profile chose within
+   * the connection, run instead of the connection's own.
    */
-  modelOverride?: string;
+  chosenModel?: string;
   /**
-   * ChatGPT launches: the upstream model the Session's SDK session runs on,
-   * recorded so that a later launch can tell the model changed.
+   * The model the Session's SDK session runs on, recorded so that a later
+   * launch can tell the model changed. Empty for a pass-through relay that
+   * names no model.
    */
   sessionModel?: string;
-  /**
-   * ChatGPT launches: the reasoning effort this conversation picked. It is
-   * minted into the gateway grant, never into the runner's environment.
-   */
+  /** ChatGPT: the conversation's effort, minted into the gateway grant. */
   sessionEffort?: string;
+  /** ChatGPT: the Agent-level effort the gateway applies without a pick. */
+  gatewayAgentEffort?: string;
+  /** ContainerInput.launchEffort for this launch; absent on ChatGPT. */
+  launchEffort?: string | null;
 }
 
 /**
- * A ChatGPT session's encrypted reasoning only verifies for the model that
- * issued it, so a conversation that changes model has to start a new SDK
- * session, the same way one that changes provider does. Record the model this
- * launch runs on and flag the reset when it differs from the recorded one.
+ * A launch that runs without a connection (the Workspace's own environment)
+ * on a Session whose SDK session ran on one: that session belongs to another
+ * account, so it starts over, seeded with history, and the binding is
+ * dropped so the switch happens once.
+ */
+export function leaveSessionConnection(
+  groupFolder: string,
+  agentId: string | null | undefined,
+): {
+  profileId: string;
+  previousProviderId: string;
+  resetSession: true;
+} | null {
+  const boundId = getSessionProviderId(groupFolder, agentId);
+  if (!boundId) return null;
+  setSessionProviderId(groupFolder, agentId, null);
+  return { profileId: '', previousProviderId: boundId, resetSession: true };
+}
+
+/** The input a launch starts with: a connection switch, its effort. */
+export function prepareLaunchInput(
+  input: ContainerInput,
+  selection: PoolProviderSelection | null,
+): ContainerInput {
+  const switched = applyProviderSwitchToInput(
+    input,
+    selection ?? leaveSessionConnection(input.groupFolder, input.agentId),
+  );
+  return selection?.launchEffort !== undefined
+    ? { ...switched, launchEffort: selection.launchEffort }
+    : switched;
+}
+
+/**
+ * Record the model this launch runs on and flag the reset when it differs
+ * from the recorded one. Only the upstream model counts: `[1m]` (a window)
+ * is not a model change.
  */
 function withSessionModel(
   selection: PoolProviderSelection,
@@ -1704,22 +1891,21 @@ function withSessionModel(
   agentId: string | null | undefined,
 ): PoolProviderSelection {
   const { config } = selection.resolved;
-  if (!isCodexGatewayBaseUrl(config.anthropicBaseUrl)) return selection;
   const provider = getProviders().find(
     (item) => item.id === selection.profileId,
   );
   if (!provider) return selection;
-  const sessionModel = chatGptLaunchModel(
-    selection.modelOverride || config.anthropicModel,
-    provider,
-  );
+  const chatGpt = isCodexGatewayBaseUrl(config.anthropicBaseUrl);
+  const sessionModel = chatGpt
+    ? chatGptLaunchModel(config.anthropicModel, provider)
+    : (selection.chosenModel ?? provider.anthropicModel);
   const modelChanged =
     !selection.resetSession &&
     sessionModelHasChanged(
       groupFolder,
       agentId,
       sessionModel,
-      chatGptDefaultModel(provider),
+      chatGpt ? chatGptDefaultModel(provider) : provider.anthropicModel,
     );
   if (modelChanged) {
     logger.info(
@@ -1733,243 +1919,6 @@ function withSessionModel(
     sessionModel,
     ...(modelChanged ? { resetSession: true } : {}),
   };
-}
-
-function selectPoolProvider(
-  groupFolder: string,
-  agentId?: string | null,
-  modelConfigId?: string | null,
-  transientRetryProfileId?: string | null,
-): PoolProviderSelection | null {
-  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId, {
-    groupFolder,
-    agentId,
-  });
-  const existingBoundId = getSessionProviderId(groupFolder, agentId);
-  if (selectedModelConfigId) {
-    // Agent/single-enabled selection is authoritative. Workspace credentials must
-    // never move a Workspace away from the model configuration selected for
-    // its top-level Agent. `enabled` only controls the global automatic pool;
-    // an Agent may explicitly bind any saved model configuration.
-    const providers = getProviders();
-    const selected = providers.find(
-      (provider) => provider.id === selectedModelConfigId,
-    );
-    if (!selected) {
-      throw new Error(
-        `agent_model_unavailable: model configuration ${selectedModelConfigId} is missing`,
-      );
-    }
-    providerPool.refreshFromConfig(providers, getBalancingConfig());
-    const resolved = resolveProviderById(selected.id);
-    providerPool.acquireSession(selected.id);
-    setSessionProviderId(groupFolder, agentId, selected.id);
-    // A ChatGPT conversation may run another of the account's models and at
-    // another effort. Only the main model is replaced: the OPUS / SONNET /
-    // SUBAGENT tiers follow it when the environment is built, and the haiku
-    // tier (background work) deliberately stays on the configuration's model.
-    const overrides = resolveSessionLaunchOverrides(
-      groupFolder,
-      agentId,
-      selected,
-    );
-    return {
-      profileId: selected.id,
-      resolved: {
-        config: overrides.model
-          ? { ...resolved.config, anthropicModel: overrides.model }
-          : resolved.config,
-        customEnv: resolved.customEnv,
-      },
-      previousProviderId: existingBoundId,
-      resetSession: !!existingBoundId && existingBoundId !== selected.id,
-      ...(overrides.effort ? { sessionEffort: overrides.effort } : {}),
-    };
-  }
-
-  if (workspaceHasProviderEnv(groupFolder)) return null;
-
-  // Refresh pool state from V4 config
-  const enabledProviders = getEnabledProviders();
-  if (enabledProviders.length === 0) return null;
-  const balancing = getBalancingConfig();
-  providerPool.refreshFromConfig(enabledProviders, balancing);
-  // The sticky-health read below must see the same time-based recovery that
-  // selectProvider() applies internally. Without this, a binding quarantined
-  // long ago (idle group, no intervening selections) still reads as unhealthy
-  // and forces a needless provider switch + session reset + history reinjection.
-  providerPool.refreshRecoveryState();
-  const boundId = existingBoundId;
-
-  // Which model tier this turn should run on. Every account holds an
-  // independent per-model quota, so the pool drains the primary tier across
-  // *all* accounts before any account escalates to the system fallback tier.
-  const tierModel = resolvePoolTierModel(enabledProviders);
-  const tier: ProviderTier =
-    tierModel ??
-    new Map(
-      enabledProviders.map((p) => [p.id, providerModelTier(p.anthropicModel)]),
-    );
-
-  // A transient verdict authorizes one replay of the same provider attempt,
-  // not one extra pool rotation. Honor that pin even for round-robin/weighted
-  // strategies, but only while the member remains enabled, account-healthy,
-  // and able to serve the current model tier.
-  if (transientRetryProfileId) {
-    const pinned = enabledProviders.find(
-      (provider) => provider.id === transientRetryProfileId,
-    );
-    const healthy = providerPool.getHealthStatus(
-      transientRetryProfileId,
-    ).healthy;
-    const tierAvailable =
-      !!pinned &&
-      stickyBindingCanServeTier(
-        transientRetryProfileId,
-        enabledProviders,
-        tierModel,
-      );
-    if (pinned && healthy && tierAvailable) {
-      try {
-        const resolved = resolveProviderById(transientRetryProfileId);
-        providerPool.acquireSession(transientRetryProfileId);
-        setSessionProviderId(groupFolder, agentId, transientRetryProfileId);
-        logger.info(
-          {
-            groupFolder,
-            agentId: agentId || null,
-            providerId: transientRetryProfileId,
-          },
-          'Reusing provider selected by transient replay fence',
-        );
-        return {
-          profileId: transientRetryProfileId,
-          resolved: {
-            config: resolved.config,
-            customEnv: resolved.customEnv,
-          },
-          previousProviderId: existingBoundId,
-          resetSession:
-            !!existingBoundId && existingBoundId !== transientRetryProfileId,
-          ...(tierModel ? { modelOverride: tierModel } : {}),
-        };
-      } catch (err) {
-        logger.warn(
-          { err, providerId: transientRetryProfileId },
-          'Transient replay provider could not be resolved; returning to pool selection',
-        );
-      }
-    } else {
-      logger.warn(
-        {
-          providerId: transientRetryProfileId,
-          enabled: !!pinned,
-          healthy,
-          tierAvailable,
-        },
-        'Transient replay provider is no longer eligible; returning to pool selection',
-      );
-    }
-  }
-
-  // Sticky path: respect previous session→provider binding when the bound
-  // provider is still enabled. Only the failover strategy is sticky — the
-  // round-robin strategies are expected to rotate on every request, so a
-  // binding must not pin them to one account.
-  if (enabledProviders.length > 1 && !providerPool.rotatesPerRequest) {
-    if (boundId && enabledProviders.some((p) => p.id === boundId)) {
-      const boundHealth = providerPool.getHealthStatus(boundId);
-      if (!boundHealth.healthy) {
-        logger.info(
-          { groupFolder, agentId: agentId || null, providerId: boundId },
-          'Sticky provider is unhealthy, falling back to pool selection',
-        );
-      } else if (
-        !stickyBindingCanServeTier(boundId, enabledProviders, tierModel)
-      ) {
-        // The account is fine but its budget for this turn's model is walled.
-        // Failing over is the whole point of the strategy; reusing the binding
-        // here would replay the same rejection until the quarantine expires.
-        logger.info(
-          {
-            groupFolder,
-            agentId: agentId || null,
-            providerId: boundId,
-            tierModel,
-          },
-          'Sticky provider cannot serve this model tier, falling back to pool selection',
-        );
-      } else {
-        try {
-          const resolved = resolveProviderById(boundId);
-          providerPool.acquireSession(boundId);
-          logger.debug(
-            { groupFolder, agentId: agentId || null, providerId: boundId },
-            'Reusing sticky provider binding for resumed session',
-          );
-          return {
-            profileId: boundId,
-            resolved: {
-              config: resolved.config,
-              customEnv: resolved.customEnv,
-            },
-            // The pool may have escalated past the primary tier while this
-            // session stayed bound; the turn must run on the escalated model.
-            ...(tierModel ? { modelOverride: tierModel } : {}),
-          };
-        } catch (err) {
-          logger.warn(
-            { err, providerId: boundId },
-            'Sticky provider resolution failed, falling back to pool selection',
-          );
-        }
-      }
-    } else if (boundId) {
-      // Bound provider was disabled or removed — fall through and pick a fresh one.
-      logger.info(
-        { groupFolder, agentId: agentId || null, providerId: boundId },
-        'Sticky provider no longer enabled, falling back to pool selection',
-      );
-    }
-  }
-
-  // Single provider: return its ID for display, acquire session for consistency
-  if (enabledProviders.length === 1) {
-    try {
-      const resolved = resolveProviderById(enabledProviders[0].id);
-      providerPool.acquireSession(enabledProviders[0].id);
-      setSessionProviderId(groupFolder, agentId, enabledProviders[0].id);
-      return {
-        profileId: enabledProviders[0].id,
-        resolved: { config: resolved.config, customEnv: resolved.customEnv },
-        previousProviderId: boundId,
-        resetSession: !!boundId && boundId !== enabledProviders[0].id,
-        ...(tierModel ? { modelOverride: tierModel } : {}),
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  try {
-    const profileId = providerPool.selectProvider(tier);
-    const resolved = resolveProviderById(profileId);
-    providerPool.acquireSession(profileId);
-    setSessionProviderId(groupFolder, agentId, profileId);
-    return {
-      profileId,
-      resolved: { config: resolved.config, customEnv: resolved.customEnv },
-      previousProviderId: boundId,
-      resetSession: !!boundId && boundId !== profileId,
-      ...(tierModel ? { modelOverride: tierModel } : {}),
-    };
-  } catch (err) {
-    logger.warn(
-      { err },
-      'Provider pool selection failed, falling back to active profile',
-    );
-    return null;
-  }
 }
 
 /**
@@ -2002,27 +1951,25 @@ export function prepareHostPlugins(
 }
 
 /**
- * Apply the pool's chosen model tier to a runner environment.
- *
- * With more than one account enabled the *pool* owns tier escalation: the
- * primary tier must be drained across every account before anything moves to
- * the fallback model. The runner's own in-process fallback would short-circuit
- * that by jumping to the fallback tier on the current account first, so it is
- * only handed over for single-account installs.
+ * The name the runner's same-turn fallback model is handed under: like the
+ * turn's model, with `[1m]` when the connection gives it a window above
+ * Claude Code's default. On an official connection only a declared window
+ * counts (`[1m]` there is the billed 1M opt-in); ChatGPT maps names itself.
  */
-export function resolvePoolTierEnv(
-  modelOverride: string | undefined,
-  enabledProviderCount: number,
-  configuredFallbackModel = getSystemSettings().fallbackModel,
-  modelSelectionPinned = false,
-): { model?: string; runnerFallbackModel?: string } {
-  const fallbackModel = configuredFallbackModel?.trim();
-  return {
-    ...(modelOverride ? { model: modelOverride } : {}),
-    ...((enabledProviderCount <= 1 || modelSelectionPinned) && fallbackModel
-      ? { runnerFallbackModel: fallbackModel }
-      : {}),
-  };
+export function fallbackLaunchModel(
+  fallbackModel: string | null | undefined,
+  provider: UnifiedProvider | null | undefined,
+): string | undefined {
+  const model = fallbackModel?.trim();
+  if (!model) return undefined;
+  if (!provider || provider.codexOAuthCredentials) return model;
+  const models = effectiveProviderModels(provider);
+  return launchModelName(
+    model,
+    provider.anthropicBaseUrl
+      ? windowOf(models, model)
+      : findModelEntry(models, model)?.contextWindow,
+  );
 }
 
 /** Inject the globally configured same-turn fallback into the agent runner. */
@@ -2040,6 +1987,19 @@ export function applyFallbackModelToEnvLines(
   envLines.push(`HAPPYCLAW_FALLBACK_MODEL=${fallbackModel}`);
 }
 
+/**
+ * Create a session's owner-only IPC root (the runner's /workspace/ipc) and
+ * the directories the host and runner exchange files through.
+ */
+function ensureSessionIpcDir(groupFolder: string, agentId: string): string {
+  const ipcDir = sessionIpcDir(groupFolder, agentId);
+  mkdirForContainer(ipcDir);
+  for (const sub of ['messages', 'tasks', 'input']) {
+    mkdirForContainer(path.join(ipcDir, sub));
+  }
+  return ipcDir;
+}
+
 function assertRuntimeEnvPathSegment(value: string, label: string): string {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
     throw new Error(`Invalid ${label} for container environment isolation`);
@@ -2048,16 +2008,15 @@ function assertRuntimeEnvPathSegment(value: string, label: string): string {
 }
 
 /**
- * Keep generated env files isolated by both runtime and Feishu Bot identity.
+ * Keep generated env files isolated by both session and Feishu Bot identity.
  *
- * Conversation agents and task runs can execute concurrently inside one
- * workspace. A bound channel account is also included so two Bots routed to
- * the same main workspace can never overwrite each other's credentials.
+ * The sessions of one workspace can execute concurrently, each from its own
+ * directory. A bound channel account is also included so two Bots routed to
+ * the same workspace can never overwrite each other's credentials.
  */
 export function getContainerRuntimeEnvDir(
   groupFolder: string,
-  ipcAgentId?: string,
-  taskRunId?: string,
+  agentId: string,
   feishuChannelAccountId?: string | null,
 ): string {
   const safeGroupFolder = assertValidWorkspaceFolderName(
@@ -2073,60 +2032,14 @@ export function getContainerRuntimeEnvDir(
         ),
       ]
     : ['default'];
-  const runtimePath = ipcAgentId
-    ? ['agents', assertRuntimeEnvPathSegment(ipcAgentId, 'agent id')]
-    : taskRunId
-      ? ['tasks-run', assertRuntimeEnvPathSegment(taskRunId, 'task run id')]
-      : ['main'];
   return path.join(
     DATA_DIR,
     'env',
     safeGroupFolder,
     ...identityPath,
-    ...runtimePath,
+    'agents',
+    assertRuntimeEnvPathSegment(agentId, 'agent id'),
   );
-}
-
-/**
- * Remove every identity-specific environment snapshot for one isolated task
- * run. The scheduler does not need to retain or rediscover which Bot identity
- * was selected after the container exits.
- */
-export function cleanupContainerTaskRuntimeEnvDirs(
-  groupFolder: string,
-  taskRunId: string,
-): void {
-  const safeTaskRunId = assertRuntimeEnvPathSegment(taskRunId, 'task run id');
-  const safeGroupFolder = assertValidWorkspaceFolderName(
-    groupFolder,
-    'group folder',
-  );
-  const workspaceEnvRoot = path.join(DATA_DIR, 'env', safeGroupFolder);
-  const taskRuntimeSuffix = path.join('tasks-run', safeTaskRunId);
-
-  fs.rmSync(path.join(workspaceEnvRoot, 'default', taskRuntimeSuffix), {
-    recursive: true,
-    force: true,
-  });
-
-  const accountRoot = path.join(workspaceEnvRoot, 'channel-accounts');
-  let accountEntries: fs.Dirent[];
-  try {
-    accountEntries = fs.readdirSync(accountRoot, { withFileTypes: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-    throw error;
-  }
-  for (const entry of accountEntries) {
-    if (!entry.isDirectory()) continue;
-    // Ignore unexpected legacy/manual entries instead of letting them broaden
-    // the deletion target.
-    if (!/^[A-Za-z0-9_-]{1,128}$/.test(entry.name)) continue;
-    fs.rmSync(path.join(accountRoot, entry.name, taskRuntimeSuffix), {
-      recursive: true,
-      force: true,
-    });
-  }
 }
 
 export interface OAuthLaunchSnapshot {
@@ -2149,18 +2062,12 @@ interface PreparedVolumeMounts {
 function prepareVolumeMounts(
   group: RegisteredGroup,
   isAdminHome: boolean,
+  agentId: string,
   mountUserSkills = true,
-  sessionAgentId?: string,
   ownerHomeFolder?: string,
-  taskRunId?: string,
   resolvedProvider?: ResolvedProvider,
-  ipcAgentId?: string,
   agentProfile?: RunnerAgentProfile,
   channelContext?: ChannelTurnContext,
-  /** Set when the pool escalated past the primary model tier for this turn. */
-  poolModelOverride?: string,
-  /** Explicit Agent model selection keeps fallback inside the pinned account. */
-  modelSelectionPinned = false,
   containerProxy: ResolvedContainerProxyConfig = {
     envLines: [],
     addHostGateway: false,
@@ -2211,31 +2118,21 @@ function prepareVolumeMounts(
 
     // Admin home also gets its group folder as the working directory
     mounts.push({
-      hostPath: path.join(GROUPS_DIR, group.folder),
+      hostPath: workspaceDirOf(group.folder),
       containerPath: '/workspace/group',
       readonly: false,
     });
   } else {
     // Member home and non-home groups only get their own folder
     mounts.push({
-      hostPath: path.join(GROUPS_DIR, group.folder),
+      hostPath: workspaceDirOf(group.folder),
       containerPath: '/workspace/group',
       readonly: false,
     });
   }
 
-  // Per-group Claude sessions directory (isolated from other groups)
-  // Sub-agents and task sessions get their own session dir under agents/{id}/.claude/
-  const groupSessionsDir = sessionAgentId
-    ? path.join(
-        DATA_DIR,
-        'sessions',
-        group.folder,
-        'agents',
-        sessionAgentId,
-        '.claude',
-      )
-    : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
+  // The session's own Claude directory, isolated from every other session.
+  const groupSessionsDir = sessionClaudeDir(group.folder, agentId);
   mkdirForContainer(groupSessionsDir);
   const userSkillsPolicy = resolveAgentProfileUserSkillsPolicy(
     ownerId,
@@ -2316,7 +2213,7 @@ function prepareVolumeMounts(
   // realpath(skillsDir), which would follow a planted symlink).
   let groupReal: string | null = null;
   try {
-    groupReal = fs.realpathSync(path.join(GROUPS_DIR, group.folder));
+    groupReal = fs.realpathSync(workspaceDirOf(group.folder));
   } catch {
     groupReal = null;
   }
@@ -2433,26 +2330,8 @@ function prepareVolumeMounts(
     });
   }
 
-  // Per-group IPC namespace: each group gets its own IPC directory
-  // Sub-agents get their own IPC subdirectory under agents/{agentId}/
-  // Isolated tasks get their own IPC subdirectory under tasks-run/{taskRunId}/
-  // Keep host IPC roots owner-only; the entrypoint applies the selected bridge.
-  const groupIpcDir = ipcAgentId
-    ? path.join(DATA_DIR, 'ipc', group.folder, 'agents', ipcAgentId)
-    : taskRunId
-      ? path.join(DATA_DIR, 'ipc', group.folder, 'tasks-run', taskRunId)
-      : path.join(DATA_DIR, 'ipc', group.folder);
-  mkdirForContainer(groupIpcDir);
-  // All agents (main + sub/conversation) get agents/ subdir for spawn/message IPC
-  for (const sub of ['messages', 'tasks', 'input', 'agents'] as const) {
-    const subDir = path.join(groupIpcDir, sub);
-    fs.mkdirSync(subDir, { recursive: true });
-    try {
-      fs.chmodSync(subDir, 0o700);
-    } catch {
-      /* ignore if already correct */
-    }
-  }
+  // The session's own IPC root; the entrypoint applies the selected bridge.
+  const groupIpcDir = ensureSessionIpcDir(group.folder, agentId);
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -2463,8 +2342,7 @@ function prepareVolumeMounts(
   // Global config merged with per-container overrides.
   const envDir = getContainerRuntimeEnvDir(
     group.folder,
-    ipcAgentId,
-    taskRunId,
+    agentId,
     feishuCliBinding?.source === 'channel_account'
       ? feishuCliBinding.accountId
       : null,
@@ -2500,8 +2378,11 @@ function prepareVolumeMounts(
     effectiveContainerOverride,
     resolvedProvider?.customEnv,
   );
-  const agentEffort = resolveAgentSdkEffort(agentProfile?.runtimePolicy);
-  removeProviderEffortEnv(envLines, agentEffort);
+  applyLaunchEffortEnv(
+    envLines,
+    resolveAgentSdkEffort(agentProfile?.runtimePolicy),
+    resolvedProvider ? (resolvedProvider.launchEffort ?? null) : undefined,
+  );
   // Agent policy is authoritative; do not inherit global/custom runtime env.
   for (let index = envLines.length - 1; index >= 0; index -= 1) {
     if (
@@ -2525,29 +2406,10 @@ function prepareVolumeMounts(
   if (mcpPolicyMode !== 'inherit') {
     envLines.push(`HAPPYCLAW_AGENT_MCP_POLICY=${mcpPolicyMode}`);
   }
-  const containerTierEnv = resolvePoolTierEnv(
-    poolModelOverride,
-    getEnabledProviders().length,
-    undefined,
-    modelSelectionPinned,
+  applyFallbackModelToEnvLines(
+    envLines,
+    resolvedProvider?.fallbackModel ?? getSystemSettings().fallbackModel,
   );
-  applyFallbackModelToEnvLines(envLines, containerTierEnv.runnerFallbackModel);
-  if (containerTierEnv.model) {
-    const walledSubagentLine = `CLAUDE_CODE_SUBAGENT_MODEL=${rawGlobalConfig.anthropicModel}`;
-    let subagentFollowedPrimary = false;
-    for (let i = envLines.length - 1; i >= 0; i--) {
-      if (envLines[i].startsWith('ANTHROPIC_MODEL=')) envLines.splice(i, 1);
-      else if (envLines[i] === walledSubagentLine) {
-        envLines.splice(i, 1);
-        subagentFollowedPrimary = true;
-      }
-    }
-    envLines.push(`ANTHROPIC_MODEL=${containerTierEnv.model}`);
-    // Subagents that followed the walled primary model escalate with it.
-    if (subagentFollowedPrimary) {
-      envLines.push(`CLAUDE_CODE_SUBAGENT_MODEL=${containerTierEnv.model}`);
-    }
-  }
   applyFeishuCliBindingToEnvLines(envLines, feishuCliBinding);
   applyContainerProxyEnvLines(envLines, containerProxy.envLines);
   // Both the gateway and a rewritten loopback relay live on
@@ -2670,7 +2532,7 @@ function prepareVolumeMounts(
       group.name,
       group.is_home === true,
     );
-    mounts.push(...validatedMounts);
+    mounts.push(...withHostNfsSources(validatedMounts));
   }
 
   return {
@@ -2682,6 +2544,114 @@ function prepareVolumeMounts(
     usesCodexGateway,
     providerNeedsHostGateway,
   };
+}
+
+/**
+ * A host directory on an NFS share whose allowed root sets `nfsDirectMount`
+ * is mounted by Docker from the same export directory instead of bound from
+ * the host mount, so a host remount cannot leave the container with a stale
+ * handle (see host-nfs-mounts.ts). Every other host directory stays a bind.
+ * An opted-in directory that cannot be mounted directly fails the launch.
+ */
+export function withHostNfsSources(
+  mounts: VolumeMount[],
+  resolve: (
+    hostPaths: string[],
+  ) => NfsDirectMountResolution[] = resolveNfsDirectMounts,
+): VolumeMount[] {
+  const candidates = mounts.filter(
+    (mount) => !mount.storage && mount.nfsDirectMountRoot,
+  );
+  if (candidates.length === 0) return mounts;
+  const results = resolve(candidates.map((mount) => mount.hostPath));
+  const byMount = new Map(
+    candidates.map((mount, index) => [mount, results[index]]),
+  );
+  const issues: string[] = [];
+  const converted = mounts.map((mount) => {
+    const result = byMount.get(mount);
+    if (!result || result.kind === 'bind') return mount;
+    if (result.kind === 'error') {
+      issues.push(
+        `${mount.hostPath} cannot be mounted directly from NFS: ${result.reason}. Set nfsDirectMount to false on allowed root "${mount.nfsDirectMountRoot}" to bind it from the host instead`,
+      );
+      return mount;
+    }
+    logger.info(
+      {
+        hostPath: mount.hostPath,
+        nfs: `${result.source.server}:${result.source.device}`,
+        options: result.source.options,
+        containerPath: mount.containerPath,
+      },
+      'Host directory is on NFS; mounting its export directly',
+    );
+    return { ...mount, storage: { type: 'nfs' as const, ...result.source } };
+  });
+  if (issues.length > 0) throw new AdditionalMountValidationError(issues);
+  return converted;
+}
+
+/** Named SMB volumes for a launch, keyed by the share path they mount. */
+export type StorageVolumeNames = Map<string, string | Error>;
+
+function cifsVolumeKey(storage: { device: string; sourceId: string }): string {
+  return `${storage.sourceId}\u0000${storage.device}`;
+}
+
+/**
+ * Creates the named volumes the group's SMB mounts need, so the password
+ * stays out of argv. Validation failures are left to prepareVolumeMounts,
+ * which reports them where every other mount error is reported.
+ */
+export async function ensureGroupStorageVolumes(
+  group: RegisteredGroup,
+  ensureVolume: typeof ensureCifsVolume = ensureCifsVolume,
+): Promise<StorageVolumeNames> {
+  const names: StorageVolumeNames = new Map();
+  if (group.containerConfigError) return names;
+  const configured = parseContainerConfig(group.containerConfig).config
+    ?.additionalMounts;
+  if (!configured?.some(isStorageSourceMount)) return names;
+  let validated: VolumeMount[];
+  try {
+    validated = validateAdditionalMounts(
+      configured,
+      group.name,
+      group.is_home === true,
+    );
+  } catch {
+    return names;
+  }
+  for (const mount of validated) {
+    if (mount.storage?.type !== 'cifs') continue;
+    const key = cifsVolumeKey(mount.storage);
+    if (names.has(key)) continue;
+    try {
+      names.set(key, await ensureVolume(mount.storage));
+    } catch (err) {
+      names.set(key, err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+  return names;
+}
+
+/** Points each SMB mount at its named volume; fails if it has none. */
+export function withNamedStorageVolumes(
+  mounts: VolumeMount[],
+  names: StorageVolumeNames,
+): VolumeMount[] {
+  return mounts.map((mount) => {
+    if (mount.storage?.type !== 'cifs') return mount;
+    const name = names.get(cifsVolumeKey(mount.storage));
+    if (name instanceof Error) throw name;
+    if (!name) {
+      throw new Error(
+        `SMB volume for ${mount.containerPath} was not prepared before launch`,
+      );
+    }
+    return { ...mount, storage: { type: 'named' as const, name } };
+  });
 }
 
 export function buildVolumeMounts(
@@ -3015,6 +2985,7 @@ export function buildContainerArgs(
   hostIdentity: ContainerHostIdentity = detectContainerHostIdentity(),
   networkConfig: ContainerNetworkConfig = { addHostGateway: false },
   containerImage = CONTAINER_IMAGE,
+  memoryLimit: ContainerMemoryLimit | null = CONTAINER_MEMORY_LIMIT,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
   // Hardening from the Agent SDK secure-deployment guidance that this image
@@ -3022,6 +2993,11 @@ export function buildContainerArgs(
   // --no-sandbox, so nothing needs a setuid privilege gain; the pids limit
   // only stops runaway forks and stays far above browser and build loads.
   args.push('--security-opt', 'no-new-privileges', '--pids-limit', '4096');
+  // Opt-in cap so one runaway agent cannot exhaust a shared Docker VM.
+  if (memoryLimit) {
+    const { dockerValue } = memoryLimit;
+    args.push('--memory', dockerValue, '--memory-swap', dockerValue);
+  }
 
   // Set timezone so container Node.js processes use local time (Asia/Shanghai)
   args.push('-e', `TZ=${tz}`);
@@ -3042,9 +3018,14 @@ export function buildContainerArgs(
     args.push('--add-host', 'host.docker.internal:host-gateway');
   }
 
-  // Docker: -v with :ro suffix for readonly
+  // Docker: -v with :ro suffix for readonly; storage mounts are volumes
   for (const mount of mounts) {
-    if (mount.readonly) {
+    if (mount.storage) {
+      args.push(
+        '--mount',
+        storageMountArg(mount.storage, mount.containerPath, mount.readonly),
+      );
+    } else if (mount.readonly) {
       args.push('-v', `${mount.hostPath}:${mount.containerPath}:ro`);
     } else {
       args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
@@ -3142,49 +3123,67 @@ export async function runContainerAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
+  // Single-user host mode never runs Docker, whatever a leftover Container
+  // row says (other users kept while the mode comes only from env).
+  if (isSingleUserHost()) {
+    return {
+      status: 'error',
+      result: SINGLE_USER_HOST_CONTAINER_REFUSAL,
+      // A deterministic configuration failure: settled at once, no retry.
+      error: `agent_profile_unavailable: ${SINGLE_USER_HOST_CONTAINER_REFUSAL}`,
+    };
+  }
   const startTime = Date.now();
+  // Worktrees are host checkouts; a container would run this session in the
+  // shared workspace directory instead, so refuse rather than substitute.
+  const sessionWorktree = getSessionWorktree(input.agentId);
+  if (sessionWorktree) {
+    const message = `会话使用独立 worktree（分支 ${sessionWorktree.branch}），只能在宿主机模式运行，本次运行已停止。`;
+    return { status: 'error', result: message, error: message };
+  }
+
   // Probed per launch as before, but asynchronously and ahead of provider
   // selection, so everything from selection to spawn stays one synchronous
   // step while the docker CLI round trip no longer blocks the event loop.
   const hostIdentity = await detectContainerHostIdentityAsync();
-  const sessionAgentId = input.sessionAgentId ?? input.agentId;
+  // SMB shares become named volumes through the Docker Engine API; that round
+  // trip also happens ahead of the selection-to-spawn block.
+  const storageVolumes = await ensureGroupStorageVolumes(group);
 
-  const groupDir = path.join(GROUPS_DIR, group.folder);
+  const groupDir = workspaceDirOf(group.folder);
   mkdirForContainer(groupDir);
   // Like the probe above, the host-owned OAuth renewal awaits ahead of the
   // synchronous selection-to-spawn block.
   await refreshLaunchOAuthCredentials(
     group.folder,
-    sessionAgentId,
+    input.agentId,
     input.agentProfile?.modelConfigId,
   );
 
-  // ─── Provider Pool selection ───
+  // ─── Model connection selection ───
   const poolResult = trySelectPoolProvider(
     group.folder,
-    sessionAgentId,
+    input.agentId,
     input.agentProfile?.modelConfigId,
-    transientRetryProfileForInput(input.turnId),
+    input.agentProfile?.model,
+    resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
   );
   const selectedProfileId = poolResult?.profileId ?? null;
   const selectedProviderQuotaEpoch = selectedProfileId
     ? captureProviderQuotaObservationEpoch(selectedProfileId)
     : null;
   const resolvedProvider = poolResult?.resolved;
-  const modelSelectionPinned = !!resolvePinnedModelConfigId(
-    input.agentProfile?.modelConfigId,
-    { groupFolder: group.folder, agentId: sessionAgentId },
-  );
   let providerFailureReported = false;
   let providerFailureTerminal: boolean | undefined;
+  /** The streamed failure the disposition was decided on, if it waits. */
+  let providerFailureDecision: ContainerOutput | undefined;
   let providerFailureMaintenance = false;
   let healthyInputTurnCompleted = false;
-  input = applyProviderSwitchToInput(input, poolResult, sessionAgentId);
+  input = prepareLaunchInput(input, poolResult);
 
   const workspaceMemoryCapabilityScope: WorkspaceMemoryCapabilityScope = {
     groupFolder: group.folder,
-    agentId: input.agentId ?? null,
-    taskRunId: input.taskRunId ?? null,
+    agentId: input.agentId,
   };
   const {
     runnerInstanceId: workspaceMemoryRunnerInstanceId,
@@ -3196,10 +3195,10 @@ export async function runContainerAgent(
   const codexGatewayLease = new CodexGatewayRunnerLease({
     kind: 'container',
     groupFolder: group.folder,
-    agentId: input.agentId ?? null,
-    sessionAgentId: sessionAgentId ?? null,
-    taskRunId: input.taskRunId ?? null,
-    agentEffort: resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
+    agentId: input.agentId,
+    agentEffort:
+      poolResult?.gatewayAgentEffort ??
+      resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
     sessionEffort: poolResult?.sessionEffort,
   });
   try {
@@ -3212,20 +3211,19 @@ export async function runContainerAgent(
     const preparedLaunch = prepareVolumeMounts(
       group,
       isAdminHome,
-      shouldMountUserSkills,
-      sessionAgentId,
-      ownerHomeFolder,
-      input.taskRunId,
-      resolvedProvider,
       input.agentId,
+      shouldMountUserSkills,
+      ownerHomeFolder,
+      resolvedProvider,
       input.agentProfile,
       input.channelContext,
-      poolResult?.modelOverride,
-      modelSelectionPinned,
       containerProxy,
       codexGatewayLease,
     );
-    const mounts = preparedLaunch.mounts;
+    const mounts = withNamedStorageVolumes(
+      preparedLaunch.mounts,
+      storageVolumes,
+    );
     const dockerPlugins = group.created_by
       ? loadUserPlugins(group.created_by, { runtime: 'docker' })
       : [];
@@ -3257,10 +3255,8 @@ export async function runContainerAgent(
     };
     const skillManifest = preparedLaunch.claudeContextPlan.effectiveSkills;
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-    const agentSuffix = sessionAgentId
-      ? `-${sessionAgentId.replace(/[^a-zA-Z0-9-]/g, '-')}`
-      : '';
-    const containerName = `happyclaw-${safeName}${agentSuffix}-${Date.now()}`;
+    const safeAgentId = input.agentId.replace(/[^a-zA-Z0-9-]/g, '-');
+    const containerName = `happyclaw-${safeName}-${safeAgentId}-${Date.now()}`;
     const containerArgs = buildContainerArgs(
       mounts,
       containerName,
@@ -3293,14 +3289,15 @@ export async function runContainerAgent(
         group: group.name,
         containerName,
         mountCount: mounts.length,
-        isMain: input.isMain,
+        agentId: input.agentId,
         imageProfile:
           containerImage === CONTAINER_IMAGE_HEADROOM ? 'headroom' : 'core',
+        memoryLimit: CONTAINER_MEMORY_LIMIT?.dockerValue ?? null,
       },
       'Spawning container agent',
     );
 
-    const logsDir = path.join(GROUPS_DIR, group.folder, 'logs');
+    const logsDir = workspaceLogsDirOf(group.folder);
     fs.mkdirSync(logsDir, { recursive: true });
 
     const result = await new Promise<ContainerOutput>((resolve) => {
@@ -3325,6 +3322,8 @@ export async function runContainerAgent(
       // the caller's `input` object (queue/log/retry paths reuse the same ref).
       const dockerInput: ContainerInput = {
         ...input,
+        webFetchPreflightPolicy:
+          resolveProviderWebFetchPreflightPolicy(selectedProfileId),
         workspaceMemoryMutationSigningSecret,
         workspaceMemoryRunnerInstanceId,
         plugins: dockerPlugins,
@@ -3432,6 +3431,8 @@ export async function runContainerAgent(
           return;
         }
         if (!onOutput) return;
+        recordUsageConnection(output, selectedProfileId);
+        settleUsageLimitWaitForOutput(output, input);
         if (
           !output.providerFailure &&
           output.inputTurnCompleted !== undefined
@@ -3442,7 +3443,6 @@ export async function runContainerAgent(
           if (output.providerFailure && selectedProfileId) {
             if (!providerFailureReported) {
               providerFailureReported = true;
-              quarantineFromOutput(selectedProfileId, output);
               logger.warn(
                 {
                   group: group.name,
@@ -3459,7 +3459,6 @@ export async function runContainerAgent(
         if (output.providerFailure && selectedProfileId) {
           if (!providerFailureReported) {
             providerFailureReported = true;
-            quarantineFromOutput(selectedProfileId, output);
             logger.warn(
               {
                 group: group.name,
@@ -3506,9 +3505,10 @@ export async function runContainerAgent(
           const terminal = applyProviderFailureDisposition(
             output,
             selectedProfileId,
-            !modelSelectionPinned,
+            usageLimitWaitScopeFor(input),
           );
           providerFailureTerminal = terminal;
+          providerFailureDecision = output;
           logger.warn(
             {
               group: group.name,
@@ -3612,25 +3612,6 @@ export async function runContainerAgent(
     });
 
     applyCodexGatewayVerdict(result, codexGatewayLease);
-    // ─── Provider Pool health reporting ───
-    if (selectedProfileId) {
-      if (result.providerFailure) {
-        if (!providerFailureReported) {
-          quarantineFromOutput(selectedProfileId, result);
-          providerFailureReported = true;
-        }
-      } else if (
-        !providerFailureReported &&
-        (result.status === 'success' || result.status === 'closed')
-      ) {
-        providerPool.reportSuccess(
-          selectedProfileId,
-          result.providerRateLimitModel,
-        );
-      } else if (result.status === 'error' && isApiError(result.error || '')) {
-        providerPool.reportFailure(selectedProfileId);
-      }
-    }
     if (providerFailureMaintenance) {
       return {
         ...result,
@@ -3647,10 +3628,11 @@ export async function runContainerAgent(
         providerFailureTerminal = applyProviderFailureDisposition(
           result,
           selectedProfileId,
-          !modelSelectionPinned,
+          usageLimitWaitScopeFor(input),
         );
       } else {
         applyKnownProviderFailureDisposition(result, providerFailureTerminal);
+        carryUsageLimitWait(providerFailureDecision, result);
       }
     }
 
@@ -3669,43 +3651,7 @@ export async function runContainerAgent(
         'Failed to release Owner Profile introduction lease',
       );
     }
-    // Guarantee session release even if buildVolumeMounts/spawn throws
-    if (selectedProfileId) {
-      providerPool.releaseSession(selectedProfileId);
-    }
   }
-}
-
-export function writeTasksSnapshot(
-  groupFolder: string,
-  isAdminHome: boolean,
-  tasks: Array<{
-    id: string;
-    groupFolder: string;
-    prompt: string;
-    schedule_type: string;
-    schedule_value: string;
-    status: string;
-    next_run: string | null;
-  }>,
-): void {
-  // Write filtered tasks to the group's IPC directory
-  const groupIpcDir = path.join(DATA_DIR, 'ipc', groupFolder);
-  fs.mkdirSync(groupIpcDir, { recursive: true });
-
-  // Admin home sees all tasks, others only see their own
-  const filteredTasks = isAdminHome
-    ? tasks
-    : tasks.filter((t) => t.groupFolder === groupFolder);
-
-  const tasksFile = path.join(groupIpcDir, 'current_tasks.json');
-  // 删除后重建：容器创建的文件归属 node(1000) 用户，宿主机进程无法覆写
-  try {
-    fs.unlinkSync(tasksFile);
-  } catch {
-    /* ignore */
-  }
-  fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
 }
 
 export interface AvailableGroup {
@@ -3716,17 +3662,17 @@ export interface AvailableGroup {
 }
 
 /**
- * Write available groups snapshot for the container to read.
- * Only admin home can see all available groups (for activation).
- * Other groups see nothing (they can't activate groups).
+ * Write the available groups snapshot into a session's IPC root (the runner's
+ * /workspace/ipc). Only admin home sees all available groups (for
+ * activation); other workspaces see nothing (they can't activate groups).
  */
 export function writeGroupsSnapshot(
   groupFolder: string,
+  agentId: string,
   isAdminHome: boolean,
   groups: AvailableGroup[],
-  registeredJids: Set<string>,
 ): void {
-  const groupIpcDir = path.join(DATA_DIR, 'ipc', groupFolder);
+  const groupIpcDir = sessionIpcDir(groupFolder, agentId);
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
   // Admin home sees all groups; others see nothing (they can't activate groups)
@@ -4082,7 +4028,6 @@ export async function runHostAgent(
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
-  const sessionAgentId = input.sessionAgentId ?? input.agentId;
   const setupInstallHint = 'npm --prefix container/agent-runner install';
   const setupBuildHint = 'npm --prefix container/agent-runner run build';
   const hostModeSetupError = (message: string): ContainerOutput => ({
@@ -4092,7 +4037,16 @@ export async function runHostAgent(
   });
 
   // 1. 确定工作目录
-  const defaultGroupDir = path.join(GROUPS_DIR, group.folder);
+  const defaultGroupDir = workspaceDirOf(group.folder);
+  // A session that owns a worktree runs only there. A missing or damaged
+  // checkout fails the run; falling back would put its edits in the main
+  // checkout.
+  const sessionWorkdir = resolveSessionWorkingDirectory(input.agentId);
+  if (sessionWorkdir.kind === 'broken') {
+    return hostModeSetupError(
+      sessionWorktreeRunError(sessionWorkdir.worktree, sessionWorkdir.reason),
+    );
+  }
   if (!group.customCwd) {
     fs.mkdirSync(defaultGroupDir, { recursive: true });
     // 确保 group 目录是独立 git root，防止 Claude Code 向上找到父项目的 .git
@@ -4116,7 +4070,10 @@ export async function runHostAgent(
       }
     }
   }
-  let groupDir = group.customCwd || defaultGroupDir;
+  let groupDir =
+    sessionWorkdir.kind === 'worktree'
+      ? sessionWorkdir.cwd
+      : group.customCwd || defaultGroupDir;
   if (!path.isAbsolute(groupDir)) {
     return hostModeSetupError(`工作目录必须是绝对路径：${groupDir}`);
   }
@@ -4133,6 +4090,18 @@ export async function runHostAgent(
   // Runtime allowlist validation for custom CWD (defense-in-depth: web.ts validates at creation,
   // but re-check here in case allowlist was tightened or path was injected via DB)
   if (group.customCwd) {
+    // A worktree lives under data/worktrees; the directory the allowlist
+    // governs is still the workspace's own custom directory.
+    let allowlistTarget = groupDir;
+    if (sessionWorkdir.kind === 'worktree') {
+      try {
+        allowlistTarget = fs.realpathSync(group.customCwd);
+      } catch {
+        return hostModeSetupError(
+          `工作目录不存在或无法解析：${group.customCwd}`,
+        );
+      }
+    }
     const allowlist = loadMountAllowlist();
     if (
       allowlist &&
@@ -4155,7 +4124,7 @@ export async function runHostAgent(
           continue;
         }
 
-        const relative = path.relative(realRoot, groupDir);
+        const relative = path.relative(realRoot, allowlistTarget);
         if (!relative.startsWith('..') && !path.isAbsolute(relative)) {
           allowed = true;
           break;
@@ -4164,52 +4133,20 @@ export async function runHostAgent(
 
       if (!allowed) {
         return hostModeSetupError(
-          `工作目录 ${groupDir} 不在允许的根目录下，请检查 mount-allowlist.json`,
+          `工作目录 ${allowlistTarget} 不在允许的根目录下，请检查 mount-allowlist.json`,
         );
       }
     }
   }
 
-  // Always store logs in data/groups/{folder}/logs/, not in customCwd
-  const logsBaseDir = path.join(defaultGroupDir, 'logs');
+  // Logs never go to customCwd or a recorded workspace directory: they stay
+  // in data/groups/{folder}/logs/, or data/logs/{folder} (workspaceLogsDirOf).
+  const logsBaseDir = workspaceLogsDirOf(group.folder);
   fs.mkdirSync(logsBaseDir, { recursive: true });
 
-  // 2. 确保目录结构（宿主机模式下限制目录权限）
-  // Sub-agents get their own IPC and session directories
-  // Isolated tasks get their own IPC subdirectory under tasks-run/{taskRunId}/
-  const groupIpcDir = input.agentId
-    ? path.join(DATA_DIR, 'ipc', group.folder, 'agents', input.agentId)
-    : input.taskRunId
-      ? path.join(DATA_DIR, 'ipc', group.folder, 'tasks-run', input.taskRunId)
-      : path.join(DATA_DIR, 'ipc', group.folder);
-  fs.mkdirSync(path.join(groupIpcDir, 'messages'), {
-    recursive: true,
-    mode: 0o700,
-  });
-  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), {
-    recursive: true,
-    mode: 0o700,
-  });
-  fs.mkdirSync(path.join(groupIpcDir, 'input'), {
-    recursive: true,
-    mode: 0o700,
-  });
-  // All agents (main + sub/conversation) get agents/ subdir for spawn/message IPC
-  fs.mkdirSync(path.join(groupIpcDir, 'agents'), {
-    recursive: true,
-    mode: 0o700,
-  });
-
-  const groupSessionsDir = sessionAgentId
-    ? path.join(
-        DATA_DIR,
-        'sessions',
-        group.folder,
-        'agents',
-        sessionAgentId,
-        '.claude',
-      )
-    : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
+  // 2. 确保目录结构（宿主机模式下限制目录权限）：会话自己的 IPC 与 .claude 目录
+  const groupIpcDir = ensureSessionIpcDir(group.folder, input.agentId);
+  const groupSessionsDir = sessionClaudeDir(group.folder, input.agentId);
   fs.mkdirSync(groupSessionsDir, { recursive: true });
 
   // Symlink .claude.json 到宿主机 ~/.claude.json，确保 deviceId 一致
@@ -4240,6 +4177,9 @@ export async function runHostAgent(
     mountUserSkills: hostUserSkillsPolicy.mountUserSkills,
     userSkillsDirOverride: hostUserSkillsPolicy.userSkillsDirOverride,
     managedSkillPolicy: input.agentProfile?.runtimePolicy?.skills,
+    workspaceSkillRoots: resolveWorkspaceSkillRoots(group, {
+      agentId: input.agentId,
+    }),
     pluginSkillLayers: pluginSkillLayers(preparedHostPlugins),
   });
   const hostClaudeContextSync = syncHostClaudeContext(
@@ -4250,16 +4190,17 @@ export async function runHostAgent(
     hostClaudeContextSync.claudeMdStatus;
   hostClaudeContextPlan.audit.warnings = hostClaudeContextSync.warnings;
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  ensureSettingsJson(
-    settingsFile,
-    resolveRuntimeMcpServers(group, input.agentProfile),
-    {
-      replaceMcpServers: true,
-      baseSettings: loadHostClaudeSettings(hostClaudeContextPlan),
-    },
-  );
-  const hostMcpManifest = buildRuntimeMcpManifest(
+  const hostMcpServers = resolveRuntimeMcpServers(
     group,
+    input.agentProfile,
+    groupDir,
+  );
+  ensureSettingsJson(settingsFile, hostMcpServers, {
+    replaceMcpServers: true,
+    baseSettings: loadHostClaudeSettings(hostClaudeContextPlan),
+  });
+  const hostMcpManifest = buildRuntimeMcpManifest(
+    hostMcpServers,
     input.agentProfile,
     preparedHostPlugins,
   );
@@ -4293,40 +4234,38 @@ export async function runHostAgent(
   // on non-macOS hosts (the var does not exist there).
   delete hostEnv['XPC_FLAGS'];
 
-  // ─── Provider Pool selection (host mode) ───
+  // ─── Model connection selection (host mode) ───
   await refreshLaunchOAuthCredentials(
     group.folder,
-    sessionAgentId,
+    input.agentId,
     input.agentProfile?.modelConfigId,
   );
   const containerOverride = getContainerEnvConfig(group.folder);
   const hostPoolResult = trySelectPoolProvider(
     group.folder,
-    sessionAgentId,
+    input.agentId,
     input.agentProfile?.modelConfigId,
-    transientRetryProfileForInput(input.turnId),
+    input.agentProfile?.model,
+    resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
   );
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
   const hostProviderQuotaEpoch = hostSelectedProfileId
     ? captureProviderQuotaObservationEpoch(hostSelectedProfileId)
     : null;
-  const hostModelSelectionPinned = !!resolvePinnedModelConfigId(
-    input.agentProfile?.modelConfigId,
-    { groupFolder: group.folder, agentId: sessionAgentId },
-  );
   const rawGlobalConfig =
     hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
   let hostProviderFailureReported = false;
   let hostProviderFailureTerminal: boolean | undefined;
+  /** The streamed failure the disposition was decided on, if it waits. */
+  let hostProviderFailureDecision: ContainerOutput | undefined;
   let hostProviderFailureMaintenance = false;
   let hostHealthyInputTurnCompleted = false;
   let hostOauthLaunch: OAuthLaunchSnapshot | null = null;
-  input = applyProviderSwitchToInput(input, hostPoolResult, sessionAgentId);
+  input = prepareLaunchInput(input, hostPoolResult);
 
   const workspaceMemoryCapabilityScope: WorkspaceMemoryCapabilityScope = {
     groupFolder: group.folder,
-    agentId: input.agentId ?? null,
-    taskRunId: input.taskRunId ?? null,
+    agentId: input.agentId,
   };
   const {
     runnerInstanceId: workspaceMemoryRunnerInstanceId,
@@ -4338,10 +4277,10 @@ export async function runHostAgent(
   const codexGatewayLease = new CodexGatewayRunnerLease({
     kind: 'host',
     groupFolder: group.folder,
-    agentId: input.agentId ?? null,
-    sessionAgentId: sessionAgentId ?? null,
-    taskRunId: input.taskRunId ?? null,
-    agentEffort: resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
+    agentId: input.agentId,
+    agentEffort:
+      hostPoolResult?.gatewayAgentEffort ??
+      resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
     sessionEffort: hostPoolResult?.sessionEffort,
   });
   try {
@@ -4359,10 +4298,13 @@ export async function runHostAgent(
         : containerOverride,
       hostPoolResult?.resolved.customEnv,
     );
-    const agentEffort = resolveAgentSdkEffort(
-      input.agentProfile?.runtimePolicy,
+    applyLaunchEffortEnv(
+      envLines,
+      resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
+      hostPoolResult
+        ? (hostPoolResult.resolved.launchEffort ?? null)
+        : undefined,
     );
-    removeProviderEffortEnv(envLines, agentEffort);
     const injectsAnthropicAuthToken = envLines.some((line) =>
       line.startsWith('ANTHROPIC_AUTH_TOKEN='),
     );
@@ -4372,26 +4314,13 @@ export async function runHostAgent(
         hostEnv[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
       }
     }
-    const tierEnv = resolvePoolTierEnv(
-      hostPoolResult?.modelOverride,
-      getEnabledProviders().length,
-      undefined,
-      hostModelSelectionPinned,
-    );
-    if (tierEnv.runnerFallbackModel) {
-      hostEnv['HAPPYCLAW_FALLBACK_MODEL'] = tierEnv.runnerFallbackModel;
+    const hostFallbackModel =
+      hostPoolResult?.resolved.fallbackModel ??
+      getSystemSettings().fallbackModel?.trim();
+    if (hostFallbackModel) {
+      hostEnv['HAPPYCLAW_FALLBACK_MODEL'] = hostFallbackModel;
     } else {
       delete hostEnv['HAPPYCLAW_FALLBACK_MODEL'];
-    }
-    if (tierEnv.model) {
-      // Subagents that followed the walled primary model escalate with it.
-      if (
-        hostEnv['CLAUDE_CODE_SUBAGENT_MODEL'] &&
-        hostEnv['CLAUDE_CODE_SUBAGENT_MODEL'] === rawGlobalConfig.anthropicModel
-      ) {
-        hostEnv['CLAUDE_CODE_SUBAGENT_MODEL'] = tierEnv.model;
-      }
-      hostEnv['ANTHROPIC_MODEL'] = tierEnv.model;
     }
     if (isCodexGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl)) {
       applyCodexGatewayNoProxy(hostEnv, 'host');
@@ -4462,6 +4391,7 @@ export async function runHostAgent(
         effectiveOauth = await syncClaudeKeychainOAuth(resolvedSessionsDir, {
           providerId: hostSelectedProfileId ?? '',
           claudeAiOauth: effectiveOauth,
+          folder: group.folder,
           persistRefreshedCredentials: (expected, refreshed) => {
             if (!hostSelectedProfileId) return false;
             return updateProviderOAuthCredentialsIfCurrent(
@@ -4642,7 +4572,7 @@ export async function runHostAgent(
       {
         group: group.name,
         workingDir: groupDir,
-        isMain: input.isMain,
+        agentId: input.agentId,
       },
       'Spawning host agent',
     );
@@ -4689,6 +4619,9 @@ export async function runHostAgent(
       // plugins.
       const hostInput: ContainerInput = {
         ...input,
+        webFetchPreflightPolicy: resolveProviderWebFetchPreflightPolicy(
+          hostSelectedProfileId,
+        ),
         workspaceMemoryMutationSigningSecret,
         workspaceMemoryRunnerInstanceId,
         plugins: preparedHostPlugins,
@@ -4783,6 +4716,8 @@ export async function runHostAgent(
           return;
         }
         if (!onOutput) return;
+        recordUsageConnection(output, hostSelectedProfileId);
+        settleUsageLimitWaitForOutput(output, input);
         if (
           !output.providerFailure &&
           output.inputTurnCompleted !== undefined
@@ -4793,7 +4728,6 @@ export async function runHostAgent(
           if (output.providerFailure && hostSelectedProfileId) {
             if (!hostProviderFailureReported) {
               hostProviderFailureReported = true;
-              quarantineFromOutput(hostSelectedProfileId, output);
               logger.warn(
                 {
                   group: group.name,
@@ -4810,7 +4744,6 @@ export async function runHostAgent(
         if (output.providerFailure && hostSelectedProfileId) {
           if (!hostProviderFailureReported) {
             hostProviderFailureReported = true;
-            quarantineFromOutput(hostSelectedProfileId, output);
             logger.warn(
               {
                 group: group.name,
@@ -4852,9 +4785,10 @@ export async function runHostAgent(
           const terminal = applyProviderFailureDisposition(
             output,
             hostSelectedProfileId,
-            !hostModelSelectionPinned,
+            usageLimitWaitScopeFor(input),
           );
           hostProviderFailureTerminal = terminal;
+          hostProviderFailureDecision = output;
           logger.warn(
             {
               group: group.name,
@@ -4947,28 +4881,6 @@ export async function runHostAgent(
     });
 
     applyCodexGatewayVerdict(hostResult, codexGatewayLease);
-    // ─── Provider Pool health reporting (host mode) ───
-    if (hostSelectedProfileId) {
-      if (hostResult.providerFailure) {
-        if (!hostProviderFailureReported) {
-          quarantineFromOutput(hostSelectedProfileId, hostResult);
-          hostProviderFailureReported = true;
-        }
-      } else if (
-        !hostProviderFailureReported &&
-        (hostResult.status === 'success' || hostResult.status === 'closed')
-      ) {
-        providerPool.reportSuccess(
-          hostSelectedProfileId,
-          hostResult.providerRateLimitModel,
-        );
-      } else if (
-        hostResult.status === 'error' &&
-        isApiError(hostResult.error || '')
-      ) {
-        providerPool.reportFailure(hostSelectedProfileId);
-      }
-    }
     if (hostProviderFailureMaintenance) {
       return {
         ...hostResult,
@@ -4985,13 +4897,14 @@ export async function runHostAgent(
         hostProviderFailureTerminal = applyProviderFailureDisposition(
           hostResult,
           hostSelectedProfileId,
-          !hostModelSelectionPinned,
+          usageLimitWaitScopeFor(input),
         );
       } else {
         applyKnownProviderFailureDisposition(
           hostResult,
           hostProviderFailureTerminal,
         );
+        carryUsageLimitWait(hostProviderFailureDecision, hostResult);
       }
     }
 
@@ -5010,10 +4923,6 @@ export async function runHostAgent(
         'Failed to release Owner Profile introduction lease',
       );
     }
-    // Guarantee session release even if spawn/setup throws
-    if (hostSelectedProfileId) {
-      providerPool.releaseSession(hostSelectedProfileId);
-    }
   }
 }
 
@@ -5021,11 +4930,10 @@ export async function runHostAgent(
 export type AgentRunner = typeof runContainerAgent | typeof runHostAgent;
 
 /**
- * Model-tier fallback lives inside agent-runner. Scheduled tasks have no warm
- * user-turn stream, so they can also retry the same immutable prompt across
- * healthy provider profiles here. Interactive conversations keep failover in
- * GroupQueue/IPC recovery so a late warm-turn failure never replays the
- * process's original cold-start prompt.
+ * Model-tier fallback lives inside agent-runner, and provider failover for a
+ * conversation lives in GroupQueue/IPC recovery, so a late warm-turn failure
+ * never replays the process's original cold-start prompt. This is the single
+ * entry both runner kinds go through.
  */
 export async function runAgentWithModelFallback(
   runFn: AgentRunner,
@@ -5039,195 +4947,5 @@ export async function runAgentWithModelFallback(
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
-  // Isolated scheduled tasks historically omitted turnId. Give the whole
-  // outer fallback loop one stable logical identity so the transient ledger
-  // can pin its authorized replay to the first attempted provider. Reuse the
-  // durable task occurrence when available; otherwise generate exactly once.
-  if (input.isScheduledTask && !input.turnId) {
-    input = {
-      ...input,
-      turnId: input.taskRunId?.trim() || randomUUID(),
-    };
-  }
-  // A top-level Agent owns exactly one complete model configuration. Retrying
-  // through other enabled configurations would violate that contract and can
-  // send a Workspace to a different gateway or official subscription. The
-  // global default binds the same way, but only because the operator chose
-  // it; with none chosen a multi-provider pool still retries across its
-  // members (see resolvePinnedModelConfigId).
-  const selectedModelConfigId = resolvePinnedModelConfigId(
-    input.agentProfile?.modelConfigId,
-    {
-      groupFolder: group.folder,
-      agentId: input.sessionAgentId ?? input.agentId,
-    },
-  );
-  const enabledProviders = getEnabledProviders();
-  const fallbackTier = getSystemSettings().fallbackModel?.trim();
-  const fallbackOnlyCombinations = fallbackTier
-    ? enabledProviders.filter(
-        (provider) =>
-          providerModelTier(provider.anthropicModel) !==
-          providerModelTier(fallbackTier),
-      ).length
-    : 0;
-  // Account failures remove every tier at once; model failures remove one
-  // (account, tier) pair. This bound covers every distinct reachable pair
-  // without allowing a malformed non-terminal signal to loop forever.
-  const maxAttempts = selectedModelConfigId
-    ? 1
-    : Math.max(1, enabledProviders.length + fallbackOnlyCombinations);
-  let lastOutput: ContainerOutput | undefined;
-  let availabilityState = providerPool.getAvailabilityStateKey();
-  // A transient replay is not a distinct combination — it re-runs the same
-  // (account, tier) on purpose — so it must not consume the combination budget.
-  // Without this a single-account install computes maxAttempts = 1 and a
-  // scheduled task could never use the retry the disposition granted it, while
-  // adding the headroom up front would instead hand a pinned Agent a second
-  // attempt it must not get for an account failure. Granted only after an
-  // observed transient failure, and capped independently of the per-input
-  // ledger that is the real bound.
-  let transientReplayBudget = 0;
-
-  for (
-    let attempt = 0;
-    attempt < maxAttempts + transientReplayBudget;
-    attempt += 1
-  ) {
-    let completedInputBeforeProviderFailure = false;
-    let attemptedProviderId: string | null = null;
-    const gatedOnOutput = onOutput
-      ? async (output: ContainerOutput): Promise<void> => {
-          if (!output.providerFailure && output.inputTurnCompleted) {
-            completedInputBeforeProviderFailure = true;
-          }
-          if (
-            input.isScheduledTask &&
-            output.providerFailure &&
-            (completedInputBeforeProviderFailure ||
-              output.providerFailureTerminal !== true)
-          ) {
-            return;
-          }
-          await onOutput(output);
-        }
-      : undefined;
-
-    lastOutput = await runFn(
-      group,
-      input,
-      (proc, identifier, selectedProviderId) => {
-        attemptedProviderId = selectedProviderId;
-        onProcess(proc, identifier, selectedProviderId);
-      },
-      gatedOnOutput,
-      ownerHomeFolder,
-    );
-    if (
-      input.isScheduledTask &&
-      lastOutput.providerFailure &&
-      completedInputBeforeProviderFailure
-    ) {
-      logger.warn(
-        {
-          group: group.name,
-          attempt: attempt + 1,
-        },
-        'Provider failed after scheduled input completed; suppressing replay to avoid duplicate side effects',
-      );
-      return {
-        ...lastOutput,
-        status: 'success',
-        result: null,
-        providerFailure: false,
-        providerFailureTerminal: undefined,
-        inputTurnCompleted: true,
-      };
-    }
-    if (
-      input.isScheduledTask &&
-      lastOutput.providerFailure &&
-      scheduledInputHasPhysicalSideEffect(input)
-    ) {
-      logger.warn(
-        { group: group.name, taskRunId: input.taskRunId },
-        'Scheduled input produced an acknowledged or uncertain physical side effect; suppressing whole-prompt provider replay',
-      );
-      return {
-        ...lastOutput,
-        status: 'success',
-        result: null,
-        providerFailure: false,
-        providerFailureTerminal: undefined,
-        inputTurnCompleted: true,
-      };
-    }
-    if (
-      !input.isScheduledTask ||
-      !lastOutput.providerFailure ||
-      lastOutput.providerFailureTerminal === true
-    ) {
-      return lastOutput;
-    }
-
-    const nextAvailabilityState = providerPool.getAvailabilityStateKey();
-    // A transient failure deliberately leaves availability untouched, so the
-    // no-progress guard below would read "nothing changed" and stop — burning
-    // the replay budget the disposition just granted without ever using it.
-    // Reaching here already proves the failure was non-terminal, i.e. the
-    // bounded ledger allowed one more attempt, so the same-provider replay this
-    // guard normally prevents is exactly the intended behaviour here.
-    const replayableTransient =
-      resolveProviderFailureClass(lastOutput) === 'transient';
-    if (
-      replayableTransient &&
-      transientReplayBudget < DEFAULT_MAX_TRANSIENT_RETRIES
-    ) {
-      transientReplayBudget += 1;
-    }
-    if (
-      attemptedProviderId !== null &&
-      !replayableTransient &&
-      nextAvailabilityState === availabilityState
-    ) {
-      logger.error(
-        {
-          group: group.name,
-          attempt: attempt + 1,
-          providerId: attemptedProviderId,
-        },
-        'Scheduled provider retry made no availability progress; stopping replay',
-      );
-      applyKnownProviderFailureDisposition(lastOutput, true);
-      return lastOutput;
-    }
-    availabilityState = nextAvailabilityState;
-
-    logger.warn(
-      {
-        group: group.name,
-        attempt: attempt + 1,
-        maxAttempts,
-      },
-      replayableTransient
-        ? 'Scheduled task hit a transient provider failure; replaying the same prompt on the same provider'
-        : 'Scheduled task provider failed; retrying the same prompt on another provider',
-    );
-  }
-
-  if (lastOutput?.providerFailure) {
-    logger.error(
-      { group: group.name, maxAttempts },
-      'Scheduled provider retry reached its distinct-combination safety bound',
-    );
-    applyKnownProviderFailureDisposition(lastOutput, true);
-    return lastOutput;
-  }
-  return (
-    lastOutput ?? {
-      status: 'error',
-      result: null,
-      error: 'No provider attempt was executed',
-    }
-  );
+  return runFn(group, input, onProcess, onOutput, ownerHomeFolder);
 }

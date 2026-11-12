@@ -18,6 +18,7 @@ import {
 import { isNativeContextContainer } from '../src/channel-mount-service.js';
 import { resolveNativeThreadContext } from '../src/channel-native-context.js';
 import { DefinitiveChannelDeliveryError } from '../src/channel-outbox-delivery.js';
+import { isCancelledInput } from '../src/follow-up-policy.js';
 import { getChannelType } from '../src/im-channel.js';
 import {
   OWNER_REQUIRED_IM_COMMANDS,
@@ -25,6 +26,7 @@ import {
   formatContextMessages,
   isDirectMessageJid,
   resolveBoundChatTarget,
+  resolveSessionTarget,
 } from '../src/im-command-utils.js';
 import { createRuntimeSourceHarness } from './helpers/runtime-source.js';
 
@@ -226,12 +228,17 @@ function recallLane() {
       bindings[`${jid}|${contextId}`],
     buildResolveEffectiveChatJid: () => router,
     findGroupNameByFolder: () => 'Workspace',
+    resolveBoundChatTarget,
+    resolveSessionTarget,
     getMessagesPage,
+    isCancelledInput,
     summarizeWithClaude: vi.fn(async () => null),
     formatContextMessages,
   };
   const harness = createRuntimeSourceHarness(globals);
   for (const name of [
+    'UNBOUND_CHAT_REPLY',
+    'resolveCommandSession',
     'recallCooldowns',
     'resolveRecallTarget',
     'handleRecallCommand',
@@ -293,6 +300,155 @@ describe('/recall reads the Session this message routes to (P0-2)', () => {
       10,
     );
   });
+
+  test('a cancelled input is left out of the summary and the raw fallback', async () => {
+    const l = recallLane();
+    const row = (id: string, content: string, extra: object = {}) => ({
+      id,
+      chat_jid: 'web:ws#agent:session-normal',
+      sender: 'u',
+      sender_name: 'User',
+      content,
+      is_from_me: false,
+      ...extra,
+    });
+    // Newest first, as getMessagesPage returns them.
+    l.getMessagesPage.mockReturnValueOnce([
+      row('m3', 'withdrawn secret', { delivery_status: 'cancelled' }),
+      row('m2', 'the answer', { is_from_me: true, sender_name: 'AI' }),
+      row('m1', 'the question', { delivery_status: 'subsumed' }),
+    ] as never);
+    const reply = await l.recall('feishu:oc_normal');
+    const transcript = l.globals.summarizeWithClaude.mock.calls[0][0];
+    expect(transcript).toContain('the question');
+    expect(transcript).toContain('the answer');
+    expect(transcript).not.toContain('withdrawn secret');
+    expect(reply).toContain('the answer');
+    expect(reply).not.toContain('withdrawn secret');
+  });
+
+  test('an unbound chat reads nothing and says so', async () => {
+    const l = recallLane();
+    l.globals.registeredGroups['feishu:oc_unbound'] = {
+      name: 'Unbound',
+      folder: 'home-u1',
+      feishu_chat_mode: 'p2p',
+    };
+    await expect(l.recall('feishu:oc_unbound')).resolves.toBe(
+      '本聊天未绑定会话。',
+    );
+    expect(l.getMessagesPage).not.toHaveBeenCalled();
+  });
+});
+
+/** The generic `/clear` and `/fresh` handlers of handleCommand. */
+function slashResetLane(groups: Record<string, any>) {
+  const executeSessionReset = vi.fn(async () => {});
+  const executeFreshWindowReset = vi.fn(async () => {});
+  const globals: Record<string, any> = {
+    logger,
+    path: { join: (...parts: string[]) => parts.join('/') },
+    GROUPS_DIR: '/groups',
+    registeredGroups: groups,
+    getRegisteredGroup: (jid: string) => groups[jid],
+    getAgent: (id: string) =>
+      id === 'session-dm'
+        ? { id, chat_jid: 'web:ws', name: 'DM session', group_folder: 'ws' }
+        : undefined,
+    isNativeContextContainer,
+    resolveNativeThreadContext,
+    getImContextBinding: () => undefined,
+    findGroupNameByFolder: () => 'Workspace',
+    resolveBoundChatTarget,
+    resolveSessionTarget,
+    queue: {},
+    sessions: {},
+    broadcastNewMessage: vi.fn(),
+    setCursors: vi.fn(),
+    executeSessionReset,
+    executeFreshWindowReset,
+    captureWorkspaceSnapshot: async () => ({}),
+    resolveWorkspaceProjectRoot: () => '/groups/ws',
+    formatFreshWindowHandoff: () => 'handoff',
+    FRESH_WINDOW_SUCCESS_REPLY: 'FRESH_OK',
+    FRESH_WINDOW_FAILURE_REPLY: 'FRESH_FAILED',
+  };
+  const harness = createRuntimeSourceHarness(globals);
+  for (const name of [
+    'UNBOUND_CHAT_REPLY',
+    'resolveCommandSession',
+    'handleClearCommand',
+    'handleFreshCommand',
+  ]) {
+    harness.install(name);
+  }
+  return {
+    executeSessionReset,
+    executeFreshWindowReset,
+    clear: (jid: string) => globals.handleClearCommand(jid) as Promise<string>,
+    fresh: (jid: string) =>
+      globals.handleFreshCommand(jid, '') as Promise<string>,
+  };
+}
+
+describe('slash /clear and /fresh act on the bound session only', () => {
+  const groups = () => ({
+    // An unbound private chat whose row still records the Home folder.
+    'feishu:oc_unbound': {
+      name: 'unbound',
+      folder: 'home-u1',
+      feishu_chat_mode: 'p2p',
+      owner_im_id: OWNER,
+    },
+    // A stale workspace binding on an ordinary chat names no session.
+    'feishu:oc_stale': {
+      name: 'stale',
+      folder: 'ws',
+      feishu_chat_mode: 'group',
+      owner_im_id: OWNER,
+      target_main_jid: 'web:ws',
+    },
+    'feishu:oc_dm': {
+      name: 'dm',
+      folder: 'ws',
+      feishu_chat_mode: 'p2p',
+      owner_im_id: OWNER,
+      target_agent_id: 'session-dm',
+    },
+    'web:ws': { name: 'Workspace', folder: 'ws' },
+    'web:home-u1': { name: 'Home', folder: 'home-u1', is_home: true },
+  });
+
+  test.each(['feishu:oc_unbound', 'feishu:oc_stale', 'feishu:oc_missing'])(
+    '%s resets nothing and replies 本聊天未绑定会话。',
+    async (jid) => {
+      const l = slashResetLane(groups());
+      await expect(l.clear(jid)).resolves.toBe('本聊天未绑定会话。');
+      await expect(l.fresh(jid)).resolves.toBe('本聊天未绑定会话。');
+      expect(l.executeSessionReset).not.toHaveBeenCalled();
+      expect(l.executeFreshWindowReset).not.toHaveBeenCalled();
+    },
+  );
+
+  test('a bound chat resets exactly its session', async () => {
+    const l = slashResetLane(groups());
+    await expect(l.clear('feishu:oc_dm')).resolves.toBe(
+      'Session context cleared.',
+    );
+    expect(l.executeSessionReset).toHaveBeenCalledWith(
+      'web:ws',
+      'ws',
+      expect.anything(),
+      'session-dm',
+    );
+    await expect(l.fresh('feishu:oc_dm')).resolves.toBe('FRESH_OK');
+    expect(l.executeFreshWindowReset).toHaveBeenCalledWith(
+      'web:ws',
+      'ws',
+      expect.anything(),
+      expect.objectContaining({ agentId: 'session-dm' }),
+    );
+  });
 });
 
 function runtimeControlLane(groups: Record<string, any>) {
@@ -332,6 +488,8 @@ function runtimeControlLane(groups: Record<string, any>) {
     executeSessionReset,
     executeFreshWindowReset,
     captureWorkspaceSnapshot: async () => ({}),
+    resolveWorkspaceProjectRoot: (group: { folder: string }) =>
+      `/groups/${group.folder}`,
     formatFreshWindowHandoff: () => 'handoff',
     FRESH_WINDOW_SUCCESS_REPLY: 'FRESH_OK',
     FRESH_WINDOW_FAILURE_REPLY: 'FRESH_FAILED',
@@ -350,6 +508,7 @@ function runtimeControlLane(groups: Record<string, any>) {
     clearTrackedProcessingIndicators: vi.fn(async () => {}),
     getStreamingSession: () => undefined,
     cancelRetryWaitChannelTurnsForInputs: vi.fn(() => 0),
+    endUsageLimitWait: vi.fn(),
     ...directChatLearning(groups),
   };
   const harness = createRuntimeSourceHarness(globals);
@@ -452,9 +611,11 @@ describe('Feishu runtime /clear and /fresh (P1-3, P1-4)', () => {
     await expect(
       l.breakRun({ sourceJid: unknownDm, senderImId: OWNER }),
     ).resolves.toBe('Current task stopped.');
+    // An explicit stop, not a steer.
     expect(l.globals.queue.interruptQuery).toHaveBeenCalledWith(
       'web:ws#agent:session-dm',
       'run-active',
+      'stop',
     );
   });
 
@@ -599,6 +760,7 @@ describe('a recalled Feishu message is withdrawn (prod P2-4)', () => {
     expect(l.queue.interruptQuery).toHaveBeenCalledWith(
       'web:ws#agent:s1',
       'run-1',
+      'stop',
     );
     // The run is told it was a recall stop (it settles the input and leaves
     // no card), the card is closed without a "已停止" note, and the input is

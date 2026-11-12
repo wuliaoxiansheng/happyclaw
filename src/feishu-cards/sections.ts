@@ -6,15 +6,25 @@
  * strict); colors are always v2 enum tokens (never hex).
  */
 
-import type { AgentCardInput, CardMeta, ToolCallStat } from './types.js';
+import type {
+  AgentCardInput,
+  AskCardInput,
+  AskQuestionView,
+  CardMeta,
+} from './types.js';
 import { resolveStatusTheme } from './status-theme.js';
 import { splitIntoBodySections } from './length.js';
 import { isMarkdownTableDelimiter, markdownFenceOpener } from './pagination.js';
+import { CARDKIT_ANSWER_BUTTONS_MAX_BYTES } from './capacity.js';
 import {
   formatFeishuTokenCount,
   formatFeishuTokenSummary,
 } from '../feishu-usage-display.js';
 import { neutralizeFeishuMentions } from '../feishu-errors.js';
+import {
+  answerQuestionValue,
+  CARD_ANSWER_TEXT_LIMIT,
+} from '../feishu-card-actions.js';
 
 /** Element ids for both the structured streaming layout and the static terminal card.
  *
@@ -25,9 +35,9 @@ import { neutralizeFeishuMentions } from '../feishu-errors.js';
  *  Keep every value below under 20 chars.
  *
  *  Streaming runtime panels (normally an outer `*_PANEL` collapsible and an
- *  inner `*_CONTENT` markdown patchable via cardElement.content). ASK_CONTENT
- *  is intentionally a standalone blank slot so no waiting panel appears
- *  before a real AskUserQuestion call.
+ *  inner `*_CONTENT` markdown patchable via cardElement.content). The
+ *  AskUserQuestion block is inserted only once a real call arrives (see
+ *  ASK_BLOCK_ELEMENT_ID).
  *  Final card uses a distinct set suffixed `_final` so both can coexist when
  *  transitioning from streaming to completed.
  */
@@ -48,7 +58,6 @@ export const CARD_ELEMENT_IDS = {
   THINKING_PANEL: 'thinking_live',
   THINKING_CONTENT: 'thinking_live_md',
   // Phase F — aligning with web StreamingDisplay
-  ASK_CONTENT: 'ask_md',
   TIMELINE_PANEL: 'timeline_panel',
   TIMELINE_CONTENT: 'timeline_md',
   DETAILS_PANEL: 'runtime_details',
@@ -60,9 +69,6 @@ export const CARD_ELEMENT_IDS = {
 
   // Static terminal card extras
   META_ROW: 'meta_row',
-  THINKING_PANEL_FINAL: 'thinking_final',
-  THINKING_CONTENT_FINAL: 'thinking_fin_md',
-  TOOLS_PANEL_FINAL: 'tools_final',
   FOOTER: 'footer',
 } as const;
 
@@ -71,21 +77,6 @@ const PANEL_PADDING = '6px 10px 6px 10px';
 const PANEL_ICON = {
   tag: 'standard_icon',
   token: 'down-small-ccm_outlined',
-} as const;
-
-/**
- * Per-panel header tints. collapsible_panel header.background_color must be an
- * ENUM colour token — the API rejects rgba()/rgb()/hex here with
- * `code=11310 collapsible panel header background color is invalid`, which
- * silently fails card.create and forces the whole streaming card to degrade
- * from the L0 typewriter path down to L1 CardKit full-update on every reply.
- * Use the light `-50` gradient tokens: near-white fills that keep the dark
- * title legible while still differentiating the panels, and that the API
- * actually accepts.
- */
-const PANEL_TINT = {
-  thinking: 'blue-50', // light blue
-  tools: 'wathet-50', // light cyan/sky
 } as const;
 
 type El = Record<string, unknown>;
@@ -306,62 +297,6 @@ export function buildBodyChunks(bodyText: string): El[] {
   return els;
 }
 
-export function buildThinkingPanel(thinking: string | undefined): El[] {
-  const trimmed = thinking?.trim();
-  if (!trimmed) return [];
-  return [
-    collapsiblePanel({
-      title: '**💭 思考过程**',
-      expanded: false,
-      elementId: CARD_ELEMENT_IDS.THINKING_PANEL_FINAL,
-      backgroundColor: PANEL_TINT.thinking,
-      elements: [
-        {
-          tag: 'markdown',
-          content: neutralizeFeishuMentions(trimmed, 'card'),
-          element_id: CARD_ELEMENT_IDS.THINKING_CONTENT_FINAL,
-        },
-      ],
-    }),
-  ];
-}
-
-export function buildToolsPanel(toolCalls: ToolCallStat[] | undefined): El[] {
-  if (!toolCalls || toolCalls.length === 0) return [];
-  const total = toolCalls.reduce((s, t) => s + t.count, 0);
-  const sorted = [...toolCalls].sort((a, b) => b.count - a.count);
-  const MAX_VISIBLE = 10;
-  const top = sorted.slice(0, MAX_VISIBLE);
-  const rest = sorted.slice(MAX_VISIBLE);
-  // Use <number_tag> for per-tool counts — cleaner than inline text counters.
-  const lines = top.map(
-    (t) =>
-      `- \`${codeSpanText(t.name)}\` <number_tag background_color='grey' font_color='white'>${clampNumberTag(t.count)}</number_tag>`,
-  );
-  if (rest.length > 0) {
-    const restTotal = rest.reduce((s, t) => s + t.count, 0);
-    lines.push(`- _… 其余 ${rest.length} 种共 ${restTotal} 次_`);
-  }
-  // Title uses a number_tag badge so the total glows as a pill, not plain text.
-  const totalBadge = `<number_tag background_color='violet' font_color='white'>${clampNumberTag(total)}</number_tag>`;
-  return [
-    collapsiblePanel({
-      title: `**🛠 工具调用** ${totalBadge}`,
-      expanded: false,
-      elementId: CARD_ELEMENT_IDS.TOOLS_PANEL_FINAL,
-      backgroundColor: PANEL_TINT.tools,
-      elements: [{ tag: 'markdown', content: lines.join('\n') }],
-    }),
-  ];
-}
-
-/** number_tag accepts integers 1-99 only; clamp to stay in-range. */
-function clampNumberTag(n: number): number {
-  if (!Number.isFinite(n) || n <= 0) return 1;
-  if (n > 99) return 99;
-  return Math.floor(n);
-}
-
 export function buildFooter(
   footer: string | undefined,
   completedAtMs?: number,
@@ -579,30 +514,109 @@ export function buildThinkingBlockquote(text: string): string {
     .join('\n');
 }
 
-// ─── AskUserQuestion card ──────────────────────────────────────
+// ─── AskUserQuestion block ─────────────────────────────────────
 
-export interface AskQuestionView {
-  question: string;
-  options?: Array<{ value?: string; label?: string }>;
+/** Top-level element ids of the AskUserQuestion block: `ask_0`, `ask_1`, … */
+export const ASK_BLOCK_ELEMENT_ID = /^ask_\d+$/;
+/**
+ * AskUserQuestion accepts at most four questions of 2–4 options, but the
+ * block renders streamed input before that validation: bound it so a
+ * malformed call can never outgrow one card.
+ */
+const ASK_MAX_QUESTIONS = 4;
+const ASK_MAX_OPTIONS = 10;
+export const ASK_MAX_BUTTONS_PER_QUESTION = 5;
+const ASK_OPTION_DISPLAY_CHARS = 60;
+
+function askOptionTag(label: string): string {
+  return `<text_tag color='blue'>${escapeFeishuPanelInline(truncate(label, ASK_OPTION_DISPLAY_CHARS))}</text_tag>`;
 }
 
-/** Render an AskUserQuestion set as a markdown block with option tags. */
-export function buildAskQuestionText(questions: AskQuestionView[]): string {
-  if (questions.length === 0) return '';
-  return questions
-    .map((q) => {
-      const head = `**${escapeFeishuPanelInline(q.question)}**`;
-      const opts = q.options ?? [];
-      if (opts.length === 0) return head;
-      const tags = opts
-        .map((o) => {
-          const label = escapeFeishuPanelInline(o.label || o.value || '—');
-          return `<text_tag color='blue'>${label}</text_tag>`;
-        })
-        .join(' ');
-      return `${head}\n${tags}\n<font color='grey'>请在智能体终端回复</font>`;
-    })
-    .join('\n\n');
+/** One answer button in a flow column; same callback shape as the stop button. */
+function askAnswerColumn(question: string, label: string): El {
+  return {
+    tag: 'column',
+    width: 'auto',
+    elements: [
+      {
+        tag: 'button',
+        text: {
+          tag: 'plain_text',
+          content: neutralizeFeishuMentions(
+            truncate(label, ASK_OPTION_DISPLAY_CHARS),
+            'text',
+          ),
+        },
+        type: 'default',
+        behaviors: [
+          { type: 'callback', value: answerQuestionValue(question, label) },
+        ],
+      },
+    ],
+  };
+}
+
+/**
+ * The open questions of an AskUserQuestion call: one Markdown element per
+ * question, then its option buttons. Only single-choice options become
+ * buttons, at most five per question and CARDKIT_ANSWER_BUTTONS_MAX_BYTES per
+ * card; multi-choice and remaining options are listed as text.
+ */
+export function buildAskQuestionElements(ask: AskCardInput | undefined): El[] {
+  if (!ask?.questions.length) return [];
+  const shown = ask.questions.slice(0, ASK_MAX_QUESTIONS);
+  const hidden = ask.questions.length - shown.length;
+  let budget = ask.buttons ? CARDKIT_ANSWER_BUTTONS_MAX_BYTES : 0;
+  const elements: El[] = [];
+  shown.forEach((q, index) => {
+    const options = (q.options ?? [])
+      .map((option) => (option.label || option.value || '').trim())
+      .filter(Boolean);
+    const labels = options.slice(0, ASK_MAX_OPTIONS);
+    const columns: El[] = [];
+    if (!q.multiSelect) {
+      for (const label of labels.slice(0, ASK_MAX_BUTTONS_PER_QUESTION)) {
+        const column = askAnswerColumn(q.question, label);
+        const size = Buffer.byteLength(JSON.stringify(column));
+        if (size > budget) {
+          budget = 0;
+          break;
+        }
+        budget -= size;
+        columns.push(column);
+      }
+    }
+    const listed = labels.slice(columns.length).map(askOptionTag);
+    if (options.length > labels.length) listed.push('…');
+    const hint = columns.length
+      ? '点击选项，或直接回复消息作答'
+      : q.multiSelect && labels.length
+        ? '可多选，请直接回复所选项'
+        : '请直接回复消息作答';
+    const lines = [
+      ...(index === 0 ? ['**❓ 等待你的回复**'] : []),
+      `**${escapeFeishuPanelInline(truncate(q.question, CARD_ANSWER_TEXT_LIMIT))}**`,
+      ...(listed.length ? [listed.join(' ')] : []),
+      `<font color='grey'>${hint}</font>`,
+      ...(hidden > 0 && index === shown.length - 1
+        ? [`<font color='grey'>另有 ${hidden} 个问题未在卡片中展示</font>`]
+        : []),
+    ];
+    elements.push({
+      tag: 'markdown',
+      element_id: `ask_${elements.length}`,
+      content: lines.join('\n'),
+    });
+    if (columns.length)
+      elements.push({
+        tag: 'column_set',
+        element_id: `ask_${elements.length}`,
+        flex_mode: 'flow',
+        horizontal_spacing: '8px',
+        columns,
+      });
+  });
+  return elements;
 }
 
 /** Extract question objects from a raw AskUserQuestion tool input payload. */
@@ -621,6 +635,7 @@ export function collectAskQuestions(
   } else if (typeof toolInput.question === 'string') {
     out.push({
       question: toolInput.question,
+      multiSelect: toolInput.multiSelect === true,
       options: Array.isArray(toolInput.options)
         ? (toolInput.options as AskQuestionView['options'])
         : undefined,
@@ -673,7 +688,6 @@ export interface StreamingPanelsInit {
   taskContent?: string;
   toolsContent?: string;
   thinkingContent?: string;
-  askContent?: string;
   timelineContent?: string;
   /** Show panels expanded (true) or folded (false) at creation time. */
   expandProgress?: boolean;
@@ -724,7 +738,7 @@ export function buildStreamingDetails(init: StreamingPanelsInit): El[] {
   ];
 }
 
-/** The caller places the main answer between these fixed slots and details. */
+/** The caller places the main answer between this banner and the details. */
 export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
   return [
     {
@@ -732,11 +746,6 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
       element_id: CARD_ELEMENT_IDS.STATUS_BANNER,
       content: init.statusBanner ?? buildStatusBannerText({ phase: 'idle' }),
       text_size: 'notation',
-    },
-    {
-      tag: 'markdown',
-      element_id: CARD_ELEMENT_IDS.ASK_CONTENT,
-      content: init.askContent ?? '',
     },
   ];
 }
@@ -757,30 +766,6 @@ export function buildFinalDetails(input: AgentCardInput): El[] {
   });
 }
 
-/** One runtime panel (collapsible wrapping a single patchable markdown). */
-export function buildRuntimePanel(opts: {
-  elementId: string;
-  contentElementId: string;
-  title: string;
-  expanded: boolean;
-  content: string;
-  backgroundColor?: string;
-}): El {
-  return collapsiblePanel({
-    title: opts.title,
-    expanded: opts.expanded,
-    elementId: opts.elementId,
-    backgroundColor: opts.backgroundColor,
-    elements: [
-      {
-        tag: 'markdown',
-        element_id: opts.contentElementId,
-        content: opts.content,
-      },
-    ],
-  });
-}
-
 interface CollapsibleOpts {
   title: string;
   expanded: boolean;
@@ -791,6 +776,11 @@ interface CollapsibleOpts {
    * accent (thinking→wathet, tools→turquoise, ask→orange) so the eye can tell
    * them apart at a glance without the card turning into a colour soup — keep
    * the palette to ≤3 accents plus grey.
+   * Must be an ENUM colour token (e.g. the light `-50` gradients): the API
+   * rejects rgba()/rgb()/hex with `code=11310 collapsible panel header
+   * background color is invalid`, which silently fails card.create and forces
+   * the streaming card to degrade from the L0 typewriter path to L1 CardKit
+   * full-update on every reply.
    */
   backgroundColor?: string;
   /** Header leading icon. Defaults to the shared fold chevron. */

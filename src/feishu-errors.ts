@@ -75,12 +75,78 @@ const STREAMING_CLOSED_CODES = new Set([200850, 300309, 200510]);
 /** The content itself was refused: DLP audit, invalid card content. */
 const CONTENT_REJECTED_CODES = new Set([230028, 230099, 11310]);
 
-/** The app has not been granted a scope the API requires. */
-const MISSING_SCOPE_CODES = new Set([99991672]);
+/**
+ * A scope the API requires has not been granted: to the app (99991672) or to
+ * the user token (99991679).
+ */
+const MISSING_SCOPE_CODES = new Set([99991672, 99991679]);
+/** Feishu names the scopes in its message, in English and Chinese. */
+const MISSING_SCOPE_MESSAGE =
+  /scopes? (?:is|are) required|one of the following scopes|所需的[^，。]*权限/i;
+
+/** Feishu's own error text: response body `msg`, envelope `msg`, message. */
+export function feishuErrorMessageText(error: unknown): string {
+  const err = record(error);
+  const candidates = [
+    record(record(err.response).data).msg,
+    err.msg,
+    error instanceof Error ? error.message : undefined,
+  ];
+  return (
+    candidates.find((value): value is string => typeof value === 'string') ?? ''
+  );
+}
+
+/**
+ * Feishu's answers that prove a chat is gone for this bot: the bot is no
+ * longer in it (232011 from chat.get, 230002 from the message APIs) or the
+ * chat was dissolved (232009).
+ *
+ * Nothing else counts. An invalid chat_id (232006) may come from our own
+ * parsing; app-level refusals (232004 app missing, 232025 bot ability off,
+ * 232034 app disabled by the tenant), cross-tenant and permission errors, a
+ * missing scope or a bad token are the app's problem; and a 4xx without a
+ * Feishu code in the body (a proxy's 403/407, a gateway's 404 page) never
+ * reached Feishu at all. Removing a binding deletes its data, so an
+ * inconclusive answer must keep it.
+ */
+const CHAT_GONE_CODES = new Set([232011, 230002, 232009]);
+
+/**
+ * Whether a failed chat lookup proves the chat is gone for this bot: Feishu
+ * itself answered with one of CHAT_GONE_CODES.
+ */
+export function isFeishuChatGoneError(error: unknown): boolean {
+  const code = feishuErrorCode(error);
+  return code !== undefined && CHAT_GONE_CODES.has(code);
+}
 
 export function isFeishuMissingScopeError(error: unknown): boolean {
   const code = feishuErrorCode(error);
-  return code !== undefined && MISSING_SCOPE_CODES.has(code);
+  if (code !== undefined && MISSING_SCOPE_CODES.has(code)) return true;
+  return MISSING_SCOPE_MESSAGE.test(feishuErrorMessageText(error));
+}
+
+/**
+ * The scopes a missing-permission error names, e.g. `[im:resource, …]` in
+ * "One of the following scopes is required: [...]". Empty when Feishu did not
+ * list them.
+ */
+export function feishuMissingScopes(error: unknown): string[] {
+  const text = feishuErrorMessageText(error);
+  const listed = /scopes?[^[]*\[([^\]]+)\]|权限[：:]\s*\[([^\]]+)\]/i.exec(
+    text,
+  );
+  const raw = listed?.[1] ?? listed?.[2];
+  if (!raw) return [];
+  return [
+    ...new Set(
+      raw
+        .split(/[,，\s]+/)
+        .map((scope) => scope.trim())
+        .filter((scope) => /^[a-z][\w.:-]*$/i.test(scope)),
+    ),
+  ].sort();
 }
 
 export type FeishuErrorKind =

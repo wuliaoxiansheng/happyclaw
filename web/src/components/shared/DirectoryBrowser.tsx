@@ -14,6 +14,7 @@ import { Label } from '@/components/ui/label';
 import { Spinner } from '@/components/ui/spinner';
 import { api } from '../../api/client';
 import { extractErrorMessage } from '../../utils/error';
+import { workspaceDirPlaceholder } from '../../lib/workspace-root';
 
 interface DirectoryEntry {
   name: string;
@@ -200,10 +201,11 @@ export function DirectoryBrowser({
         <Input
           id={resolvedInputId}
           type="text"
+          variant="code"
           value={value}
           onChange={(event) => onChange(event.target.value, 'input')}
-          placeholder={placeholder || '默认: data/groups/{folder}/'}
-          className="flex-1 pointer-coarse:h-10"
+          placeholder={placeholder || workspaceDirPlaceholder()}
+          className="flex-1"
           aria-describedby={describedBy || undefined}
           aria-invalid={!!error}
           autoComplete="off"
@@ -213,7 +215,7 @@ export function DirectoryBrowser({
           type="button"
           variant="outline"
           onClick={handleToggleBrowse}
-          className="shrink-0 pointer-coarse:h-10"
+          className="shrink-0 phone:h-11"
           aria-expanded={browsing}
           aria-controls={`${resolvedInputId}-browser`}
           disabled={disabled}
@@ -235,7 +237,7 @@ export function DirectoryBrowser({
                   label="返回允许的目录根列表"
                   icon={<Folder />}
                   onClick={() => void fetchDirectories()}
-                  className="text-muted-foreground pointer-coarse:size-9"
+                  className="text-muted-foreground"
                 />
                 {breadcrumbs.map((breadcrumb, index) => {
                   const isCurrent = index === breadcrumbs.length - 1;
@@ -258,7 +260,7 @@ export function DirectoryBrowser({
                           variant="ghost"
                           size="xs"
                           onClick={() => handleNavigate(breadcrumb.path)}
-                          className="px-1.5 text-caption font-normal text-muted-foreground pointer-coarse:h-9"
+                          className="px-1.5 text-caption font-normal text-muted-foreground"
                         >
                           {breadcrumb.name}
                         </Button>
@@ -271,7 +273,7 @@ export function DirectoryBrowser({
                 type="button"
                 size="sm"
                 onClick={() => handleSelect(currentPath)}
-                className="shrink-0 pointer-coarse:h-9"
+                className="shrink-0"
                 disabled={!canSelectCurrent}
               >
                 <FolderCheck />
@@ -344,7 +346,7 @@ export function DirectoryBrowser({
                         variant="ghost"
                         size="sm"
                         onClick={() => handleSelect(directory.path)}
-                        className="shrink-0 text-muted-foreground pointer-coarse:h-9"
+                        className="shrink-0 text-muted-foreground"
                         disabled={!canSelectDirectory}
                         aria-label={
                           canSelectDirectory
@@ -377,7 +379,7 @@ export function DirectoryBrowser({
                       }
                     }}
                     placeholder="文件夹名称"
-                    className="min-w-40 flex-1 pointer-coarse:h-10"
+                    className="min-w-40 flex-1"
                     aria-label="新文件夹名称"
                     autoFocus
                   />
@@ -385,7 +387,7 @@ export function DirectoryBrowser({
                     type="button"
                     onClick={() => void handleCreateFolder()}
                     disabled={!newFolderName.trim() || createLoading}
-                    className="pointer-coarse:h-10"
+                    className="phone:h-11"
                   >
                     {createLoading ? (
                       <Loader2 className="animate-spin" />
@@ -400,7 +402,7 @@ export function DirectoryBrowser({
                       setCreating(false);
                       setNewFolderName('');
                     }}
-                    className="pointer-coarse:h-10"
+                    className="phone:h-11"
                   >
                     取消
                   </Button>
@@ -410,7 +412,7 @@ export function DirectoryBrowser({
                   type="button"
                   variant="ghost"
                   onClick={() => setCreating(true)}
-                  className="px-2 font-normal text-muted-foreground pointer-coarse:h-10"
+                  className="px-2 font-normal text-muted-foreground"
                 >
                   <FolderPlus />
                   新建文件夹

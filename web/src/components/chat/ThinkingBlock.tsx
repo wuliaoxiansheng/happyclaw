@@ -2,6 +2,8 @@ import { useId, useLayoutEffect, useRef, useState } from 'react';
 import { ChevronRight, Sparkles } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { FinalMarkdown, StreamingMarkdown } from './StreamingMarkdown';
+import { ClampedDetail } from './ClampedDetail';
+import { InfoTip } from '../common/InfoTip';
 import { useThrottledValue } from '../../hooks/useThrottledValue';
 import { streamingMarkdownInterval } from '../../lib/streaming-interval';
 import { thinkingLabel } from '../../utils/thinking-duration';
@@ -17,13 +19,17 @@ const HEADER_BUTTON_CLASS =
  * bold title. It reads as Markdown, set small and quiet beside the answer.
  */
 const BODY_CLASS =
-  'mt-1 mb-3 max-h-64 overflow-y-auto overscroll-contain border-l-2 border-surface-border pl-3 text-muted-foreground [&_[data-markdown-root]]:text-label [&_[data-markdown-root]]:leading-6 [&_[data-markdown-root]]:text-muted-foreground [&_strong]:text-foreground/85';
+  'mt-1 mb-3 border-l-2 border-surface-border pl-3 text-muted-foreground [&_[data-markdown-root]]:text-label [&_[data-markdown-root]]:leading-6 [&_[data-markdown-root]]:text-muted-foreground [&_strong]:text-foreground/85';
 /**
  * The same text as one row of the process timeline: that has its own line on
  * the left, so the body brings none, and it sits under the row's label.
  */
 const ROW_BODY_CLASS =
-  'mt-0.5 mb-1.5 max-h-48 overflow-y-auto overscroll-contain text-muted-foreground [&_[data-markdown-root]]:text-label [&_[data-markdown-root]]:leading-6 [&_[data-markdown-root]]:text-muted-foreground [&_strong]:text-foreground/85';
+  'mt-0.5 mb-1.5 text-muted-foreground [&_[data-markdown-root]]:text-label [&_[data-markdown-root]]:leading-6 [&_[data-markdown-root]]:text-muted-foreground [&_strong]:text-foreground/85';
+
+/** Why a reasoning row has no text to open. */
+export const NO_SUMMARY_EXPLANATION =
+  '这个模型只返回加密的推理，不提供可读的思考摘要（ChatGPT 订阅的 GPT-6 系列多数如此）。';
 
 export function ThinkingBody({
   id,
@@ -31,6 +37,7 @@ export function ThinkingBody({
   live = false,
   groupJid,
   variant = 'block',
+  maxHeightClass = variant === 'row' ? 'max-h-48' : 'max-h-64',
   className,
 }: {
   id?: string;
@@ -40,13 +47,15 @@ export function ThinkingBody({
   groupJid?: string;
   /** `row`: inside a row of the process timeline, without a line of its own. */
   variant?: 'block' | 'row';
+  /** Its height (`max-h-*`); past it, the text scrolls or, on a phone, folds. */
+  maxHeightClass?: string;
   className?: string;
 }) {
   const shown = useThrottledValue(
     text,
     live ? streamingMarkdownInterval(text) : 0,
   );
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLElement>(null);
   // Text that is still arriving is followed to its end, unless the reader
   // scrolled up to re-read.
   const following = useRef(true);
@@ -61,11 +70,14 @@ export function ThinkingBody({
     }
   };
   return (
-    <div
+    <ClampedDetail
       id={id}
       ref={scrollRef}
       onScroll={handleScroll}
       data-hc-thinking-body=""
+      title="思考"
+      maxHeightClass={maxHeightClass}
+      cutAt={live ? 'start' : 'end'}
       className={cn(variant === 'row' ? ROW_BODY_CLASS : BODY_CLASS, className)}
     >
       {live ? (
@@ -73,7 +85,7 @@ export function ThinkingBody({
       ) : (
         <FinalMarkdown content={text} variant="docs" groupJid={groupJid} />
       )}
-    </div>
+    </ClampedDetail>
   );
 }
 
@@ -158,13 +170,15 @@ export function ThinkingBlock({
           <span aria-hidden="true" className="shrink-0 text-faint-foreground">
             ·
           </span>
-          <span
-            className="min-w-0 truncate text-faint-foreground"
-            title="这个模型只返回加密的推理，不提供可读的思考摘要（ChatGPT 订阅的 GPT-6 系列多数如此）。"
-            data-hc-no-summary=""
-          >
-            模型未返回思考内容
-          </span>
+          <InfoTip content={NO_SUMMARY_EXPLANATION}>
+            <button
+              type="button"
+              className="min-w-0 cursor-help truncate rounded-sm text-faint-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+              data-hc-no-summary=""
+            >
+              模型未返回思考内容
+            </button>
+          </InfoTip>
         </>
       )}
       {canOpen && (

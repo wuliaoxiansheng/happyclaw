@@ -104,15 +104,13 @@ describe('Feishu conversation policy', () => {
     },
   );
 
-  test('ordinary group preserves only the current reply anchor, not an old active context', () => {
+  test('ordinary group plan carries neither a quote anchor nor an old active context', () => {
     const result = plan({
       rootId: 'om_current_root',
       activeContext: { contextId: 'old', rootMessageId: 'om_old_root' },
     });
-    expect(result).toMatchObject({
-      independentContext: false,
-      rootMessageId: 'om_current_root',
-    });
+    expect(result).toMatchObject({ independentContext: false });
+    expect(result.rootMessageId).toBeUndefined();
     expect(result.contextId).toBeUndefined();
   });
 

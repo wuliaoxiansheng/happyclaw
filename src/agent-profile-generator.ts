@@ -26,6 +26,14 @@ export interface AgentProfilePromptRefinement {
 
 const MAX_AGENT_NAME_LENGTH = 80;
 
+/** No usable Claude provider; routes report it as HTTP 503 instead of 502. */
+export class ClaudeProviderNotConfiguredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ClaudeProviderNotConfiguredError';
+  }
+}
+
 function hasUsableClaudeProvider(): boolean {
   const config = getClaudeProviderConfig();
   return !!(
@@ -211,7 +219,9 @@ export async function generateAgentProfileDraft(
     throw new Error('请输入智能体描述');
   }
   if (!hasUsableClaudeProvider()) {
-    throw new Error('Claude 提供商未配置，请先配置 Claude 后再生成');
+    throw new ClaudeProviderNotConfiguredError(
+      'Claude 提供商未配置，请先配置 Claude 后再生成',
+    );
   }
 
   const result = await sdkQuery(buildAgentProfileDraftPrompt(trimmed), {
@@ -245,7 +255,9 @@ export async function refineAgentProfilePrompt(input: {
     throw new Error('请输入你希望如何调整提示词');
   }
   if (!hasUsableClaudeProvider()) {
-    throw new Error('Claude 提供商未配置，请先配置 Claude 后再调整');
+    throw new ClaudeProviderNotConfiguredError(
+      'Claude 提供商未配置，请先配置 Claude 后再调整',
+    );
   }
 
   const result = await sdkQuery(buildAgentProfileRefinementPrompt(input), {

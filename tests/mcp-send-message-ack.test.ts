@@ -107,24 +107,6 @@ describe('send_message host acknowledgement', () => {
     });
   });
 
-  test('scheduled tasks always use separate delivery semantics', async () => {
-    const { root, sendTool } = setupSendTool('send_message', {
-      isScheduledTask: true,
-    });
-    const pending = sendTool.handler(
-      { text: '定时报告', delivery_role: 'final' },
-      {} as never,
-    );
-    const request = await readRequest(root);
-    expect(request).toMatchObject({
-      deliveryRole: 'separate',
-      isScheduledTask: true,
-      interactionMode: 'assistant',
-    });
-    writeResult(root, request.requestId as string, { success: true });
-    await expect(pending).resolves.toBeDefined();
-  });
-
   test('proactive turns keep the semantic role while forcing independent native delivery', async () => {
     const { root, sendTool } = setupSendTool('send_message', {
       interactionMode: 'proactive',

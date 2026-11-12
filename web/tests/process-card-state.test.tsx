@@ -153,7 +153,7 @@ describe('a group of read-only calls as the window slides', () => {
 });
 
 describe('the clock on the header', () => {
-  it('counts the step that is running, from its start', async () => {
+  it('counts the process from its first step, as cindy\u2019s work timer does', async () => {
     await render(
       <ProcessCard
         {...props({
@@ -169,17 +169,14 @@ describe('the clock on the header', () => {
         })}
       />,
     );
-    expect(header()?.textContent).toContain('7s');
-    expect(header()?.textContent).not.toContain('1m');
+    expect(header()?.querySelector('.font-mono')?.textContent).toBe('1m 40s');
   });
 
-  it('shows no clock when nothing is running, and does not start over for a new step', async () => {
+  it('goes on between steps, and does not start over for a new step', async () => {
     const done = tool('a', 'Read', { at: NOW - 40_000, endedAt: NOW - 39_000 });
     await render(<ProcessCard {...props({ steps: [done] })} />);
-    expect(header()?.textContent).not.toMatch(/\d+s/);
+    expect(header()?.querySelector('.font-mono')?.textContent).toBe('40s');
 
-    // The run's first step shows up late: the card never says "1s" for a run
-    // that is a minute old.
     await render(
       <ProcessCard
         {...props({
@@ -195,7 +192,7 @@ describe('the clock on the header', () => {
       />,
     );
     await advance(300);
-    expect(header()?.textContent).toContain('2s');
+    expect(header()?.querySelector('.font-mono')?.textContent).toBe('40s');
   });
 
   it('is not moved by steps dropped from the front of the list', async () => {
@@ -220,8 +217,8 @@ describe('the clock on the header', () => {
         })}
       />,
     );
-    expect(header()?.textContent).toContain('5s');
-    expect(before).toContain('5s');
+    expect(before).toContain('3m 20s');
+    expect(header()?.textContent).toContain('3m 20s');
   });
 
   it('counts the wait for the model while that is all there is', async () => {
@@ -235,18 +232,20 @@ describe('the clock on the header', () => {
 });
 
 describe('the summary of a finished run that dropped steps', () => {
-  it('says there were earlier steps it does not count', async () => {
+  it('says there were earlier steps it does not count, once opened', async () => {
     await render(
       <ProcessCard
         {...props({
           mode: 'settled',
           steps: [tool('a', 'Bash'), thinking()],
           stepsDropped: 12,
+          defaultOpen: true,
         })}
       />,
     );
-    expect(header()?.textContent).toContain('另有较早 12 步');
-    expect(header()?.textContent).toContain('1 个工具');
+    expect(container.querySelector('[data-hc-work-counts]')?.textContent).toBe(
+      '1 个工具 · 1 段思考 · 另有较早 12 步',
+    );
   });
 });
 
@@ -467,7 +466,7 @@ describe('the rows a settled timeline lists', () => {
     expect(rows()).toHaveLength(11);
   });
 
-  it('are folded past thirty, as a live window folds past six', async () => {
+  it('are folded past thirty, as a live window folds past five', async () => {
     await render(
       <ProcessCard
         {...props({ mode: 'settled', steps: commands(33), defaultOpen: true })}
@@ -477,7 +476,7 @@ describe('the rows a settled timeline lists', () => {
     expect(rows()).toHaveLength(31);
 
     await render(<ProcessCard {...props({ steps: commands(11) })} />);
-    expect(text()).toContain('较早 5 步');
+    expect(text()).toContain('较早 6 步');
   });
 });
 

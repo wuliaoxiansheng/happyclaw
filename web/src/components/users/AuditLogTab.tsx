@@ -43,6 +43,8 @@ const EVENT_TYPE_LABELS: Record<string, string> = {
   invite_deleted: '删除邀请码',
   system_settings_updated: '更新系统设置',
   host_integration_updated: '更新宿主机集成',
+  storage_source_saved: '保存存储源',
+  storage_source_deleted: '删除存储源',
 };
 
 const PAGE_SIZES = [50, 100, 200, 500];
@@ -181,6 +183,7 @@ export function AuditLogTab({ setError }: AuditLogTabProps) {
           ))}
         </NativeSelect>
         <Input
+          variant="code"
           value={username}
           onChange={(e) => setUsername(e.target.value)}
           onKeyDown={loadOnEnter}
@@ -189,6 +192,7 @@ export function AuditLogTab({ setError }: AuditLogTabProps) {
           className="w-full sm:w-40"
         />
         <Input
+          variant="code"
           value={actorUsername}
           onChange={(e) => setActorUsername(e.target.value)}
           onKeyDown={loadOnEnter}

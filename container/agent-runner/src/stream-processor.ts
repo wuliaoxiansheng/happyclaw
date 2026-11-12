@@ -42,6 +42,17 @@ const SDK_TERMINAL_TASK_STATUSES = new Set([
   'aborted',
 ]);
 
+// SDK task types that are sub-agents, as Claude Code 2.1.296 itself groups
+// them; task_started reports the CLI's own task type. Shells (local_bash),
+// monitors (monitor_mcp, monitor_ws), MCP tasks and any type not listed here
+// are not sub-agents.
+const SUB_AGENT_TASK_TYPES: ReadonlySet<string> = new Set([
+  'local_agent',
+  'remote_agent',
+  'in_process_teammate',
+  'local_workflow',
+]);
+
 // Tool calls remembered by id so a result can be matched to its tool's name.
 const MAX_TRACKED_TOOL_CALLS = 512;
 
@@ -261,6 +272,8 @@ export class StreamEventProcessor {
       description: string;
       taskType?: string;
       isBackgrounded: boolean;
+      /** Launched by a sub-agent rather than the main Agent. */
+      launchedBySubAgent: boolean;
     }
   >();
 
@@ -977,8 +990,10 @@ export class StreamEventProcessor {
       }
     }
 
-    // Track AskUserQuestion tool
-    if (block.name === 'AskUserQuestion' && block.id) {
+    // Track AskUserQuestion tool. A sub-agent's question is refused, never
+    // put to the user (runnerCanUseTool), so its input is not streamed as
+    // questions a Web or Feishu card would show.
+    if (block.name === 'AskUserQuestion' && block.id && !isNested) {
       if (typeof blockIndex === 'number') {
         this.pendingAskUserInput.set(blockIndex, {
           toolUseId: block.id,
@@ -1449,10 +1464,8 @@ export class StreamEventProcessor {
         message.task_id;
       const desc = message.description || message.prompt || '';
       if (message.task_id && !message.skip_transcript) {
-        this.backgroundDrain.taskStarted(
-          message.task_id,
-          !this.isSubAgentOwnedTask(message),
-        );
+        const subAgentOwned = this.isSubAgentOwnedTask(message);
+        this.backgroundDrain.taskStarted(message.task_id, !subAgentOwned);
         this.pendingSdkTasks.set(message.task_id, {
           description: desc,
           taskType:
@@ -1460,6 +1473,8 @@ export class StreamEventProcessor {
               ? message.task_type
               : undefined,
           isBackgrounded: false,
+          launchedBySubAgent:
+            subAgentOwned || typeof message.parent_task_id === 'string',
         });
         this.log(
           `[pending-tasks] +${message.task_id.slice(0, 12)} (${shorten(desc, 60)}) → ${this.pendingSdkTasks.size} pending`,
@@ -1557,6 +1572,7 @@ export class StreamEventProcessor {
         task_id: string;
         task_type?: string;
         description?: string;
+        parent_task_id?: string;
       }> = Array.isArray(message.tasks)
         ? (message.tasks as unknown[]).filter(
             (
@@ -1565,6 +1581,7 @@ export class StreamEventProcessor {
               task_id: string;
               task_type?: string;
               description?: string;
+              parent_task_id?: string;
             } =>
               typeof task === 'object' &&
               task !== null &&
@@ -1581,15 +1598,18 @@ export class StreamEventProcessor {
       for (const task of tasks) {
         this.backgroundLevelTaskIds.add(task.task_id);
         const existing = this.pendingSdkTasks.get(task.task_id);
+        const launchedBySubAgent = typeof task.parent_task_id === 'string';
         if (!existing) {
           this.pendingSdkTasks.set(task.task_id, {
             description: task.description || task.task_id,
             taskType: task.task_type,
             isBackgrounded: true,
+            launchedBySubAgent,
           });
         } else {
           existing.isBackgrounded = true;
           existing.taskType ??= task.task_type;
+          existing.launchedBySubAgent ||= launchedBySubAgent;
         }
       }
       this.backgroundDrain.replaceBackgroundTasks([...nextIds]);
@@ -1883,6 +1903,13 @@ export class StreamEventProcessor {
 
     if (message.type === 'assistant') {
       this.recordSubAgentText(msgParentToolUseId, message);
+      // Logged only: subagentType names the agent type (e.g. Explore), and
+      // the Web and Feishu cards keep the last one they were sent.
+      const subModel =
+        typeof message.message?.model === 'string' &&
+        message.message.model.trim()
+          ? message.message.model.trim()
+          : undefined;
       const subContent = message.message?.content as
         | Array<{
             type: string;
@@ -1965,7 +1992,7 @@ export class StreamEventProcessor {
           }
         }
         this.log(
-          `[sub-agent] parent=${msgParentToolUseId.slice(0, 12)} blocks=${subContent.length} types=[${subContent.map((b) => b.type).join(',')}]`,
+          `[sub-agent] parent=${msgParentToolUseId.slice(0, 12)}${subModel ? ` model=${subModel}` : ''} blocks=${subContent.length} types=[${subContent.map((b) => b.type).join(',')}]`,
         );
       }
     }
@@ -2514,6 +2541,22 @@ export class StreamEventProcessor {
   /** 尚未 settle 的 SDK 任务数（异步 Agent / backgrounded Bash 等）。 */
   getPendingSdkTaskCount(): number {
     return this.pendingSdkTasks.size;
+  }
+
+  /**
+   * Unsettled sub-agents the main Agent launched (Task/Agent, workflows):
+   * what an explicit stop waits on before it closes the query. A nested
+   * sub-agent ends with its parent, possibly without a notification of its
+   * own; shells, monitors, MCP tasks and unknown types are never counted.
+   */
+  getActiveSubAgentTaskIds(): string[] {
+    return [...this.pendingSdkTasks]
+      .filter(
+        ([, pending]) =>
+          !pending.launchedBySubAgent &&
+          SUB_AGENT_TASK_TYPES.has(pending.taskType ?? ''),
+      )
+      .map(([taskId]) => taskId);
   }
 
   /** Tasks which still make replay unsafe. A detached local bash command has

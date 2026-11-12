@@ -15,6 +15,7 @@ import {
   SettingsGroup,
   SettingsSection,
 } from '@/components/settings/SettingsLayout';
+import { extractErrorMessage } from '@/utils/error';
 import {
   Callout,
   CapabilityListSkeleton,
@@ -92,9 +93,7 @@ export function PluginsPage() {
         toast.success(`已禁用 ${plugin.fullId}。下次新会话生效。`);
       }
     } catch (err) {
-      toast.error(
-        `切换失败：${err instanceof Error ? err.message : String(err)}`,
-      );
+      toast.error(`切换失败：${extractErrorMessage(err)}`);
     }
   };
 
@@ -108,9 +107,7 @@ export function PluginsPage() {
         toast.warning(`扫描告警:\n${report.warnings.join('\n')}`);
       }
     } catch (err) {
-      toast.error(
-        `扫描失败：${err instanceof Error ? err.message : String(err)}`,
-      );
+      toast.error(`扫描失败：${extractErrorMessage(err)}`);
     }
   };
 
@@ -123,15 +120,32 @@ export function PluginsPage() {
       );
       setDeleteTarget(null);
     } catch (err) {
-      toast.error(
-        `删除失败：${err instanceof Error ? err.message : String(err)}`,
-      );
+      toast.error(`删除失败：${extractErrorMessage(err)}`);
     }
   };
 
   return (
     <div className="space-y-4">
-      <CapabilitySectionActions>
+      <CapabilitySectionActions
+        phoneMenu={[
+          ...(isAdmin
+            ? [
+                {
+                  label: '扫描宿主机 Catalog',
+                  icon: FolderSync,
+                  onSelect: () => void handleScan(),
+                  disabled: scanning,
+                },
+              ]
+            : []),
+          {
+            label: '刷新',
+            icon: RefreshCw,
+            onSelect: () => void loadPlugins(),
+            disabled: loading,
+          },
+        ]}
+      >
         {isAdmin && (
           <Button
             variant="outline"

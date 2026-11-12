@@ -1,11 +1,9 @@
 import { createHash } from 'node:crypto';
 
+import type { SessionKind } from './session-kind.js';
+
 export type PromptBlockScope = 'main' | 'subagent' | 'both';
-export type PromptBlockOwner =
-  | 'platform'
-  | 'agent_profile'
-  | 'workspace'
-  | 'channel';
+export type PromptBlockOwner = 'platform' | 'agent_profile' | 'workspace';
 
 export interface PromptBlockInput {
   id: string;
@@ -38,6 +36,15 @@ export interface HappyClawPromptSources {
   platformIdentity?: string;
   platformBootstrap?: string;
   agentIdentity?: string;
+  /**
+   * The engine layer: with the Claude Code preset, how it applies here
+   * (`runtime-adaptation`); without it, the working basics it would have
+   * given (`runtime-baseline`).
+   */
+  engine?: {
+    id: 'runtime-adaptation' | 'runtime-baseline';
+    text: string;
+  };
   interaction: string;
   security: string;
   memory?: {
@@ -45,13 +52,19 @@ export interface HappyClawPromptSources {
     text: string;
   };
   agentBuilder?: string;
-  output: string;
-  web?: string;
-  backgroundTasks?: string;
-  channel?: {
-    id: string;
+  /**
+   * Team mode: the router's or the worker's contract, or a delegated item's
+   * worker contract. It takes the place of the output and delivery
+   * contracts, which are built on send_message.
+   */
+  team?: {
+    id: RolePromptId;
     text: string;
   };
+  /** Required, except that a team section replaces it. */
+  output?: string;
+  web?: string;
+  backgroundTasks?: string;
   deliveryContract?: string;
 }
 
@@ -153,6 +166,55 @@ export function hasBackgroundTaskTools(
   return allowedTools.includes('Task');
 }
 
+const ENGINE_CONDITIONS: Record<
+  NonNullable<HappyClawPromptSources['engine']>['id'],
+  string
+> = {
+  'runtime-adaptation': 'Claude Code preset is included',
+  'runtime-baseline': 'Claude Code preset is not included',
+};
+
+const TEAM_CONDITIONS: Record<RolePromptId, string> = {
+  'team-router': 'team mode router session',
+  'team-worker': 'team mode worker session',
+  'delegated-worker': 'multi-task mode delegated worker session',
+};
+
+/** A session role's section, named after its file under prompts/. */
+export type RolePromptId = Exclude<SessionKind, 'single' | 'multi'>;
+
+/** Background-task guidance, named after its file under prompts/. */
+export type BackgroundTasksPromptId =
+  | 'background-tasks'
+  | 'background-tasks.team'
+  | 'background-tasks.multi'
+  | 'background-tasks.delegated';
+
+/**
+ * The role section and background-task guidance each kind of session gets:
+ * a conversation of a multi-task workspace swaps in the delegation guidance,
+ * and a delegated item's worker has a section of its own.
+ */
+export const SESSION_PROMPTS: Record<
+  SessionKind,
+  { role?: RolePromptId; backgroundTasks: BackgroundTasksPromptId }
+> = {
+  single: { backgroundTasks: 'background-tasks' },
+  multi: { backgroundTasks: 'background-tasks.multi' },
+  'team-router': {
+    role: 'team-router',
+    backgroundTasks: 'background-tasks.team',
+  },
+  'team-worker': {
+    role: 'team-worker',
+    backgroundTasks: 'background-tasks.team',
+  },
+  'delegated-worker': {
+    role: 'delegated-worker',
+    backgroundTasks: 'background-tasks.delegated',
+  },
+};
+
 function wrap(tag: string, text: string): string {
   if (!text.trim()) return '';
   return `<${tag}>\n${text}\n</${tag}>`;
@@ -163,6 +225,20 @@ export function buildHappyClawPromptPlan(
   sources: HappyClawPromptSources,
 ): PromptPlan {
   const inputs: PromptBlockInput[] = [];
+
+  // Directly after the Claude Code preset (or in its place), ahead of the
+  // identity it defers to.
+  if (sources.engine) {
+    inputs.push({
+      id: sources.engine.id,
+      version: 1,
+      scope: 'main',
+      owner: 'platform',
+      required: true,
+      condition: ENGINE_CONDITIONS[sources.engine.id],
+      text: wrap(sources.engine.id, sources.engine.text),
+    });
+  }
 
   if (sources.platformIdentity) {
     inputs.push({
@@ -246,15 +322,30 @@ export function buildHappyClawPromptPlan(
     });
   }
 
-  inputs.push({
-    id: 'output',
-    version: 1,
-    scope: 'main',
-    owner: 'platform',
-    required: true,
-    condition: 'always',
-    text: wrap('output-contract', sources.output),
-  });
+  if (sources.team) {
+    inputs.push({
+      id: sources.team.id,
+      version: 1,
+      scope: 'main',
+      owner: 'platform',
+      required: true,
+      condition: TEAM_CONDITIONS[sources.team.id],
+      text: wrap(sources.team.id, sources.team.text),
+    });
+  }
+
+  // A team section is the session's output contract.
+  if (!sources.team) {
+    inputs.push({
+      id: 'output',
+      version: 1,
+      scope: 'main',
+      owner: 'platform',
+      required: true,
+      condition: 'always',
+      text: wrap('output-contract', sources.output ?? ''),
+    });
+  }
 
   if (sources.web) {
     inputs.push({
@@ -277,18 +368,6 @@ export function buildHappyClawPromptPlan(
       required: false,
       condition: 'Task is available',
       text: wrap('background-tasks', sources.backgroundTasks),
-    });
-  }
-
-  if (sources.channel) {
-    inputs.push({
-      id: `channel.${sources.channel.id}`,
-      version: 1,
-      scope: 'main',
-      owner: 'channel',
-      required: false,
-      condition: `message source resolves to ${sources.channel.id}`,
-      text: wrap('channel-format', sources.channel.text),
     });
   }
 

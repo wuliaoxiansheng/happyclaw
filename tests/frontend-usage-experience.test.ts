@@ -343,7 +343,9 @@ describe('usage page product and accessibility surface', () => {
     expect(page).toMatch(/aria-busy=|aria-pressed=|role="alert"/);
     expect(page).toMatch(/用量数据加载失败|重试加载/);
     expect(page).toMatch(/当前筛选没有用量数据|开始一次对话/);
-    expect(page).toContain('min-h-11');
+    // Phones name the page in the app's top bar (touch sizes come from the
+    // primitives).
+    expect(page).toContain('<PhonePageHeader');
     expect(page).toContain('overflow-x-auto');
     expect(page).toContain('导出 CSV');
     expect(page).toContain('账单扣费：不适用（未启用计费）');

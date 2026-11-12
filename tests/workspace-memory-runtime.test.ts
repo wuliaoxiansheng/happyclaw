@@ -10,10 +10,8 @@ import {
   type McpContext,
   type WorkspaceMemorySnapshot,
 } from '../container/agent-runner/src/mcp-tools.js';
-import {
-  createSerializedAsyncTrigger,
-  loadWorkspaceMemoryTurnContext,
-} from '../container/agent-runner/src/workspace-memory-context.js';
+import { createSerializedAsyncTrigger } from '../container/agent-runner/src/workspace-memory-context.js';
+import { TurnNoteLedger } from '../container/agent-runner/src/turn-notes.js';
 import { signWorkspaceMemoryMutation } from '../container/agent-runner/src/workspace-memory-auth.js';
 import {
   createWorkspaceMemoryWriteGuard,
@@ -28,7 +26,9 @@ import {
 } from '../src/workspace-memory-capability.js';
 import {
   buildWorkspaceMemoryUpdateInput,
+  isWorkspaceMemoryOwnerTurn,
   workspaceMemoryWriteRejection,
+  workspaceOwnerImIds,
 } from '../src/workspace-memory-ipc.js';
 
 const roots: string[] = [];
@@ -46,7 +46,6 @@ function context(root: string, patch: Partial<McpContext> = {}): McpContext {
     isHome: false,
     isAdminHome: false,
     agentBuilderEnabled: false,
-    isScheduledTask: false,
     currentInputTurnId: 'turn-1',
     currentSessionId: 'session-1',
     workspaceIpc: root,
@@ -155,26 +154,11 @@ describe('Workspace Memory runtime boundary', () => {
       content: [
         {
           type: 'text',
-          text: expect.stringContaining('"storeRevision": 1'),
+          text: expect.stringContaining('"storeRevision":1'),
         },
       ],
     });
     revokeWorkspaceMemoryWriteCapability(scope, capability.runnerInstanceId);
-  });
-
-  test('scheduled/group-task MCP surfaces are read-only', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'workspace-memory-ro-'));
-    roots.push(root);
-    for (const ctx of [
-      context(root, { isScheduledTask: true }),
-      context(root, { currentTaskId: 'task-1' }),
-    ]) {
-      const names = createMcpTools(ctx).map((tool) => tool.name);
-      expect(names).toContain('workspace_memory_search');
-      expect(names).not.toContain('workspace_memory_remember');
-      expect(names).not.toContain('workspace_memory_update');
-      expect(names).not.toContain('workspace_memory_forget');
-    }
   });
 
   test('the PreToolUse matcher selects exactly the tools the guard can deny', () => {
@@ -220,8 +204,8 @@ describe('Workspace Memory runtime boundary', () => {
     expect(
       tools.get('send_message')?.annotations?.readOnlyHint,
     ).toBeUndefined();
-    expect(tools.get('list_tasks')?.annotations?.readOnlyHint).toBe(true);
-    expect(tools.get('list_tasks')?._meta).toBeUndefined();
+    expect(tools.get('automation_list')?.annotations?.readOnlyHint).toBe(true);
+    expect(tools.get('automation_list')?._meta).toBeUndefined();
     expect(
       tools.get('workspace_memory_remember')?.annotations?.readOnlyHint,
     ).toBeUndefined();
@@ -256,7 +240,7 @@ describe('Workspace Memory runtime boundary', () => {
     ).resolves.toEqual({});
   });
 
-  test('host allows ordinary conversation sessions and rejects scheduled, spawn, task, and unknown turns', () => {
+  test('host admits conversation sessions and automation runs, and rejects spawn, task, and unknown turns', () => {
     expect(
       workspaceMemoryWriteRejection({
         operation: 'create',
@@ -266,15 +250,26 @@ describe('Workspace Memory runtime boundary', () => {
         capabilityValid: true,
       }),
     ).toBeNull();
+    // An automation run writes only proposals (workspaceMemoryWriteMode), and
+    // only with the runner's signed capability.
     expect(
       workspaceMemoryWriteRejection({
         operation: 'create',
-        hostTurnKind: 'scheduled',
+        hostTurnKind: 'automation',
         runtimeAgentId: null,
         runtimeAgentKind: null,
         capabilityValid: true,
       }),
-    ).toMatchObject({ code: 'scheduled_memory_read_only' });
+    ).toBeNull();
+    expect(
+      workspaceMemoryWriteRejection({
+        operation: 'create',
+        hostTurnKind: 'automation',
+        runtimeAgentId: null,
+        runtimeAgentKind: null,
+        capabilityValid: false,
+      }),
+    ).toMatchObject({ code: 'workspace_memory_invalid_capability' });
     for (const runtimeAgentKind of ['spawn', 'task'] as const) {
       expect(
         workspaceMemoryWriteRejection({
@@ -307,7 +302,7 @@ describe('Workspace Memory runtime boundary', () => {
     expect(
       workspaceMemoryWriteRejection({
         operation: 'search',
-        hostTurnKind: 'scheduled',
+        hostTurnKind: 'automation',
         runtimeAgentId: 'agent-1',
         runtimeAgentKind: 'task',
         capabilityValid: false,
@@ -557,33 +552,104 @@ describe('Workspace Memory runtime boundary', () => {
     await expect(pending).resolves.toBeNull();
   });
 
-  test('warm turn fetches a fresh B snapshot and never reuses A snapshot', async () => {
-    const seenQueries: string[] = [];
-    const fetchSnapshot = async (
-      query: string,
-    ): Promise<WorkspaceMemorySnapshot> => {
-      seenQueries.push(query);
-      return {
-        workspaceJid: 'web:workspace',
-        storeRevision: seenQueries.length,
-        items: [],
-        renderedText: `memory-for-${query}`,
-        retrievalTrace: {
-          itemRevisions: [
-            { id: `memory-${query}`, revision: seenQueries.length },
-          ],
-          query,
-          generatedAt: '2026-07-28T00:00:00.000Z',
+  test('a snapshot asks for the changes since the revision the session holds', async () => {
+    const root = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'workspace-memory-snapshot-'),
+    );
+    roots.push(root);
+    const pending = fetchWorkspaceMemorySnapshot(context(root), 'query C', {
+      timeoutMs: 2_000,
+      changedSince: 4,
+      heldIds: ['gone', 'kept'],
+    });
+    const request = await readMemoryRequest(root);
+    expect(request).toMatchObject({
+      operation: 'snapshot',
+      changedSince: 4,
+      heldIds: ['gone', 'kept'],
+    });
+    const base = {
+      workspaceJid: 'web:workspace',
+      storeRevision: 6,
+      items: [],
+      renderedText: '',
+      retrievalTrace: {
+        itemRevisions: [],
+        generatedAt: '2026-07-28T00:00:00.000Z',
+      },
+    };
+    acknowledge(root, request.requestId as string, {
+      snapshot: {
+        ...base,
+        changes: {
+          reset: false,
+          items: [{ id: 'gone', revision: 2, status: 'deleted' }],
         },
-      };
+      },
+    });
+    await expect(pending).resolves.toMatchObject({
+      changes: {
+        reset: false,
+        items: [{ id: 'gone', revision: 2, status: 'deleted' }],
+      },
+    });
+
+    // Malformed changes are dropped; the snapshot itself still holds.
+    const other = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'workspace-memory-snapshot-'),
+    );
+    roots.push(other);
+    const next = fetchWorkspaceMemorySnapshot(context(other), 'query D', {
+      timeoutMs: 2_000,
+    });
+    const second = await readMemoryRequest(other);
+    expect(second).not.toHaveProperty('changedSince');
+    expect(second).not.toHaveProperty('heldIds');
+    acknowledge(other, second.requestId as string, {
+      snapshot: { ...base, changes: { reset: 'no', items: [] } },
+    });
+    const parsed = await next;
+    expect(parsed).not.toBeNull();
+    expect(parsed).not.toHaveProperty('changes');
+  });
+
+  test("a warm turn carries B's snapshot and never A's again", () => {
+    const snapshot = (...ids: string[]): WorkspaceMemorySnapshot => ({
+      workspaceJid: 'web:workspace',
+      storeRevision: 3,
+      items: ids.map((id) => ({
+        id,
+        revision: 1,
+        kind: 'fact',
+        content: `memory-for-${id}`,
+      })),
+      renderedText: ids
+        .map((id) => `<memory id="${id}">memory-for-${id}</memory>`)
+        .join('\n'),
+      retrievalTrace: {
+        itemRevisions: ids.map((id) => ({ id, revision: 1 })),
+        generatedAt: '2026-07-28T00:00:00.000Z',
+      },
+    });
+    const ledger = new TurnNoteLedger();
+    ledger.beginQuery(undefined);
+    const turn = (uuid: string, memory: WorkspaceMemorySnapshot) => {
+      const notes = ledger.stage(uuid, {
+        memory,
+        ownerProfile: null,
+        channelContext: undefined,
+      });
+      ledger.observeAnswered([uuid]);
+      ledger.commitAnswered();
+      return notes.memory;
     };
 
-    const initial = await loadWorkspaceMemoryTurnContext('A', fetchSnapshot);
-    const warm = await loadWorkspaceMemoryTurnContext('B', fetchSnapshot);
-    expect(seenQueries).toEqual(['A', 'B']);
-    expect(initial.block).toContain('memory-for-A');
-    expect(warm.block).toContain('memory-for-B');
-    expect(warm.block).not.toContain('memory-for-A');
+    expect(turn('cold', snapshot('A'))).toContain('memory-for-A');
+    // Retrieved again for B's query, A is already in the conversation.
+    const warm = turn('warm', snapshot('A', 'B'));
+    expect(warm).toContain('memory-for-B');
+    expect(warm).not.toContain('memory-for-A');
+    expect(turn('again', snapshot('A', 'B'))).toBe('');
   });
 
   test('async warm-turn drains are serialized in trigger order', async () => {
@@ -641,5 +707,178 @@ describe('Workspace Memory runtime boundary', () => {
       provenance: principal.provenance,
     });
     expect(built).not.toHaveProperty('patch');
+    expect(built).toMatchObject({ proposal: false });
+    expect(
+      buildWorkspaceMemoryUpdateInput(
+        { itemId: 'mem-1', patch: { proposal: false } },
+        { ...principal, proposal: true },
+      ),
+    ).toMatchObject({ proposal: true });
+  });
+
+  test("a snapshot is asked for by the senders' words and brings the index", async () => {
+    const root = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'workspace-memory-snapshot-'),
+    );
+    roots.push(root);
+    const pending = fetchWorkspaceMemorySnapshot(
+      context(root),
+      '<system_context>\nold</system_context>\n\n<messages>\n<message id="m1" sender="Alice" time="t">\nMac mini 怎么部署 &amp; 回滚</message>\n</messages>',
+      { timeoutMs: 2_000 },
+    );
+    const request = await readMemoryRequest(root);
+    expect(request.query).toBe('Mac mini 怎么部署 & 回滚');
+    const base = {
+      workspaceJid: 'web:workspace',
+      storeRevision: 6,
+      items: [],
+      renderedText: '',
+      retrievalTrace: {
+        itemRevisions: [],
+        generatedAt: '2026-07-28T00:00:00.000Z',
+      },
+    };
+    acknowledge(root, request.requestId as string, {
+      snapshot: {
+        ...base,
+        directory: {
+          entries: [{ id: 'wmi_a', kind: 'fact', title: 'Deploy', extra: 1 }],
+          total: 3,
+        },
+      },
+    });
+    await expect(pending).resolves.toMatchObject({
+      directory: {
+        entries: [{ id: 'wmi_a', kind: 'fact', title: 'Deploy' }],
+        total: 3,
+      },
+    });
+
+    const other = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'workspace-memory-snapshot-'),
+    );
+    roots.push(other);
+    const next = fetchWorkspaceMemorySnapshot(context(other), 'plain', {
+      timeoutMs: 2_000,
+    });
+    const second = await readMemoryRequest(other);
+    acknowledge(other, second.requestId as string, {
+      snapshot: { ...base, directory: { entries: [{ id: 1 }], total: 1 } },
+    });
+    const parsed = await next;
+    expect(parsed).not.toBeNull();
+    expect(parsed).not.toHaveProperty('directory');
+  });
+
+  test('a write result names the item, and a proposal says it waits for the owner', async () => {
+    const root = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'workspace-memory-mcp-'),
+    );
+    roots.push(root);
+    const tools = new Map(
+      createMcpTools(context(root)).map((tool) => [tool.name, tool]),
+    );
+    const pending = tools
+      .get('workspace_memory_remember')!
+      .handler(
+        { kind: 'lesson', title: 'Back up first', content: 'Long content.' },
+        {} as never,
+      );
+    const request = await readMemoryRequest(root);
+    acknowledge(root, request.requestId as string, {
+      storeRevision: 9,
+      item: {
+        id: 'wmi_1',
+        revision: 1,
+        kind: 'lesson',
+        title: 'Back up first',
+        content: 'Long content.',
+        status: 'proposed',
+      },
+      replayed: false,
+    });
+    const response = (await pending) as {
+      content: Array<{ text: string }>;
+    };
+    const text = response.content[0].text;
+    expect(
+      text.startsWith(
+        '{"result":"proposed","id":"wmi_1","title":"Back up first"',
+      ),
+    ).toBe(true);
+    expect(JSON.parse(text)).toEqual({
+      result: 'proposed',
+      id: 'wmi_1',
+      title: 'Back up first',
+      revision: 1,
+      kind: 'lesson',
+      storeRevision: 9,
+      note: "Submitted, awaiting the workspace owner's confirmation on the Memory page; it is not recalled until confirmed.",
+    });
+    expect(text).not.toContain('Long content.');
+  });
+
+  test("only a batch of the owner's own messages is the owner's turn", () => {
+    const registrations: Record<
+      string,
+      { created_by?: string; owner_im_id?: string; owner_claim_source?: string }
+    > = {
+      'web:ws': { created_by: 'owner-1' },
+      'feishu:oc_group': {
+        created_by: 'owner-1',
+        owner_im_id: 'ou_owner',
+        owner_claim_source: 'auto_feishu',
+      },
+      'feishu:oc_claimed': {
+        created_by: 'owner-1',
+        owner_im_id: 'ou_claimer',
+        owner_claim_source: 'explicit',
+      },
+    };
+    const lookup = {
+      ownerUserId: 'owner-1',
+      workspaceJids: Object.keys(registrations),
+      channelType: (jid: string) => jid.split(':')[0],
+      registration: (jid: string) => registrations[jid],
+    };
+    // A first claim any member can make never vouches for the owner.
+    expect(workspaceOwnerImIds({ ...lookup, provider: 'feishu' })).toEqual([
+      'ou_owner',
+    ]);
+    const turnOf =
+      (...inputs: Array<{ sender: string; source_jid: string }>) =>
+      (isOwnerInput: (input: never) => boolean) => {
+        for (const input of inputs) {
+          if (!isOwnerInput({ ...input, is_from_me: 0 } as never)) {
+            throw new Error('not the owner');
+          }
+        }
+      };
+    const ownerTurn = (requireActiveOwnerTurn: ReturnType<typeof turnOf>) =>
+      isWorkspaceMemoryOwnerTurn({ ...lookup, requireActiveOwnerTurn });
+    expect(ownerTurn(turnOf({ sender: 'owner-1', source_jid: 'web:ws' }))).toBe(
+      true,
+    );
+    expect(
+      ownerTurn(turnOf({ sender: 'ou_owner', source_jid: 'feishu:oc_group' })),
+    ).toBe(true);
+    expect(
+      ownerTurn(
+        turnOf(
+          { sender: 'ou_owner', source_jid: 'feishu:oc_group' },
+          { sender: 'ou_member', source_jid: 'feishu:oc_group' },
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      ownerTurn(
+        turnOf({ sender: 'ou_claimer', source_jid: 'feishu:oc_claimed' }),
+      ),
+    ).toBe(false);
+    expect(
+      ownerTurn(() => {
+        throw new Error('automation or non-human');
+      }),
+    ).toBe(false);
   });
 });

@@ -208,6 +208,7 @@ export function AddMcpServerDialog({
               服务器 ID <span className="text-error">*</span>
             </Label>
             <Input
+              variant="code"
               id="mcp-id"
               value={id}
               onChange={(e) => setId(e.target.value)}
@@ -243,6 +244,7 @@ export function AddMcpServerDialog({
                   URL <span className="text-error">*</span>
                 </Label>
                 <Input
+                  variant="code"
                   id="mcp-url"
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
@@ -259,6 +261,7 @@ export function AddMcpServerDialog({
                   {headers.map((row, i) => (
                     <div key={i} className="flex items-center gap-2">
                       <Input
+                        variant="code"
                         value={row.key}
                         onChange={(e) => {
                           const next = [...headers];
@@ -270,6 +273,7 @@ export function AddMcpServerDialog({
                         className="w-2/5 font-mono"
                       />
                       <Input
+                        variant="code"
                         type="password"
                         value={row.value}
                         onChange={(e) => {
@@ -315,6 +319,7 @@ export function AddMcpServerDialog({
                   命令 <span className="text-error">*</span>
                 </Label>
                 <Input
+                  variant="code"
                   id="mcp-command"
                   value={command}
                   onChange={(e) => setCommand(e.target.value)}
@@ -331,6 +336,7 @@ export function AddMcpServerDialog({
                   {args.map((arg, i) => (
                     <div key={i} className="flex items-center gap-2">
                       <Input
+                        variant="code"
                         value={arg}
                         onChange={(e) => {
                           const next = [...args];
@@ -370,6 +376,7 @@ export function AddMcpServerDialog({
                   {env.map((row, i) => (
                     <div key={i} className="flex items-center gap-2">
                       <Input
+                        variant="code"
                         value={row.key}
                         onChange={(e) => {
                           const next = [...env];
@@ -381,6 +388,7 @@ export function AddMcpServerDialog({
                         className="w-2/5 font-mono"
                       />
                       <Input
+                        variant="code"
                         type="password"
                         value={row.value}
                         onChange={(e) => {

@@ -105,7 +105,7 @@ function fromStep(
     case 'text':
       return headline(
         'step',
-        '过程说明',
+        step.progress ? '进展' : '过程说明',
         stripInlineMarkdown(step.text ?? ''),
         false,
         from,

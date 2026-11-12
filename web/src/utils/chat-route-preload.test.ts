@@ -17,9 +17,9 @@ describe('chat route preload policy', () => {
     ['/login', '', '/', false],
     ['/register', '', '/', false],
     ['/setup/providers', '', '/', false],
-    ['/tasks', '', '/', false],
+    ['/automations', '', '/', false],
     ['/memory', '', '/', false],
-    ['/happyclaw/tasks', '', '/happyclaw/', false],
+    ['/happyclaw/automations/a1', '', '/happyclaw/', false],
     ['/happyclaw/', '#/memory', '/happyclaw/', false],
     ['/chatty', '', '/', false],
   ])('pathname=%s hash=%s base=%s => %s', (pathname, hash, base, expected) => {

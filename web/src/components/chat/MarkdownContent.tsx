@@ -4,6 +4,7 @@ import React, {
   Suspense,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -13,9 +14,15 @@ import ReactMarkdown, {
   type ExtraProps,
   type UrlTransform,
 } from 'react-markdown';
-import { Check, Copy } from 'lucide-react';
-import { PreviewDialog } from './PreviewDialog';
+import { Check, Copy, Download } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { toast } from 'sonner';
+import { useIsPhone } from '../layout/phone';
+import { DetailSheet } from './DetailSheet';
+import { downloadFromUrl, downloadTextFile } from '../../utils/download';
+import { ImageLightbox } from './ImageLightbox';
 import {
+  decodeMarkdownImagePath,
   resolveMarkdownImageSrc,
   resolveMarkdownLinkHref,
 } from '../../utils/markdownImageSrc';
@@ -23,10 +30,21 @@ import { cn } from '@/lib/utils';
 import { REMARK_REHYPE_OPTIONS } from '../../lib/markdown/pipeline';
 import { useCopyFeedback } from '../../lib/markdown/use-copy-feedback';
 import {
+  csvFileName,
+  readTable,
+  toCsv,
+  toTsv,
+} from '../../lib/markdown/table-data';
+import {
   RENDERED_CACHE_MAX_CHARS,
   rememberRendered,
   renderedCost,
 } from '../../lib/markdown/rendered-cache';
+import {
+  rehypeStreamFade,
+  syncStreamFade,
+  type StreamFade,
+} from '../../lib/markdown/rehype-stream-fade';
 
 const MermaidDiagram = lazy(() =>
   import('./MermaidDiagram').then((module) => ({
@@ -49,6 +67,20 @@ export interface MarkdownRendererProps {
    * between its parts.
    */
   trimEdges?: boolean;
+  /** Fade the words in as they arrive (the open block of a stream). */
+  fade?: StreamFade;
+  /**
+   * The whole reply is final, so its text may wrap for looks (default:
+   * neither streaming nor fading). A block that closed while the rest of
+   * its reply streams is not: re-breaking its lines can change its height
+   * and move the text arriving under it.
+   */
+  settled?: boolean;
+  /**
+   * Show 复制 and 下载 CSV under each table (default). A view that never
+   * settles, such as a sub-agent's text tail, leaves them out.
+   */
+  tableTools?: boolean;
 }
 
 interface MarkdownContentProps extends MarkdownRendererProps {
@@ -100,31 +132,44 @@ const markdownUrlTransform: UrlTransform = (url, key, node) =>
     ? url
     : defaultUrlTransform(url);
 
-function MarkdownImageLightbox({
-  src,
-  onClose,
-}: {
-  src: string;
-  onClose: () => void;
-}) {
-  return (
-    <PreviewDialog
-      title="图片预览"
-      onClose={onClose}
-      layer="nested"
-      className="left-1/2 top-1/2 max-h-[90dvh] max-w-[90vw] -translate-x-1/2 -translate-y-1/2"
-    >
-      <img
-        src={src}
-        alt="放大查看"
-        className="max-w-[90vw] max-h-[90vh] object-contain cursor-default"
-      />
-    </PreviewDialog>
-  );
+interface Gallery {
+  images: string[];
+  names: (string | undefined)[];
+  index: number;
+}
+
+/**
+ * The images of the Markdown around `image`, in order, and where it is among
+ * them: one viewer pages through a reply's images, as the attachments do.
+ */
+function markdownGallery(image: HTMLImageElement): Gallery {
+  const root = image.closest('[data-markdown-root]');
+  const all = root
+    ? [...root.querySelectorAll<HTMLImageElement>('img[data-hc-md-image]')]
+    : [image];
+  return {
+    images: all.map((img) => img.currentSrc || img.src),
+    names: all.map((img) => img.dataset.hcMdName),
+    index: Math.max(0, all.indexOf(image)),
+  };
+}
+
+/**
+ * The file name a Markdown image or link path ends in, decoded (the parser
+ * percent-encodes it), to show and save it under.
+ */
+function markdownFileName(src: string): string | undefined {
+  if (/^(?:data|blob):/i.test(src)) return undefined;
+  const base = src
+    .replace(/[?#].*$/, '')
+    .split('/')
+    .pop();
+  return base ? decodeMarkdownImagePath(base) : undefined;
 }
 
 function MarkdownImage({
   src,
+  name,
   alt,
   title,
   width,
@@ -132,14 +177,18 @@ function MarkdownImage({
   loading,
 }: {
   src?: string;
+  /** What saving it from the viewer names the file. */
+  name?: string;
   alt?: string;
   title?: string;
   width?: number | string;
   height?: number | string;
   loading?: 'lazy' | 'eager';
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const [gallery, setGallery] = useState<Gallery | null>(null);
   const [error, setError] = useState(false);
+  const open = (event: React.SyntheticEvent<HTMLImageElement>) =>
+    setGallery(markdownGallery(event.currentTarget));
 
   if (!src) return null;
   if (error) {
@@ -177,17 +226,26 @@ function MarkdownImage({
         aria-label={alt ? `放大图片：${alt}` : '放大图片'}
         className="my-3 h-auto max-w-full cursor-zoom-in rounded-lg border border-surface-border transition-colors hover:border-foreground/25"
         style={{ maxHeight: '400px', objectFit: 'contain' }}
-        onClick={() => setExpanded(true)}
+        data-hc-md-image=""
+        data-hc-md-name={name}
+        // A long press is the system image menu's, not the reply's menu.
+        data-native-image-menu=""
+        onClick={open}
         onKeyDown={(event) => {
           if (event.key === 'Enter' || event.key === ' ') {
             event.preventDefault();
-            setExpanded(true);
+            open(event);
           }
         }}
         onError={() => setError(true)}
       />
-      {expanded && (
-        <MarkdownImageLightbox src={src} onClose={() => setExpanded(false)} />
+      {gallery && (
+        <ImageLightbox
+          images={gallery.images}
+          names={gallery.names}
+          initialIndex={gallery.index}
+          onClose={() => setGallery(null)}
+        />
       )}
     </>
   );
@@ -200,6 +258,88 @@ function extractText(node: React.ReactNode): string {
     return extractText((node.props as { children?: React.ReactNode }).children);
   }
   return '';
+}
+
+/**
+ * On a phone a wide table scrolls sideways under its first column, so the
+ * row it is reading stays named. Not in a shared image, which does not scroll.
+ * The pinned cells paint `--md-table-bg`, the surface the reply sits on: a
+ * container that is not the page background (a card, a sheet) sets it.
+ */
+const STICKY_FIRST_CELL =
+  'phone:first:sticky phone:first:left-0 phone:first:z-1 phone:first:shadow-[inset_-1px_0_0_var(--surface-border)] [.share-card-content_&]:static';
+const TH_CLASS = cn(
+  'border-b border-surface-border px-3 py-2 text-start align-top text-caption font-medium whitespace-nowrap text-foreground/75',
+  STICKY_FIRST_CELL,
+  'phone:first:bg-[color-mix(in_srgb,var(--muted)_60%,var(--md-table-bg,var(--background)))]',
+);
+const TABLE_TOOL_CLASS =
+  'inline-flex h-6 cursor-pointer items-center gap-1 rounded-md px-1.5 transition-colors hover:bg-surface-hover hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none pointer-coarse:h-9 pointer-coarse:px-2.5';
+
+/** Whether tables show their tools (`MarkdownRendererProps.tableTools`). */
+const MarkdownTableToolsContext = createContext(true);
+
+/**
+ * A reply's table, with 复制 (tab-separated, so a spreadsheet paste splits it
+ * into cells) and 下载 CSV under it, usable once the reply has settled.
+ */
+function MarkdownTable({ children }: { children: React.ReactNode }) {
+  const streaming = useContext(MarkdownStreamingContext);
+  const tools = useContext(MarkdownTableToolsContext);
+  const tableRef = useRef<HTMLTableElement>(null);
+  const { copied, copy } = useCopyFeedback();
+  const rows = () => (tableRef.current ? readTable(tableRef.current) : []);
+  const download = () =>
+    downloadTextFile(toCsv(rows()), csvFileName(), 'text/csv;charset=utf-8');
+  return (
+    <div data-md-table="" className="group/table my-4">
+      <HorizontalScroll
+        as="div"
+        className="max-w-full overflow-x-auto overflow-y-hidden overscroll-x-contain rounded-lg border border-surface-border [-webkit-overflow-scrolling:touch] [touch-action:pan-x_pan-y]"
+      >
+        <table
+          ref={tableRef}
+          className="min-w-full border-separate border-spacing-0 font-sans"
+        >
+          {children}
+        </table>
+      </HorizontalScroll>
+      {/* Held, not left out, while the reply streams: the text under the
+          table does not move down when the tools appear. */}
+      {tools && (
+        <div
+          data-md-table-tools=""
+          inert={streaming}
+          className={cn(
+            'mt-1 flex justify-end gap-0.5 font-sans text-caption text-muted-foreground opacity-0 transition-opacity select-none group-hover/table:opacity-100 focus-within:opacity-100 pointer-coarse:opacity-100 [.share-card-content_&]:hidden',
+            streaming && 'invisible',
+          )}
+        >
+          <button
+            type="button"
+            onClick={() => copy(toTsv(rows()))}
+            aria-label="复制表格，可直接粘贴到表格软件"
+            className={TABLE_TOOL_CLASS}
+          >
+            {copied ? <Check size={13} /> : <Copy size={13} />}
+            {copied ? '已复制' : '复制'}
+          </button>
+          <span className="sr-only" aria-live="polite">
+            {copied ? '已复制表格' : ''}
+          </span>
+          <button
+            type="button"
+            onClick={download}
+            aria-label="下载为 CSV"
+            className={TABLE_TOOL_CLASS}
+          >
+            <Download size={13} />
+            CSV
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 type ScrollFade = 'none' | 'start' | 'end' | 'both';
@@ -383,6 +523,100 @@ function scrollToMarkdownAnchor(event: React.MouseEvent<HTMLAnchorElement>) {
   }
 }
 
+/** Workspace files a phone shows in the image viewer rather than a sheet. */
+const IMAGE_FILE = /\.(?:avif|bmp|gif|jpe?g|png|svg|webp)$/i;
+
+/**
+ * A link in Markdown. In-page links (footnotes) jump within the message, with
+ * a finger-sized hit area; links elsewhere open in a new tab. A workspace
+ * file on a phone opens inside the app instead: a new tab would leave the
+ * installed PWA for the browser. An image goes to the image viewer, anything
+ * else to a sheet that previews it, with a download for what cannot be shown.
+ */
+function MarkdownLink({
+  href,
+  groupJid,
+  children,
+  ...rest
+}: Omit<React.ComponentPropsWithoutRef<'a'>, 'className'> & {
+  groupJid?: string;
+}) {
+  const isPhone = useIsPhone();
+  const [preview, setPreview] = useState(false);
+  const inPage = href?.startsWith('#') ?? false;
+  const resolved =
+    href && !inPage ? resolveMarkdownLinkHref(href, groupJid) : href;
+  const workspaceFile = !!href && !inPage && resolved !== href;
+  const inApp = isPhone && workspaceFile;
+  const name = (href && markdownFileName(href)) || '文件';
+  return (
+    <>
+      <a
+        {...rest}
+        href={resolved}
+        {...(inPage
+          ? { onClick: scrollToMarkdownAnchor, 'data-hc-anchor': '' }
+          : inApp
+            ? {
+                onClick: (event: React.MouseEvent<HTMLAnchorElement>) => {
+                  event.preventDefault();
+                  setPreview(true);
+                },
+              }
+            : { target: '_blank', rel: 'noopener noreferrer' })}
+        className={cn(
+          'text-primary-text underline [overflow-wrap:anywhere] hover:text-primary-text',
+          // A footnote mark is a few pixels wide: the finger gets 44.
+          inPage &&
+            "pointer-coarse:relative pointer-coarse:after:absolute pointer-coarse:after:top-1/2 pointer-coarse:after:left-1/2 pointer-coarse:after:size-11 pointer-coarse:after:-translate-1/2 pointer-coarse:after:content-['']",
+        )}
+      >
+        {children}
+      </a>
+      {preview &&
+        resolved &&
+        (IMAGE_FILE.test(name) ? (
+          <ImageLightbox
+            images={[resolved]}
+            names={[name]}
+            initialIndex={0}
+            onClose={() => setPreview(false)}
+          />
+        ) : (
+          <DetailSheet
+            title={name}
+            onClose={() => setPreview(false)}
+            className="h-[calc(var(--vvh,100dvh)-4rem)]"
+            bodyClassName="flex flex-col p-0"
+            action={
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  // iOS and an installed app ignore a link's `download`.
+                  void downloadFromUrl(
+                    new URL(resolved, window.location.href).href,
+                    name,
+                  ).catch(() => toast.error('下载失败'))
+                }
+              >
+                <Download aria-hidden="true" />
+                下载
+              </Button>
+            }
+          >
+            <iframe
+              title={name}
+              src={resolved}
+              data-hc-file-preview=""
+              className="min-h-0 w-full flex-1 border-t border-surface-border bg-background"
+            />
+          </DetailSheet>
+        ))}
+    </>
+  );
+}
+
 type MarkdownOptions = React.ComponentProps<typeof ReactMarkdown>;
 type MarkdownComponents = NonNullable<MarkdownOptions['components']>;
 
@@ -443,6 +677,7 @@ function markdownComponents(
             ? resolveMarkdownImageSrc(src, groupJid)
             : undefined
         }
+        name={typeof src === 'string' ? markdownFileName(src) : undefined}
         alt={alt}
         title={title}
         width={width}
@@ -456,33 +691,12 @@ function markdownComponents(
       children,
       className: _className,
       ...rest
-    }: React.ComponentPropsWithoutRef<'a'> & ExtraProps) => {
-      const inPage = href?.startsWith('#') ?? false;
-      return (
-        <a
-          {...rest}
-          href={
-            href && !inPage ? resolveMarkdownLinkHref(href, groupJid) : href
-          }
-          {...(inPage
-            ? { onClick: scrollToMarkdownAnchor }
-            : { target: '_blank', rel: 'noopener noreferrer' })}
-          className="text-primary-text underline [overflow-wrap:anywhere] hover:text-primary-text"
-        >
-          {children}
-        </a>
-      );
-    },
-    table: ({ children }) => (
-      <HorizontalScroll
-        as="div"
-        className="my-4 max-w-full overflow-x-auto overflow-y-hidden overscroll-x-contain rounded-lg border border-surface-border [-webkit-overflow-scrolling:touch] [touch-action:pan-x_pan-y]"
-      >
-        <table className="min-w-full border-separate border-spacing-0 font-sans">
-          {children}
-        </table>
-      </HorizontalScroll>
+    }: React.ComponentPropsWithoutRef<'a'> & ExtraProps) => (
+      <MarkdownLink {...rest} href={href} groupJid={groupJid}>
+        {children}
+      </MarkdownLink>
     ),
+    table: ({ children }) => <MarkdownTable>{children}</MarkdownTable>,
     thead: ({ children }) => <thead className="bg-muted/60">{children}</thead>,
     tbody: ({ children }) => <tbody>{children}</tbody>,
     tr: ({ children }) => (
@@ -492,10 +706,7 @@ function markdownComponents(
     ),
     // GFM column alignment arrives as an inline `text-align` style.
     th: ({ children, style }) => (
-      <th
-        style={style}
-        className="border-b border-surface-border px-3 py-2 text-start align-top text-caption font-medium whitespace-nowrap text-foreground/75"
-      >
+      <th style={style} className={TH_CLASS}>
         {children}
       </th>
     ),
@@ -505,6 +716,8 @@ function markdownComponents(
         className={cn(
           'min-w-[6rem] max-w-[28rem] px-3 py-2 text-start align-top whitespace-normal text-foreground [overflow-wrap:anywhere]',
           tableTextClass,
+          STICKY_FIRST_CELL,
+          'phone:first:bg-[var(--md-table-bg,var(--background))]',
         )}
       >
         {children}
@@ -608,13 +821,14 @@ function markdownComponents(
     details: ({ children, open }) => (
       <details
         open={open}
-        className="my-3 rounded-lg border border-surface-border px-3 py-2 [&>*:last-child]:mb-0 [&[open]>summary]:mb-2"
+        className="my-3 rounded-lg border border-surface-border px-3 py-2 pointer-coarse:pt-0 [&>*:last-child]:mb-0 [&[open]>summary]:mb-2"
       >
         {children}
       </details>
     ),
     summary: ({ children }) => (
-      <summary className="cursor-pointer font-medium select-none marker:text-muted-foreground">
+      // A finger-high row on touch: the border box's top padding moves into it.
+      <summary className="cursor-pointer font-medium select-none marker:text-muted-foreground pointer-coarse:py-2.5 pointer-coarse:leading-6">
         {children}
       </summary>
     ),
@@ -639,6 +853,9 @@ export function MarkdownContent({
   eagerImages = false,
   streaming = false,
   trimEdges = true,
+  fade,
+  settled = !streaming && !fade,
+  tableTools = true,
   remarkPlugins,
   rehypePlugins,
   pipeline,
@@ -651,18 +868,29 @@ export function MarkdownContent({
     () => sharedMarkdownComponents(variant, groupJid, eagerImages),
     [variant, groupJid, eagerImages],
   );
+  const plugins = useMemo(
+    () => (fade ? [...rehypePlugins, [rehypeStreamFade, fade]] : rehypePlugins),
+    [rehypePlugins, fade],
+  );
+  const rootRef = useRef<HTMLDivElement>(null);
+  // Every commit may mount word spans (a new word, or a re-read structure).
+  useLayoutEffect(() => {
+    if (fade && rootRef.current) syncStreamFade(rootRef.current);
+  });
   const rendered = useMemo(() => {
     // react-markdown's sync renderer is a plain function of its options.
     const render = () =>
       ReactMarkdown({
         remarkPlugins: remarkPlugins as MarkdownOptions['remarkPlugins'],
-        rehypePlugins: rehypePlugins as MarkdownOptions['rehypePlugins'],
+        rehypePlugins: plugins as MarkdownOptions['rehypePlugins'],
         remarkRehypeOptions: REMARK_REHYPE_OPTIONS,
         urlTransform: markdownUrlTransform,
         components,
         children: content,
       });
-    if (streaming || content.length > RENDERED_CACHE_MAX_CHARS) return render();
+    if (streaming || fade || content.length > RENDERED_CACHE_MAX_CHARS) {
+      return render();
+    }
     return rememberRendered(
       [pipeline, variant, groupJid ?? '', eagerImages, content].join('\0'),
       renderedCost(content, pipeline.includes('code')),
@@ -672,7 +900,7 @@ export function MarkdownContent({
     content,
     components,
     remarkPlugins,
-    rehypePlugins,
+    plugins,
     pipeline,
     streaming,
     variant,
@@ -682,6 +910,7 @@ export function MarkdownContent({
 
   return (
     <div
+      ref={rootRef}
       data-markdown-root=""
       className={cn(
         textSizeClass,
@@ -695,10 +924,16 @@ export function MarkdownContent({
         // card lets wide tables overflow so it can grow to fit them.
         'overflow-clip [overflow-clip-margin:0.25rem] [.share-card-content_&]:overflow-visible',
         trimEdges && '[&>*:first-child]:mt-0 [&>*:last-child]:mb-0',
+        // A settled reply wraps like edited text: no lone character or
+        // punctuation on a paragraph's last line, headings in even lines.
+        settled &&
+          '[&_li]:text-pretty [&_p]:text-pretty [&_:is(h1,h2,h3,h4)]:text-balance',
       )}
     >
       <MarkdownStreamingContext.Provider value={streaming}>
-        {rendered}
+        <MarkdownTableToolsContext.Provider value={tableTools}>
+          {rendered}
+        </MarkdownTableToolsContext.Provider>
       </MarkdownStreamingContext.Provider>
     </div>
   );

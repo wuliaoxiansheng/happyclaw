@@ -80,7 +80,27 @@ export interface ChannelAccount {
     bypassProxy?: boolean;
     streamingMode?: 'card' | 'text' | 'edit' | 'off';
     phoneNumber?: string;
+    domain?: FeishuBrand;
   };
+}
+
+export type FeishuBrand = 'feishu' | 'lark';
+
+/** A one-click Feishu/Lark app creation, polled by the server. */
+export interface FeishuRegistration {
+  id: string;
+  status: 'pending' | 'creating' | 'success' | 'expired' | 'denied' | 'error';
+  brand: FeishuBrand;
+  /** Present while pending. */
+  user_code?: string;
+  verification_url?: string;
+  qr_data_url?: string;
+  expires_at: string;
+  interval: number;
+  error?: string;
+  account_id?: string;
+  /** Event subscription page of the new app. */
+  event_console_url?: string;
 }
 
 export interface ChannelAccountCreateInput {
@@ -133,7 +153,17 @@ interface ChannelAccountsState {
   toggleAccount: (id: string) => Promise<ChannelAccount>;
   deleteAccount: (id: string) => Promise<void>;
   applyStatusEvent: (event: ChannelAccountStatusEvent) => void;
+  beginFeishuRegistration: (input: {
+    name?: string;
+    brand: FeishuBrand;
+  }) => Promise<FeishuRegistration>;
+  getFeishuRegistration: (
+    id: string,
+  ) => Promise<{ registration: FeishuRegistration; account?: ChannelAccount }>;
+  cancelFeishuRegistration: (id: string) => Promise<void>;
 }
+
+const FEISHU_REGISTRATIONS_PATH = '/api/channel-accounts/feishu/registrations';
 
 export function mergeChannelAccount(
   accounts: ChannelAccount[],
@@ -285,6 +315,35 @@ export const useChannelAccountsStore = create<ChannelAccountsState>((set) => ({
       accounts: state.accounts.filter((account) => account.id !== id),
       error: null,
     }));
+  },
+
+  beginFeishuRegistration: async (input) => {
+    // Starting waits for Feishu to issue a code; allow more than the default.
+    const result = await api.post<{ registration: FeishuRegistration }>(
+      FEISHU_REGISTRATIONS_PATH,
+      input,
+      20_000,
+    );
+    return result.registration;
+  },
+
+  getFeishuRegistration: async (id) => {
+    const result = await api.get<{
+      registration: FeishuRegistration;
+      account?: ChannelAccount;
+    }>(`${FEISHU_REGISTRATIONS_PATH}/${encodeURIComponent(id)}`);
+    const account = result.account;
+    if (account) {
+      set((state) => ({
+        accounts: mergeChannelAccount(state.accounts, account),
+        error: null,
+      }));
+    }
+    return result;
+  },
+
+  cancelFeishuRegistration: async (id) => {
+    await api.delete(`${FEISHU_REGISTRATIONS_PATH}/${encodeURIComponent(id)}`);
   },
 
   applyStatusEvent: (event) => {

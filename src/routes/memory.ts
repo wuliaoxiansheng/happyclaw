@@ -6,12 +6,14 @@ import { authMiddleware } from '../middleware/auth.js';
 import {
   WorkspaceMemoryCreateSchema,
   WorkspaceMemoryForgetSchema,
+  WorkspaceMemoryProposalAnswerSchema,
   WorkspaceMemoryListQuerySchema,
   WorkspaceMemoryPatchSchema,
   WorkspaceMemorySearchQuerySchema,
   WorkspaceMemoryVersionsQuerySchema,
 } from '../schemas.js';
 import {
+  answerWorkspaceMemoryProposal,
   createWorkspaceMemory,
   forgetWorkspaceMemory,
   getWorkspaceMemory,
@@ -41,15 +43,14 @@ function serviceError(c: Context, error: unknown): Response {
     }
     if (
       error.code === 'revision_conflict' ||
-      error.code === 'idempotency_conflict'
+      error.code === 'idempotency_conflict' ||
+      error.code === 'not_proposed' ||
+      error.code === 'memory_duplicate'
     ) {
+      // details: currentRevision / storeRevision, and the `existing` item a
+      // duplicate names.
       return c.json(
-        {
-          error: error.code,
-          message: error.message,
-          currentRevision: error.details?.currentRevision,
-          storeRevision: error.details?.storeRevision,
-        },
+        { error: error.code, message: error.message, ...error.details },
         409,
       );
     }
@@ -202,6 +203,34 @@ memoryRoutes.delete('/workspaces/:workspaceJid/items/:itemId', async (c) => {
     return serviceError(c, error);
   }
 });
+
+// A proposal (written by a non-owner or scheduled turn) waits for the owner:
+// confirming makes it active memory, rejecting forgets it.
+for (const answer of ['confirm', 'reject'] as const) {
+  memoryRoutes.post(
+    `/workspaces/:workspaceJid/items/:itemId/${answer}`,
+    async (c) => {
+      const body = await c.req.json().catch(() => null);
+      const parsed = WorkspaceMemoryProposalAnswerSchema.safeParse(body);
+      if (!parsed.success) return validationError(c, parsed.error.format());
+      try {
+        const user = c.get('user') as AuthUser;
+        return c.json(
+          answerWorkspaceMemoryProposal({
+            actor: actor(user),
+            workspaceJid: c.req.param('workspaceJid'),
+            itemId: c.req.param('itemId'),
+            sourceType: 'web_user',
+            answer,
+            ...parsed.data,
+          }),
+        );
+      } catch (error) {
+        return serviceError(c, error);
+      }
+    },
+  );
+}
 
 const legacyMemoryGone = (c: Context) =>
   c.json(

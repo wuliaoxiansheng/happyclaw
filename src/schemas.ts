@@ -5,6 +5,21 @@ import { AGENT_EFFORT_LEVELS } from './agent-effort.js';
 import { ALL_PERMISSIONS } from './permissions.js';
 import type { Permission } from './types.js';
 import { MAX_GROUP_NAME_LEN } from './group-constants.js';
+import { AUTOMATION_LIMITS } from './automation.js';
+import {
+  TEAM_RULE_LIMIT,
+  TEAM_RULE_NAME_LIMIT,
+  TEAM_RULE_TEXT_LIMIT,
+} from './work-items.js';
+import {
+  getModelPreset,
+  isValidModelId,
+  MAX_CONTEXT_WINDOW,
+  MAX_PROVIDER_MODEL_ID_LENGTH,
+  MAX_PROVIDER_MODELS,
+  MIN_CONTEXT_WINDOW,
+  MODEL_EFFORTS,
+} from './model-providers.js';
 
 export const ChannelProviderSchema = z.enum([
   'feishu',
@@ -53,171 +68,103 @@ export const ChannelAccountPatchSchema = z.object({
   credentials: ChannelCredentialsSchema.optional(),
 });
 
+/** Start a one-click Feishu/Lark app creation (device-code registration). */
+export const FeishuAppRegistrationCreateSchema = z.object({
+  name: z.string().trim().min(1).max(80).optional(),
+  brand: z.enum(['feishu', 'lark']).optional().default('feishu'),
+});
+
+const AutomationScheduleSchema = z.object({
+  kind: z.enum(['cron', 'interval', 'once', 'manual']),
+  cronExpr: z.string().max(200).nullable().optional(),
+  timezone: z.string().max(64).nullable().optional(),
+  intervalMs: z.number().int().positive().nullable().optional(),
+  runAt: z.string().max(64).nullable().optional(),
+});
+
+const AutomationPreRunCheckSchema = z.object({
+  command: z.string().max(AUTOMATION_LIMITS.scriptCommandMax * 2),
+  timeoutMs: z.number().int().positive().nullable().optional(),
+});
+
 /**
- * A schedule's prompt is replayed on a timer, so it is stored content with no
- * natural bound.
- *
- * Exported because the REST schemas are not the only writers: the MCP/IPC
- * `schedule_task` and `update_task` handlers call createTask/updateTask
- * directly. The Agent path is the one this cap exists for, so it must use the
- * same number rather than leave the hole open.
+ * Shape and a generous size cap only: the automation service applies the
+ * shared validateAutomationDraft rules, cron syntax and the permission
+ * checks, so REST and the agent tools reject the same drafts with the same
+ * messages.
  */
-export const MAX_TASK_PROMPT_LENGTH = 16384;
-
-/** Same reasoning as MAX_TASK_PROMPT_LENGTH, for script tasks. */
-export const MAX_TASK_SCRIPT_COMMAND_LENGTH = 4096;
-
-export const TaskPatchSchema = z.object({
-  chat_jid: z.string().min(1).optional(),
-  // Same bound as TaskCreateSchema; an update must not be a way around it.
-  prompt: z.string().max(MAX_TASK_PROMPT_LENGTH).optional(),
-  schedule_type: z.enum(['cron', 'interval', 'once']).optional(),
-  schedule_value: z.string().optional(),
-  context_mode: z.enum(['group', 'isolated']).optional(),
-  execution_type: z.enum(['agent', 'script']).optional(),
-  execution_mode: z.enum(['host', 'container']).optional(),
-  script_command: z
+const AutomationDraftFields = {
+  name: z.string().max(200),
+  prompt: z
     .string()
-    .max(MAX_TASK_SCRIPT_COMMAND_LENGTH)
+    .max(AUTOMATION_LIMITS.promptMax * 2)
     .nullable()
     .optional(),
-  status: z.enum(['active', 'paused']).optional(),
-  // next_run 必须是可解析的 ISO 日期。schedule_value 在 PATCH 路由里随
-  // schedule_type 决定语义（cron/interval/once 各有要求），路由层会单独检查。
-  // 这里只兜底 next_run 的格式，避免 garbage-in 让 scheduler computeNextRun 抛
-  // RangeError 把任务永久卡死在 runningTaskIds（高危 bug 修复）。
-  next_run: z
+  stopWhen: z.string().max(2000).nullable().optional(),
+  schedule: AutomationScheduleSchema,
+  endAt: z.string().max(64).nullable().optional(),
+  silentWhenIdle: z.boolean().optional(),
+  preRunCheck: AutomationPreRunCheckSchema.nullable().optional(),
+  scriptCommand: z
     .string()
-    .refine((v) => !isNaN(Date.parse(v)), 'next_run must be ISO 8601')
-    .optional(),
-  notify_channels: z
-    .array(
-      z.enum([
-        'feishu',
-        'telegram',
-        'qq',
-        'wechat',
-        'wecom',
-        'dingtalk',
-        'discord',
-        'whatsapp',
-      ]),
-    )
+    .max(AUTOMATION_LIMITS.scriptCommandMax * 2)
     .nullable()
     .optional(),
+};
+
+const AutomationSessionModeSchema = z.enum(['fresh', 'persistent', 'bound']);
+
+export const AutomationCreateSchema = z.object({
+  ...AutomationDraftFields,
+  workspaceJid: z.string().min(1).max(512),
+  sessionMode: AutomationSessionModeSchema,
+  targetSessionJid: z.string().max(512).nullable().optional(),
+  execution: z.enum(['agent', 'script']).optional(),
 });
 
-export const TaskPurgeSchema = z.object({
-  tasks: z
-    .array(
-      z.object({
-        id: z.string().trim().min(1).max(128),
-        expected_revision: z.number().int().positive(),
-      }),
-    )
-    .min(1)
-    .max(500),
-});
-
-// Cron 表达式校验：5 段（分 时 日 月 周）或 6 段（秒 分 时 日 月 周）
-// 也允许预定义表达式如 @daily, @hourly 等
-const CRON_REGEX =
-  /^(@(yearly|annually|monthly|weekly|daily|hourly|minutely|secondly)|(\S+\s+){4,5}\S+)$/;
-
-// interval 调度上限：1 年毫秒数。再大就接近 JS Date 的安全范围边界，
-// `new Date(Date.now() + ms).toISOString()` 会抛 RangeError。1 年内任何场景
-// 都该用 cron 而不是 interval，所以这是合理的硬上限。
-const MAX_INTERVAL_MS = 365 * 24 * 60 * 60 * 1000;
-const MIN_INTERVAL_MS = 60 * 1000;
-
-// JS Date 安全上限（约 8.64e15ms after 1970）。once 任务给 100 年余量足够。
-const MAX_ONCE_TIMESTAMP_MS = 100 * 365 * 24 * 60 * 60 * 1000;
-
-export const TaskCreateSchema = z
-  .object({
-    group_folder: z.string().min(1).optional(),
-    chat_jid: z.string().min(1).optional(),
-    // See MAX_TASK_PROMPT_LENGTH: the same bound applies on every writer.
-    prompt: z.string().max(MAX_TASK_PROMPT_LENGTH).optional().default(''),
-    schedule_type: z.enum(['cron', 'interval', 'once']),
-    schedule_value: z.string().min(1),
-    context_mode: z.enum(['group', 'isolated']).optional(),
-    execution_type: z.enum(['agent', 'script']).optional(),
-    execution_mode: z.enum(['host', 'container']).optional(),
-    script_command: z.string().max(MAX_TASK_SCRIPT_COMMAND_LENGTH).optional(),
-    notify_channels: z
-      .array(
-        z.enum([
-          'feishu',
-          'telegram',
-          'qq',
-          'wechat',
-          'wecom',
-          'dingtalk',
-          'discord',
-          'whatsapp',
-        ]),
-      )
-      .nullable()
-      .optional(),
-  })
-  .superRefine((data, ctx) => {
-    const execType = data.execution_type || 'agent';
-    if (execType === 'agent' && !data.prompt?.trim()) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['prompt'],
-        message: '智能体模式下 prompt 为必填项',
-      });
-    }
-    if (execType === 'script' && !data.script_command?.trim()) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['script_command'],
-        message: '脚本模式下 script_command 为必填项',
-      });
-    }
-    if (data.schedule_type === 'cron') {
-      if (!CRON_REGEX.test(data.schedule_value.trim())) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['schedule_value'],
-          message: 'Invalid cron expression (expected 5 or 6 fields)',
-        });
-      }
-    } else if (data.schedule_type === 'interval') {
-      const num = Number(data.schedule_value);
-      if (!Number.isFinite(num) || num < MIN_INTERVAL_MS) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['schedule_value'],
-          message: 'Interval must be at least 60000 milliseconds',
-        });
-      } else if (num > MAX_INTERVAL_MS) {
-        // 防止 `new Date(Date.now() + ms).toISOString()` 抛 RangeError 让请求 500
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['schedule_value'],
-          message: `Interval exceeds maximum (${MAX_INTERVAL_MS} ms = 1 year). Use cron for longer schedules.`,
-        });
-      }
-    } else if (data.schedule_type === 'once') {
-      const ts = Date.parse(data.schedule_value);
-      if (isNaN(ts)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['schedule_value'],
-          message: 'Once schedule must be a valid ISO 8601 date string',
-        });
-      } else if (Math.abs(ts) > MAX_ONCE_TIMESTAMP_MS) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['schedule_value'],
-          message: 'Once schedule out of representable range',
-        });
-      }
-    }
+export const AutomationPatchSchema = z
+  .object(AutomationDraftFields)
+  .partial()
+  .extend({
+    expectedRevision: z.number().int().positive(),
+    sessionMode: AutomationSessionModeSchema.optional(),
+    targetSessionJid: z.string().max(512).nullable().optional(),
   });
+
+export const AutomationMarkReadSchema = z.object({
+  runIds: z.array(z.string().min(1).max(128)).max(500).optional(),
+});
+
+// Team mode (团队模式): a group mount's settings as the owner saves them.
+// `version` is the server's to bump, so the body never carries it.
+
+const TeamUnaddressedSchema = z.enum(['inferred', 'ignore']);
+
+export const TeamSettingsBodySchema = z.object({
+  settings: z.object({
+    enabled: z.boolean(),
+    admission: z.object({
+      listedUnaddressed: TeamUnaddressedSchema,
+      unlistedAddressed: z.enum(['explicit', 'inferred', 'ignore']),
+      unlistedUnaddressed: TeamUnaddressedSchema,
+    }),
+    acceptMode: z.enum(['off', 'observe', 'auto']),
+    rules: z
+      .array(
+        z.object({
+          id: z.string().min(1).max(64),
+          name: z.string().trim().min(1).max(TEAM_RULE_NAME_LIMIT),
+          instruction: z.string().trim().min(1).max(TEAM_RULE_TEXT_LIMIT),
+          enabled: z.boolean(),
+        }),
+      )
+      .max(TEAM_RULE_LIMIT)
+      .refine(
+        (rules) => new Set(rules.map((rule) => rule.id)).size === rules.length,
+        { message: 'Rule ids must be unique' },
+      ),
+  }),
+});
 
 // 单张图片附件上限 5MB（base64 编码后约 6.67MB）
 const MAX_IMAGE_BASE64_LENGTH = (5 * 1024 * 1024 * 4) / 3; // ~6.67M chars
@@ -247,6 +194,10 @@ export const MessageCreateSchema = z
     content: z.string().max(MAX_MESSAGE_CONTENT_LENGTH).optional().default(''),
     attachments: z.array(MessageAttachmentSchema).max(10).optional(),
     followUpBehavior: z.enum(['queue', 'steer']).optional().default('queue'),
+    // Idempotency key minted by the client for one logical send and reused
+    // when it resends after a timeout, so a slow network never stores (and
+    // bills) the same message twice.
+    clientMessageId: z.string().uuid().optional(),
   })
   .superRefine((data, ctx) => {
     const hasContent = data.content.trim().length > 0;
@@ -267,17 +218,50 @@ const InteractionModeSchema = z
 /** How much of a proactive turn's process the Web shows (see ProcessVisibility). */
 export const ProcessVisibilitySchema = z.enum(['hidden', 'activity', 'full']);
 
+/** How a workspace's sessions take on work (see WorkMode). */
+export const WorkModeSchema = z.enum(['single', 'multi']);
+
 export const ChannelMountInteractionModePatchSchema = z
   .object({
     interaction_mode_override: z.enum(['assistant', 'proactive']).nullable(),
   })
   .strict();
 
-export const AdditionalMountCreateSchema = z
+export const AdditionalMountCreateSchema = z.union([
+  z
+    .object({
+      host_path: z.string().trim().min(1).max(4096),
+      container_path: z.string().trim().min(1).max(512),
+      readonly: z.boolean().optional().default(true),
+    })
+    .strict(),
+  z
+    .object({
+      source: z.string().trim().min(1).max(63),
+      sub_path: z.string().max(1024).optional(),
+      container_path: z.string().trim().min(1).max(512),
+      readonly: z.boolean().optional().default(true),
+    })
+    .strict(),
+]);
+
+/** Admin storage source editor; the id comes from the URL. */
+export const StorageSourceSaveSchema = z
   .object({
-    host_path: z.string().trim().min(1).max(4096),
-    container_path: z.string().trim().min(1).max(512),
-    readonly: z.boolean().optional().default(true),
+    type: z.enum(['nfs', 'cifs']),
+    server: z.string().trim().min(1).max(253),
+    exportPath: z.string().trim().min(1).max(1024).optional(),
+    nfsVersion: z.enum(['3', '4', '4.1', '4.2']).optional(),
+    share: z.string().trim().min(1).max(80).optional(),
+    username: z.string().trim().max(256).optional(),
+    domain: z.string().trim().max(256).optional(),
+    smbVersion: z.enum(['2.1', '3.0', '3.1.1']).optional(),
+    allowReadWrite: z.boolean(),
+    description: z.string().max(200).optional(),
+    // Write-only: omitted keeps the stored password, '' removes it.
+    password: z.string().max(1024).optional(),
+    // Confirms revoking read-write from workspaces that mount it read-write.
+    force: z.boolean().optional(),
   })
   .strict();
 
@@ -290,6 +274,7 @@ export const GroupCreateSchema = z.object({
   execution_mode: z.enum(['container', 'host']).optional(),
   interaction_mode: InteractionModeSchema.optional(),
   process_visibility: ProcessVisibilitySchema.optional(),
+  work_mode: WorkModeSchema.optional(),
   custom_cwd: z
     .string()
     .optional()
@@ -311,22 +296,54 @@ export const GroupAgentProfilePatchSchema = z.object({
 
 /**
  * Chat composer model picker: null returns the conversation to the default.
- * `model` and `effort` pick inside a ChatGPT configuration; the request replaces
- * the whole choice, so leaving them out follows the configuration's defaults.
- * The catalog decides which values are valid, so they are plain strings here.
+ * `model` picks inside any configuration, `effort` only inside a ChatGPT one;
+ * the request replaces the whole choice, so leaving them out follows the
+ * configuration's defaults. The configuration's model list (a ChatGPT
+ * catalog) decides which values are valid, so they are plain strings here.
  */
 export const SessionModelSelectionSchema = z.object({
   agentId: z.string().trim().min(1).max(128).nullable().optional(),
   modelConfigId: z.string().trim().min(1).max(128).nullable(),
-  model: z.string().trim().min(1).max(128).nullable().optional(),
+  model: z
+    .string()
+    .trim()
+    .min(1)
+    .max(MAX_PROVIDER_MODEL_ID_LENGTH)
+    .nullable()
+    .optional(),
   effort: z.string().trim().min(1).max(32).nullable().optional(),
 });
+
+/**
+ * An Agent's model within its configuration; null runs the configuration's
+ * default. Whether the configuration offers it is checked by the route.
+ */
+const AgentProfileModelSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(MAX_PROVIDER_MODEL_ID_LENGTH)
+  .nullable()
+  .optional();
 
 const AgentProfileRuntimePolicyModeSchema = z.enum([
   'inherit',
   'custom',
   'disabled',
 ]);
+
+/**
+ * An MCP server id, bare or scoped as `system:`/`user:`; the scope does not
+ * count against the id's own limit, so an exported reference imports back.
+ */
+const McpPolicyReferenceSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .refine(
+    (reference) => reference.replace(/^(?:system|user):/, '').length <= 128,
+    'MCP id is too long',
+  );
 
 export const AgentProfileRuntimePolicySchema = z
   .object({
@@ -371,13 +388,15 @@ export const AgentProfileRuntimePolicySchema = z
     mcp: z
       .object({
         mode: AgentProfileRuntimePolicyModeSchema.optional(),
-        ids: z.array(z.string().trim().min(1).max(128)).max(100).optional(),
+        ids: z.array(McpPolicyReferenceSchema).max(100).optional(),
       })
       .optional(),
   })
   .strict();
 
-const AgentPromptTextSchema = z.string().max(20000);
+/** Per-section limit of an Agent's four prompts, in UTF-16 code units. */
+export const AGENT_PROMPT_MAX_CHARS = 20000;
+const AgentPromptTextSchema = z.string().max(AGENT_PROMPT_MAX_CHARS);
 const AgentPromptModeSchema = z.enum(['append', 'replace']);
 const AgentPromptSectionsSchema = z.object({
   identity_prompt: AgentPromptTextSchema,
@@ -406,31 +425,66 @@ function validatePromptModeCompatibility(
   }
 }
 
+/** Per-Agent name limit, in UTF-16 code units. */
+export const AGENT_NAME_MAX_CHARS = 80;
+/**
+ * Invisible characters that only serve to make two names look the same:
+ * zero-width space and word joiner, soft hyphen, BOM, Mongolian vowel
+ * separator, combining grapheme joiner, and bidi embedding / isolate
+ * controls. Emoji joiners (ZWJ) and variation selectors stay allowed: they
+ * are how names such as "❤️ 助手" or "👨‍💻 Coder" are written. Uniqueness
+ * still ignores every default-ignorable code point.
+ */
+const DECEPTIVE_NAME_CHARACTERS =
+  /[\u00AD\u034F\u180E\u200B\u2060\uFEFF\u202A-\u202E\u2066-\u2069]/u;
+const AgentProfileNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(AGENT_NAME_MAX_CHARS)
+  .refine(
+    (name) => !DECEPTIVE_NAME_CHARACTERS.test(name),
+    '名称不能包含不可见字符',
+  )
+  .refine(
+    (name) => /[^\p{Default_Ignorable_Code_Point}\s]/u.test(name),
+    '名称至少需要一个可见字符',
+  );
+
+/**
+ * What an Agent is apart from its owner, model binding and Workspaces: the
+ * part a create request and an export file share.
+ */
+const AgentProfileDefinitionFields = {
+  name: AgentProfileNameSchema,
+  identity_prompt: AgentPromptTextSchema.optional(),
+  soul_prompt: AgentPromptTextSchema.optional(),
+  agents_prompt: AgentPromptTextSchema.optional(),
+  tools_prompt: AgentPromptTextSchema.optional(),
+  prompt_mode: AgentPromptModeSchema.optional(),
+  avatar_emoji: z.string().max(8).nullable().optional(),
+  avatar_color: z
+    .string()
+    .regex(/^#[0-9a-fA-F]{6}$/)
+    .nullable()
+    .optional(),
+  runtime_policy: AgentProfileRuntimePolicySchema.optional(),
+};
+
 export const AgentProfileCreateSchema = z
   .object({
-    name: z.string().trim().min(1).max(80),
+    ...AgentProfileDefinitionFields,
     /** Explicitly disambiguates four-part clients from legacy identity_prompt. */
     prompt_schema_version: z.literal(2).optional(),
-    identity_prompt: AgentPromptTextSchema.optional(),
-    soul_prompt: AgentPromptTextSchema.optional(),
-    agents_prompt: AgentPromptTextSchema.optional(),
-    tools_prompt: AgentPromptTextSchema.optional(),
-    prompt_mode: AgentPromptModeSchema.optional(),
     include_claude_preset: z.boolean().optional(),
-    avatar_emoji: z.string().max(8).nullable().optional(),
-    avatar_color: z
-      .string()
-      .regex(/^#[0-9a-fA-F]{6}$/)
-      .nullable()
-      .optional(),
     model_config_id: z.string().trim().min(1).max(128).nullable().optional(),
-    runtime_policy: AgentProfileRuntimePolicySchema.optional(),
+    model: AgentProfileModelSchema,
   })
   .superRefine(validatePromptModeCompatibility);
 
 export const AgentProfilePatchSchema = z
   .object({
-    name: z.string().trim().min(1).max(80).optional(),
+    name: AgentProfileNameSchema.optional(),
     /** Explicitly disambiguates four-part clients from legacy identity_prompt. */
     prompt_schema_version: z.literal(2).optional(),
     identity_prompt: AgentPromptTextSchema.optional(),
@@ -446,9 +500,33 @@ export const AgentProfilePatchSchema = z
       .nullable()
       .optional(),
     model_config_id: z.string().trim().min(1).max(128).nullable().optional(),
+    model: AgentProfileModelSchema,
     runtime_policy: AgentProfileRuntimePolicySchema.optional(),
   })
   .superRefine(validatePromptModeCompatibility);
+
+export const AgentProfileMigrateAndDeleteSchema = z.object({
+  target_agent_profile_id: z.string().trim().min(1),
+});
+
+/**
+ * The `agent` part of a file written by GET /api/agent-profiles/:id/export.
+ * Skills and MCP are referenced by name; a model configuration, host paths
+ * and credentials never leave the instance.
+ */
+export const AgentProfileExportAgentSchema = z.object(
+  AgentProfileDefinitionFields,
+);
+
+export const AgentProfileImportSchema = z.object({
+  data: z.unknown(),
+  /** Overrides the exported name, e.g. after a name conflict. */
+  name: AgentProfileNameSchema.optional(),
+  /** Create without the Skills/MCP this account does not have. */
+  drop_missing: z.boolean().optional(),
+  /** An admin agreed to the host context / host Skills the file grants. */
+  confirm_host_grants: z.boolean().optional(),
+});
 
 export const AgentProfileGenerateSchema = z.object({
   description: z.string().trim().min(1).max(4000),
@@ -603,6 +681,15 @@ export const WorkspaceMemoryForgetSchema = z
   })
   .strict();
 
+export const WorkspaceMemoryProposalAnswerSchema = z
+  .object({
+    expectedRevision: z.number().int().positive(),
+    idempotencyKey: z.string().trim().min(1).max(128).optional(),
+    reason: z.string().trim().min(1).max(1000).nullable().optional(),
+    provenance: WorkspaceMemoryProvenanceSchema.optional(),
+  })
+  .strict();
+
 export const WorkspaceMemoryListQuerySchema = z
   .object({
     status: WorkspaceMemoryStatusSchema.optional(),
@@ -663,6 +750,7 @@ export const GroupPatchSchema = z.object({
   execution_mode: z.enum(['container', 'host']).optional(),
   interaction_mode: InteractionModeSchema.optional(),
   process_visibility: ProcessVisibilitySchema.optional(),
+  work_mode: WorkModeSchema.optional(),
 });
 
 export const LoginSchema = z.object({
@@ -709,6 +797,7 @@ export const SystemSettingsSchema = z
     maxLoginAttempts: z.number().int().min(1).max(100).optional(),
     loginLockoutMinutes: z.number().int().min(1).max(1440).optional(),
     fallbackModel: z.string().max(64).optional(),
+    allowMemberGuests: z.boolean().optional(),
   })
   .strict();
 
@@ -717,6 +806,9 @@ export const HostIntegrationSettingsSchema = z
     externalClaudeDir: z.string().max(512).optional(),
     pluginAutoScan: z.boolean().optional(),
     adminHostOnlyMode: z.boolean().optional(),
+    // '' clears the stored value; validated by src/workspace-root.ts.
+    workspaceRoot: z.string().max(1024).optional(),
+    deploymentMode: z.enum(['', 'multi_user', 'single_user_host']).optional(),
     mainAgentContextSource: z.enum(['managed', 'host_claude']).optional(),
     mainAgentAutoCompactWindow: z
       .number()
@@ -846,6 +938,35 @@ export const AdminPatchUserSchema = z.object({
   disable_reason: z.string().max(256).nullable().optional(),
   notes: z.string().max(2000).nullable().optional(),
 });
+
+/** Workspace JIDs granted to a guest: `web:*` workspace records only. */
+const GuestWorkspaceJidsSchema = z
+  .array(
+    z
+      .string()
+      .min(5)
+      .max(256)
+      .regex(/^web:[^#]+$/),
+  )
+  .max(200);
+
+export const GuestCreateSchema = z.object({
+  username: z.string().min(3).max(32),
+  password: z.string().min(8).max(128),
+  display_name: z.string().max(64).optional(),
+  workspace_jids: GuestWorkspaceJidsSchema,
+});
+
+export const GuestPatchSchema = z
+  .object({
+    display_name: z.string().max(64).optional(),
+    status: z.enum(['active', 'disabled']).optional(),
+    workspace_jids: GuestWorkspaceJidsSchema.optional(),
+    password: z.string().min(8).max(128).optional(),
+  })
+  .refine((value) => Object.keys(value).length > 0, {
+    message: 'No fields to update',
+  });
 
 export const InviteCreateSchema = z.object({
   role: z.enum(['admin', 'member']).optional(),
@@ -1127,6 +1248,57 @@ const ProviderBaseUrlSchema = z
 
 const ProviderAuthModeSchema = z.enum(['bearer', 'x-api-key']);
 
+const ProviderModelIdSchema = z
+  .string()
+  .trim()
+  .refine(isValidModelId, { message: '模型名无效' });
+
+/** '' is a pass-through relay: Claude Code picks the model itself. */
+const ProviderDefaultModelSchema = z
+  .string()
+  .max(MAX_PROVIDER_MODEL_ID_LENGTH)
+  .refine((value) => !value.trim() || isValidModelId(value.trim()), {
+    message: '模型名无效',
+  });
+
+/**
+ * The whole list a connection offers; the connection's model need not be in
+ * it. A `[1m]` id from an older client reads as a 1M window.
+ */
+const ProviderModelListSchema = z
+  .array(
+    z.object({
+      id: ProviderModelIdSchema,
+      contextWindow: z
+        .number()
+        .int()
+        .min(MIN_CONTEXT_WINDOW)
+        .max(MAX_CONTEXT_WINDOW)
+        .optional(),
+      efforts: z
+        .array(z.enum(MODEL_EFFORTS))
+        .max(MODEL_EFFORTS.length)
+        .optional(),
+      defaultEffort: z.enum(MODEL_EFFORTS).optional(),
+    }),
+  )
+  .max(MAX_PROVIDER_MODELS);
+
+/** Each role names one of the connection's models; others are dropped. */
+const ConnectionModelRolesSchema = z.object({
+  subagent: ProviderDefaultModelSchema.optional(),
+  smallFast: ProviderDefaultModelSchema.optional(),
+  opus: ProviderDefaultModelSchema.optional(),
+  sonnet: ProviderDefaultModelSchema.optional(),
+});
+
+const ProviderPresetIdSchema = z
+  .string()
+  .trim()
+  .refine((value) => !!getModelPreset(value), { message: '未知的厂商预设' });
+
+const WebFetchPreflightPolicySchema = z.enum(['check', 'skip']);
+
 export const UnifiedProviderCreateSchema = z
   .object({
     name: z.string().min(1).max(64),
@@ -1134,12 +1306,17 @@ export const UnifiedProviderCreateSchema = z
     anthropicBaseUrl: ProviderBaseUrlSchema.optional(),
     anthropicAuthToken: z.string().max(2000).optional(),
     anthropicAuthMode: ProviderAuthModeSchema.optional(),
-    anthropicModel: z.string().max(128).optional(),
+    webFetchPreflightPolicy: WebFetchPreflightPolicySchema.optional(),
+    anthropicModel: ProviderDefaultModelSchema.optional(),
+    models: ProviderModelListSchema.optional(),
+    presetId: ProviderPresetIdSchema.optional(),
     anthropicApiKey: z.string().max(2000).optional(),
     claudeCodeOauthToken: z.string().max(2000).optional(),
     claudeOAuthCredentials: ClaudeOAuthCredentialsSchema.optional(),
     claudeCredentialInput: ClaudeCredentialInputSchema.optional(),
+    roles: ConnectionModelRolesSchema.optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
+    /** Accepted from older clients and ignored. */
     weight: z.number().int().min(1).max(100).optional(),
     enabled: z.boolean().optional(),
   })
@@ -1161,9 +1338,16 @@ export const UnifiedProviderPatchSchema = z
   .object({
     name: z.string().min(1).max(64).optional(),
     anthropicBaseUrl: ProviderBaseUrlSchema.optional(),
-    anthropicAuthMode: ProviderAuthModeSchema.optional(),
-    anthropicModel: z.string().max(128).optional(),
+    /** Null goes back to inferring the header style from the token. */
+    anthropicAuthMode: ProviderAuthModeSchema.nullable().optional(),
+    webFetchPreflightPolicy: WebFetchPreflightPolicySchema.optional(),
+    anthropicModel: ProviderDefaultModelSchema.optional(),
+    /** The whole new list; models left out are removed. */
+    models: ProviderModelListSchema.optional(),
+    presetId: ProviderPresetIdSchema.nullable().optional(),
+    roles: ConnectionModelRolesSchema.optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
+    /** Accepted from older clients and ignored. */
     weight: z.number().int().min(1).max(100).optional(),
     // Third-party edits save the token with the other fields in one request,
     // so a failed half can never leave the endpoint and its key out of sync.
@@ -1175,7 +1359,11 @@ export const UnifiedProviderPatchSchema = z
       data.name !== undefined ||
       data.anthropicBaseUrl !== undefined ||
       data.anthropicAuthMode !== undefined ||
+      data.webFetchPreflightPolicy !== undefined ||
       data.anthropicModel !== undefined ||
+      data.models !== undefined ||
+      data.presetId !== undefined ||
+      data.roles !== undefined ||
       data.customEnv !== undefined ||
       data.weight !== undefined ||
       data.anthropicAuthToken !== undefined ||
@@ -1184,18 +1372,37 @@ export const UnifiedProviderPatchSchema = z
   );
 
 /**
- * Draft of a third-party endpoint to probe before (or without) saving. With a
- * providerId, blank fields fall back to the stored provider — including its
- * token, which is never sent back to the client.
+ * A connection to list models from: a saved one by providerId, or a draft
+ * that is not saved yet. With a providerId, blank fields fall back to the
+ * stored connection — including its credential, which is never sent back to
+ * the client. A draft without a type is a third-party endpoint.
  */
-export const ProviderConnectivityTestSchema = z.object({
+export const ProviderDiscoverModelsSchema = z.object({
   providerId: z.string().trim().min(1).max(64).optional(),
+  type: z.enum(['official', 'third_party']).optional(),
+  presetId: ProviderPresetIdSchema.optional(),
   anthropicBaseUrl: ProviderBaseUrlSchema.optional(),
   anthropicAuthToken: z.string().max(2000).optional(),
   anthropicAuthMode: ProviderAuthModeSchema.optional(),
-  anthropicModel: z.string().max(128).optional(),
+  anthropicApiKey: z.string().max(2000).optional(),
+  /** A pasted setup-token or .credentials.json; checked, never saved. */
+  claudeCredentialInput: ClaudeCredentialInputSchema.optional(),
+  /** A draft's env; its ANTHROPIC_CUSTOM_HEADERS go with every request. */
   customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
 });
+
+/**
+ * A connection to test: as for listing models, plus the model it runs and a
+ * draft's roles (its background model is probed too).
+ */
+export const ProviderConnectivityTestSchema =
+  ProviderDiscoverModelsSchema.extend({
+    anthropicModel: ProviderDefaultModelSchema.optional(),
+    roles: ConnectionModelRolesSchema.optional(),
+  });
+export type ProviderConnectivityTestInput = z.infer<
+  typeof ProviderConnectivityTestSchema
+>;
 
 export const UnifiedProviderSecretsSchema = z
   .object({
@@ -1225,14 +1432,6 @@ export const UnifiedProviderSecretsSchema = z
     },
     { message: 'At least one secret field must be provided' },
   );
-
-export const BalancingConfigSchema = z.object({
-  strategy: z
-    .enum(['round-robin', 'weighted-round-robin', 'failover'])
-    .optional(),
-  unhealthyThreshold: z.number().int().min(1).max(20).optional(),
-  recoveryIntervalMs: z.number().int().min(30000).max(3600000).optional(),
-});
 
 export const WeChatConfigSchema = z.object({
   enabled: z.boolean().optional(),

@@ -75,6 +75,7 @@ describe('frontend workspace interaction mode contract', () => {
       'web/src/components/chat/StreamingDisplay.tsx',
     );
     const messageList = read('web/src/components/chat/MessageList.tsx');
+    const statusBar = read('web/src/components/chat/RunStatusBar.tsx');
 
     expect(streamingDisplay).toContain(
       'showPartialText && streaming.partialText',
@@ -82,9 +83,11 @@ describe('frontend workspace interaction mode contract', () => {
     expect(streamingDisplay).toContain(
       "effectiveInteractionMode === 'proactive'",
     );
-    expect(streamingDisplay).toContain('<span>正在处理…</span>');
-    expect(streamingDisplay).toContain('role="status"');
-    expect(streamingDisplay).toContain('aria-live="polite"');
+    // That the run is busy is the run status bar's to say, not the transcript's.
+    expect(streamingDisplay).not.toContain('正在处理…');
+    expect(statusBar).toContain("const BUSY_TEXT = '处理中';");
+    expect(statusBar).toContain('role="status"');
+    expect(statusBar).toContain('aria-live="polite"');
     expect(streamingDisplay).toContain('hasActiveRun');
     expect(streamingDisplay).toContain(
       "runtimeAgentKind === 'spawn' ? 'assistant' : interactionMode",
@@ -95,6 +98,7 @@ describe('frontend workspace interaction mode contract', () => {
   test('shows a proactive workspace process read-only and never its model text', () => {
     const panel = read('web/src/components/chat/ProcessPanel.tsx');
     const display = read('web/src/components/chat/StreamingDisplay.tsx');
+    const statusBar = read('web/src/components/chat/RunStatusBar.tsx');
     const store = read('web/src/stores/chat.ts');
 
     // The panel reads the steps, the tools and the plan; model text is never
@@ -104,16 +108,17 @@ describe('frontend workspace interaction mode contract', () => {
     expect(panel).toContain("commentary={visibility === 'full'}");
     expect(panel).toContain("thinkingText={visibility === 'full'}");
 
-    // The spinner row stays and the panel follows it, above `hidden` only.
+    // At `hidden` the panel shows only for the progress the Agent sent; the
+    // run status bar says the run is busy and offers its owner the process.
     const proactive = display.slice(
       display.indexOf("if (effectiveInteractionMode === 'proactive')"),
       display.indexOf('// 计算是否有流式数据'),
     );
     expect(proactive).toContain('<ProcessPanel');
-    expect(proactive).toContain("processVisibility !== 'hidden'");
-    expect(proactive).toContain('显示过程');
-    expect(proactive).toContain('requestWorkspaceSettings(groupJid)');
+    expect(proactive).toContain("(processVisibility === 'hidden' &&");
     expect(proactive).not.toMatch(/partialText|StreamingMarkdown/);
+    expect(statusBar).toContain('显示过程');
+    expect(statusBar).toContain('requestWorkspaceSettings(groupJid)');
 
     // The reducer checks again what the host sends, and spawn Agents keep the
     // Assistant contract there too.
@@ -150,7 +155,7 @@ describe('frontend workspace interaction mode contract', () => {
     const chatView = read('web/src/components/chat/ChatView.tsx');
     const store = read('web/src/stores/chat.ts');
 
-    expect(chatView).toContain('}, [activeAgentTab, groupJid, markChatRead]);');
+    expect(chatView).toContain('}, [sessionId, groupJid, markChatRead]);');
     expect(store).toContain('s.currentGroup === jid && s.unreadReplies[jid]');
     expect(store).toContain('delete nextUnreadReplies[jid]');
     expect(store).toContain('unreadReplies: nextUnreadReplies');

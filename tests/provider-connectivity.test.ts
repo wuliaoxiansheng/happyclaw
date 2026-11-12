@@ -2,8 +2,10 @@ import { describe, expect, test, vi } from 'vitest';
 
 import {
   buildMessagesUrl,
+  connectionTestResult,
   parseCustomHeaders,
   probeProviderModel,
+  redact,
   testProviderConnectivity,
 } from '../src/provider-connectivity.js';
 
@@ -47,6 +49,42 @@ describe('provider connectivity probe', () => {
       model: 'kimi-for-coding',
       max_tokens: 16,
     });
+  });
+
+  test('sends a fresh Claude Code session id, the header session-routed gateways need', async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(200, { id: 'msg_1' }));
+    const probe = (customHeaders?: string) =>
+      probeProviderModel(
+        {
+          baseUrl: 'https://opencode.ai/zen/go',
+          token: 'sk-opencode-123456789',
+          authMode: 'x-api-key',
+          model: 'minimax-m3',
+          customHeaders,
+        },
+        { fetchImpl: fetchImpl as unknown as typeof fetch },
+      );
+    await probe();
+    await probe();
+    await probe('X-Claude-Code-Session-Id: pinned-by-user');
+    const sessions = fetchImpl.mock.calls.map(
+      (call) =>
+        (
+          (call as unknown as [string, RequestInit])[1].headers as Record<
+            string,
+            string
+          >
+        )['x-claude-code-session-id'],
+    );
+    expect(sessions[0]).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+    expect(sessions[1]).not.toBe(sessions[0]);
+    expect(sessions[2]).toBe('pinned-by-user');
+    const headers = (
+      fetchImpl.mock.calls[0] as unknown as [string, RequestInit]
+    )[1].headers as Record<string, string>;
+    expect(headers['x-opencode-session']).toBeUndefined();
   });
 
   test('explains an auth failure without echoing the key', async () => {
@@ -127,6 +165,69 @@ describe('provider connectivity probe', () => {
       'deepseek-v4-pro',
       'deepseek-v4-flash',
     ]);
+  });
+
+  test('redacts a key echoed JSON-escaped and the custom header values', async () => {
+    const key = 'bce-v3/ALTAK-abcdefgh/0123456789abcdef';
+    const escaped = JSON.stringify({ detail: { key } }).replace(/\//g, '\\/');
+    expect(redact(escaped, [key])).not.toContain('0123456789abcdef');
+
+    const probe = await probeProviderModel(
+      {
+        baseUrl: 'https://relay.test',
+        token: 'tok-abcdef-123',
+        authMode: 'bearer',
+        model: 'm',
+        customHeaders: 'X-Tenant-Secret: tenant-secret-42',
+      },
+      {
+        fetchImpl: (async () =>
+          new Response('rejected tenant tenant-secret-42', {
+            status: 403,
+          })) as unknown as typeof fetch,
+      },
+    );
+    expect(probe.message).toBe('rejected tenant ***');
+  });
+
+  test('strips the 1M suffix the way model lists read it', async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(200, {}));
+    const probe = await probeProviderModel(
+      {
+        baseUrl: 'https://relay.test',
+        token: 'tok-abcdef',
+        authMode: 'bearer',
+        model: ' glm-5[1M] ',
+      },
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    expect(probe.model).toBe('glm-5');
+  });
+
+  test('a test whose failing probe got no answer records no status', () => {
+    const result = connectionTestResult(
+      {
+        ok: false,
+        probes: [
+          { model: 'glm-5', ok: true, status: 200, latencyMs: 80 },
+          {
+            model: 'glm-5-flash',
+            ok: false,
+            status: null,
+            latencyMs: 20_000,
+            message: 'timeout',
+            code: 'TIMEOUT',
+          },
+        ],
+      },
+      { model: 'glm-5' },
+    );
+    expect(result.record).toMatchObject({
+      ok: false,
+      code: 'TIMEOUT',
+      status: null,
+      latencyMs: 80,
+    });
   });
 
   test('helpers', () => {

@@ -22,6 +22,7 @@ import {
 } from './utils/staleChunkReload';
 import { Toaster } from '@/components/ui/sonner';
 import { ConfirmHost } from '@/components/common/ConfirmHost';
+import { useLaunchQueue } from './hooks/useLaunchQueue';
 
 // The shell and chat page are preloaded at entry and render without
 // suspending once loaded (see preloadedComponent): with lazy() each load
@@ -65,7 +66,7 @@ const loadAppLayout = appLayoutRoute.preload;
 const AppLayout = appLayoutRoute.Component;
 
 // Start the expensive chat split as soon as the entry executes, but only for
-// the default/chat routes. Static HTML modulepreloads made login, setup, tasks,
+// the default/chat routes. Static HTML modulepreloads made login, setup, automations,
 // and memory download ChatPage + MarkdownRenderer even when never used.
 if (
   typeof window !== 'undefined' &&
@@ -87,8 +88,15 @@ if (
 ) {
   void loadAppLayout();
 }
-const TasksPage = lazy(() =>
-  import('./pages/TasksPage').then((m) => ({ default: m.TasksPage })),
+const AutomationsPage = lazy(() =>
+  import('./pages/AutomationsPage').then((m) => ({
+    default: m.AutomationsPage,
+  })),
+);
+const WorkItemsPage = lazy(() =>
+  import('./pages/WorkItemsPage').then((m) => ({
+    default: m.WorkItemsPage,
+  })),
 );
 const SettingsPage = lazy(() =>
   import('./pages/SettingsPage').then((m) => ({ default: m.SettingsPage })),
@@ -235,10 +243,19 @@ const appRoutes = createRoutesFromElements(
         }
       />
       <Route
-        path="/tasks"
+        path="/automations/:automationId?"
         element={
           <Suspense fallback={null}>
-            <TasksPage />
+            <AutomationsPage />
+          </Suspense>
+        }
+      />
+      <Route path="/tasks" element={<Navigate to="/automations" replace />} />
+      <Route
+        path="/work/:itemId?"
+        element={
+          <Suspense fallback={null}>
+            <WorkItemsPage />
           </Suspense>
         }
       />
@@ -345,6 +362,7 @@ function getAppRouter() {
 }
 
 export function App() {
+  useLaunchQueue(getAppRouter());
   return (
     <>
       {/* Top center stays clear of page header actions on both sides. */}

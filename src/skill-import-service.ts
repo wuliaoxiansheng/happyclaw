@@ -247,6 +247,14 @@ function findSkillDirectories(
     .sort((left, right) => left.id.localeCompare(right.id));
 }
 
+/** An install would overwrite existing Skills; install entry points report it as HTTP 409. */
+export class SkillAlreadyExistsError extends Error {
+  constructor(ids: string[]) {
+    super(`Skill already exists: ${ids.join(', ')}`);
+    this.name = 'SkillAlreadyExistsError';
+  }
+}
+
 export function installSkillDirectoriesTransactionally(
   candidates: Array<{ id: string; dir: string }>,
   targetRoot: string,
@@ -258,9 +266,7 @@ export function installSkillDirectoriesTransactionally(
     fs.existsSync(path.join(targetRoot, id)),
   );
   if (conflicts.length > 0 && !replace) {
-    throw new Error(
-      `Skill already exists: ${conflicts.map(({ id }) => id).join(', ')}`,
-    );
+    throw new SkillAlreadyExistsError(conflicts.map(({ id }) => id));
   }
 
   const transactionDir = fs.mkdtempSync(path.join(targetRoot, '.import-'));

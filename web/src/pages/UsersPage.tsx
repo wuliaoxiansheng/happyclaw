@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { ShieldOff } from 'lucide-react';
 import { EmptyState, PageContainer, PageHeader } from '@/components/common';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { PhonePageHeader } from '@/components/layout/PhonePageHeader';
 import { useAuthStore } from '../stores/auth';
 import { UserListTab } from '../components/users/UserListTab';
 import { InviteCodesTab } from '../components/users/InviteCodesTab';
@@ -124,7 +125,12 @@ export function UsersPage({ embedded = false }: UsersPageProps) {
 
   return (
     <PageContainer size="wide" className="space-y-6">
-      <PageHeader title="用户管理" subtitle="账户、邀请码与审计日志" />
+      <PhonePageHeader title="用户管理" />
+      <PageHeader
+        title="用户管理"
+        subtitle="账户、邀请码与审计日志"
+        className="phone:hidden"
+      />
       {content}
     </PageContainer>
   );

@@ -10,13 +10,14 @@ import {
   Palette,
   SquarePen,
   Sun,
+  Timer,
   Users,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import type { AgentInfo, GroupInfo } from '../types';
 import type { ColorScheme, Theme } from '../hooks/useTheme';
 import { SHORTCUTS } from './shortcuts';
-import { sessionActivityAt } from './session-presentation';
+import { compareSessionsForList } from './session-order';
 import { getAgentProfileDisplayName } from '../utils/agent-product';
 import { compareWorkspaces, type GroupEntry } from '../utils/group-utils';
 
@@ -24,15 +25,22 @@ export type CommandAction =
   | { type: 'navigate'; to: string }
   | { type: 'newConversation' }
   | { type: 'createWorkspace' }
+  | {
+      type: 'createAutomation';
+      /** From a session: prefilled with its workspace, bound to it. */
+      from?: { workspaceJid: string; sessionJid: string };
+    }
   | { type: 'toggleSidebar' }
   | { type: 'logout' }
   | { type: 'theme'; value: Theme }
   | { type: 'scheme'; value: ColorScheme }
+  /** Expand a workspace and enter it, as clicking it in the sidebar does. */
+  | { type: 'openWorkspace'; jid: string; folder: string }
   | {
       type: 'openSession';
       jid: string;
       folder: string;
-      sessionId: string | null;
+      sessionId: string;
     };
 
 export interface CommandItemSpec {
@@ -70,6 +78,10 @@ export interface CommandSourceInput {
   colorScheme: ColorScheme;
   /** Max sessions listed across all workspaces. */
   sessionLimit?: number;
+  /** The session open on the chat page, if any. */
+  currentSession?: { workspaceJid: string; sessionJid: string } | null;
+  /** False for read-only guests: no create actions (conversation, workspace, automation). */
+  canCreate?: boolean;
 }
 
 const THEME_LABELS: Record<Theme, string> = {
@@ -98,7 +110,7 @@ function workspaceLabel(group: GroupInfo): string {
 export function buildCommandGroups(
   input: CommandSourceInput,
 ): CommandGroupSpec[] {
-  const actions: CommandItemSpec[] = [
+  const createActions: CommandItemSpec[] = [
     {
       id: 'action:new-conversation',
       label: '新对话',
@@ -114,6 +126,30 @@ export function buildCommandGroups(
       icon: FolderPlus,
       action: { type: 'createWorkspace' },
     },
+    {
+      id: 'action:create-automation',
+      label: '新建自动化',
+      keywords: ['automation', 'schedule', 'cron', '定时', '计划'],
+      icon: Timer,
+      action: { type: 'createAutomation' },
+    },
+    ...(input.currentSession
+      ? [
+          {
+            id: 'action:create-automation-from-session',
+            label: '从此会话创建自动化',
+            keywords: ['automation', 'schedule', '定时', '绑定', '会话'],
+            icon: Timer,
+            action: {
+              type: 'createAutomation',
+              from: input.currentSession,
+            } as const,
+          },
+        ]
+      : []),
+  ];
+  const actions: CommandItemSpec[] = [
+    ...(input.canCreate === false ? [] : createActions),
     {
       id: 'action:toggle-sidebar',
       label: '切换侧边栏',
@@ -163,10 +199,9 @@ export function buildCommandGroups(
       keywords: [group.folder, group.name, group.agent_profile_name || ''],
       icon: LayoutGrid,
       action: {
-        type: 'openSession',
+        type: 'openWorkspace',
         jid: group.jid,
         folder: group.folder,
-        sessionId: null,
       },
     }));
 
@@ -176,11 +211,8 @@ export function buildCommandGroups(
         .filter((agent) => agent.kind === 'conversation')
         .map((agent) => ({ jid, group, agent })),
     )
-    .sort(
-      (a, b) =>
-        new Date(sessionActivityAt(b.agent)).getTime() -
-        new Date(sessionActivityAt(a.agent)).getTime(),
-    )
+    // The session lists' order: pinned first, then by recent activity.
+    .sort((a, b) => compareSessionsForList(a.agent, b.agent))
     .slice(0, input.sessionLimit ?? 50)
     .map<CommandItemSpec>(({ jid, group, agent }) => ({
       id: `session:${jid}:${agent.id}`,

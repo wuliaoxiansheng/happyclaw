@@ -56,29 +56,16 @@ describe('independent model configurations', () => {
     ).toEqual({ PROJECT_ENV: 'kept' });
   });
 
-  test('honors creation, toggle, and deletion without a default-model lock', () => {
-    const initiallyDisabled = runtimeConfig.createProvider({
-      name: 'Initially disabled',
+  test('the global connection ignores enabled, follows the resolver, else the first usable', () => {
+    const bare = runtimeConfig.createProvider({
+      name: 'No credential yet',
       type: 'official',
-      anthropicApiKey: 'disabled-key',
-      enabled: false,
     });
-    expect(initiallyDisabled.enabled).toBe(false);
-    runtimeConfig.setProviderEnabled(initiallyDisabled.id, true);
-    runtimeConfig.setProviderEnabled(initiallyDisabled.id, false);
-    runtimeConfig.deleteProvider(initiallyDisabled.id);
-    expect(
-      runtimeConfig
-        .getProviders()
-        .some((provider) => provider.id === initiallyDisabled.id),
-    ).toBe(false);
-
     const first = runtimeConfig.createProvider({
       name: 'Official subscription',
       type: 'official',
       anthropicApiKey: 'official-key',
       anthropicModel: 'sonnet',
-      enabled: true,
     });
     const second = runtimeConfig.createProvider({
       name: 'Model gateway',
@@ -87,30 +74,40 @@ describe('independent model configurations', () => {
       anthropicAuthToken: 'gateway-token',
       anthropicModel: 'gateway-model',
       customEnv: { ANTHROPIC_CUSTOM_HEADERS: 'x-tenant: model-b' },
-      enabled: true,
     });
+    for (const provider of [bare, first, second]) {
+      expect(provider).not.toHaveProperty('enabled');
+    }
 
     expect(runtimeConfig.getClaudeProviderConfig()).toMatchObject({
       anthropicApiKey: 'official-key',
       anthropicModel: 'sonnet',
     });
 
-    runtimeConfig.setProviderEnabled(first.id, false);
-    expect(runtimeConfig.getClaudeProviderConfig()).toMatchObject({
-      anthropicBaseUrl: 'https://gateway.example.test',
-      anthropicAuthToken: 'gateway-token',
-      anthropicModel: 'gateway-model',
-    });
-    expect(runtimeConfig.getActiveProfileCustomEnv()).toEqual({
-      ANTHROPIC_CUSTOM_HEADERS: 'x-tenant: model-b',
-    });
-    runtimeConfig.setProviderEnabled(second.id, false);
-    expect(runtimeConfig.getEnabledProviders()).toEqual([]);
-    expect(() => runtimeConfig.getClaudeProviderConfig()).toThrow(
-      '没有启用的模型配置',
-    );
-    runtimeConfig.setProviderEnabled(second.id, true);
-    runtimeConfig.deleteProvider(first.id);
+    runtimeConfig.setGlobalModelConfigResolver(() => second.id);
+    try {
+      expect(runtimeConfig.getGlobalProvider()?.id).toBe(second.id);
+      expect(runtimeConfig.getClaudeProviderConfig()).toMatchObject({
+        anthropicBaseUrl: 'https://gateway.example.test',
+        anthropicAuthToken: 'gateway-token',
+        anthropicModel: 'gateway-model',
+      });
+      expect(runtimeConfig.getActiveProfileCustomEnv()).toEqual({
+        ANTHROPIC_CUSTOM_HEADERS: 'x-tenant: model-b',
+      });
+      // A binding to a connection without a credential is skipped.
+      runtimeConfig.setGlobalModelConfigResolver(() => bare.id);
+      expect(runtimeConfig.getGlobalProvider()?.id).toBe(first.id);
+      expect(
+        runtimeConfig.resolveProviderById('missing').config.anthropicModel,
+      ).toBe('sonnet');
+    } finally {
+      runtimeConfig.setGlobalModelConfigResolver(null);
+    }
+
+    for (const provider of [bare, first, second]) {
+      runtimeConfig.deleteProvider(provider.id);
+    }
   });
 
   test('Agent selection overrides a legacy Workspace Provider environment', () => {
@@ -121,7 +118,6 @@ describe('independent model configurations', () => {
       anthropicAuthToken: 'agent-only-token',
       anthropicModel: 'agent-only-model',
       customEnv: { ANTHROPIC_CUSTOM_HEADERS: 'x-tenant: agent-only' },
-      enabled: false,
     });
     runtimeConfig.saveContainerEnvConfig('model-workspace', {
       anthropicBaseUrl: 'https://workspace-override.example.test',
@@ -164,21 +160,21 @@ describe('independent model configurations', () => {
   });
 
   test('normalizes an existing V5 default pointer without changing switches', () => {
-    const before = runtimeConfig
-      .getProviders()
-      .map((provider) => ({ id: provider.id, enabled: provider.enabled }));
+    const before = runtimeConfig.getProviders().map((provider) => provider.id);
+    const enabledBefore = runtimeConfig.readLegacyModelDefaults().enabledIds;
     const stored = JSON.parse(fs.readFileSync(configFile, 'utf8')) as Record<
       string,
       unknown
     >;
-    stored.defaultProviderId = before[0]?.id ?? 'legacy-default';
+    stored.defaultProviderId = before[0] ?? 'legacy-default';
     fs.writeFileSync(configFile, `${JSON.stringify(stored, null, 2)}\n`);
 
-    expect(
-      runtimeConfig
-        .getProviders()
-        .map((provider) => ({ id: provider.id, enabled: provider.enabled })),
-    ).toEqual(before);
+    expect(runtimeConfig.getProviders().map((provider) => provider.id)).toEqual(
+      before,
+    );
+    expect(runtimeConfig.readLegacyModelDefaults().enabledIds).toEqual(
+      enabledBefore,
+    );
     expect(JSON.parse(fs.readFileSync(configFile, 'utf8'))).not.toHaveProperty(
       'defaultProviderId',
     );
@@ -209,7 +205,6 @@ describe('independent model configurations', () => {
       name: 'OAuth CAS provider',
       type: 'official',
       claudeOAuthCredentials: original,
-      enabled: true,
     });
 
     expect(
@@ -241,7 +236,7 @@ describe('independent model configurations', () => {
   });
 });
 
-describe('global default model configuration', () => {
+describe('legacy default model and pool, read for the binding backfill', () => {
   function readStored(): Record<string, any> {
     return JSON.parse(fs.readFileSync(configFile, 'utf8'));
   }
@@ -252,14 +247,19 @@ describe('global default model configuration', () => {
     fs.writeFileSync(configFile, `${JSON.stringify(stored, null, 2)}\n`);
   }
 
+  /** A connection an older release had in its pool when `enabled`. */
   function official(name: string, enabled = true) {
-    return runtimeConfig.createProvider({
+    const provider = runtimeConfig.createProvider({
       name,
       type: 'official',
       anthropicApiKey: `${name}-key`,
       anthropicModel: `${name}-model`,
-      enabled,
     });
+    writeStored((stored) => {
+      stored.providers.find((item: any) => item.id === provider.id).enabled =
+        enabled;
+    });
+    return provider;
   }
 
   beforeEach(() => {
@@ -271,90 +271,49 @@ describe('global default model configuration', () => {
     });
   });
 
-  test('has no default until one is chosen, and clearing returns to none', () => {
-    const a = official('default-a');
-    official('default-b');
-    expect(runtimeConfig.getDefaultModelConfigId()).toBeNull();
-    expect(readStored()).not.toHaveProperty('defaultModelConfigId');
-
-    expect(runtimeConfig.setDefaultModelConfig(a.id)?.id).toBe(a.id);
-    expect(runtimeConfig.getDefaultModelConfigId()).toBe(a.id);
-    expect(readStored().defaultModelConfigId).toBe(a.id);
-
-    expect(runtimeConfig.setDefaultModelConfig(null)).toBeNull();
-    expect(runtimeConfig.getDefaultModelConfigId()).toBeNull();
-    expect(readStored()).not.toHaveProperty('defaultModelConfigId');
-  });
-
-  test('every other write keeps the choice', () => {
-    const a = official('keep-a');
-    const b = official('keep-b');
-    runtimeConfig.setDefaultModelConfig(a.id);
-
-    runtimeConfig.updateProvider(a.id, { anthropicModel: 'keep-a-model-2' });
-    runtimeConfig.updateProviderSecrets(a.id, { anthropicApiKey: 'rotated' });
-    runtimeConfig.setProviderEnabled(b.id, false);
-    runtimeConfig.setProviderEnabled(b.id, true);
-    runtimeConfig.saveBalancingConfig({ strategy: 'failover' });
-    official('keep-c');
-    runtimeConfig.duplicateProvider(b.id);
-
-    expect(runtimeConfig.getDefaultModelConfigId()).toBe(a.id);
-    expect(readStored().defaultModelConfigId).toBe(a.id);
-  });
-
-  test('the default has to be usable: unknown ids and missing credentials are refused', () => {
-    official('refuse-a');
-    const bare = runtimeConfig.createProvider({
-      name: 'refuse-bare',
-      type: 'official',
-      enabled: false,
+  test('reads the legacy default and enabled ids, then clears the default once', () => {
+    const a = official('legacy-a');
+    official('legacy-off', false);
+    const c = official('legacy-c');
+    writeStored((stored) => {
+      stored.defaultModelConfigId = c.id;
     });
 
-    expect(() => runtimeConfig.setDefaultModelConfig('missing')).toThrow(
-      '未找到',
-    );
-    expect(() => runtimeConfig.setDefaultModelConfig(bare.id)).toThrow('凭据');
-    expect(runtimeConfig.getDefaultModelConfigId()).toBeNull();
-  });
-
-  test('choosing a disabled configuration enables it; the default cannot be disabled', () => {
-    official('lock-a');
-    const spare = official('lock-spare', false);
-
-    expect(runtimeConfig.setDefaultModelConfig(spare.id)).toMatchObject({
-      id: spare.id,
-      enabled: true,
+    expect(runtimeConfig.readLegacyModelDefaults()).toEqual({
+      defaultModelConfigId: c.id,
+      enabledIds: [a.id, c.id],
     });
-    expect(() => runtimeConfig.setProviderEnabled(spare.id, false)).toThrow(
-      '取消默认',
-    );
+    // Other writes keep the pointer until the backfill clears it.
+    runtimeConfig.updateProvider(a.id, { name: 'renamed' });
+    expect(readStored().defaultModelConfigId).toBe(c.id);
 
-    runtimeConfig.setDefaultModelConfig(null);
-    expect(runtimeConfig.setProviderEnabled(spare.id, false).enabled).toBe(
-      false,
-    );
-  });
-
-  test('deleting the default drops the choice', () => {
-    const a = official('delete-a');
-    official('delete-b');
-    runtimeConfig.setDefaultModelConfig(a.id);
-
-    runtimeConfig.deleteProvider(a.id);
-
-    expect(runtimeConfig.getDefaultModelConfigId()).toBeNull();
+    runtimeConfig.clearLegacyDefaultModelConfigId();
     expect(readStored()).not.toHaveProperty('defaultModelConfigId');
+    expect(runtimeConfig.readLegacyModelDefaults()).toEqual({
+      defaultModelConfigId: null,
+      enabledIds: [a.id, c.id],
+    });
+    const before = fs.readFileSync(configFile, 'utf8');
+    runtimeConfig.clearLegacyDefaultModelConfigId();
+    expect(fs.readFileSync(configFile, 'utf8')).toBe(before);
   });
 
-  test('a pointer to a configuration that no longer exists reads as no default', () => {
-    official('stale-a');
+  test('a pointer to a missing or credential-less connection reads as none', () => {
+    const a = official('stale-a');
     writeStored((stored) => {
       stored.defaultModelConfigId = 'gone';
     });
+    expect(runtimeConfig.readLegacyModelDefaults().defaultModelConfigId).toBe(
+      null,
+    );
 
-    expect(runtimeConfig.getDefaultModelConfigId()).toBeNull();
-    expect(runtimeConfig.getUsableDefaultProvider()).toBeNull();
+    writeStored((stored) => {
+      stored.defaultModelConfigId = a.id;
+    });
+    runtimeConfig.updateProviderSecrets(a.id, { clearAnthropicApiKey: true });
+    expect(runtimeConfig.readLegacyModelDefaults().defaultModelConfigId).toBe(
+      null,
+    );
   });
 
   test('the legacy pointer every installation once had is never read as a choice', () => {
@@ -364,89 +323,27 @@ describe('global default model configuration', () => {
       stored.defaultProviderId = a.id;
     });
 
-    expect(runtimeConfig.getDefaultModelConfigId()).toBeNull();
+    expect(runtimeConfig.readLegacyModelDefaults().defaultModelConfigId).toBe(
+      null,
+    );
     expect(readStored()).not.toHaveProperty('defaultProviderId');
   });
 
-  test('a default that was switched off or lost its credential pins nothing', () => {
-    const a = official('usable-a');
-    official('usable-b');
-    runtimeConfig.setDefaultModelConfig(a.id);
-    expect(runtimeConfig.getUsableDefaultProvider()?.id).toBe(a.id);
-
+  test('deleting the legacy default drops the pointer', () => {
+    const a = official('delete-a');
+    official('delete-b');
     writeStored((stored) => {
-      stored.providers.find((item: any) => item.id === a.id).enabled = false;
-    });
-    expect(runtimeConfig.getDefaultModelConfigId()).toBe(a.id);
-    expect(runtimeConfig.getUsableDefaultProvider()).toBeNull();
-  });
-
-  test('a default that lost its credential is not what the host calls fall back to either', () => {
-    official('creds-a');
-    const b = official('creds-b');
-    runtimeConfig.setDefaultModelConfig(b.id);
-    expect(runtimeConfig.getClaudeProviderConfig()).toMatchObject({
-      anthropicModel: 'creds-b-model',
+      stored.defaultModelConfigId = a.id;
     });
 
-    runtimeConfig.updateProviderSecrets(b.id, { clearAnthropicApiKey: true });
+    runtimeConfig.deleteProvider(a.id);
 
-    expect(runtimeConfig.getUsableDefaultProvider()).toBeNull();
-    expect(runtimeConfig.getClaudeProviderConfig()).toMatchObject({
-      anthropicModel: 'creds-a-model',
-    });
-    expect(
-      runtimeConfig.resolveProviderById('missing').config.anthropicModel,
-    ).toBe('creds-a-model');
-  });
-
-  test('a default whose credential is cleared stops being the default, and stays so', () => {
-    const a = official('clear-a');
-    official('clear-b');
-    runtimeConfig.setDefaultModelConfig(a.id);
-
-    runtimeConfig.updateProviderSecrets(a.id, { clearAnthropicApiKey: true });
-
-    // Dropped at the write, so every reader and guard agrees at once.
-    expect(runtimeConfig.getDefaultModelConfigId()).toBeNull();
     expect(readStored()).not.toHaveProperty('defaultModelConfigId');
-    // Switching it off is no longer refused, and restoring the key does not
-    // quietly make it the default again.
-    expect(runtimeConfig.setProviderEnabled(a.id, false).enabled).toBe(false);
-    runtimeConfig.updateProviderSecrets(a.id, { anthropicApiKey: 'back' });
-    runtimeConfig.setProviderEnabled(a.id, true);
-    expect(runtimeConfig.getDefaultModelConfigId()).toBeNull();
   });
 
-  test('looking up a configuration that does not exist falls back to the default', () => {
-    official('fallback-a');
-    const b = official('fallback-b');
-    runtimeConfig.setDefaultModelConfig(b.id);
-
-    expect(
-      runtimeConfig.resolveProviderById('missing').config.anthropicModel,
-    ).toBe('fallback-b-model');
-    runtimeConfig.setDefaultModelConfig(null);
-    expect(
-      runtimeConfig.resolveProviderById('missing').config.anthropicModel,
-    ).toBe('fallback-a-model');
-  });
-
-  test("the host's own Claude calls follow the default, else the first enabled", () => {
-    official('host-a');
-    const b = official('host-b');
-    expect(runtimeConfig.getClaudeProviderConfig()).toMatchObject({
-      anthropicModel: 'host-a-model',
-    });
-
-    runtimeConfig.setDefaultModelConfig(b.id);
-    expect(runtimeConfig.getClaudeProviderConfig()).toMatchObject({
-      anthropicModel: 'host-b-model',
-    });
-
-    runtimeConfig.setDefaultModelConfig(null);
-    expect(runtimeConfig.getClaudeProviderConfig()).toMatchObject({
-      anthropicModel: 'host-a-model',
-    });
+  test('without connections the host calls say a model has to be added', () => {
+    expect(() => runtimeConfig.getClaudeProviderConfig()).toThrow(
+      '还没有模型连接',
+    );
   });
 });

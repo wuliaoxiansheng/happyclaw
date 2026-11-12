@@ -96,6 +96,126 @@ export interface StreamingStep {
    * it (a proactive workspace). It is never the answer, whatever follows.
    */
   commentary?: boolean;
+  /**
+   * text (commentary): a progress statement the Agent sent the user
+   * (send_message with delivery_role=progress). Shown at every process
+   * visibility, unlike narration.
+   */
+  progress?: boolean;
+  /**
+   * tool (AskUserQuestion): the questions it put to the reader. The call
+   * returns at once (the answer is the reader's next message), so they are
+   * kept on the step for the reader to answer after the turn.
+   */
+  questions?: StepQuestion[];
+  /**
+   * tool, task (status `error`): why it ended without a result of its own. A
+   * stop caught it in flight, or a permission denial refused it; absent for a
+   * call that failed by itself (and in steps stored before it was kept).
+   */
+  outcome?: StepOutcome;
+}
+
+export type StepOutcome = 'stopped' | 'denied';
+
+/**
+ * What a call a stop caught in flight says it returned, and the word every
+ * view uses for a stopped call. Steps stored before `outcome` was kept are
+ * recognised by it.
+ */
+export const STOPPED_PREVIEW = '已停止';
+
+/** One question of an AskUserQuestion call, as the reader answers it. */
+export interface StepQuestion {
+  question: string;
+  multiSelect?: boolean;
+  /** The option labels, in order. */
+  options: string[];
+  /**
+   * What each option means, by the index of its label; absent when no option
+   * has one (and in steps stored before it was kept).
+   */
+  descriptions?: string[];
+}
+
+/** The tool whose call is a question for the reader. */
+export const QUESTION_TOOL_NAME = 'AskUserQuestion';
+/**
+ * The start of the Runner's answer to every AskUserQuestion call: the reader
+ * answers in their next message. A question answered with any other failure
+ * (input that failed validation) asked nothing.
+ */
+export const QUESTION_DEFERRED_MARK =
+  'The question was not answered inside this turn.';
+/** AskUserQuestion allows four questions; streamed input is not yet checked. */
+const MAX_STEP_QUESTIONS = 4;
+const MAX_QUESTION_OPTIONS = 10;
+const MAX_QUESTION_CHARS = 300;
+const MAX_OPTION_CHARS = 120;
+const MAX_OPTION_DESCRIPTION_CHARS = 200;
+
+function boundedText(value: unknown, max: number): string {
+  if (typeof value !== 'string') return '';
+  const text = value.trim();
+  const points = Array.from(text);
+  return points.length > max ? `${points.slice(0, max - 1).join('')}…` : text;
+}
+
+/**
+ * The questions in an AskUserQuestion input (`{questions: [...]}`, or the
+ * older single `{question, options}`), bounded; undefined when it has none.
+ * Options are `{label, description?}` or `{value}` objects, or plain strings
+ * (a stored step's, with `descriptions` beside them).
+ */
+export function readStepQuestions(input: unknown): StepQuestion[] | undefined {
+  if (!input || typeof input !== 'object') return undefined;
+  const record = input as Record<string, unknown>;
+  const raw = Array.isArray(record.questions)
+    ? record.questions
+    : typeof record.question === 'string'
+      ? [record]
+      : [];
+  const questions: StepQuestion[] = [];
+  for (const item of raw.slice(0, MAX_STEP_QUESTIONS)) {
+    if (!item || typeof item !== 'object') continue;
+    const entry = item as Record<string, unknown>;
+    const question = boundedText(entry.question, MAX_QUESTION_CHARS);
+    if (!question) continue;
+    const options: string[] = [];
+    const descriptions: string[] = [];
+    // A stored step keeps the descriptions beside the labels, by index.
+    const stored = Array.isArray(entry.descriptions) ? entry.descriptions : [];
+    const rawOptions = Array.isArray(entry.options) ? entry.options : [];
+    rawOptions.forEach((option, index) => {
+      if (options.length >= MAX_QUESTION_OPTIONS) return;
+      const fields: Record<string, unknown> =
+        option && typeof option === 'object'
+          ? (option as Record<string, unknown>)
+          : { label: option, description: stored[index] };
+      const label =
+        boundedText(fields.label, MAX_OPTION_CHARS) ||
+        boundedText(fields.value, MAX_OPTION_CHARS);
+      if (!label) return;
+      options.push(label);
+      descriptions.push(
+        boundedText(fields.description, MAX_OPTION_DESCRIPTION_CHARS),
+      );
+    });
+    questions.push({
+      question,
+      ...(entry.multiSelect === true ? { multiSelect: true } : {}),
+      options,
+      ...(descriptions.some(Boolean) ? { descriptions } : {}),
+    });
+  }
+  return questions.length > 0 ? questions : undefined;
+}
+
+function sameQuestions(
+  a: readonly StepQuestion[] | undefined,
+  b: readonly StepQuestion[],
+): boolean {
+  return JSON.stringify(a ?? null) === JSON.stringify(b);
 }
 
 export interface StepList {
@@ -314,6 +434,7 @@ export function addCommentaryStep(
   list: StepList,
   at: number,
   text: string,
+  progress = false,
 ): StepList {
   const own = text.trim();
   if (!own) return list;
@@ -325,6 +446,7 @@ export function addCommentaryStep(
     status: 'done',
     text: tail(own, MAX_TEXT_STEP_CHARS),
     commentary: true,
+    ...(progress ? { progress: true } : {}),
   });
 }
 
@@ -345,6 +467,8 @@ export interface ToolStepInput {
   toolName: string;
   skillName?: string;
   summary?: string;
+  /** Read from the call's input; kept only on an AskUserQuestion step. */
+  questions?: StepQuestion[];
 }
 
 function toolIndex(list: StepList, toolUseId: string): number {
@@ -364,10 +488,14 @@ export function startToolStep(
 ): StepList {
   const index = toolIndex(list, tool.toolUseId);
   if (index >= 0) {
+    const toolName = tool.toolName || list.steps[index].toolName;
     return replaceAt(list, index, {
-      toolName: tool.toolName || list.steps[index].toolName,
+      toolName,
       skillName: tool.skillName ?? list.steps[index].skillName,
       summary: tool.summary ?? list.steps[index].summary,
+      ...(toolName === QUESTION_TOOL_NAME && tool.questions
+        ? { questions: tool.questions }
+        : {}),
     });
   }
   const isTask = TASK_TOOL_NAMES.has(tool.toolName);
@@ -383,6 +511,9 @@ export function startToolStep(
     skillName: tool.skillName,
     summary: tool.summary,
     taskId: isTask ? tool.toolUseId : undefined,
+    ...(tool.toolName === QUESTION_TOOL_NAME && tool.questions
+      ? { questions: tool.questions }
+      : {}),
   });
 }
 
@@ -390,7 +521,7 @@ export function startToolStep(
 export function patchToolStep(
   list: StepList,
   toolUseId: string,
-  patch: { skillName?: string; summary?: string },
+  patch: { skillName?: string; summary?: string; questions?: StepQuestion[] },
 ): StepList {
   const index = toolIndex(list, toolUseId);
   if (index < 0) return list;
@@ -402,6 +533,13 @@ export function patchToolStep(
   if (patch.summary && patch.summary !== step.summary) {
     next.summary = patch.summary;
   }
+  if (
+    patch.questions &&
+    step.toolName === QUESTION_TOOL_NAME &&
+    !sameQuestions(step.questions, patch.questions)
+  ) {
+    next.questions = patch.questions;
+  }
   return Object.keys(next).length > 0 ? replaceAt(list, index, next) : list;
 }
 
@@ -410,6 +548,7 @@ export interface ToolProgressInput {
   toolName?: string;
   skillName?: string;
   summary?: string;
+  questions?: StepQuestion[];
 }
 
 /** Progress of a call: update its step, or start one if it was not seen. */
@@ -422,6 +561,7 @@ export function progressToolStep(
     return patchToolStep(list, tool.toolUseId, {
       skillName: tool.skillName,
       summary: tool.summary,
+      questions: tool.questions,
     });
   }
   return startToolStep(
@@ -431,6 +571,7 @@ export function progressToolStep(
       toolName: tool.toolName || 'unknown',
       skillName: tool.skillName,
       summary: tool.summary,
+      questions: tool.questions,
     },
     at,
   );
@@ -472,6 +613,26 @@ export function endToolStep(
       ? replaceAt(list, index, { resultFacts: extra.facts })
       : list;
   }
+  // The Runner answers every question with the same refusal (the reader
+  // answers in their next message): that question was asked, nothing failed.
+  if (step.toolName === QUESTION_TOOL_NAME) {
+    if (!failed || result?.includes(QUESTION_DEFERRED_MARK)) {
+      return replaceAt(list, index, {
+        status: 'done',
+        endedAt: step.endedAt ?? at,
+      });
+    }
+    // Refused for another reason: there is no question for the reader.
+    const { questions: _questions, ...asked } = step;
+    const steps = list.steps.slice();
+    steps[index] = {
+      ...asked,
+      status: 'error',
+      endedAt: step.endedAt ?? at,
+      resultPreview: text || step.resultPreview,
+    };
+    return { steps, dropped: list.dropped };
+  }
   return replaceAt(list, index, {
     status: failed ? 'error' : step.status === 'error' ? 'error' : 'done',
     endedAt: step.endedAt ?? at,
@@ -493,6 +654,7 @@ export function failToolStep(
     status: 'error',
     endedAt: list.steps[index].endedAt ?? at,
     resultPreview: head(reason, MAX_RESULT_PREVIEW_CHARS),
+    outcome: 'denied',
   });
 }
 
@@ -567,13 +729,17 @@ export function ensureTaskStep(
   });
 }
 
-/** The sub-agent's own lifecycle moved. */
+/**
+ * The sub-agent's own lifecycle moved. `outcome` says why an `error` ended it
+ * (a stop killed it); running again or done clears it.
+ */
 export function setTaskStepStatus(
   list: StepList,
   taskId: string,
   status: StepStatus,
   at: number,
   summary?: string,
+  outcome?: StepOutcome,
 ): StepList {
   const index = taskIndex(list, taskId);
   if (index < 0) return list;
@@ -584,7 +750,16 @@ export function setTaskStepStatus(
     if (status !== 'running') patch.endedAt = step.endedAt ?? at;
   }
   if (summary && summary !== step.summary) patch.summary = summary;
-  return Object.keys(patch).length > 0 ? replaceAt(list, index, patch) : list;
+  if (status === 'error' && outcome && outcome !== step.outcome) {
+    patch.outcome = outcome;
+  }
+  const clearOutcome = status !== 'error' && step.outcome !== undefined;
+  if (Object.keys(patch).length === 0 && !clearOutcome) return list;
+  if (!clearOutcome) return replaceAt(list, index, patch);
+  const { outcome: _outcome, ...rest } = step;
+  const steps = list.steps.slice();
+  steps[index] = { ...rest, ...patch };
+  return { steps, dropped: list.dropped };
 }
 
 // ── the end of a reply ──────────────────────────────────────────────────
@@ -602,22 +777,19 @@ export function finishSteps(
   if (!list.steps.some((step) => step.status === 'running')) return list;
   return {
     dropped: list.dropped,
-    steps: list.steps.map((step) =>
-      step.status !== 'running'
-        ? step
-        : {
+    steps: list.steps.map((step) => {
+      if (step.status !== 'running') return step;
+      const cut = stopped && (step.kind === 'tool' || step.kind === 'task');
+      return cut
+        ? {
             ...step,
             endedAt: at,
-            status:
-              stopped && (step.kind === 'tool' || step.kind === 'task')
-                ? 'error'
-                : 'done',
-            resultPreview:
-              stopped && (step.kind === 'tool' || step.kind === 'task')
-                ? (step.resultPreview ?? '已停止')
-                : step.resultPreview,
-          },
-    ),
+            status: 'error',
+            resultPreview: step.resultPreview ?? STOPPED_PREVIEW,
+            outcome: 'stopped',
+          }
+        : { ...step, endedAt: at, status: 'done' };
+    }),
   };
 }
 
@@ -780,9 +952,10 @@ export function rebuildSteps(input: SnapshotSteps): StepList {
       status:
         task.status === 'completed'
           ? 'done'
-          : task.status === 'error'
+          : task.status === 'error' || task.status === 'stopped'
             ? 'error'
             : 'running',
+      ...(task.status === 'stopped' ? { outcome: 'stopped' as const } : {}),
       taskId: task.id,
       toolUseId: task.id,
       toolName: 'Task',

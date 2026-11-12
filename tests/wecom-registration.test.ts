@@ -29,7 +29,10 @@ describe('WeCom full-stack provider registration', () => {
     expect(branch).toContain('workspace.jid');
     expect(branch).toContain('onConnectionStateChange: (state) =>');
     expect(branch).toContain("state.status === 'connected'");
-    expect(branch).toContain('resolveRegisteredGroup: getRegisteredGroup');
+    // The group audience callbacks (isSenderAllowedInGroup and the
+    // registered-group lookup) arrive through the shared options;
+    // channel-account-reload-wiring.test.ts runs the branch to prove it.
+    expect(branch).toContain('...common,');
   });
 
   test('does not route unknown providers through the WhatsApp legacy branch', () => {
@@ -54,8 +57,7 @@ describe('WeCom full-stack provider registration', () => {
       'web/src/components/settings/channel-meta.tsx',
       'web/src/utils/channel-accounts.ts',
       'web/src/stores/channel-accounts.ts',
-      'web/src/utils/task-utils.ts',
-      'src/task-scheduler.ts',
+      'src/channel-prefixes.ts',
       'src/schemas.ts',
     ]) {
       expect(read(file), file).toContain('wecom');

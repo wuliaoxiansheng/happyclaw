@@ -7,6 +7,7 @@
 // Streaming event types (canonical source: shared/stream-event.ts)
 export type { StreamEventType, StreamEvent } from './stream-event.types.js';
 import type { ClaudeContextAudit, StreamEvent } from './stream-event.types.js';
+import type { TeamRole } from './work-items.js';
 
 export interface ChannelContentLink {
   kind: 'forward_bundle' | 'rapid_topic_bundle';
@@ -207,23 +208,17 @@ export function normalizeChannelTurnContext(
   };
 }
 
-/** Compact per-turn prompt material. It is a user-turn prefix, not a frozen
- * system prompt, so warm SDK sessions always observe the latest channel. */
-export function formatChannelTurnContextForPrompt(
-  context: ChannelTurnContext | undefined,
-): string {
-  if (!context) return '';
-  return [
-    '<channel_context source="happyclaw_host" trust="verified">',
-    JSON.stringify(context),
-    '</channel_context>',
-    'Use this context for the current input only. Never guess IDs or credentials that are absent.',
-  ].join('\n');
-}
-
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
+  /**
+   * The effort the host resolved for this launch: Claude Code runs at it, and
+   * null means none is sent at all, not even the Agent's own effort as the
+   * SDK option. Absent without a connection (the Workspace's own
+   * environment) or on a ChatGPT subscription, whose gateway applies it:
+   * the Agent's effort then goes as before.
+   */
+  launchEffort?: string | null;
   turnId?: string;
   /** Persisted message IDs already represented by the cold bootstrap prompt. */
   currentBatchMessageIds?: readonly string[];
@@ -233,6 +228,21 @@ export interface ContainerInput {
   chatJid: string;
   /** Workspace-scoped interaction contract for this public Agent turn. */
   interactionMode?: 'assistant' | 'proactive';
+  /** Set when the selected connection skips WebFetch's domain check. */
+  webFetchPreflightPolicy?: 'skip';
+  /**
+   * Team mode (团队模式): this session is a group's router or a work item's
+   * worker. It picks the work tools, the team prompt section and the
+   * disallowed tools; absent leaves the session exactly as it is.
+   */
+  teamRole?: TeamRole;
+  /**
+   * Multi-task mode (多任务模式): set only for an ordinary conversation of a
+   * multi-task workspace, never with a team role. It adds the delegation
+   * tools and their background-task guidance; absent leaves the session
+   * exactly as it is.
+   */
+  workMode?: 'multi';
   /** Source JID of the latest message that triggered this run (e.g. `discord:123…`).
    * Used by per-channel MCP tools (discord_*, etc.) to identify the current
    * incoming chat. Undefined when chatJid already encodes the IM source. */
@@ -241,13 +251,10 @@ export interface ContainerInput {
    * current turn. This value is mutable on a warm runner and must be replaced
    * whenever a new IPC input becomes current. */
   channelContext?: ChannelTurnContext;
-  /** @deprecated Use isHome + isAdminHome instead. Kept for backward compatibility with older host processes. */
-  isMain?: boolean;
   /** Whether this is the user's home container (admin or member). */
   isHome?: boolean;
   /** Whether this is the admin's home container (full privileges). */
   isAdminHome?: boolean;
-  isScheduledTask?: boolean;
   /**
    * Internal HMAC secret delivered only in the stdin bootstrap. It must remain
    * runner-private and must never be written to IPC, files, env, or prompts.
@@ -255,14 +262,6 @@ export interface ContainerInput {
   workspaceMemoryMutationSigningSecret?: string;
   /** Public identity paired with the runner-private signing secret. */
   workspaceMemoryRunnerInstanceId?: string;
-  /** Isolated task-run namespace selected by the host. */
-  taskRunId?: string;
-  /** Claude session/provider namespace selected by the host runner. */
-  sessionAgentId?: string;
-  /** If the last unprocessed message was emitted by a scheduled task prompt,
-   * this is that task's ID; used to tag MCP send_message outputs so the host
-   * routes results to the task's configured chat_jid / notify channels. */
-  messageTaskId?: string;
   images?: Array<{ data: string; mimeType?: string }>;
   agentProfile?: {
     id: string;
@@ -326,7 +325,7 @@ export interface ContainerOutput {
    *
    * Proactive mode keeps `result` null and public interactive hosts must never
    * publish this candidate. It crosses the runner boundary only for internal
-   * diagnostics and scheduled-result extraction.
+   * diagnostics and automation result extraction.
    */
   proactiveFinalCandidate?: string;
   newSessionId?: string;

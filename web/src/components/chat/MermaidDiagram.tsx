@@ -7,6 +7,8 @@ import {
 } from 'react';
 import { Copy, Check, Maximize2, X } from 'lucide-react';
 import { PreviewDialog } from './PreviewDialog';
+import { ZoomPanSurface } from './ZoomPanSurface';
+import { useIsPhone } from '../layout/phone';
 import { Button } from '@/components/ui/button';
 import { IconButton } from '@/components/common/IconButton';
 import { useCopyFeedback } from '../../lib/markdown/use-copy-feedback';
@@ -164,6 +166,7 @@ export function MermaidDiagram({
   const [loading, setLoading] = useState(!initial);
   const { copied, copy } = useCopyFeedback();
   const [expanded, setExpanded] = useState(false);
+  const isPhone = useIsPhone();
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const renderKeyRef = useRef(cacheKey(theme, code));
   renderKeyRef.current = cacheKey(theme, code);
@@ -336,11 +339,17 @@ export function MermaidDiagram({
         />
       </div>
       {expanded && (
+        // A phone gets the whole screen, and the diagram pinches and pans like
+        // an image (ZoomPanSurface); a tap on a node still follows its link.
         <PreviewDialog
           title="Mermaid 图表预览"
           onClose={() => setExpanded(false)}
           layer="nested"
-          className="left-1/2 top-1/2 h-[95dvh] w-[95vw] -translate-x-1/2 -translate-y-1/2 rounded-xl bg-card p-6 shadow-floating ring-1 ring-foreground/10"
+          className={
+            isPhone
+              ? 'inset-0 bg-card pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]'
+              : 'left-1/2 top-1/2 h-[95dvh] w-[95vw] -translate-x-1/2 -translate-y-1/2 rounded-xl bg-card p-6 shadow-floating ring-1 ring-foreground/10'
+          }
         >
           <IconButton
             label="关闭图表预览"
@@ -348,13 +357,30 @@ export function MermaidDiagram({
             icon={<X />}
             size="icon"
             onClick={() => setExpanded(false)}
-            className="absolute top-3 right-3 z-20 text-muted-foreground"
+            className={
+              isPhone
+                ? 'absolute top-[calc(0.5rem+env(safe-area-inset-top))] right-[calc(0.5rem+env(safe-area-inset-right))] z-20 bg-card/80 text-muted-foreground'
+                : 'absolute top-3 right-3 z-20 text-muted-foreground'
+            }
           />
-          <div
-            className="flex h-full w-full items-center justify-center overflow-auto [touch-action:pan-x_pan-y_pinch-zoom] [&>svg]:!h-auto [&>svg]:!max-h-[90vh] [&>svg]:!w-[90vw] [&>svg]:!max-w-none"
-            onClick={openMermaidLink}
-            dangerouslySetInnerHTML={{ __html: svg! }}
-          />
+          {isPhone ? (
+            <ZoomPanSurface
+              className="flex h-full w-full items-center justify-center"
+              contentClassName="w-full px-3"
+            >
+              <div
+                className="flex justify-center [&>svg]:!h-auto [&>svg]:!max-h-[calc(var(--vvh,100dvh)-6rem)] [&>svg]:!w-full [&>svg]:!max-w-none"
+                onClick={openMermaidLink}
+                dangerouslySetInnerHTML={{ __html: svg! }}
+              />
+            </ZoomPanSurface>
+          ) : (
+            <div
+              className="flex h-full w-full items-center justify-center overflow-auto [touch-action:pan-x_pan-y_pinch-zoom] [&>svg]:!h-auto [&>svg]:!max-h-[90vh] [&>svg]:!w-[90vw] [&>svg]:!max-w-none"
+              onClick={openMermaidLink}
+              dangerouslySetInnerHTML={{ __html: svg! }}
+            />
+          )}
         </PreviewDialog>
       )}
     </>

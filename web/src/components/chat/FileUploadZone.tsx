@@ -73,8 +73,10 @@ export function FileUploadZone({ groupJid }: FileUploadZoneProps) {
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
+      // A phone has nothing to drag, nor a folder picker: there it is just
+      // the upload button, beside 新建文件夹's width.
       className={cn(
-        'relative rounded-lg border border-dashed p-3 transition-colors',
+        'relative rounded-lg border border-dashed p-3 transition-colors phone:border-0 phone:p-0',
         isDragging ? 'border-primary bg-primary/5' : 'border-surface-border',
       )}
     >
@@ -137,14 +139,15 @@ export function FileUploadZone({ groupJid }: FileUploadZoneProps) {
       ) : (
         /* Idle state */
         <div className="flex flex-col items-center gap-2 text-center">
-          <p className="text-caption text-muted-foreground">
+          <p className="text-caption text-muted-foreground phone:hidden">
             {isDragging ? '释放以上传' : '拖拽文件到这里，或'}
           </p>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 phone:w-full">
             <Button
               type="button"
               variant="outline"
               onClick={() => fileInputRef.current?.click()}
+              className="phone:h-11 phone:flex-1"
             >
               <Upload />
               上传文件
@@ -153,6 +156,7 @@ export function FileUploadZone({ groupJid }: FileUploadZoneProps) {
               type="button"
               variant="outline"
               onClick={() => folderInputRef.current?.click()}
+              className="phone:hidden"
             >
               <FolderUp />
               上传文件夹

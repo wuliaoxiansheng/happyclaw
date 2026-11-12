@@ -1,15 +1,24 @@
+import type {
+  ConnectionModelRoles,
+  ProviderModelEntry,
+  ProviderTestRecord,
+} from '@/lib/model-providers';
+import type { DeploymentMode } from '../../stores/auth';
+
 // ─── 统一供应商类型 (V4) ─────────────────────────────────────
+
+export type WebFetchPreflightPolicy = 'check' | 'skip';
 
 export interface UnifiedProviderPublic {
   id: string;
   name: string;
   type: 'official' | 'third_party';
-  enabled: boolean;
-  weight: number;
   anthropicBaseUrl: string;
   anthropicModel: string;
   /** null for third-party providers saved before the explicit choice. */
   anthropicAuthMode: 'bearer' | 'x-api-key' | null;
+  /** `skip` skips WebFetch's domain check; `check` follows Claude Code's settings. */
+  webFetchPreflightPolicy?: WebFetchPreflightPolicy;
   hasAnthropicAuthToken: boolean;
   anthropicAuthTokenMasked: string | null;
   hasAnthropicApiKey: boolean;
@@ -46,59 +55,19 @@ export interface UnifiedProviderPublic {
   /** Effort the gateway applies when the Agent does not choose one. */
   codexDefaultEffort?: string | null;
   customEnv: Record<string, string>;
+  /** The connection's effective model list; [] for ChatGPT (it uses its catalog). */
+  models: ProviderModelEntry[];
+  /** Which of its models Claude Code uses for sub-agents and background calls. */
+  roles?: ConnectionModelRoles;
+  /** The MODEL_PRESETS id the connection started from. */
+  presetId: string | null;
+  /** The outcome of the last connection test. */
+  lastTest: ProviderTestRecord | null;
   updatedAt: string;
 }
 
-export interface ProviderHealthStatus {
-  profileId: string;
-  healthy: boolean;
-  consecutiveErrors: number;
-  lastErrorAt: number | null;
-  lastSuccessAt: number | null;
-  unhealthySince: number | null;
-  activeSessionCount: number;
-}
-
-export interface ProviderWithHealth extends UnifiedProviderPublic {
-  health: ProviderHealthStatus | null;
-}
-
-export interface BalancingConfig {
-  strategy: 'round-robin' | 'weighted-round-robin' | 'failover';
-  unhealthyThreshold: number;
-  recoveryIntervalMs: number;
-}
-
 export interface ProvidersListResponse {
-  providers: ProviderWithHealth[];
-  balancing: BalancingConfig;
-  enabledCount: number;
-  /** The configuration unselected conversations run on; null = automatic pool. */
-  defaultModelConfigId: string | null;
-}
-
-export interface ClaudeApplyResult {
-  success: boolean;
-  stoppedCount: number;
-  failedCount?: number;
-  error?: string;
-}
-
-// ─── 兼容旧类型（仍被 GET /claude 返回） ────────────────────
-
-export interface ClaudeConfigPublic {
-  anthropicBaseUrl: string;
-  anthropicModel: string;
-  updatedAt: string | null;
-  hasAnthropicAuthToken: boolean;
-  hasAnthropicApiKey: boolean;
-  hasClaudeCodeOauthToken: boolean;
-  anthropicAuthTokenMasked: string | null;
-  anthropicApiKeyMasked: string | null;
-  claudeCodeOauthTokenMasked: string | null;
-  hasClaudeOAuthCredentials: boolean;
-  claudeOAuthCredentialsExpiresAt: number | null;
-  claudeOAuthCredentialsAccessTokenMasked: string | null;
+  providers: UnifiedProviderPublic[];
 }
 
 // ─── 通用类型 ────────────────────────────────────────────────
@@ -125,6 +94,7 @@ export interface SystemSettings {
   maxLoginAttempts: number;
   loginLockoutMinutes: number;
   fallbackModel: string;
+  allowMemberGuests: boolean;
 }
 
 export interface HostIntegrationSettings {
@@ -134,6 +104,29 @@ export interface HostIntegrationSettings {
   mainAgentAutoCompactPercentage: number;
   externalClaudeDir: string;
   pluginAutoScan: boolean;
+  // The rest are absent on servers older than the workspace root setting.
+  /** Stored root of new Host workspaces; '' = unset. */
+  workspaceRoot?: string;
+  /** Where new Host workspaces go; null: no usable root, so data/groups/<folder>. */
+  workspaceRootEffective?: string | null;
+  workspaceRootSource?: SettingSource;
+  /** Why the requested root is not used (a problem code), or null. */
+  workspaceRootFallbackReason?: string | null;
+  workspaceRootFallbackWarning?: string | null;
+  /** Effective mode. */
+  deploymentMode?: DeploymentMode;
+  /** Stored mode; '' = unset. */
+  deploymentModeConfigured?: '' | DeploymentMode;
+  deploymentModeSource?: SettingSource;
+}
+
+export type SettingSource = 'settings' | 'env' | 'default';
+
+/** The user list of a 409 `SINGLE_USER_HOST_OTHER_USERS`. */
+export interface OtherActiveUser {
+  id: string;
+  username: string;
+  role: string;
 }
 
 // ─── OAuth Usage ────────────────────────────────────────────
@@ -226,11 +219,13 @@ export type SettingsTab =
   | 'system'
   | 'main-agent'
   | 'host-integration'
+  | 'storage-sources'
   | 'billing'
   | 'profile'
   | 'preferences'
   | 'my-channels'
   | 'security'
+  | 'guests'
   | 'groups'
   | 'agent-profiles'
   | 'memory'

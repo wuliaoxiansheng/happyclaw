@@ -1,44 +1,50 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
 import type { Variables } from '../web-context.js';
 import {
   getWebDeps,
-  projectWebAgentRemoved,
+  hasHostExecutionPermission,
+  isHostExecutionGroup,
   projectWebAgentStatus,
 } from '../web-context.js';
+import {
+  createSessionWorktree,
+  dirtyWorktreesConflict,
+  findDirtySessionWorktrees,
+  refreshSessionWorktreeStatus,
+  removeSessionWorktree,
+  toSessionWorktreePayload,
+  WorktreeUnavailableError,
+} from '../session-worktree.js';
+import {
+  getSessionWorktree,
+  listSessionWorktreesByFolder,
+  type SessionWorktree,
+} from '../session-worktree-store.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { canAccessGroup, canModifyGroup } from '../group-acl.js';
+import { canViewGroup } from '../guest-access.js';
 import {
-  clearSessionChannelOwner,
   getRegisteredGroup,
   getAllRegisteredGroups,
   listAgentsByJid,
   getAgent,
-  deleteAgent,
-  updateAgentStatus,
-  createAgent,
-  ensureChatExists,
-  deleteMessagesForChatJid,
-  deleteSession,
-  getGroupsByTargetAgent,
   getGroupsByTargetAgents,
   setRegisteredGroup,
   getJidsByFolder,
-  updateAgentLastImJid,
   updateAgentInfo,
   updateAgentContextInfo,
   updateChatName,
   getLatestMessagePreviewPerChat,
   listImContextBindingsByAgent,
-  listChannelMountsBySession,
   listChannelMountsBySessions,
   getRegisteredGroupNames,
   getChannelAccount,
-  VALID_ACTIVATION_MODES,
+  getUserPinnedSessions,
+  pinSession,
+  unpinSession,
 } from '../db.js';
-import { DATA_DIR } from '../config.js';
+import { sortSessionsForList } from '../session-order.js';
 import type {
   AudienceMode,
   AuthUser,
@@ -47,108 +53,46 @@ import type {
 } from '../types.js';
 import { logger } from '../logger.js';
 import { getChannelType, extractChatId } from '../im-channel.js';
-import { ensureAgentDirectories } from '../utils.js';
+import {
+  carryUnprocessedInputs,
+  createConversationSession,
+  deleteConversationSession,
+  deliverCarriedInputs,
+} from '../session-factory.js';
+import { getAutomationService } from '../automation-run-ledger.js';
 import {
   buildSessionMountUpdate,
   buildDetachedWorkspaceUpdate,
   buildWorkspaceMountUpdate,
   commitChannelMountUpdate,
+  writeChannelMountUpdates,
   hasRemainingThreadMapMount,
   hasSessionMountConflict,
   hasWorkspaceMountConflict,
+  isBindableSession,
   isNativeContextContainer,
+  listSessionBoundChatJids,
+  SESSION_NOT_BINDABLE,
   matchesWorkspaceMount,
   unbindChannelMount,
   resolveWorkspaceJid,
-  type NativeContextMetadata,
 } from '../channel-mount-service.js';
 import {
-  channelConversationJid,
-  parseChannelAddress,
-} from '../channel-address.js';
-import { isMentionActivationMode } from '../feishu-conversation-policy.js';
-import { normalizeLegacyOwnerMention } from '../im-audience-policy.js';
-import {
   conversationBindingPolicyError,
-  resolveChannelConversationKind,
   type ChannelConversationKind,
 } from '../channel-conversation-kind.js';
+import {
+  FEISHU_P2P_MENTION_ACTIVATION_ERROR,
+  feishuP2pRejectsMentionActivation,
+  fetchLiveChatInfo,
+  getConversationKind,
+  hasConsistentChannelAccount,
+  parseBindingResponsePolicy,
+  refreshAgentLastImJid,
+  type ChannelChatInfo,
+} from '../channel-binding-helpers.js';
 
 const router = new Hono<{ Variables: Variables }>();
-
-type ChannelChatInfo = NativeContextMetadata & {
-  avatar?: string;
-  name?: string;
-  user_count?: string;
-};
-
-/** Preserve omitted policies and normalize legacy Feishu owner-only mentions. */
-function parseBindingResponsePolicy(
-  imJid: string,
-  body: Record<string, unknown>,
-): {
-  activationMode?: RegisteredGroup['activation_mode'];
-  audienceMode?: AudienceMode;
-} {
-  const rawActivationMode = body.activation_mode;
-  const activationMode =
-    typeof rawActivationMode === 'string' &&
-    VALID_ACTIVATION_MODES.has(rawActivationMode)
-      ? (rawActivationMode as RegisteredGroup['activation_mode'])
-      : undefined;
-  const audienceMode: AudienceMode | undefined =
-    body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
-      ? body.audience_mode
-      : undefined;
-  const policy = { activationMode, audienceMode };
-  return getChannelType(imJid) === 'feishu'
-    ? normalizeLegacyOwnerMention(policy)
-    : policy;
-}
-
-function getConversationKind(
-  imJid: string,
-  group: Pick<
-    RegisteredGroup,
-    'feishu_chat_mode' | 'feishu_group_message_type' | 'native_context_type'
-  >,
-  chatInfo?: ChannelChatInfo | null,
-): ChannelConversationKind {
-  return resolveChannelConversationKind(imJid, {
-    feishu_chat_mode: group.feishu_chat_mode,
-    feishu_group_message_type: group.feishu_group_message_type,
-    native_context_type:
-      chatInfo?.native_context_type ?? group.native_context_type,
-    chat_mode: chatInfo?.chat_mode,
-    group_message_type: chatInfo?.group_message_type,
-    thread_capable: chatInfo?.thread_capable,
-  });
-}
-
-// Only fetches live chat metadata — does NOT compute threadCapable. That
-// decision must be (re-)computed by the caller against a freshly re-read
-// imGroup taken AFTER this await, never against the pre-await snapshot:
-// getChannelChatInfo/getFeishuChatInfo is a real network call that yields
-// the event loop, during which the message router can upgrade
-// native_context_type from 'none' to 'thread' for this exact imJid. Using a
-// stale imGroup here would compute threadCapable from outdated persisted
-// state and could bind a now-native-thread-capable container as a fixed
-// single_session, breaking that thread's session isolation from its
-// siblings. See callers for the fresh-read + recompute pattern.
-async function fetchLiveChatInfo(
-  userId: string,
-  imJid: string,
-): Promise<{ chatInfo?: ChannelChatInfo | null }> {
-  const channelType = getChannelType(imJid);
-  if (!channelType) return {};
-  const deps = getWebDeps();
-  const chatInfo = deps?.getChannelChatInfo
-    ? ((await deps.getChannelChatInfo(imJid)) as ChannelChatInfo | null)
-    : channelType === 'feishu' && deps?.getFeishuChatInfo
-      ? await deps.getFeishuChatInfo(userId, extractChatId(imJid))
-      : null;
-  return { chatInfo };
-}
 
 /** Update workspace RegisteredGroup in DB + in-memory cache. */
 function updateWorkspaceGroup(jid: string, workspace: RegisteredGroup): void {
@@ -160,28 +104,6 @@ function updateWorkspaceGroup(jid: string, workspace: RegisteredGroup): void {
   }
 }
 
-function hasConsistentChannelAccount(
-  userId: string,
-  imJid: string,
-  group: RegisteredGroup,
-): boolean {
-  const encodedAccountId = parseChannelAddress(imJid)?.channelAccountId ?? null;
-  const storedAccountId = group.channel_account_id ?? null;
-  if (encodedAccountId !== storedAccountId) {
-    // Legacy/default account chats intentionally retain their historical
-    // unscoped JID while the normalized account id is stored on the row.
-    if (!encodedAccountId && storedAccountId) {
-      const account = getChannelAccount(storedAccountId);
-      return (
-        account?.is_legacy_default === true && account.owner_user_id === userId
-      );
-    }
-    return false;
-  }
-  if (!storedAccountId) return true;
-  return getChannelAccount(storedAccountId)?.owner_user_id === userId;
-}
-
 function markNativeContextWorkspace(jid: string): void {
   const freshWorkspace = getRegisteredGroup(jid);
   if (!freshWorkspace) return;
@@ -190,25 +112,6 @@ function markNativeContextWorkspace(jid: string): void {
     conversation_source: 'native_thread',
     conversation_nav_mode: 'vertical_threads',
   });
-}
-
-/** Keep the agent's fallback reply route when another bound chat remains. */
-function refreshAgentLastImJid(agentId: string): void {
-  const agent = getAgent(agentId);
-  if (!agent) return;
-  const remaining = getGroupsByTargetAgent(agentId);
-  const current = agent.last_im_jid
-    ? channelConversationJid(agent.last_im_jid)
-    : null;
-  if (current && remaining.some(({ jid }) => jid === current)) return;
-
-  remaining.sort((a, b) => {
-    const dateDiff =
-      Date.parse(b.group.added_at) - Date.parse(a.group.added_at);
-    if (Number.isFinite(dateDiff) && dateDiff !== 0) return dateDiff;
-    return a.jid.localeCompare(b.jid);
-  });
-  updateAgentLastImJid(agentId, remaining[0]?.jid ?? null);
 }
 
 /**
@@ -290,7 +193,70 @@ function unbindError(result: { reason: string }): string {
     : 'IM group no longer exists';
 }
 
+/** Guests get 404 so an ungranted workspace's existence is not revealed. */
+function guestAwareForbidden(
+  c: Context<{ Variables: Variables }>,
+  user: Pick<AuthUser, 'role'>,
+) {
+  return user.role === 'guest'
+    ? c.json({ error: 'Group not found' }, 404)
+    : c.json({ error: 'Forbidden' }, 403);
+}
+
 // GET /api/groups/:jid/agents — list all agents for a group
+/**
+ * Names of the user's automations in a workspace, for labelling their run
+ * sessions. Another user's automation stays unnamed (owner isolation).
+ */
+function automationNamesFor(
+  user: AuthUser,
+  jid: string,
+  sessions: SubAgent[],
+): Map<string, string> {
+  const service = getAutomationService();
+  if (!service || !sessions.some((a) => a.source_kind === 'automation')) {
+    return new Map();
+  }
+  try {
+    return new Map(
+      service
+        .list(
+          { kind: 'web', userId: user.id, isAdmin: user.role === 'admin' },
+          { workspaceJid: jid },
+        )
+        .map((automation) => [automation.id, automation.name]),
+    );
+  } catch (err) {
+    logger.warn({ err, jid }, 'Failed to list automations for sessions');
+    return new Map();
+  }
+}
+
+/** Sessions in the shared list order, each with the viewer's pin time. */
+function orderSessions(
+  sessions: SubAgent[],
+  pins: Record<string, string>,
+): Array<SubAgent & { pinned_at: string | null }> {
+  return sortSessionsForList(
+    sessions.map((session) => ({
+      ...session,
+      pinned_at: pins[session.id] ?? null,
+    })),
+  );
+}
+
+/** `automation_id` / `automation_name` of an automation run session. */
+function automationFields(
+  session: SubAgent,
+  names: Map<string, string>,
+): { automation_id?: string; automation_name?: string | null } {
+  if (session.source_kind !== 'automation' || !session.automation_id) return {};
+  return {
+    automation_id: session.automation_id,
+    automation_name: names.get(session.automation_id) ?? null,
+  };
+}
+
 router.get('/:jid/agents', authMiddleware, async (c) => {
   const jid = decodeURIComponent(c.req.param('jid'));
   const user = c.get('user');
@@ -300,18 +266,27 @@ router.get('/:jid/agents', authMiddleware, async (c) => {
     return c.json({ error: 'Group not found' }, 404);
   }
 
-  if (!canAccessGroup(user, { ...group, jid })) {
-    return c.json({ error: 'Forbidden' }, 403);
+  if (!canViewGroup(user, { ...group, jid })) {
+    return guestAwareForbidden(c, user);
   }
 
-  const agents = listAgentsByJid(jid);
-  const virtualChatJids = agents
-    .filter((a) => a.kind === 'conversation')
-    .map((a) => `${jid}#agent:${a.id}`);
-  const latestByChatJid = getLatestMessagePreviewPerChat(virtualChatJids);
-  const linkedByAgent = getGroupsByTargetAgents(
-    agents.filter((a) => a.kind === 'conversation').map((a) => a.id),
+  const all = listAgentsByJid(jid);
+  const conversations = orderSessions(
+    all.filter((a) => a.kind === 'conversation'),
+    getUserPinnedSessions(user.id),
   );
+  // Conversation sessions first, in the shared list order; then /sw tasks.
+  // Rows of the retired `task` kind stay in the database but are not listed.
+  const agents: Array<SubAgent & { pinned_at?: string | null }> = [
+    ...conversations,
+    ...all.filter((a) => a.kind === 'spawn'),
+  ];
+  const automationNames = automationNamesFor(user, jid, agents);
+  const latestByChatJid = getLatestMessagePreviewPerChat(
+    conversations.map((a) => `${jid}#agent:${a.id}`),
+  );
+  const linkedByAgent = getGroupsByTargetAgents(conversations.map((a) => a.id));
+  const worktrees = worktreesBySession(group.folder, user);
   return c.json({
     agents: agents.map((a) => {
       const base = {
@@ -328,12 +303,17 @@ router.get('/:jid/agents', authMiddleware, async (c) => {
         root_message_id: a.root_message_id ?? null,
         title_source: a.title_source ?? null,
         last_active_at: a.last_active_at ?? null,
+        ...automationFields(a, automationNames),
+        ...(a.kind === 'spawn'
+          ? { spawned_from_jid: a.spawned_from_jid ?? null }
+          : {}),
       };
       if (a.kind === 'conversation') {
         const linked = linkedByAgent.get(a.id) ?? [];
         const latest = latestByChatJid.get(`${jid}#agent:${a.id}`);
         return {
           ...base,
+          pinned_at: a.pinned_at ?? null,
           latest_message: latest
             ? {
                 content: latest.content,
@@ -344,6 +324,7 @@ router.get('/:jid/agents', authMiddleware, async (c) => {
             jid: l.jid,
             name: l.group.name,
           })),
+          worktree: toSessionWorktreePayload(worktrees.get(a.id)),
         };
       }
       return base;
@@ -360,11 +341,15 @@ router.get('/:jid/sessions', authMiddleware, async (c) => {
   if (!group) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  if (!canAccessGroup(user, { ...group, jid })) {
-    return c.json({ error: 'Forbidden' }, 403);
+  if (!canViewGroup(user, { ...group, jid })) {
+    return guestAwareForbidden(c, user);
   }
 
-  const agents = listAgentsByJid(jid).filter((a) => a.kind === 'conversation');
+  const agents = orderSessions(
+    listAgentsByJid(jid).filter((a) => a.kind === 'conversation'),
+    getUserPinnedSessions(user.id),
+  );
+  const automationNames = automationNamesFor(user, jid, agents);
   const virtualChatJids = agents.map((a) => `${jid}#agent:${a.id}`);
   const latestByChatJid = getLatestMessagePreviewPerChat(virtualChatJids);
   const mountsBySession = listChannelMountsBySessions(agents.map((a) => a.id));
@@ -373,25 +358,10 @@ router.get('/:jid/sessions', authMiddleware, async (c) => {
       [...mountsBySession.values()].flat().map((mount) => mount.channel_jid),
     ),
   ]);
+  const worktrees = worktreesBySession(group.folder, user);
 
   return c.json({
     sessions: [
-      {
-        id: 'main',
-        name: '主会话',
-        prompt: '',
-        status: 'idle',
-        kind: 'main',
-        chat_jid: jid,
-        is_main: true,
-        created_at: group.added_at,
-        source_kind: null,
-        thread_id: null,
-        root_message_id: null,
-        title_source: null,
-        last_active_at: null,
-        latest_message: null,
-      },
       ...agents.map((a) => {
         const latest = latestByChatJid.get(`${jid}#agent:${a.id}`);
         return {
@@ -401,7 +371,6 @@ router.get('/:jid/sessions', authMiddleware, async (c) => {
           status: a.status,
           kind: 'conversation',
           chat_jid: jid,
-          is_main: false,
           created_at: a.created_at,
           completed_at: a.completed_at,
           result_summary: a.result_summary,
@@ -410,6 +379,8 @@ router.get('/:jid/sessions', authMiddleware, async (c) => {
           root_message_id: a.root_message_id ?? null,
           title_source: a.title_source ?? null,
           last_active_at: a.last_active_at ?? null,
+          pinned_at: a.pinned_at,
+          ...automationFields(a, automationNames),
           latest_message: latest
             ? {
                 content: latest.content,
@@ -420,6 +391,7 @@ router.get('/:jid/sessions', authMiddleware, async (c) => {
             jid: mount.channel_jid,
             name: mountNames.get(mount.channel_jid) ?? mount.channel_jid,
           })),
+          worktree: toSessionWorktreePayload(worktrees.get(a.id)),
         };
       }),
     ],
@@ -438,6 +410,148 @@ const NON_WORKSPACE_SESSION_PARENT_ERROR =
 
 function isWorkspaceSessionParent(jid: string): boolean {
   return jid.startsWith('web:') && !jid.includes('#');
+}
+
+/**
+ * Create the worktree a new session asked for (`worktree: true`) before the
+ * session itself, so a failure leaves nothing behind. Returns null when none
+ * was requested, or the error response.
+ */
+async function createRequestedWorktree(
+  c: Context<{ Variables: Variables }>,
+  input: {
+    body: Record<string, unknown>;
+    jid: string;
+    group: RegisteredGroup;
+    user: AuthUser;
+    sessionId: string;
+  },
+): Promise<SessionWorktree | null | Response> {
+  if (input.body.worktree !== true) return null;
+  if (
+    isHostExecutionGroup(input.group) &&
+    !hasHostExecutionPermission(input.user)
+  ) {
+    return c.json(
+      { error: 'Insufficient permissions for host execution mode' },
+      403,
+    );
+  }
+  try {
+    return await createSessionWorktree({
+      group: input.group,
+      chatJid: input.jid,
+      agentId: input.sessionId,
+    });
+  } catch (error) {
+    if (error instanceof WorktreeUnavailableError) {
+      return c.json(
+        {
+          error: error.message,
+          code: 'WORKTREE_UNAVAILABLE',
+          reason: error.reason,
+        },
+        400,
+      );
+    }
+    logger.error(
+      { err: error, jid: input.jid, sessionId: input.sessionId },
+      'Failed to create session worktree',
+    );
+    return c.json(
+      {
+        error: `创建 worktree 失败：${error instanceof Error ? error.message : String(error)}`,
+        code: 'WORKTREE_CREATE_FAILED',
+      },
+      500,
+    );
+  }
+}
+
+/** The workspace's worktrees, rechecked on disk so the list shows broken and
+ * recovered checkouts as they are now. */
+/** Each session's worktree; none for guests, who get no repository details. */
+function worktreesBySession(
+  folder: string,
+  user: { role: string },
+): Map<string, SessionWorktree> {
+  if (user.role === 'guest') return new Map();
+  return new Map(
+    listSessionWorktreesByFolder(folder).map((record) => [
+      record.agent_id,
+      refreshSessionWorktreeStatus(record),
+    ]),
+  );
+}
+
+/**
+ * Refuse to delete a session whose worktree holds uncommitted changes until
+ * the caller confirms with `force_worktree=true`. Checked before the runner
+ * is stopped, so a refused delete leaves the session untouched.
+ */
+async function checkWorktreeBeforeDelete(
+  c: Context<{ Variables: Variables }>,
+  sessionId: string,
+  force: boolean,
+): Promise<Response | null> {
+  const worktree = getSessionWorktree(sessionId);
+  if (!worktree || force) return null;
+  try {
+    const dirty = await findDirtySessionWorktrees([worktree]);
+    return dirty.length > 0 ? c.json(dirtyWorktreesConflict(dirty), 409) : null;
+  } catch (error) {
+    logger.error({ err: error, sessionId }, 'Failed to inspect worktree');
+    return c.json({ error: '无法检查会话 worktree 的改动，会话未删除' }, 500);
+  }
+}
+
+/**
+ * Remove a deleted session's worktree, keeping its branch. The runner is
+ * stopped first so nothing writes into the checkout while it is checked
+ * again and removed, with only this session's lane held (never another
+ * session's) and its queued work kept:
+ * when the removal is refused (409, work found after the runner stopped) or
+ * fails (500), the lane is released as it was. Otherwise the caller deletes
+ * the session and then calls `finish` on every path, which drops the lane's
+ * work and runs its discard hook.
+ */
+async function releaseSessionWorktree(
+  c: Context<{ Variables: Variables }>,
+  input: { jid: string; sessionId: string; force: boolean },
+): Promise<{ refusal: Response } | { finish: () => void }> {
+  if (!getSessionWorktree(input.sessionId)) return { finish: () => {} };
+  const queue = getWebDeps()?.queue;
+  const laneJid = `${input.jid}#agent:${input.sessionId}`;
+  queue?.holdLane(laneJid);
+  const refuse = (refusal: Response) => {
+    queue?.releaseLane(laneJid);
+    return { refusal };
+  };
+  try {
+    await queue?.stopGroup(laneJid, { force: true, preserveQueuedWork: true });
+    const result = await removeSessionWorktree(input.sessionId, {
+      force: input.force,
+      keepRecord: true,
+    });
+    if (result && !result.removed) {
+      return refuse(c.json(dirtyWorktreesConflict([result.risk]), 409));
+    }
+  } catch (error) {
+    logger.error(
+      { err: error, sessionId: input.sessionId },
+      'Failed to remove session worktree',
+    );
+    return refuse(
+      c.json(
+        {
+          error: `移除 worktree 失败，会话未删除：${error instanceof Error ? error.message : String(error)}`,
+          code: 'WORKTREE_REMOVE_FAILED',
+        },
+        500,
+      ),
+    );
+  }
+  return { finish: () => queue?.discardHeldLane(laneJid) };
 }
 
 // POST /api/groups/:jid/agents — create a user conversation
@@ -466,55 +580,31 @@ router.post('/:jid/agents', authMiddleware, async (c) => {
     return c.json({ error: NON_WORKSPACE_SESSION_PARENT_ERROR }, 400);
   }
   const body = await c.req.json().catch(() => ({}));
-  let name = typeof body.name === 'string' ? body.name.trim() : '';
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
   if (name.length > 40) {
     return c.json({ error: 'Name too long (max 40 chars)' }, 400);
   }
-  const isAutoTitle = !name;
-  if (!name) name = '新对话';
   const description =
     typeof body.description === 'string' ? body.description.trim() : '';
 
   const agentId = crypto.randomUUID();
-  const now = new Date().toISOString();
-
-  const agent: SubAgent = {
-    id: agentId,
-    group_folder: group.folder,
-    chat_jid: jid,
+  const worktree = await createRequestedWorktree(c, {
+    body,
+    jid,
+    group,
+    user,
+    sessionId: agentId,
+  });
+  if (worktree instanceof Response) return worktree;
+  const agent = await createConversationSession({
+    workspaceJid: jid,
+    group,
+    createdBy: user.id,
     name,
-    prompt: description,
-    status: 'idle',
-    kind: 'conversation',
-    created_by: user.id,
-    created_at: now,
-    completed_at: null,
-    result_summary: null,
-    last_im_jid: null,
-    spawned_from_jid: null,
-    // Channel-native topics and Web-created conversations intentionally
-    // coexist in one workspace. The source belongs to the session, not to
-    // the workspace-wide navigation mode.
-    source_kind: 'manual',
-    title_source: isAutoTitle ? 'auto_pending' : 'manual',
-  };
-
-  createAgent(agent);
-
-  // Create IPC + session directories
-  ensureAgentDirectories(group.folder, agentId);
-
-  // Create virtual chat record for this agent's messages
-  const virtualChatJid = `${jid}#agent:${agentId}`;
-  ensureChatExists(virtualChatJid);
-
-  // Broadcast through the injected Web projection boundary.
-  projectWebAgentStatus(jid, agentId, 'idle', name, description);
-
-  logger.info(
-    { agentId, jid, name, userId: user.id },
-    'User conversation created',
-  );
+    description,
+    sessionId: agentId,
+    worktree,
+  });
 
   return c.json({
     agent: {
@@ -529,6 +619,7 @@ router.post('/:jid/agents', authMiddleware, async (c) => {
       root_message_id: agent.root_message_id ?? null,
       title_source: agent.title_source ?? null,
       last_active_at: agent.last_active_at ?? null,
+      worktree: toSessionWorktreePayload(worktree ?? undefined),
     },
   });
 });
@@ -559,44 +650,30 @@ router.post('/:jid/sessions', authMiddleware, async (c) => {
   if (name.length > 40) {
     return c.json({ error: 'Name too long (max 40 chars)' }, 400);
   }
-  const isAutoTitle = !name;
-  if (!name) name = '新对话';
   const description =
     typeof body.description === 'string' ? body.description.trim() : '';
 
   const sessionId = crypto.randomUUID();
-  const now = new Date().toISOString();
-  const session: SubAgent = {
-    id: sessionId,
-    group_folder: group.folder,
-    chat_jid: jid,
+  const worktree = await createRequestedWorktree(c, {
+    body,
+    jid,
+    group,
+    user,
+    sessionId,
+  });
+  if (worktree instanceof Response) return worktree;
+  // A thread-mapped channel only controls its own native sessions. It must
+  // not remove the workspace owner's ability to create independent Web
+  // sessions in the same workspace.
+  const session = await createConversationSession({
+    workspaceJid: jid,
+    group,
+    createdBy: user.id,
     name,
-    prompt: description,
-    status: 'idle',
-    kind: 'conversation',
-    created_by: user.id,
-    created_at: now,
-    completed_at: null,
-    result_summary: null,
-    last_im_jid: null,
-    spawned_from_jid: null,
-    // A thread-mapped channel only controls its own native sessions. It must
-    // not remove the workspace owner's ability to create independent Web
-    // sessions in the same workspace.
-    source_kind: 'manual',
-    title_source: isAutoTitle ? 'auto_pending' : 'manual',
-  };
-
-  createAgent(session);
-  ensureAgentDirectories(group.folder, sessionId);
-  ensureChatExists(`${jid}#agent:${sessionId}`);
-
-  projectWebAgentStatus(jid, sessionId, 'idle', name, description);
-
-  logger.info(
-    { sessionId, jid, name, userId: user.id },
-    'Workspace session created',
-  );
+    description,
+    sessionId,
+    worktree,
+  });
 
   const payload = {
     id: session.id,
@@ -610,7 +687,8 @@ router.post('/:jid/sessions', authMiddleware, async (c) => {
     root_message_id: session.root_message_id ?? null,
     title_source: session.title_source ?? null,
     last_active_at: session.last_active_at ?? null,
-    is_main: false,
+    pinned_at: null,
+    worktree: toSessionWorktreePayload(worktree ?? undefined),
   };
   return c.json({ session: payload, agent: payload });
 });
@@ -675,14 +753,11 @@ router.patch('/:jid/agents/:agentId', authMiddleware, async (c) => {
 });
 
 // PATCH /api/groups/:jid/sessions/:sessionId — rename a workspace session
+// (`name`, owner only) and/or pin it for the current user (`pinned`).
 router.patch('/:jid/sessions/:sessionId', authMiddleware, async (c) => {
   const jid = decodeURIComponent(c.req.param('jid'));
   const sessionId = c.req.param('sessionId');
   const user = c.get('user');
-
-  if (sessionId === 'main') {
-    return c.json({ error: 'Main session is renamed with the workspace' }, 400);
-  }
 
   const group = getRegisteredGroup(jid);
   if (!group) {
@@ -691,45 +766,240 @@ router.patch('/:jid/sessions/:sessionId', authMiddleware, async (c) => {
   if (!canAccessGroup(user, { ...group, jid })) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  if (!canModifyGroup(user, { ...group, jid })) {
-    return c.json(
-      { error: 'Only the workspace owner can manage sessions' },
-      403,
-    );
-  }
 
   const session = getAgent(sessionId);
   if (!session || session.chat_jid !== jid || session.kind !== 'conversation') {
     return c.json({ error: 'Session not found' }, 404);
   }
-  if (isNativeManagedSession(session)) {
+
+  const body = await c.req.json().catch(() => ({}));
+  const pinned = typeof body.pinned === 'boolean' ? body.pinned : undefined;
+  if (pinned === undefined || body.name !== undefined) {
+    if (!canModifyGroup(user, { ...group, jid })) {
+      return c.json(
+        { error: 'Only the workspace owner can manage sessions' },
+        403,
+      );
+    }
+    if (isNativeManagedSession(session)) {
+      return c.json(
+        { error: 'Native thread sessions use read-only titles' },
+        400,
+      );
+    }
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    if (!name || name.length > 40) {
+      return c.json({ error: 'Name is required (max 40 chars)' }, 400);
+    }
+
+    updateAgentInfo(sessionId, name, session.prompt);
+    updateAgentContextInfo(sessionId, { title_source: 'manual' });
+    updateChatName(`${jid}#agent:${sessionId}`, name);
+
+    projectWebAgentStatus(
+      jid,
+      sessionId,
+      session.status as import('../types.js').AgentStatus,
+      name,
+      session.prompt,
+    );
+    logger.info({ sessionId, jid, name, userId: user.id }, 'Session renamed');
+  }
+
+  let pinnedAt: string | null = null;
+  if (pinned === true) pinnedAt = pinSession(user.id, sessionId);
+  else if (pinned === false) unpinSession(user.id, sessionId);
+  else pinnedAt = getUserPinnedSessions(user.id)[sessionId] ?? null;
+  return c.json({ success: true, pinned_at: pinnedAt });
+});
+
+/**
+ * Everything deleting a session takes with it: the direct chats and
+ * ordinary groups bound to it, its native topic bindings, and its bound
+ * automations.
+ */
+function collectSessionDeleteImpact(jid: string, sessionId: string) {
+  const linkedJids = listSessionBoundChatJids(jid, sessionId);
+  const contexts = listImContextBindingsByAgent(sessionId);
+  const names = getRegisteredGroupNames([
+    ...new Set([
+      ...linkedJids,
+      ...contexts.map((binding) => binding.source_jid),
+    ]),
+  ]);
+  const automations = (
+    getAutomationService()?.listForSession(`${jid}#agent:${sessionId}`) ?? []
+  )
+    .filter((automation) => automation.status !== 'completed')
+    .map((automation) => ({ id: automation.id, name: automation.name }));
+  return {
+    linkedImGroups: linkedJids.map((imJid) => ({
+      jid: imJid,
+      name: names.get(imJid) ?? imJid,
+    })),
+    threadBindings: contexts.map((binding) => ({
+      jid: binding.source_jid,
+      name: names.get(binding.source_jid) ?? binding.source_jid,
+      context_id: binding.context_id,
+    })),
+    automations,
+  };
+}
+
+/**
+ * Moving the chats of session `doomed` to session `targetId` before it is
+ * deleted: every chat bound to it, each passing the checks a session bind
+ * runs, with its own reply, activation and audience settings kept. Either
+ * the whole move or a refusal; a chat whose row is gone has nothing to move.
+ */
+function planRebind(
+  user: AuthUser,
+  jid: string,
+  doomed: SubAgent,
+  targetId: string,
+): { updates: Array<[string, RegisteredGroup]> } | { refusal: string } {
+  const target = getAgent(targetId);
+  if (
+    targetId === doomed.id ||
+    target?.chat_jid !== jid ||
+    !isBindableSession(target)
+  ) {
+    return {
+      refusal:
+        'The rebind target must be another session of this workspace that chats can bind to',
+    };
+  }
+  const updates: Array<[string, RegisteredGroup]> = [];
+  for (const chatJid of listSessionBoundChatJids(jid, doomed.id)) {
+    const chat = getRegisteredGroup(chatJid);
+    if (!chat) continue;
+    // The PUT im-binding checks, on the stored chat kind (the move runs in one
+    // synchronous transaction, so no live chat info). The chat is bound here,
+    // so there is no conflict to force; a topic group's workspace binding is
+    // refused rather than detached.
+    if (
+      !canModifyGroup(user, { ...chat, jid: chatJid }) ||
+      !hasConsistentChannelAccount(user.id, chatJid, chat) ||
+      chat.target_main_jid ||
+      isNativeContextContainer(chatJid, chat) ||
+      conversationBindingPolicyError(
+        getConversationKind(chatJid, chat),
+        'session',
+      )
+    ) {
+      return {
+        refusal: `Chat ${chat.name || chatJid} cannot be bound to the rebind target`,
+      };
+    }
+    updates.push([
+      chatJid,
+      buildSessionMountUpdate(chat, targetId, {
+        replyPolicy: chat.reply_policy,
+      }),
+    ]);
+  }
+  return { updates };
+}
+
+/**
+ * Delete one session of workspace `jid`. A session that chats, topics or
+ * automations depend on answers 409 `session_has_bindings` until the client
+ * confirms with `confirm_bindings=true`; `rebind_to=<session>` then moves
+ * every chat bound to it to another session of the same workspace, together
+ * with their inputs it has not taken yet, in the same transaction that
+ * deletes it. Without it those chats are left unbound. Topic bindings go
+ * with the session (the topic's next message opens a new one); bound
+ * automations pause.
+ */
+async function deleteWorkspaceSession(
+  c: Context<{ Variables: Variables }>,
+  input: {
+    jid: string;
+    group: RegisteredGroup;
+    session: SubAgent;
+  },
+): Promise<Response | null> {
+  const { jid, group, session } = input;
+  const user = c.get('user');
+  const rebindTo = c.req.query('rebind_to');
+  const invalidRebind = (error: string) =>
+    c.json({ error, code: 'invalid_rebind_target' }, 400);
+  if (rebindTo) {
+    const plan = planRebind(user, jid, session, rebindTo);
+    if ('refusal' in plan) return invalidRebind(plan.refusal);
+  }
+
+  const impact =
+    session.kind === 'conversation'
+      ? collectSessionDeleteImpact(jid, session.id)
+      : { linkedImGroups: [], threadBindings: [], automations: [] };
+  if (
+    c.req.query('confirm_bindings') !== 'true' &&
+    (impact.linkedImGroups.length > 0 ||
+      impact.threadBindings.length > 0 ||
+      impact.automations.length > 0)
+  ) {
     return c.json(
-      { error: 'Native thread sessions use read-only titles' },
-      400,
+      {
+        error: 'Session has channel bindings or automations',
+        code: 'session_has_bindings',
+        linked_im_groups: impact.linkedImGroups,
+        thread_bindings: impact.threadBindings,
+        automations: impact.automations,
+      },
+      409,
     );
   }
 
-  const body = await c.req.json().catch(() => ({}));
-  const name = typeof body.name === 'string' ? body.name.trim() : '';
-  if (!name || name.length > 40) {
-    return c.json({ error: 'Name is required (max 40 chars)' }, 400);
-  }
-
-  updateAgentInfo(sessionId, name, session.prompt);
-  updateAgentContextInfo(sessionId, { title_source: 'manual' });
-  updateChatName(`${jid}#agent:${sessionId}`, name);
-
-  projectWebAgentStatus(
-    jid,
-    sessionId,
-    session.status as import('../types.js').AgentStatus,
-    name,
-    session.prompt,
+  const forceWorktree = c.req.query('force_worktree') === 'true';
+  const worktreeBlock = await checkWorktreeBeforeDelete(
+    c,
+    session.id,
+    forceWorktree,
   );
+  if (worktreeBlock) return worktreeBlock;
 
-  logger.info({ sessionId, jid, name, userId: user.id }, 'Session renamed');
-  return c.json({ success: true });
-});
+  // Nothing destructive happens before the worktree is settled: a refused
+  // removal leaves the session, its runner state and its queue as they were.
+  const worktreeRelease = await releaseSessionWorktree(c, {
+    jid,
+    sessionId: session.id,
+    force: forceWorktree,
+  });
+  if ('refusal' in worktreeRelease) return worktreeRelease.refusal;
+  try {
+    const deletion = { workspaceJid: jid, group, session };
+    if (!rebindTo) {
+      deleteConversationSession(deletion);
+      return null;
+    }
+    // From here on synchronous: the move is checked again against the rows
+    // as they are after the awaits, and commits with the deletion or not at
+    // all. (A worktree checkout removed above is not restored on a refusal;
+    // its branch is kept.)
+    const plan = planRebind(user, jid, session, rebindTo);
+    if ('refusal' in plan) return invalidRebind(plan.refusal);
+    deleteConversationSession(deletion, () => {
+      const applyCache = writeChannelMountUpdates(plan.updates);
+      const carried = carryUnprocessedInputs(
+        jid,
+        session.id,
+        rebindTo,
+        new Set(plan.updates.map(([imJid]) => imJid)),
+      );
+      refreshAgentLastImJid(rebindTo);
+      return {
+        reboundChatsCache: applyCache,
+        carriedInputs: () => deliverCarriedInputs(jid, rebindTo, carried),
+      };
+    });
+  } finally {
+    // The worktree is gone: whatever happened above, the lane's work must
+    // not run on without it.
+    worktreeRelease.finish();
+  }
+  return null;
+}
 
 // DELETE /api/groups/:jid/agents/:agentId — stop and delete an agent
 router.delete('/:jid/agents/:agentId', authMiddleware, async (c) => {
@@ -757,117 +1027,12 @@ router.delete('/:jid/agents/:agentId', authMiddleware, async (c) => {
   if (!agent || agent.chat_jid !== jid) {
     return c.json({ error: 'Agent not found' }, 404);
   }
-  if (agent.kind === 'conversation' && isNativeManagedSession(agent)) {
-    return c.json(
-      {
-        error:
-          'Native thread conversations are managed by their channel container and cannot be deleted directly',
-      },
-      409,
-    );
-  }
-  // Block deletion if conversation agent has active IM bindings
-  if (agent.kind === 'conversation') {
-    const legacyLinkedImGroups = getGroupsByTargetAgent(agentId);
-    const mountedImGroups = listChannelMountsBySession(agentId).map(
-      (mount) => ({
-        jid: mount.channel_jid,
-        group: getRegisteredGroup(mount.channel_jid),
-      }),
-    );
-    const linkedByJid = new Map<string, { jid: string; name: string }>();
-    for (const { jid: imJid, group: imGroup } of legacyLinkedImGroups) {
-      linkedByJid.set(imJid, { jid: imJid, name: imGroup.name });
-    }
-    for (const { jid: imJid, group: imGroup } of mountedImGroups) {
-      linkedByJid.set(imJid, { jid: imJid, name: imGroup?.name ?? imJid });
-    }
-    const linkedImGroups = Array.from(linkedByJid.values());
-    const threadBindings = listImContextBindingsByAgent(agentId);
-    if (linkedImGroups.length > 0) {
-      return c.json(
-        {
-          error:
-            'Session has active IM bindings. Unbind all IM groups before deleting.',
-          linked_im_groups: linkedImGroups,
-        },
-        409,
-      );
-    }
-    if (threadBindings.length > 0) {
-      const linkedThreadGroups = threadBindings.map((binding) => {
-        const imGroup = getRegisteredGroup(binding.source_jid);
-        return {
-          jid: binding.source_jid,
-          name: imGroup?.name ?? binding.source_jid,
-          context_id: binding.context_id,
-        };
-      });
-      return c.json(
-        {
-          error:
-            'Session is managed by a thread-mapped IM channel. Unbind the workspace channel before deleting.',
-          linked_im_groups: linkedThreadGroups,
-        },
-        409,
-      );
-    }
-  }
-
-  // If the agent is still running or idle, stop the process
-  if (agent.status === 'running' || agent.status === 'idle') {
-    updateAgentStatus(agentId, 'error', '用户手动停止');
-    // Stop running process via queue
-    const deps = getWebDeps();
-    if (deps) {
-      const virtualJid = `${jid}#agent:${agentId}`;
-      deps.queue.stopGroup(virtualJid);
-    }
-  }
-
-  // Clean up IPC/session directories
-  const agentIpcDir = path.join(
-    DATA_DIR,
-    'ipc',
-    group.folder,
-    'agents',
-    agentId,
-  );
-  try {
-    fs.rmSync(agentIpcDir, { recursive: true, force: true });
-  } catch {
-    /* ignore */
-  }
-  const agentSessionDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    'agents',
-    agentId,
-  );
-  try {
-    fs.rmSync(agentSessionDir, { recursive: true, force: true });
-  } catch {
-    /* ignore */
-  }
-
-  // Delete virtual chat messages for conversation agents
-  if (agent.kind === 'conversation') {
-    const virtualChatJid = `${jid}#agent:${agentId}`;
-    deleteMessagesForChatJid(virtualChatJid);
-
-    // Note: IM bindings are checked above and block deletion if present.
-    // No auto-clear here — user must unbind explicitly before deleting.
-  }
-
-  // Delete session records
-  deleteSession(group.folder, agentId);
-  clearSessionChannelOwner(group.folder, agentId);
-
-  deleteAgent(agentId);
-
-  // Broadcast removal
-  projectWebAgentRemoved(jid, agentId, agent.name);
+  const refused = await deleteWorkspaceSession(c, {
+    jid,
+    group,
+    session: agent,
+  });
+  if (refused) return refused;
 
   logger.info({ agentId, jid, userId: user.id }, 'Agent deleted by user');
   return c.json({ success: true });
@@ -878,10 +1043,6 @@ router.delete('/:jid/sessions/:sessionId', authMiddleware, async (c) => {
   const jid = decodeURIComponent(c.req.param('jid'));
   const sessionId = c.req.param('sessionId');
   const user = c.get('user');
-
-  if (sessionId === 'main') {
-    return c.json({ error: 'Main session cannot be deleted' }, 400);
-  }
 
   const group = getRegisteredGroup(jid);
   if (!group) {
@@ -901,84 +1062,12 @@ router.delete('/:jid/sessions/:sessionId', authMiddleware, async (c) => {
   if (!session || session.chat_jid !== jid || session.kind !== 'conversation') {
     return c.json({ error: 'Session not found' }, 404);
   }
-  if (isNativeManagedSession(session)) {
-    return c.json(
-      {
-        error:
-          'Native thread sessions are managed by their channel container and cannot be deleted directly',
-      },
-      409,
-    );
-  }
-
-  const legacyLinkedImGroups = getGroupsByTargetAgent(sessionId);
-  const mountedImGroups = listChannelMountsBySession(sessionId).map(
-    (mount) => ({
-      jid: mount.channel_jid,
-      group: getRegisteredGroup(mount.channel_jid),
-    }),
-  );
-  const linkedByJid = new Map<string, { jid: string; name: string }>();
-  for (const { jid: imJid, group: imGroup } of legacyLinkedImGroups) {
-    linkedByJid.set(imJid, { jid: imJid, name: imGroup.name });
-  }
-  for (const { jid: imJid, group: imGroup } of mountedImGroups) {
-    linkedByJid.set(imJid, { jid: imJid, name: imGroup?.name ?? imJid });
-  }
-  const linkedImGroups = Array.from(linkedByJid.values());
-  if (linkedImGroups.length > 0) {
-    return c.json(
-      {
-        error:
-          'Session has active IM bindings. Unbind all IM groups before deleting.',
-        linked_im_groups: linkedImGroups,
-      },
-      409,
-    );
-  }
-
-  const threadBindings = listImContextBindingsByAgent(sessionId);
-  if (threadBindings.length > 0) {
-    return c.json(
-      {
-        error:
-          'Session is managed by a thread-mapped IM channel. Unbind the workspace channel before deleting.',
-        linked_im_groups: threadBindings.map((binding) => {
-          const imGroup = getRegisteredGroup(binding.source_jid);
-          return {
-            jid: binding.source_jid,
-            name: imGroup?.name ?? binding.source_jid,
-            context_id: binding.context_id,
-          };
-        }),
-      },
-      409,
-    );
-  }
-
-  if (session.status === 'running' || session.status === 'idle') {
-    updateAgentStatus(sessionId, 'error', '用户手动停止');
-    const deps = getWebDeps();
-    if (deps) deps.queue.stopGroup(`${jid}#agent:${sessionId}`);
-  }
-
-  for (const dir of [
-    path.join(DATA_DIR, 'ipc', group.folder, 'agents', sessionId),
-    path.join(DATA_DIR, 'sessions', group.folder, 'agents', sessionId),
-  ]) {
-    try {
-      fs.rmSync(dir, { recursive: true, force: true });
-    } catch {
-      /* ignore */
-    }
-  }
-
-  deleteMessagesForChatJid(`${jid}#agent:${sessionId}`);
-  deleteSession(group.folder, sessionId);
-  clearSessionChannelOwner(group.folder, sessionId);
-  deleteAgent(sessionId);
-
-  projectWebAgentRemoved(jid, sessionId, session.name);
+  const refused = await deleteWorkspaceSession(c, {
+    jid,
+    group,
+    session,
+  });
+  if (refused) return refused;
 
   logger.info({ sessionId, jid, userId: user.id }, 'Session deleted by user');
   return c.json({ success: true });
@@ -1280,131 +1369,68 @@ router.put(
     const force = body.force === true;
     const replyPolicy = 'source_only' as const;
 
-    if (sessionId !== 'main') {
-      const session = getAgent(sessionId);
-      if (
-        !session ||
-        session.chat_jid !== jid ||
-        session.kind !== 'conversation'
-      ) {
-        return c.json({ error: 'Session not found' }, 404);
-      }
-      const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
-      // Re-read after the await: fetchLiveChatInfo makes a live network
-      // call (e.g. Feishu getFeishuChatInfo) that yields the event loop,
-      // during which a concurrent bind request or the message router's
-      // owner-learning path can commit a new mount for this exact imJid —
-      // or upgrade native_context_type from 'none' to 'thread'. Building
-      // the update, or computing threadCapable, from the pre-await
-      // snapshot would silently clobber that concurrent write, bypass the
-      // conflict check below (commitChannelMountUpdate persists the full
-      // row), or bind a now-thread-capable container as a fixed single
-      // session, breaking that thread's session isolation.
-      const freshImGroup = getRegisteredGroup(imJid);
-      if (!freshImGroup) {
-        return c.json({ error: 'IM group not found' }, 404);
-      }
-      // The pre-await canModifyGroup/hasConsistentChannelAccount checks
-      // above only proved authorization against the stale imGroup. During
-      // the await, ownership could have changed (credential transfer,
-      // delete+recreate, owner-learning) — re-run both checks against the
-      // fresh row before committing, or a mutation could cross the
-      // original authorization boundary.
-      if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
-        return c.json({ error: 'Forbidden' }, 403);
-      }
-      if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
-        return c.json(
-          { error: 'Invalid or inaccessible channel account' },
-          400,
-        );
-      }
-      const freshSession = getAgent(sessionId);
-      const freshTargetGroup = getRegisteredGroup(jid);
-      if (
-        !freshSession ||
-        freshSession.chat_jid !== jid ||
-        freshSession.kind !== 'conversation' ||
-        !freshTargetGroup
-      ) {
-        return c.json({ error: 'Session not found' }, 404);
-      }
-      if (!canModifyGroup(user, { ...freshTargetGroup, jid })) {
-        return c.json({ error: 'Forbidden' }, 403);
-      }
-      if (isNativeContextContainer(imJid, freshImGroup, chatInfo ?? {})) {
-        return c.json(
-          {
-            error:
-              'Native thread containers can only bind to a workspace, not a single session',
-          },
-          400,
-        );
-      }
-      const bindingPolicyError = conversationBindingPolicyError(
-        getConversationKind(imJid, freshImGroup, chatInfo),
-        'session',
-      );
-      if (bindingPolicyError) {
-        return c.json({ error: bindingPolicyError }, 400);
-      }
-      const hasConflict = hasSessionMountConflict(freshImGroup, sessionId);
-      if (hasConflict && !force) {
-        return c.json({ error: 'IM group is already bound elsewhere' }, 409);
-      }
-
-      const { activationMode, audienceMode } = parseBindingResponsePolicy(
-        imJid,
-        body,
-      );
-      if (
-        getChannelType(imJid) === 'feishu' &&
-        (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
-        isMentionActivationMode(activationMode)
-      ) {
-        return c.json(
-          { error: 'Feishu private chats do not support mention activation' },
-          400,
-        );
-      }
-
-      const updated = buildSessionMountUpdate(freshImGroup, sessionId, {
-        replyPolicy,
-        activationMode,
-        audienceMode,
-      });
-      commitChannelMountUpdate(imJid, updated);
-      detachPreviousThreadMapIfLast(imJid, freshImGroup);
-      logger.info(
-        { imJid, sessionId, userId: user.id },
-        'IM group bound to workspace session',
-      );
-      return c.json({ success: true });
+    const session = getAgent(sessionId);
+    if (
+      !session ||
+      session.chat_jid !== jid ||
+      session.kind !== 'conversation'
+    ) {
+      return c.json({ error: 'Session not found' }, 404);
     }
-
+    if (!isBindableSession(session)) {
+      return c.json(SESSION_NOT_BINDABLE, 400);
+    }
     const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
-    // Re-read after the await — see the analogous comment in the
-    // session-bind branch above: fetchLiveChatInfo yields the event loop
-    // on a live network call, and a concurrent write to this imJid must
-    // not be silently overwritten by the pre-await snapshot.
+    // Re-read after the await: fetchLiveChatInfo makes a live network
+    // call (e.g. Feishu getFeishuChatInfo) that yields the event loop,
+    // during which a concurrent bind request or the message router's
+    // owner-learning path can commit a new mount for this exact imJid —
+    // or upgrade native_context_type from 'none' to 'thread'. Building
+    // the update, or computing threadCapable, from the pre-await
+    // snapshot would silently clobber that concurrent write, bypass the
+    // conflict check below (commitChannelMountUpdate persists the full
+    // row), or bind a now-thread-capable container as a fixed single
+    // session, breaking that thread's session isolation.
     const freshImGroup = getRegisteredGroup(imJid);
     if (!freshImGroup) {
       return c.json({ error: 'IM group not found' }, 404);
     }
-    // Re-run authorization against the fresh row — see the analogous
-    // comment in the session-bind branch above.
+    // The pre-await canModifyGroup/hasConsistentChannelAccount checks
+    // above only proved authorization against the stale imGroup. During
+    // the await, ownership could have changed (credential transfer,
+    // delete+recreate, owner-learning) — re-run both checks against the
+    // fresh row before committing, or a mutation could cross the
+    // original authorization boundary.
     if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
       return c.json({ error: 'Forbidden' }, 403);
     }
     if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
       return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
     }
+    const freshSession = getAgent(sessionId);
     const freshTargetGroup = getRegisteredGroup(jid);
-    if (!freshTargetGroup) {
-      return c.json({ error: 'Group not found' }, 404);
+    if (
+      !freshSession ||
+      freshSession.chat_jid !== jid ||
+      freshSession.kind !== 'conversation' ||
+      !freshTargetGroup
+    ) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+    if (!isBindableSession(freshSession)) {
+      return c.json(SESSION_NOT_BINDABLE, 400);
     }
     if (!canModifyGroup(user, { ...freshTargetGroup, jid })) {
       return c.json({ error: 'Forbidden' }, 403);
+    }
+    if (isNativeContextContainer(imJid, freshImGroup, chatInfo ?? {})) {
+      return c.json(
+        {
+          error:
+            'Native thread containers can only bind to a workspace, not a single session',
+        },
+        400,
+      );
     }
     const bindingPolicyError = conversationBindingPolicyError(
       getConversationKind(imJid, freshImGroup, chatInfo),
@@ -1413,77 +1439,35 @@ router.put(
     if (bindingPolicyError) {
       return c.json({ error: bindingPolicyError }, 400);
     }
-    // Compute against freshImGroup, not the pre-await snapshot — see
-    // fetchLiveChatInfo's doc comment.
-    let threadCapable = isNativeContextContainer(
-      imJid,
-      freshImGroup,
-      chatInfo ?? {},
-    );
-    const targetMainJid = jid;
-    const legacyMainJid = `web:${freshTargetGroup.folder}`;
-    const hasConflict = hasWorkspaceMountConflict(
-      freshImGroup,
-      targetMainJid,
-      legacyMainJid,
-    );
+    const hasConflict = hasSessionMountConflict(freshImGroup, sessionId);
     if (hasConflict && !force) {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
+
     const { activationMode, audienceMode } = parseBindingResponsePolicy(
       imJid,
       body,
     );
     if (
-      getChannelType(imJid) === 'feishu' &&
-      (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
-      isMentionActivationMode(activationMode)
+      feishuP2pRejectsMentionActivation(
+        imJid,
+        chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
+        activationMode,
+      )
     ) {
-      return c.json(
-        { error: 'Feishu private chats do not support mention activation' },
-        400,
-      );
+      return c.json({ error: FEISHU_P2P_MENTION_ACTIVATION_ERROR }, 400);
     }
-    threadCapable = isNativeContextContainer(imJid, freshImGroup, {
-      ...(chatInfo ?? {}),
-      activation_mode: activationMode ?? freshImGroup.activation_mode,
+
+    const updated = buildSessionMountUpdate(freshImGroup, sessionId, {
+      replyPolicy,
+      activationMode,
+      audienceMode,
     });
-    const ownerImId =
-      typeof body.owner_im_id === 'string' && body.owner_im_id.trim()
-        ? body.owner_im_id.trim()
-        : undefined;
-
-    const updated: RegisteredGroup = {
-      ...buildWorkspaceMountUpdate(
-        freshImGroup,
-        targetMainJid,
-        threadCapable ? 'thread_map' : 'single_session',
-        {
-          replyPolicy,
-          ...(activationMode !== undefined ? { activationMode } : {}),
-          ...(audienceMode !== undefined ? { audienceMode } : {}),
-          ...(ownerImId !== undefined ? { ownerImId } : {}),
-        },
-      ),
-      feishu_chat_mode: chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
-      feishu_group_message_type:
-        chatInfo?.group_message_type ?? freshImGroup.feishu_group_message_type,
-      ...(ownerImId !== undefined
-        ? { owner_claim_source: 'configured' as const }
-        : {}),
-    };
     commitChannelMountUpdate(imJid, updated);
-    detachPreviousThreadMapIfLast(
-      imJid,
-      freshImGroup,
-      targetMainJid,
-      threadCapable ? 'thread_map' : 'single_session',
-    );
-    if (threadCapable) markNativeContextWorkspace(jid);
-
+    detachPreviousThreadMapIfLast(imJid, freshImGroup);
     logger.info(
-      { imJid, targetMainJid, threadCapable, userId: user.id },
-      'IM group bound to workspace main session',
+      { imJid, sessionId, userId: user.id },
+      'IM group bound to workspace session',
     );
     return c.json({ success: true });
   },
@@ -1521,49 +1505,26 @@ router.delete(
       return c.json({ error: 'Forbidden' }, 403);
     }
 
-    if (sessionId !== 'main') {
-      const session = getAgent(sessionId);
-      if (
-        !session ||
-        session.chat_jid !== jid ||
-        session.kind !== 'conversation'
-      ) {
-        return c.json({ error: 'Session not found' }, 404);
-      }
-      if (imGroup.target_agent_id !== sessionId) {
-        return c.json({ error: 'IM group is not bound to this session' }, 400);
-      }
-      const restored = await unbindBinding(user, imJid, imGroup);
-      if (restored.status !== 'resolved') {
-        return c.json({ error: unbindError(restored) }, 409);
-      }
-      refreshAgentLastImJid(sessionId);
-      logger.info(
-        {
-          imJid,
-          sessionId,
-          unbound: true,
-          userId: user.id,
-        },
-        'IM channel unbound',
-      );
-      return c.json({ success: true, target_main_jid: restored.workspaceJid });
+    const session = getAgent(sessionId);
+    if (
+      !session ||
+      session.chat_jid !== jid ||
+      session.kind !== 'conversation'
+    ) {
+      return c.json({ error: 'Session not found' }, 404);
     }
-
-    const targetMainJid = jid;
-    const legacyMainJid = `web:${group.folder}`;
-    if (!matchesWorkspaceMount(imGroup, targetMainJid, legacyMainJid)) {
-      return c.json({ error: 'IM group is not bound to this workspace' }, 400);
+    if (imGroup.target_agent_id !== sessionId) {
+      return c.json({ error: 'IM group is not bound to this session' }, 400);
     }
     const restored = await unbindBinding(user, imJid, imGroup);
     if (restored.status !== 'resolved') {
       return c.json({ error: unbindError(restored) }, 409);
     }
-
+    refreshAgentLastImJid(sessionId);
     logger.info(
       {
         imJid,
-        targetMainJid,
+        sessionId,
         unbound: true,
         userId: user.id,
       },
@@ -1603,8 +1564,8 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
   if (!agent || agent.chat_jid !== jid) {
     return c.json({ error: 'Session not found' }, 404);
   }
-  if (agent.kind !== 'conversation') {
-    return c.json({ error: 'Only workspace sessions can bind IM groups' }, 400);
+  if (!isBindableSession(agent)) {
+    return c.json(SESSION_NOT_BINDABLE, 400);
   }
 
   const body = await c.req.json().catch(() => ({}));
@@ -1646,6 +1607,9 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
   ) {
     return c.json({ error: 'Session not found' }, 404);
   }
+  if (!isBindableSession(freshAgent)) {
+    return c.json(SESSION_NOT_BINDABLE, 400);
+  }
   if (!canModifyGroup(user, { ...freshTargetGroup, jid })) {
     return c.json({ error: 'Forbidden' }, 403);
   }
@@ -1679,14 +1643,13 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
     body,
   );
   if (
-    getChannelType(imJid) === 'feishu' &&
-    (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
-    isMentionActivationMode(activationMode)
+    feishuP2pRejectsMentionActivation(
+      imJid,
+      chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
+      activationMode,
+    )
   ) {
-    return c.json(
-      { error: 'Feishu private chats do not support mention activation' },
-      400,
-    );
+    return c.json({ error: FEISHU_P2P_MENTION_ACTIVATION_ERROR }, 400);
   }
 
   // Update DB + in-memory cache — clear target_main_jid to avoid conflicts
@@ -1771,7 +1734,8 @@ router.delete(
   },
 );
 
-// PUT /api/groups/:jid/im-binding — bind an IM group to this workspace's main conversation
+// PUT /api/groups/:jid/im-binding — bind a native topic group to this workspace:
+// each topic gets its own session (thread_map)
 router.put('/:jid/im-binding', authMiddleware, async (c) => {
   const jid = decodeURIComponent(c.req.param('jid'));
   const user = c.get('user');
@@ -1786,8 +1750,8 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   if (!canAccessGroup(user, { ...group, jid })) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  // Binding an IM group to the main conversation mutates the owner's workspace
-  // routing → owner-only (the imGroup-side check below stays Access).
+  // Binding a topic group mutates the owner's workspace routing → owner-only
+  // (the imGroup-side check below stays Access).
   if (!canModifyGroup(user, { ...group, jid })) {
     return c.json(
       { error: 'Only the workspace owner can manage IM bindings' },
@@ -1840,21 +1804,14 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   if (bindingPolicyError) {
     return c.json({ error: bindingPolicyError }, 400);
   }
-  // Compute against freshImGroup, not the pre-await snapshot — see
-  // fetchLiveChatInfo's doc comment.
-  let threadCapable = isNativeContextContainer(
-    imJid,
-    freshImGroup,
-    chatInfo ?? {},
-  );
-  const targetMainJid = jid; // Use actual registered JID (not folder-based)
-  const legacyMainJid = `web:${freshTargetGroup.folder}`;
+  const targetWorkspaceJid = jid; // Use actual registered JID (not folder-based)
+  const legacyWorkspaceJid = `web:${freshTargetGroup.folder}`;
   const force = body.force === true;
   const replyPolicy = 'source_only' as const;
   const hasConflict = hasWorkspaceMountConflict(
     freshImGroup,
-    targetMainJid,
-    legacyMainJid,
+    targetWorkspaceJid,
+    legacyWorkspaceJid,
   );
   if (hasConflict && !force) {
     return c.json({ error: 'IM group is already bound elsewhere' }, 409);
@@ -1865,19 +1822,14 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
     body,
   );
   if (
-    getChannelType(imJid) === 'feishu' &&
-    (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
-    isMentionActivationMode(activationMode)
+    feishuP2pRejectsMentionActivation(
+      imJid,
+      chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
+      activationMode,
+    )
   ) {
-    return c.json(
-      { error: 'Feishu private chats do not support mention activation' },
-      400,
-    );
+    return c.json({ error: FEISHU_P2P_MENTION_ACTIVATION_ERROR }, 400);
   }
-  threadCapable = isNativeContextContainer(imJid, freshImGroup, {
-    ...(chatInfo ?? {}),
-    activation_mode: activationMode ?? freshImGroup.activation_mode,
-  });
 
   // Parse owner_im_id for owner_mentioned mode
   // 如果前端传了 owner_im_id 就用，否则 owner_mentioned 模式下自动设为空（后续首条消息自动学习）
@@ -1890,8 +1842,8 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   const updated: RegisteredGroup = {
     ...buildWorkspaceMountUpdate(
       freshImGroup,
-      targetMainJid,
-      threadCapable ? 'thread_map' : 'single_session',
+      targetWorkspaceJid,
+      'thread_map',
       {
         ...(replyPolicy !== undefined ? { replyPolicy } : {}),
         ...(activationMode !== undefined ? { activationMode } : {}),
@@ -1910,25 +1862,19 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   detachPreviousThreadMapIfLast(
     imJid,
     freshImGroup,
-    targetMainJid,
-    threadCapable ? 'thread_map' : 'single_session',
+    targetWorkspaceJid,
+    'thread_map',
   );
-  if (threadCapable) markNativeContextWorkspace(jid);
+  markNativeContextWorkspace(jid);
 
   logger.info(
-    {
-      imJid,
-      targetMainJid,
-      activationMode,
-      threadCapable,
-      userId: user.id,
-    },
-    'IM group bound to workspace main conversation',
+    { imJid, targetWorkspaceJid, activationMode, userId: user.id },
+    'IM topic group bound to workspace',
   );
   return c.json({ success: true });
 });
 
-// DELETE /api/groups/:jid/im-binding/:imJid — unbind an IM group from this workspace's main conversation
+// DELETE /api/groups/:jid/im-binding/:imJid — unbind a topic group from this workspace
 router.delete('/:jid/im-binding/:imJid', authMiddleware, async (c) => {
   const jid = decodeURIComponent(c.req.param('jid'));
   const imJid = decodeURIComponent(c.req.param('imJid'));
@@ -1956,9 +1902,9 @@ router.delete('/:jid/im-binding/:imJid', authMiddleware, async (c) => {
   if (!canModifyGroup(user, { ...imGroup, jid: imJid })) {
     return c.json({ error: 'Forbidden' }, 403);
   }
-  const targetMainJid = jid; // Use actual registered JID (not folder-based)
-  const legacyMainJid = `web:${group.folder}`;
-  if (!matchesWorkspaceMount(imGroup, targetMainJid, legacyMainJid)) {
+  const targetWorkspaceJid = jid; // Use actual registered JID (not folder-based)
+  const legacyWorkspaceJid = `web:${group.folder}`;
+  if (!matchesWorkspaceMount(imGroup, targetWorkspaceJid, legacyWorkspaceJid)) {
     return c.json({ error: 'IM group is not bound to this workspace' }, 400);
   }
 
@@ -1970,7 +1916,7 @@ router.delete('/:jid/im-binding/:imJid', authMiddleware, async (c) => {
   logger.info(
     {
       imJid,
-      targetMainJid,
+      targetWorkspaceJid,
       unbound: true,
       userId: user.id,
     },

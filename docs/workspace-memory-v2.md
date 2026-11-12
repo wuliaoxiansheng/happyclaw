@@ -81,6 +81,11 @@ Workspace 有独立的 store revision，每个 item 有单独的 revision：
 - 创建、编辑和忘记可以携带稳定的 `idempotencyKey`。相同请求重试返回
   `replayed: true`；同一个 key 对应不同请求时返回
   `idempotency_conflict`。
+- `canonicalKey` 表示“同一个想法”：忽略大小写、全半角和空格/`_`/`-` 的差异后，
+  key 已被占用时，创建（以及把条目改到这个 key、确认提议）返回 409
+  `memory_duplicate` 和已有条目的 id、标题、状态，调用方应改为更新那一条。owner 的
+  写入只被 active 条目占用；提议还会被另一条提议占用。确认一条提议时，同一 key 已有
+  active 条目也返回 409，由 owner 拒绝提议或先改 key。幂等重放先于这一检查。
 
 `validFrom`、`validUntil` 和 `expiresAt` 用于控制知识的时间有效性；`importance` 和
 `confidence` 的范围都是 0 到 1。详情字段与端点见 [API 文档](API.md#workspace-memory-v2)。
@@ -98,15 +103,57 @@ Workspace 有独立的 store revision，每个 item 有单独的 revision：
 `sourceType` 或 actor。读取要求能够访问 Workspace，写入要求能够修改 Workspace；
 未授权与不存在均返回 404，管理员也不能跨 owner 读取 Workspace Memory。
 
-Agent Runtime 还按执行上下文收紧写权限：顶层交互式 Main/Runtime Session 可按
-Workspace ACL 读写；Scheduled Run（group/isolated）和 SDK Task Sub-Agent
-只能读取，不能创建、更新或忘记 Memory。
+Agent Runtime 还按执行上下文收紧写权限，所有写入都必须带 Runner 的 HMAC 写能力：
+
+- 当前批次的输入全部来自 owner 本人（Web 输入按用户 id；IM 输入按发送者 IM id，
+  只认该工作区由宿主记录 owner 的注册：`configured`、`trusted_direct`、
+  `auto_feishu`）的 Main/Runtime Session 轮次可以直接创建、更新和忘记。
+- 其他交互轮次（群聊成员、混有非 owner 输入的批次）和 Scheduled Run
+  （group/isolated）的写入一律存为 `proposed`：创建得到待确认条目，更新和忘记
+  只能作用于待确认条目，不能改动已生效的记忆（`owner_confirmation_required`）。
+  工具结果告诉模型“已提交，待主人确认”。
+- Spawn/Task 会话和 SDK Sub-Agent 只能读取。
+
+`proposed` 条目不进入召回、记忆目录和搜索，由 owner 在记忆页确认（变为 active）或
+拒绝（写入 tombstone）；两者各自写一条 `confirm` / `reject` 审计事件。`proposed`
+只装提议者写下的内容：owner 的写入（Web 编辑或 owner 轮次的更新）会把提议直接变为
+active 并记为 `confirm`，owner 也不能把条目设成 `proposed`，所以提议者永远改不到
+owner 写过的内容。
+
+已知取舍：
+
+- 非飞书群若只通过 `/owner_mention` 认领 owner（claim source 为 `explicit`），owner
+  在该群里的写入也会存为 `proposed`（fail-closed），需要在 Web 确认。
+- 记忆目录随每个轮次发送，群聊里的成员也能通过 Agent 的回复间接看到其中的标题。
+- 很长的消息只取前 40 个检索词参与召回。
 
 Owner Profile 的边界更严格：只允许 Home 内置 HappyClaw 的 Main/普通 Runtime
 Session，并且宿主必须把本次持久化消息 sender 验证为实际 owner。每个 cold/warm
 turn 都单独读取最新投影；排队 turn 只能用自己的 host-issued turn ID 读取，
 set/clear/skip 还必须是当前 active turn。SDK Sub-Agent 对整个专用工具（包括
 `get`）均被 hook 拒绝。
+
+## 运行时召回
+
+每个用户轮次附带的记忆分两部分，都走 Runner 的 TurnNoteLedger，只发上下文里还没有
+的部分，压缩或换会话后整体重发：
+
+- **记忆目录** `workspace_memory_index`：全部可召回条目，每条一行
+  `id · kind · title`（无标题取正文首行，截到 80 字），按 importance、更新时间排序，
+  最多 80 条、3000 字；放不下的给出数量并提示用 `workspace_memory_search`。之后的
+  目录块带 `changes_only="true"`，`+` 为新增或改名，`-` 为离开目录（忘记、过期、
+  被挤出上限）。
+- **相关条目快照** `workspace_memory_snapshot`：最多 8 条正文。检索词只取发送者本人
+  的正文：剥掉消息信封、注入的历史、引用和转发内容以及定时任务前导语，取前 2000 字。
+  召回使用单独的 FTS5 索引 `workspace_memory_recall_fts`（`porter unicode61`），
+  文本预先切成英文词和中日韩二元组，每行带所属工作区的 scope 词，查询只在本工作区
+  内匹配；检索词去掉常见虚词后最多 40 个，OR 组合，按 bm25（标题权重最高）排序，
+  不足的名额用 importance、更新时间补位。旧库启动时若该索引与 trigram 索引行数
+  不一致，会从 trigram 索引整体重建。
+
+目录只有标题，快照只有相关条目的正文：一条记忆在一轮里最多重复 id 和 kind。
+Runtime 的 `workspace_memory_search` 先按同样的相关性排序，再补上原有 trigram
+子串匹配；Web 搜索仍是子串匹配。
 
 ## Web 交互
 
@@ -119,6 +166,11 @@ Memory 页面采用 Workspace-first 流程：
 4. 详情展示来源 Session/来源 ID、观察时间、item revision、store revision 和修订
    时间线。
 5. 有修改权限时可以创建、编辑和忘记；只读 Workspace 不显示可执行写操作。
+6. 列表可切换“已生效 / 待确认”；待确认条目可以先编辑，再确认或拒绝（拒绝需要二次
+   确认）。`?item=<id>` 直接打开某条记忆，并切到它所在的列表。
+
+聊天回复的过程卡片下方，对本轮成功的记忆写入显示“已记住：标题”或
+“已提交待确认：标题”，链接到记忆页的对应条目。
 
 空状态需要区分“没有 Workspace”“Workspace 尚无 Memory”和“搜索无结果”。请求
 失败在当前区域展示并允许刷新，不能回退到旧文件源。移动端在列表和详情之间切换，
@@ -154,4 +206,6 @@ Memory 页面采用 Workspace-first 流程：
 - PATCH/DELETE 携带 `expectedRevision`；409 时本地草稿仍在。
 - 忘记后活跃列表不再显示 item，来源 Session 历史仍存在。
 - 只读 Workspace 无写操作，未授权资源不泄露存在性。
+- 群聊成员和定时任务的写入只出现在“待确认”，确认后才参与召回。
+- 同一 canonical key 的第二次创建返回 `memory_duplicate` 并指向已有条目。
 - UI 和 Runtime 均不调用旧 `/sources`、`/search`、`/file`、`/global` 端点。

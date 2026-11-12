@@ -509,6 +509,8 @@ interface LiveCodexCatalog {
   fetchedAt: number;
   attemptedAt: number;
   failed: boolean;
+  /** Why the last refresh failed: an HTTP status, or null for no answer. */
+  failure: { status: number | null; message: string } | null;
   /** x-models-etag 通报目录已变，下次检查时刷新。 */
   stale: boolean;
   /** 最近一次 /models 响应的 ETag。 */
@@ -529,6 +531,7 @@ function liveState(providerId: string): LiveCodexCatalog {
       fetchedAt: 0,
       attemptedAt: 0,
       failed: false,
+      failure: null,
       stale: false,
       etag: null,
       notedEtag: null,
@@ -615,6 +618,7 @@ export async function refreshCodexProviderCatalog(
   if (state.inflight) return state.inflight;
   const doRefresh = async (): Promise<boolean> => {
     state.attemptedAt = Date.now();
+    state.failure = null;
     try {
       // 动态导入：token-manager 依赖 runtime-config，而 runtime-config 静态
       // 依赖本模块；运行时才取用可避免模块环。
@@ -636,7 +640,11 @@ export async function refreshCodexProviderCatalog(
       );
       if (!response.ok) {
         await response.body?.cancel().catch(() => {});
-        throw new Error(`Codex models endpoint HTTP ${response.status}`);
+        state.failure = {
+          status: response.status,
+          message: `Codex models endpoint HTTP ${response.status}`,
+        };
+        throw new Error(state.failure.message);
       }
       const models = parseUpstreamModelCatalog(
         JSON.parse(await readBodyWithCap(response)),
@@ -645,6 +653,7 @@ export async function refreshCodexProviderCatalog(
       state.models = models;
       state.fetchedAt = Date.now();
       state.failed = false;
+      state.failure = null;
       state.stale = false;
       state.etag = response.headers.get('etag');
       logger.info(
@@ -654,6 +663,10 @@ export async function refreshCodexProviderCatalog(
       return true;
     } catch (err) {
       state.failed = true;
+      state.failure ??= {
+        status: null,
+        message: err instanceof Error ? err.message : String(err),
+      };
       logger.warn(
         { providerId, err: err instanceof Error ? err.message : String(err) },
         'Codex model catalog: account refresh failed, keeping current catalog',
@@ -665,6 +678,13 @@ export async function refreshCodexProviderCatalog(
     state.inflight = null;
   });
   return state.inflight;
+}
+
+/** Why the last refresh of a provider's catalog failed; null after a success. */
+export function codexProviderCatalogFailure(
+  providerId: string,
+): { status: number | null; message: string } | null {
+  return liveCatalogs.get(providerId)?.failure ?? null;
 }
 
 function liveCatalogStale(
@@ -724,11 +744,6 @@ export function noteCodexModelsEtag(
   state.stale = true;
   if (state.failed) state.attemptedAt = 0;
   maybeRefreshCodexProviderCatalog(providerId);
-}
-
-/** Provider 删除或重新登录后丢弃其账号目录。 */
-export function forgetCodexProviderCatalog(providerId: string): void {
-  liveCatalogs.delete(providerId);
 }
 
 /** 测试专用：重置内存状态与磁盘缓存路径覆写。 */

@@ -20,6 +20,8 @@
  * one request.
  */
 
+import { withTimeout } from './with-timeout.js';
+
 export type FeishuSenderNameSource = 'contact' | 'chat_members';
 
 /**
@@ -114,29 +116,6 @@ function touch<V>(map: Map<string, V>, key: string, value: V, max: number) {
     if (oldest === undefined) break;
     map.delete(oldest);
   }
-}
-
-function withTimeout<T>(
-  promise: Promise<T>,
-  ms: number,
-  label: string,
-): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${ms}ms`));
-    }, ms);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
 }
 
 /** Resolve to `undefined` after `ms`, leaving the underlying work running. */

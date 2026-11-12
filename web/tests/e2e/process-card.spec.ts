@@ -20,6 +20,12 @@ declare global {
 
 test.use({ viewport: { width: 390, height: 844 } });
 
+/**
+ * A tablet in landscape: touch, but not the phone layout, which has no window
+ * in the chat (the 'on a phone' tests).
+ */
+const WIDE_TOUCH = { viewport: { width: 1100, height: 844 } };
+
 const header = (page: Page) => page.locator('[data-hc-process-card] > button');
 const win = (page: Page) => page.locator('[data-hc-process-window]');
 
@@ -172,54 +178,122 @@ test.describe('the live card', () => {
     await expect(header(page)).toContainText(/\d+s/);
   });
 
-  test('limits its window and follows the end, until the reader scrolls up', async ({
+  test.describe('on a wide touch screen', () => {
+    test.use(WIDE_TOUCH);
+
+    test('limits its window and follows the end, until the reader scrolls up', async ({
+      page,
+    }) => {
+      await open(page, 'scenario=live');
+      await runCommands(page, 14);
+      await expect(win(page)).toBeVisible();
+      await expect
+        .poll(async () => (await scrollState(page)).scrollable)
+        .toBe(true);
+      // 240px with a mouse, and the end of the steps is in view.
+      expect((await scrollState(page)).height).toBeLessThanOrEqual(241);
+      await expect
+        .poll(async () => (await scrollState(page)).gap)
+        .toBeLessThan(4);
+      await expect(win(page)).toHaveAttribute('data-scroll-fade', 'top');
+      await expect(win(page).getByText('echo step-13')).toBeVisible();
+      // The card does not push the answer away: it is as tall as header + window.
+      const card = await page.locator('[data-hc-process-card]').boundingBox();
+      expect(card!.height).toBeLessThan(220);
+
+      // More steps keep the end in view...
+      await runCommands(page, 1, 14);
+      await expect(win(page).getByText('echo step-14')).toBeVisible();
+      await expect
+        .poll(async () => (await scrollState(page)).gap)
+        .toBeLessThan(4);
+
+      // ...until the reader has gone back to read.
+      const box = (await win(page).boundingBox())!;
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.mouse.wheel(0, -2000);
+      await expect(win(page)).not.toHaveAttribute('data-scroll-fade', 'top');
+      await page.waitForTimeout(150);
+      await runCommands(page, 1, 15);
+      await expect(win(page).getByText('echo step-15')).toHaveCount(1);
+      expect((await scrollState(page)).top).toBeLessThan(8);
+
+      // Back at the end, it follows again.
+      await page.mouse.wheel(0, 2000);
+      await expect
+        .poll(async () => (await scrollState(page)).gap)
+        .toBeLessThan(4);
+      await page.waitForTimeout(150);
+      await runCommands(page, 1, 16);
+      await expect(win(page).getByText('echo step-16')).toBeVisible();
+      await expect
+        .poll(async () => (await scrollState(page)).gap)
+        .toBeLessThan(4);
+    });
+  });
+
+  test('on a phone has no window of its own: its rows scroll with the chat', async ({
     page,
   }) => {
     await open(page, 'scenario=live');
     await runCommands(page, 14);
-    await expect(win(page)).toBeVisible();
-    await expect
-      .poll(async () => (await scrollState(page)).scrollable)
-      .toBe(true);
-    // 160px on a touch screen, and the end of the steps is in view.
-    expect((await scrollState(page)).height).toBeLessThanOrEqual(161);
-    await expect
-      .poll(async () => (await scrollState(page)).gap)
-      .toBeLessThan(4);
-    await expect(win(page)).toHaveAttribute('data-scroll-fade', 'top');
     await expect(win(page).getByText('echo step-13')).toBeVisible();
-    // The card does not push the answer away: it is as tall as header + window.
+    const state = await win(page).evaluate((el) => ({
+      overflowY: getComputedStyle(el).overflowY,
+      overscroll: getComputedStyle(el).overscrollBehaviorY,
+      scrollable: el.scrollHeight > el.clientHeight + 1,
+    }));
+    expect(state).toEqual({
+      overflowY: 'visible',
+      overscroll: 'auto',
+      scrollable: false,
+    });
+    // The latest five and the fold above them, as on a desktop: bounded by
+    // rows, not by a box.
+    await expect(win(page).getByRole('listitem')).toHaveCount(6);
     const card = await page.locator('[data-hc-process-card]').boundingBox();
-    expect(card!.height).toBeLessThan(220);
+    expect(card!.height).toBeLessThan(360);
+    await expectNoSidewaysOverflow(page);
+  });
 
-    // More steps keep the end in view...
-    await runCommands(page, 1, 14);
-    await expect(win(page).getByText('echo step-14')).toBeVisible();
-    await expect
-      .poll(async () => (await scrollState(page)).gap)
-      .toBeLessThan(4);
-
-    // ...until the reader has gone back to read.
-    const box = (await win(page).boundingBox())!;
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    await page.mouse.wheel(0, -2000);
-    await expect(win(page)).not.toHaveAttribute('data-scroll-fade', 'top');
-    await page.waitForTimeout(150);
-    await runCommands(page, 1, 15);
-    await expect(win(page).getByText('echo step-15')).toHaveCount(1);
-    expect((await scrollState(page)).top).toBeLessThan(8);
-
-    // Back at the end, it follows again.
-    await page.mouse.wheel(0, 2000);
-    await expect
-      .poll(async () => (await scrollState(page)).gap)
-      .toBeLessThan(4);
-    await page.waitForTimeout(150);
-    await runCommands(page, 1, 16);
-    await expect(win(page).getByText('echo step-16')).toBeVisible();
-    await expect
-      .poll(async () => (await scrollState(page)).gap)
-      .toBeLessThan(4);
+  test('on a phone, a row cut short opens to say all of it', async ({
+    page,
+  }) => {
+    await open(page, 'scenario=live');
+    // Under the 80 characters that open a row anyway, but past its width.
+    const command =
+      'cd /workspace/group/happyclaw && npx vitest run web/src/components/chat';
+    await page.evaluate((summary) => {
+      const { start, emit } = window.renderHarness;
+      start();
+      emit({
+        eventType: 'tool_use_start',
+        toolName: 'Bash',
+        toolUseId: 'cut',
+        toolInputSummary: `command: ${summary}`,
+      });
+      emit({ eventType: 'tool_use_end', toolUseId: 'cut' });
+      emit({
+        eventType: 'tool_use_start',
+        toolName: 'Bash',
+        toolUseId: 'short',
+        toolInputSummary: 'command: ls',
+      });
+      emit({ eventType: 'tool_use_end', toolUseId: 'short' });
+    }, command);
+    const short = win(page)
+      .getByRole('listitem')
+      .filter({ hasText: /运行\s*ls/ });
+    await expect(short).toBeVisible();
+    // A row that shows all it has is no button.
+    await expect(short.getByRole('button')).toHaveCount(0);
+    const cut = win(page)
+      .getByRole('listitem')
+      .filter({ hasText: 'cd /workspace' });
+    const row = cut.getByRole('button').first();
+    await expect(row).toHaveAttribute('aria-expanded', 'false');
+    await row.tap();
+    await expect(cut.locator('[data-hc-row-more]')).toHaveText(command);
   });
 
   test('opens a row to read it within one line down the left, and nothing sticks out', async ({
@@ -387,35 +461,39 @@ test.describe('the live card', () => {
     });
   }
 
-  test('lets a reader who scrolls up with the wheel read, and takes the end again when they come back', async ({
-    page,
-  }) => {
-    await open(page, 'scenario=live');
-    await runCommands(page, 14);
-    await expect
-      .poll(async () => (await scrollState(page)).gap)
-      .toBeLessThan(4);
+  test.describe('on a wide touch screen', () => {
+    test.use(WIDE_TOUCH);
 
-    // Up with the wheel: not pulled back by what comes next.
-    const box = (await win(page).boundingBox())!;
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    await page.mouse.wheel(0, -200);
-    await expect
-      .poll(async () => (await scrollState(page)).gap)
-      .toBeGreaterThan(60);
-    await runCommands(page, 1, 15);
-    await page.waitForTimeout(300);
-    expect((await scrollState(page)).gap).toBeGreaterThan(60);
+    test('lets a reader who scrolls up with the wheel read, and takes the end again when they come back', async ({
+      page,
+    }) => {
+      await open(page, 'scenario=live');
+      await runCommands(page, 14);
+      await expect
+        .poll(async () => (await scrollState(page)).gap)
+        .toBeLessThan(4);
 
-    // Back down to the end with the wheel: following again.
-    await page.mouse.wheel(0, 600);
-    await expect
-      .poll(async () => (await scrollState(page)).gap)
-      .toBeLessThan(4);
-    await runCommands(page, 1, 16);
-    await expect
-      .poll(async () => (await scrollState(page)).gap)
-      .toBeLessThan(4);
+      // Up with the wheel: not pulled back by what comes next.
+      const box = (await win(page).boundingBox())!;
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.mouse.wheel(0, -200);
+      await expect
+        .poll(async () => (await scrollState(page)).gap)
+        .toBeGreaterThan(60);
+      await runCommands(page, 1, 15);
+      await page.waitForTimeout(300);
+      expect((await scrollState(page)).gap).toBeGreaterThan(60);
+
+      // Back down to the end with the wheel: following again.
+      await page.mouse.wheel(0, 600);
+      await expect
+        .poll(async () => (await scrollState(page)).gap)
+        .toBeLessThan(4);
+      await runCommands(page, 1, 16);
+      await expect
+        .poll(async () => (await scrollState(page)).gap)
+        .toBeLessThan(4);
+    });
   });
 
   test('keeps the output a reader opened, and their focus, when the next read makes it a group', async ({
@@ -470,8 +548,12 @@ test.describe('the settled card', () => {
     await open(page, 'scenario=settled');
     const card = page.locator('[data-hc-stream-card="settled"]');
     const summary = card.locator('[data-hc-process-card] > button');
-    await expect(summary).toContainText('已处理');
-    await expect(summary).toContainText('6 个工具');
+    // How long it worked, and that a call of the run failed; what it used is
+    // inside.
+    await expect(summary).toHaveText(/^已工作 \d+s · \d+ 个工具 · 1 个失败$/);
+    await expect(summary.locator('[data-hc-work-problems]')).toHaveClass(
+      /text-error/,
+    );
     await expect(summary).toHaveAttribute('aria-expanded', 'false');
     expect((await summary.boundingBox())!.height).toBeGreaterThanOrEqual(40);
     await expect(win(page)).toHaveCount(0);
@@ -480,6 +562,11 @@ test.describe('the settled card', () => {
     await summary.click();
     await expect(summary).toHaveAttribute('aria-expanded', 'true');
     await expect(win(page)).toBeVisible();
+    // Opened, the counts under the line say what failed: the line does not.
+    await expect(summary).toHaveText(/^已工作 \d+s$/);
+    await expect(win(page).locator('[data-hc-work-counts]')).toContainText(
+      '6 个工具',
+    );
     const { height } = await scrollState(page);
     expect(height).toBeLessThanOrEqual(0.6 * 844 + 1);
     await expect(
@@ -558,30 +645,38 @@ test.describe('tool rows that say what they did', () => {
     await expect(button).toContainText('退出码 1 · src/part0.ts(10,5)');
     const output = failed.locator('pre');
     await expect(output).toContainText('src/part13.ts(23,5)');
-    const metrics = await output.evaluate((el) => {
+    // The box that clips it, on a phone.
+    const box = failed.locator('[data-hc-clamped]:has(pre)');
+    const metrics = await box.evaluate((el) => {
       const style = getComputedStyle(el);
+      const text = getComputedStyle(el.querySelector('pre')!);
       return {
         height: el.clientHeight,
         scrollHeight: el.scrollHeight,
         overflowY: style.overflowY,
-        whiteSpace: style.whiteSpace,
-        mono: style.fontFamily.toLowerCase().includes('mono'),
+        whiteSpace: text.whiteSpace,
+        mono: text.fontFamily.toLowerCase().includes('mono'),
       };
     });
     expect(metrics.height).toBeLessThanOrEqual(161);
     expect(metrics.scrollHeight).toBeGreaterThan(metrics.height);
-    expect(metrics.overflowY).toBe('auto');
+    // No box in a box on a phone: a finger on it scrolls the chat, and all
+    // of the output is a tap away.
+    expect(metrics.overflowY).toBe('hidden');
     expect(metrics.whiteSpace).toBe('pre-wrap');
     expect(metrics.mono).toBe(true);
-
-    // It scrolls inside; the window around it does not move with it.
-    const before = (await scrollState(page)).top;
-    await output.evaluate((el) => {
-      el.scrollTop = 60;
-    });
-    expect(await output.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
-    expect((await scrollState(page)).top).toBe(before);
     await expectNoSidewaysOverflow(page);
+
+    const viewAll = failed.getByRole('button', { name: '查看全部' });
+    expect((await viewAll.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    await viewAll.tap();
+    const sheet = page.getByRole('dialog', { name: /输出/ });
+    await expect(sheet).toBeVisible();
+    await expect(sheet.locator('pre')).toContainText('src/part0.ts(10,5)');
+    await expect(sheet.locator('pre')).toContainText('src/part13.ts(23,5)');
+    // The sheet's body is the one scroller: header and handle stay put.
+    const body = sheet.locator('[data-slot="sheet-body"]');
+    await expect(body).toHaveCSS('overflow-y', 'auto');
   });
 
   test('open a good call that printed something when it is tapped, 40px high', async ({
@@ -601,12 +696,21 @@ test.describe('tool rows that say what they did', () => {
     await expect(ok.locator('pre')).toHaveCount(0);
   });
 
-  test('leave a call that printed nothing a plain row', async ({ page }) => {
+  test('leave a call that printed nothing without output to open', async ({
+    page,
+  }) => {
     await openFacts(page);
-    const fetchRow = rowOf(page, 'HTTP 200');
-    await expect(fetchRow.getByRole('button')).toHaveCount(0);
-    const edit = rowOf(page, '编辑');
-    await expect(edit.getByRole('button')).toHaveCount(0);
+    // A row cut short at this width opens to its own text (touch has no
+    // tooltip), never to an output it does not have.
+    for (const text of ['HTTP 200', '编辑']) {
+      const row = rowOf(page, text);
+      const button = row.getByRole('button');
+      if ((await button.count()) > 0) {
+        await button.first().tap();
+        await expect(row.locator('[data-hc-row-more]')).toBeVisible();
+      }
+      await expect(row.locator('pre')).toHaveCount(0);
+    }
   });
 
   test('keep the facts of the calls a merged row holds', async ({ page }) => {
@@ -627,7 +731,11 @@ test.describe('tool rows that say what they did', () => {
     await expect(agent).toContainText(
       '读 3 · 搜 2 · 改 1 · 命令 4 · +12 −3 · 1.2 万 token · 21 秒',
     );
-    await expect(agent.getByRole('button')).toHaveCount(0);
+    // Cut short in a phone's row, the facts are a tap away, whole.
+    await agent.getByRole('button').first().tap();
+    await expect(agent.locator('[data-hc-row-more]')).toHaveText(
+      '读 3 · 搜 2 · 改 1 · 命令 4 · +12 −3 · 1.2 万 token · 21 秒',
+    );
     await expectNoSidewaysOverflow(page);
 
     await open(page, 'scenario=facts-live');

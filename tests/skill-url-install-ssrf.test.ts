@@ -169,6 +169,7 @@ vi.mock('../src/agent-profile-runtime.js', () => {
     WorkspaceRuntimeQuiesceError,
     listWorkspaceGroupsForAgentProfile: () => [],
     getWorkspaceRuntimeJids: () => [],
+    collectWorkspaceRuntimeJids: () => [],
     quiesceWorkspaceRunnersAroundCommit: async (
       _deps: unknown,
       _targets: unknown,

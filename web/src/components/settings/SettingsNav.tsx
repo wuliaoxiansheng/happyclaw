@@ -1,7 +1,9 @@
 import { useState } from 'react';
 import {
+  ChevronRight,
   CreditCard,
   Gauge,
+  HardDrive,
   Info,
   MessageSquare,
   Palette,
@@ -14,6 +16,7 @@ import {
   User,
   UserCog,
   UserPlus,
+  Users,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
@@ -24,10 +27,13 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet';
+import { ListGroup, ListRow } from '@/components/common/ListRow';
 import { SearchInput } from '@/components/common/SearchInput';
 import { sidebarRowClass } from '@/components/layout/sidebar/SidebarItem';
 import { cn } from '@/lib/utils';
 import type { SettingsTab } from './types';
+import { isGuestSettingsTab } from '../../lib/guest';
+import { isSingleUserHostHiddenTab } from '../../lib/deployment-mode';
 
 export interface SettingsNavItem {
   key: SettingsTab;
@@ -95,6 +101,12 @@ const accountItems: NavItem[] = [
     icon: Shield,
     keywords: ['密码', '登录设备', '会话', '退出登录'],
   },
+  {
+    key: 'guests',
+    label: '访客',
+    icon: Users,
+    keywords: ['访客', '只读', '分享', '授权', 'Guest'],
+  },
 ];
 
 const systemItems: NavItem[] = [
@@ -116,7 +128,7 @@ const systemItems: NavItem[] = [
       'API Key',
       '密钥',
       '端点',
-      '负载均衡',
+      '模型',
     ],
   },
   {
@@ -144,6 +156,12 @@ const systemItems: NavItem[] = [
     label: '宿主机集成',
     icon: ServerCog,
     keywords: ['Claude 目录', '~/.claude', 'Plugin', '插件', 'Marketplace'],
+  },
+  {
+    key: 'storage-sources',
+    label: '存储源',
+    icon: HardDrive,
+    keywords: ['NAS', 'NFS', 'SMB', 'CIFS', '挂载', '网络存储', '共享'],
   },
   {
     key: 'billing',
@@ -186,6 +204,10 @@ export interface SettingsPermissions {
   canManageBilling: boolean;
   canManageUsers: boolean;
   isAdmin: boolean;
+  /** Read-only guests only see their own account sections. */
+  isGuest?: boolean;
+  /** Single-user host mode drops the sections about other people and money. */
+  singleUserHost?: boolean;
 }
 
 /** Settings sections visible to the current user (also used by ⌘K). */
@@ -194,20 +216,39 @@ export function getSettingsSections({
   canManageBilling,
   canManageUsers,
   isAdmin,
+  isGuest = false,
+  singleUserHost = false,
 }: SettingsPermissions): { label: string; items: NavItem[] }[] {
+  if (isGuest) {
+    return [
+      {
+        label: '账户设置',
+        items: accountItems.filter((item) => isGuestSettingsTab(item.key)),
+      },
+    ];
+  }
+  const shown = (item: NavItem) =>
+    !singleUserHost || !isSingleUserHostHiddenTab(item.key);
+  const account = accountItems.filter(shown);
   const system = systemItems.filter((item) => {
+    if (!shown(item)) return false;
     if (item.key === 'billing') return canManageBilling;
-    if (item.key === 'main-agent' || item.key === 'host-integration') {
+    if (
+      item.key === 'main-agent' ||
+      item.key === 'host-integration' ||
+      item.key === 'storage-sources'
+    ) {
       return isAdmin;
     }
     return canManageSystemConfig;
   });
   const management = managementItems.filter((item) => {
+    if (!shown(item)) return false;
     if (item.key === 'users') return canManageUsers;
     return canManageSystemConfig;
   });
   return [
-    { label: '账户设置', items: accountItems },
+    { label: '账户设置', items: account },
     ...(system.length ? [{ label: '系统配置', items: system }] : []),
     ...(management.length ? [{ label: '管理后台', items: management }] : []),
   ];
@@ -220,9 +261,16 @@ interface SettingsNavProps {
   canManageBilling: boolean;
   canManageUsers: boolean;
   isAdmin: boolean;
+  isGuest?: boolean;
+  singleUserHost?: boolean;
   mustChangePassword: boolean;
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
+  /**
+   * `sidebar`: the desktop column plus a sheet for narrow windows. `page`:
+   * the phone's full-page section list.
+   */
+  variant?: 'sidebar' | 'page';
 }
 
 const navRowClass = cn(sidebarRowClass, 'gap-2.5 pointer-coarse:h-11');
@@ -234,9 +282,12 @@ export function SettingsNav({
   canManageBilling,
   canManageUsers,
   isAdmin,
+  isGuest = false,
+  singleUserHost = false,
   mustChangePassword,
   open,
   onOpenChange,
+  variant = 'sidebar',
 }: SettingsNavProps) {
   const [query, setQuery] = useState('');
   const sections = getSettingsSections({
@@ -244,6 +295,8 @@ export function SettingsNav({
     canManageBilling,
     canManageUsers,
     isAdmin,
+    isGuest,
+    singleUserHost,
   });
 
   const keyword = query.trim().toLowerCase();
@@ -288,6 +341,56 @@ export function SettingsNav({
       ariaLabel="搜索设置项"
     />
   );
+
+  if (variant === 'page') {
+    // A phone's settings home (cindy's settings screen): grouped rows that
+    // each open their section as a page of its own.
+    const renderPageItem = (item: NavItem) => (
+      <ListRow
+        key={item.key}
+        media={
+          <item.icon
+            aria-hidden="true"
+            className="size-5 text-muted-foreground"
+          />
+        }
+        title={item.label}
+        meta={
+          <ChevronRight
+            aria-hidden="true"
+            className="size-4 text-faint-foreground"
+          />
+        }
+        disabled={disabled(item)}
+        onClick={() => onTabChange(item.key)}
+        className="active:bg-surface-hover"
+      />
+    );
+    const pageGroups = [
+      ...visibleSections,
+      ...(showAbout ? [{ label: '', items: [aboutItem] }] : []),
+    ];
+    return (
+      <nav aria-label="设置导航" className="space-y-5 px-4 pt-2 pb-6">
+        {search}
+        {pageGroups.map((section) => (
+          <section key={section.label || 'about'} className="space-y-1.5">
+            {section.label && (
+              <h2 className="px-4 text-caption font-medium text-muted-foreground">
+                {section.label}
+              </h2>
+            )}
+            <ListGroup>{section.items.map(renderPageItem)}</ListGroup>
+          </section>
+        ))}
+        {pageGroups.length === 0 && (
+          <p className="py-6 text-center text-caption text-muted-foreground">
+            没有匹配的设置
+          </p>
+        )}
+      </nav>
+    );
+  }
 
   const navigation = (
     <>

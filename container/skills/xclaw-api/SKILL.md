@@ -61,32 +61,34 @@ missing a required param — re-check the request schema below.
 
 ## Endpoints (all POST, all require `X-API-Key`)
 
-| Endpoint | Purpose | Body (required**) |
-|---|---|---|
-| `/data/xclaw` | **Complete account analysis** (user info, KOL followers, classification, fundraising) | `handle`** |
-| `/data/kol_follow` | Account's KOL-follow analysis | `handle`** |
-| `/data/rank` | Account ranking | `handle`** |
-| `/data/token_mention` | Tokens an account has mentioned | `handle`** |
-| `/data/discussion` | Project discussion analysis | `handle`** |
-| `/data/relation` | Project relation analysis | `handle`** |
-| `/data/hot_topics` | Hot topics across social platforms | `days`, `group` |
-| `/data/trending_kol` | Trending KOLs | `days`, `group` |
-| `/data/trending_project` | Trending projects | `days`, `group` |
-| `/data/trending_discussion` | Trending discussions | `days`, `group` |
-| `/ai/ability_model` | Account ability-model analysis | `handle`** |
-| `/ai/mbti` | Account MBTI personality profiling | `handle`** |
-| `/ai/soul_index` | Account "soul index" analysis | `handle`** |
-| `/ai/narrative` | Project narrative analysis | `handle`** |
-| `/ai/projectAnalysis` | Project analysis data | `handle`** |
-| `/ai/tokenAnalysis` | Token analysis data | `ticker`**, `ca` (optional) |
+| Endpoint                    | Purpose                                                                               | Body (required\*\*)           |
+| --------------------------- | ------------------------------------------------------------------------------------- | ----------------------------- |
+| `/data/xclaw`               | **Complete account analysis** (user info, KOL followers, classification, fundraising) | `handle`\*\*                  |
+| `/data/kol_follow`          | Account's KOL-follow analysis                                                         | `handle`\*\*                  |
+| `/data/rank`                | Account ranking                                                                       | `handle`\*\*                  |
+| `/data/token_mention`       | Tokens an account has mentioned                                                       | `handle`\*\*                  |
+| `/data/discussion`          | Project discussion analysis                                                           | `handle`\*\*                  |
+| `/data/relation`            | Project relation analysis                                                             | `handle`\*\*                  |
+| `/data/hot_topics`          | Hot topics across social platforms                                                    | `days`, `group`               |
+| `/data/trending_kol`        | Trending KOLs                                                                         | `days`, `group`               |
+| `/data/trending_project`    | Trending projects                                                                     | `days`, `group`               |
+| `/data/trending_discussion` | Trending discussions                                                                  | `days`, `group`               |
+| `/ai/ability_model`         | Account ability-model analysis                                                        | `handle`\*\*                  |
+| `/ai/mbti`                  | Account MBTI personality profiling                                                    | `handle`\*\*                  |
+| `/ai/soul_index`            | Account "soul index" analysis                                                         | `handle`\*\*                  |
+| `/ai/narrative`             | Project narrative analysis                                                            | `handle`\*\*                  |
+| `/ai/projectAnalysis`       | Project analysis data                                                                 | `handle`\*\*                  |
+| `/ai/tokenAnalysis`         | Token analysis data                                                                   | `ticker`\*\*, `ca` (optional) |
 
 **Param notes**
+
 - `handle`: Twitter username **without** the `@` (e.g. `cz_binance`).
 - `days`: time range in days; `group`: `cn` (Chinese region) or `global` (English region).
   Both optional for the trending/hot endpoints — omit for defaults.
 - `ticker`: token symbol (required); `ca`: contract address (optional).
 
 > Confirm the live list anytime:
+>
 > ```bash
 > curl -s -H 'User-Agent: Mozilla/5.0 ...' https://pro.xclaw.info/api/openapi.json \
 >   | jq -r '.paths | to_entries[] | "\(.value.post.summary)\t\(.key)"'
@@ -95,16 +97,19 @@ missing a required param — re-check the request schema below.
 ## Workflow for common requests
 
 **"分析这个账号 / 僵尸粉 / 真实流量 / KOL 粉丝"**
+
 1. Strip the `@` and any URL wrapper to get the bare `handle`.
 2. Call `/data/xclaw` for the full picture (includes KOL followers + classification).
 3. For deeper profiling add `/ai/ability_model`, `/ai/mbti`, or `/ai/soul_index`.
 
 **"项目分析 / 代币分析 / 叙事"**
+
 1. For a project tied to an X account, use `handle` with `/ai/projectAnalysis`,
    `/ai/narrative`, `/data/relation`, or `/data/discussion`.
 2. For a token, use `/ai/tokenAnalysis` with `ticker` (+ `ca` if you have the contract).
 
 **"热门 KOL / 热门项目 / 热点话题"**
+
 1. Use `/data/trending_kol`, `/data/trending_project`, `/data/trending_discussion`,
    or `/data/hot_topics`.
 2. Pass `group: "cn"` or `"global"` and a `days` window to scope results.

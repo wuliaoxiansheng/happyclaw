@@ -21,7 +21,7 @@ export function SetupChannelsPage() {
   }, [initialized, navigate, user]);
 
   return (
-    <main className="h-dvh overflow-y-auto bg-background">
+    <main className="safe-area-top h-dvh overflow-y-auto bg-background">
       <PageContainer size="narrow" className="space-y-6">
         <header>
           <p className="text-caption text-muted-foreground">可选步骤</p>

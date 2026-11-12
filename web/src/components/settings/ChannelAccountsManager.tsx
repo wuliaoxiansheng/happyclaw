@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Bot,
+  ExternalLink,
   KeyRound,
   Loader2,
   MoreHorizontal,
@@ -17,6 +18,7 @@ import { wsManager } from '@/api/ws';
 import { EmptyState } from '@/components/common/EmptyState';
 import { IconButton } from '@/components/common/IconButton';
 import { ListGroup, ListRow } from '@/components/common/ListRow';
+import { SegmentedControl } from '@/components/common/SegmentedControl';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -27,13 +29,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
+import { ResponsiveMenu } from '@/components/common/ResponsiveMenu';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
@@ -54,6 +50,11 @@ import {
 import {
   buildChannelAccountPayload,
   CHANNEL_PROVIDER_OPTIONS,
+  channelAccountLabel,
+  FEISHU_EVENT_SUBSCRIPTIONS,
+  feishuBrandName,
+  feishuBrandOf,
+  spacedLabel,
   providerAuthMode,
   providerDefinition,
   providerLabel,
@@ -73,8 +74,15 @@ import {
 import { SettingsSwitchRow } from './SettingsFormControls';
 import { usePairedChats } from './hooks/usePairedChats';
 import { usePairingCode } from './hooks/usePairingCode';
-import { ProviderConnectionFields } from './channel-accounts/ProviderConnectionFields';
+import {
+  FeishuBrandField,
+  ProviderConnectionFields,
+} from './channel-accounts/ProviderConnectionFields';
 import { QrOnboardingPanel } from './channel-accounts/QrOnboardingPanel';
+import {
+  FeishuRegistrationPanel,
+  type FeishuRegistrationResult,
+} from './channel-accounts/FeishuRegistrationPanel';
 
 type WorkspaceOption = { jid: string; name: string };
 
@@ -99,6 +107,11 @@ export function ChannelAccountsManager() {
     string | null
   >(null);
   const [actionId, setActionId] = useState<string | null>(null);
+  /** Shown once in the details of an app just created by scanning. */
+  const [registeredNotice, setRegisteredNotice] = useState<{
+    accountId: string;
+    eventConsoleUrl?: string;
+  } | null>(null);
 
   useEffect(() => {
     void Promise.allSettled([loadAccounts(), loadGroups()]);
@@ -301,6 +314,12 @@ export function ChannelAccountsManager() {
             setConnectionId(account.id);
           }
         }}
+        onRegistered={({ account, eventConsoleUrl }) => {
+          setCreateOpen(false);
+          toast.success(`已创建「${account.name}」`);
+          setRegisteredNotice({ accountId: account.id, eventConsoleUrl });
+          setConnectionId(account.id);
+        }}
       />
 
       <AccountSettingsDialog
@@ -312,9 +331,16 @@ export function ChannelAccountsManager() {
       <AccountConnectionDialog
         account={connectionAccount}
         autoStart={connectionAccount?.id === autoStartConnectionId}
+        registeredNotice={
+          registeredNotice &&
+          registeredNotice.accountId === connectionAccount?.id
+            ? registeredNotice
+            : null
+        }
         onClose={() => {
           setConnectionId(null);
           setAutoStartConnectionId(null);
+          setRegisteredNotice(null);
         }}
       />
     </SettingsSection>
@@ -370,7 +396,7 @@ function ChannelAccountRow({
           <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <AccountStateBadges account={account} />
             <span>
-              {providerLabel(account.provider)} ·{' '}
+              {channelAccountLabel(account)} ·{' '}
               {defaultTargetLabel(account, workspaces)}
             </span>
           </span>
@@ -412,8 +438,37 @@ function ChannelAccountRow({
             aria-label={`${account.enabled ? '停用' : '启用'}账号 ${account.name}`}
             className="mx-1.5"
           />
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
+          <ResponsiveMenu
+            title={`${account.name} 的操作`}
+            groups={[
+              [
+                {
+                  label: connectionLabel,
+                  icon: KeyRound,
+                  onSelect: onConnection,
+                },
+                ...(supportsChannelConnectionTest(account.provider) &&
+                account.has_credentials
+                  ? [
+                      {
+                        label: '测试连接',
+                        icon: TestTube2,
+                        onSelect: () => void onTest(account),
+                      },
+                    ]
+                  : []),
+                { label: '默认规则', icon: Settings2, onSelect: onSettings },
+              ],
+              [
+                {
+                  label: '删除账号',
+                  icon: Trash2,
+                  destructive: true,
+                  onSelect: () => void onDelete(account),
+                },
+              ],
+            ]}
+            trigger={
               <IconButton
                 label={`更多操作 ${account.name}`}
                 disabled={busy}
@@ -425,34 +480,8 @@ function ChannelAccountRow({
                   )
                 }
               />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-44">
-              <DropdownMenuItem onSelect={onConnection}>
-                <KeyRound />
-                {connectionLabel}
-              </DropdownMenuItem>
-              {supportsChannelConnectionTest(account.provider) &&
-                account.has_credentials && (
-                  <DropdownMenuItem onSelect={() => void onTest(account)}>
-                    <TestTube2 />
-                    测试连接
-                  </DropdownMenuItem>
-                )}
-              <DropdownMenuItem onSelect={onSettings}>
-                <Settings2 />
-                默认规则
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem
-                variant="destructive"
-                onSelect={() => void onDelete(account)}
-                aria-label={`删除账号 ${account.name}`}
-              >
-                <Trash2 />
-                删除账号
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+            }
+          />
         </>
       }
     />
@@ -464,13 +493,17 @@ function CreateChannelAccountDialog({
   workspaces,
   onClose,
   onCreate,
+  onRegistered,
 }: {
   open: boolean;
   workspaces: WorkspaceOption[];
   onClose: () => void;
   onCreate: (values: AccountFormValues) => Promise<void>;
+  onRegistered: (result: FeishuRegistrationResult) => void;
 }) {
   const [step, setStep] = useState<1 | 2>(1);
+  const [feishuMode, setFeishuMode] = useState<'scan' | 'manual'>('scan');
+  const [registering, setRegistering] = useState(false);
   const [provider, setProvider] = useState<ChannelProvider>('feishu');
   const [name, setName] = useState('');
   const [enabled, setEnabled] = useState(true);
@@ -484,6 +517,8 @@ function CreateChannelAccountDialog({
     if (!open) return;
     setStep(1);
     setProvider('feishu');
+    setFeishuMode('scan');
+    setRegistering(false);
     setName('');
     setEnabled(true);
     setIsDefault(false);
@@ -502,6 +537,8 @@ function CreateChannelAccountDialog({
     replaceCredentials: true,
   };
   const definition = providerDefinition(provider);
+  const scanning = provider === 'feishu' && feishuMode === 'scan';
+  const brand = feishuBrandOf(credentials.domain);
 
   const next = () => {
     const validationError = validateChannelAccountForm(values, 'create');
@@ -540,8 +577,13 @@ function CreateChannelAccountDialog({
         <DialogHeader>
           <DialogTitle>添加渠道账号</DialogTitle>
           <DialogDescription>
-            第 {step} 步，共 2 步 ·{' '}
-            {step === 1 ? '选择渠道并完成连接配置' : '设置账号的默认接入规则'}
+            {scanning
+              ? '扫码确认后自动创建应用并保存凭证，默认规则可在创建后修改'
+              : `第 ${step} 步，共 2 步 · ${
+                  step === 1
+                    ? '选择渠道并完成连接配置'
+                    : '设置账号的默认接入规则'
+                }`}
           </DialogDescription>
         </DialogHeader>
 
@@ -554,6 +596,7 @@ function CreateChannelAccountDialog({
                 </Label>
                 <Select
                   value={provider}
+                  disabled={registering}
                   onValueChange={(value) => {
                     const nextProvider = value as ChannelProvider;
                     setProvider(nextProvider);
@@ -580,26 +623,70 @@ function CreateChannelAccountDialog({
                 <Input
                   id="new-channel-name"
                   value={name}
+                  disabled={registering}
                   onChange={(event) => setName(event.target.value)}
-                  placeholder={`例如：${spacedLabel('客服', definition.label)} Bot`}
-                  autoFocus
+                  placeholder={
+                    scanning
+                      ? `可留空，默认为“${spacedLabel(feishuBrandName(brand), '机器人')}”`
+                      : `例如：${spacedLabel('客服', definition.label)} Bot`
+                  }
                 />
               </div>
             </div>
             <div className="border-t border-surface-border pt-4">
-              <h3 className="text-title-sm text-foreground">连接方式</h3>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-title-sm text-foreground">连接方式</h3>
+                {provider === 'feishu' && !registering && (
+                  <SegmentedControl
+                    label="飞书接入方式"
+                    size="sm"
+                    value={feishuMode}
+                    options={[
+                      { value: 'scan', label: '扫码创建（推荐）' },
+                      { value: 'manual', label: '手动填写' },
+                    ]}
+                    onChange={(mode) => {
+                      setFeishuMode(mode);
+                      setFormError(null);
+                    }}
+                  />
+                )}
+              </div>
               <p className="mt-0.5 mb-4 text-caption leading-5 text-muted-foreground">
-                {definition.description}
+                {scanning
+                  ? '用手机飞书或 Lark 扫码，自动创建一个个人智能体应用，不用去开发者后台复制凭证。'
+                  : definition.description}
               </p>
-              <ProviderConnectionFields
-                provider={provider}
-                values={credentials}
-                idPrefix="new-channel"
-                disabled={saving}
-                onChange={(key, value) =>
-                  setCredentials((current) => ({ ...current, [key]: value }))
-                }
-              />
+              {scanning ? (
+                <div className="space-y-4">
+                  <FeishuBrandField
+                    value={brand}
+                    disabled={registering}
+                    onChange={(next) =>
+                      setCredentials((current) => ({
+                        ...current,
+                        domain: next,
+                      }))
+                    }
+                  />
+                  <FeishuRegistrationPanel
+                    name={name}
+                    brand={brand}
+                    onActiveChange={setRegistering}
+                    onSuccess={onRegistered}
+                  />
+                </div>
+              ) : (
+                <ProviderConnectionFields
+                  provider={provider}
+                  values={credentials}
+                  idPrefix="new-channel"
+                  disabled={saving}
+                  onChange={(key, value) =>
+                    setCredentials((current) => ({ ...current, [key]: value }))
+                  }
+                />
+              )}
             </div>
           </div>
         ) : (
@@ -631,18 +718,20 @@ function CreateChannelAccountDialog({
           >
             {step === 1 ? '取消' : '上一步'}
           </Button>
-          <Button
-            type="button"
-            disabled={saving}
-            onClick={() => void (step === 1 ? next() : submit())}
-          >
-            {saving && <Loader2 className="size-3.5 animate-spin" />}
-            {step === 1
-              ? '下一步：默认规则'
-              : providerAuthMode(provider) === 'qr_session'
-                ? '创建并扫码'
-                : '创建账号'}
-          </Button>
+          {!scanning && (
+            <Button
+              type="button"
+              disabled={saving}
+              onClick={() => void (step === 1 ? next() : submit())}
+            >
+              {saving && <Loader2 className="size-3.5 animate-spin" />}
+              {step === 1
+                ? '下一步：默认规则'
+                : providerAuthMode(provider) === 'qr_session'
+                  ? '创建并扫码'
+                  : '创建账号'}
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -762,10 +851,12 @@ function AccountSettingsDialog({
 function AccountConnectionDialog({
   account,
   autoStart,
+  registeredNotice,
   onClose,
 }: {
   account: ChannelAccount | null;
   autoStart: boolean;
+  registeredNotice: { eventConsoleUrl?: string } | null;
   onClose: () => void;
 }) {
   const updateAccount = useChannelAccountsStore((state) => state.updateAccount);
@@ -789,6 +880,7 @@ function AccountConnectionDialog({
 
   if (!account) return null;
   const definition = providerDefinition(account.provider);
+  const optionSection = OPTION_SECTIONS[account.provider];
 
   const replaceCredentials = async () => {
     const values: AccountFormValues = {
@@ -855,7 +947,7 @@ function AccountConnectionDialog({
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>
-            {spacedLabel(providerLabel(account.provider), '连接')}
+            {spacedLabel(channelAccountLabel(account), '连接')}
           </DialogTitle>
           <DialogDescription>
             管理“{account.name}
@@ -897,6 +989,11 @@ function AccountConnectionDialog({
           </div>
         ) : (
           <div className="space-y-5">
+            {registeredNotice && (
+              <FeishuEventSubscriptionNotice
+                url={registeredNotice.eventConsoleUrl}
+              />
+            )}
             <SettingsGroup>
               <SettingsRow
                 label={
@@ -952,10 +1049,13 @@ function AccountConnectionDialog({
               </SettingsRow>
             </SettingsGroup>
 
-            {(account.provider === 'dingtalk' ||
-              account.provider === 'discord') && (
+            {optionSection && (
               <div className="space-y-2">
-                <h3 className="text-title-sm text-foreground">回复方式</h3>
+                {optionSection.title && (
+                  <h3 className="text-title-sm text-foreground">
+                    {optionSection.title}
+                  </h3>
+                )}
                 <ProviderConnectionFields
                   provider={account.provider}
                   values={options}
@@ -974,7 +1074,7 @@ function AccountConnectionDialog({
                   onClick={() => void saveOptions()}
                 >
                   {saving && <Loader2 className="size-3.5 animate-spin" />}
-                  保存回复方式
+                  {optionSection.saveLabel}
                 </Button>
               </div>
             )}
@@ -1176,20 +1276,78 @@ function AccountStateBadges({ account }: { account: ChannelAccount }) {
   );
 }
 
+function FeishuEventSubscriptionNotice({ url }: { url?: string }) {
+  return (
+    <section
+      aria-label="补订阅事件"
+      className="space-y-2 rounded-lg bg-warning/10 px-4 py-3 ring-1 ring-warning/30"
+    >
+      <p className="text-body font-medium text-foreground">
+        还差一步：补订阅事件
+      </p>
+      <p className="text-caption leading-5 text-muted-foreground">
+        扫码创建的个人智能体应用默认只订阅“接收消息”。请到开发者后台的“事件与回调”补订阅下列事件（卡片回传交互在“回调配置”中），否则卡片上的停止按钮、撤回同步和进群登记都不会生效。
+      </p>
+      <ul className="flex flex-wrap gap-1.5">
+        {FEISHU_EVENT_SUBSCRIPTIONS.filter(
+          (item) => item.name !== 'im.message.receive_v1',
+        ).map((item) => (
+          <li key={item.name}>
+            <code
+              title={item.label}
+              className="rounded bg-background px-1.5 py-0.5 font-mono text-micro text-foreground ring-1 ring-surface-border"
+            >
+              {item.name}
+            </code>
+          </li>
+        ))}
+      </ul>
+      {url && (
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-1 text-caption font-medium text-primary-text underline-offset-4 hover:underline focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none pointer-coarse:min-h-11"
+        >
+          打开该应用的事件订阅设置
+          <ExternalLink className="size-3.5" aria-hidden="true" />
+        </a>
+      )}
+    </section>
+  );
+}
+
 function defaultCredentials(provider: ChannelProvider): Record<string, string> {
+  if (provider === 'feishu') return { domain: 'feishu' };
   if (provider === 'wechat') return { bypassProxy: 'true' };
   if (provider === 'dingtalk') return { streamingMode: 'card' };
   if (provider === 'discord') return { streamingMode: 'off' };
+  if (provider === 'telegram') return { streamingMode: 'edit' };
   return {};
 }
 
+/** Account options edited apart from the credentials. The Feishu platform
+ * field labels itself, so its section has no heading. */
+const OPTION_SECTIONS: Partial<
+  Record<ChannelProvider, { title?: string; saveLabel: string }>
+> = {
+  feishu: { saveLabel: '保存平台' },
+  dingtalk: { title: '回复方式', saveLabel: '保存回复方式' },
+  discord: { title: '回复方式', saveLabel: '保存回复方式' },
+  telegram: { title: '回复方式', saveLabel: '保存回复方式' },
+};
+
 function accountOptions(account: ChannelAccount): Record<string, string> {
+  if (account.provider === 'feishu')
+    return { domain: feishuBrandOf(account.options?.domain) };
   if (account.provider === 'wechat')
     return { bypassProxy: String(account.options?.bypassProxy ?? true) };
   if (account.provider === 'dingtalk')
     return { streamingMode: account.options?.streamingMode ?? 'card' };
   if (account.provider === 'discord')
     return { streamingMode: account.options?.streamingMode ?? 'off' };
+  if (account.provider === 'telegram')
+    return { streamingMode: account.options?.streamingMode ?? 'edit' };
   return {};
 }
 
@@ -1200,15 +1358,6 @@ function defaultTargetLabel(
   if (account.default_workspace_jid)
     return `工作区偏好：${workspaces.find((item) => item.jid === account.default_workspace_jid)?.name ?? '已删除工作区'}`;
   return '未设置工作区偏好；渠道需单独绑定';
-}
-
-/** Joins copy fragments, spacing a Latin provider name from adjacent CJK text. */
-function spacedLabel(...parts: string[]) {
-  return parts.reduce((text, part) =>
-    /[A-Za-z0-9]$/.test(text) || /^[A-Za-z0-9]/.test(part)
-      ? `${text} ${part}`
-      : text + part,
-  );
 }
 
 function getApiMessage(error: unknown, fallback: string) {

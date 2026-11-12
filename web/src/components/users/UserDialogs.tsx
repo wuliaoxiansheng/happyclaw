@@ -168,6 +168,7 @@ export function CreateUserDialog({
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <SettingsField label="用户名" htmlFor="create-user-username">
               <Input
+                variant="code"
                 id="create-user-username"
                 value={newUsername}
                 onChange={(e) => setNewUsername(e.target.value)}
@@ -329,7 +330,8 @@ export function EditUserDialog({
   useEffect(() => {
     if (!target) return;
     setError(null);
-    setEditRole(target.role);
+    // Guests keep their role: it is never changed to or from 'guest' here.
+    setEditRole(target.role === 'admin' ? 'admin' : 'member');
     setEditDisplayName(target.display_name || '');
     setEditPassword('');
     setEditNotes(target.notes || '');
@@ -343,7 +345,7 @@ export function EditUserDialog({
     setError(null);
     try {
       const payload: Parameters<typeof updateUser>[1] = {};
-      if (isAdmin && editRole !== user.role) {
+      if (isAdmin && user.role !== 'guest' && editRole !== user.role) {
         payload.role = editRole;
       }
       if (editDisplayName !== (user.display_name || '')) {
@@ -409,7 +411,7 @@ export function EditUserDialog({
               />
             </SettingsField>
             <SettingsField label="角色" htmlFor="edit-user-role">
-              {isAdmin ? (
+              {isAdmin && user?.role !== 'guest' ? (
                 <Select
                   value={editRole}
                   onValueChange={(value) => setEditRole(value as Role)}
@@ -430,7 +432,9 @@ export function EditUserDialog({
                       ? '管理员'
                       : user?.role === 'member'
                         ? '成员'
-                        : ''
+                        : user?.role === 'guest'
+                          ? '访客'
+                          : ''
                   }
                   disabled
                 />
@@ -468,7 +472,7 @@ export function EditUserDialog({
             </SettingsField>
           </div>
 
-          {assignablePermissions.length > 0 && (
+          {assignablePermissions.length > 0 && user?.role !== 'guest' && (
             <div className="space-y-1.5">
               <div className="text-label text-foreground">权限明细</div>
               <PermissionChecklist
@@ -545,7 +549,8 @@ export function ResetPasswordDialog({
 
   return (
     <Dialog open={!!target} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      {/* One field: the keyboard may come up with it. */}
+      <DialogContent className="sm:max-w-md" autoFocusOnPhone>
         <form onSubmit={handleChangePassword} className="grid gap-4">
           <DialogHeader>
             <DialogTitle>修改密码</DialogTitle>

@@ -5,6 +5,8 @@
  * invoking it because every lookup consumes tenant API quota.
  */
 
+import { withTimeout } from './with-timeout.js';
+
 export interface FeishuRichContentClient {
   im: {
     v1?: {
@@ -126,31 +128,6 @@ export interface EnrichedFeishuInboundContent {
   currentMaterialResolved?: boolean;
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () =>
-        reject(
-          new Error(
-            `Feishu rich-content lookup timed out after ${timeoutMs}ms`,
-          ),
-        ),
-      timeoutMs,
-    );
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
-
 function isHighSurrogate(code: number): boolean {
   return code >= 0xd800 && code <= 0xdbff;
 }
@@ -216,6 +193,7 @@ async function getMessageItems(
       params: { card_msg_content_type: 'user_card_content' },
     }),
     timeoutMs,
+    'Feishu rich-content lookup',
   );
   return responseItems(response);
 }
@@ -784,6 +762,7 @@ export async function enrichFeishuInboundContent(
         };
       })(),
       limits.totalTimeoutMs,
+      'Feishu rich-content lookup',
     );
   } catch {
     return {

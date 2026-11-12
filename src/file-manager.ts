@@ -3,16 +3,18 @@ import fs from 'fs';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { DATA_DIR, GROUPS_DIR, MAX_FILE_SIZE } from './config.js';
+import {
+  checkRecordedWorkdirRemoval,
+  recordedWorkdirLogsDir,
+  type RecordedWorkdir,
+  workspaceDirOf,
+} from './workspace-dir.js';
 import { deleteContainerEnvConfig } from './runtime-config.js';
 import { logger } from './logger.js';
 
 // --- Storage usage cache (5 minute TTL) ---
 const _storageCache = new Map<string, { bytes: number; expires: number }>();
 const STORAGE_CACHE_TTL = 5 * 60 * 1000;
-
-function getStorageCacheKey(folder: string, rootOverride?: string): string {
-  return getFileRoot(folder, rootOverride);
-}
 
 // 类型
 export interface FileEntry {
@@ -224,7 +226,7 @@ export function getFileRoot(folder: string, rootOverride?: string): string {
   if (rootOverride && path.isAbsolute(rootOverride)) {
     return rootOverride;
   }
-  return path.join(GROUPS_DIR, folder);
+  return workspaceDirOf(folder);
 }
 
 /**
@@ -480,7 +482,7 @@ export function getGroupStorageUsage(
   folder: string,
   rootOverride?: string,
 ): number {
-  const cacheKey = getStorageCacheKey(folder, rootOverride);
+  const cacheKey = getFileRoot(folder, rootOverride);
   const cached = _storageCache.get(cacheKey);
   if (cached && cached.expires > Date.now()) {
     return cached.bytes;
@@ -507,7 +509,7 @@ export function invalidateGroupStorageUsage(
   folder: string,
   rootOverride?: string,
 ): void {
-  _storageCache.delete(getStorageCacheKey(folder, rootOverride));
+  _storageCache.delete(getFileRoot(folder, rootOverride));
 }
 
 const MAX_DIR_DEPTH = 20;
@@ -537,8 +539,31 @@ function calculateDirSize(dirPath: string, depth = 0): number {
   return total;
 }
 
-/** Remove all runtime artifacts for a group folder (workspace, sessions, ipc, env, memory). */
-export function removeFlowArtifacts(folder: string): void {
+/**
+ * Remove all runtime artifacts for a group folder (workspace, sessions, ipc,
+ * env, memory). `recorded` is the folder's directory record, read before the
+ * database row went away; it is checked again here and its directory left in
+ * place (logged) when the check fails, never removed on doubt.
+ */
+export function removeFlowArtifacts(
+  folder: string,
+  recorded: RecordedWorkdir | null = null,
+): void {
+  if (recorded) {
+    const unsafe = checkRecordedWorkdirRemoval(recorded);
+    if (unsafe) {
+      logger.error(
+        { folder, workdir: recorded.workdir, reason: unsafe },
+        'Kept a deleted workspace directory that failed the safety check',
+      );
+    } else {
+      fs.rmSync(recorded.workdir, { recursive: true, force: true });
+    }
+    fs.rmSync(recordedWorkdirLogsDir(folder), {
+      recursive: true,
+      force: true,
+    });
+  }
   fs.rmSync(path.join(GROUPS_DIR, folder), { recursive: true, force: true });
   fs.rmSync(path.join(DATA_DIR, 'sessions', folder), {
     recursive: true,

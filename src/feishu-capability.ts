@@ -18,7 +18,12 @@ export type FeishuCapabilityOperation =
   | 'remove_reaction'
   | 'edit_message'
   | 'recall_message'
-  | 'api_request';
+  | 'api_request'
+  /**
+   * Host-only (team mode): a plain-text reply quoted under a message of the
+   * chat, in the main chat (never a thread). Not on the Runner's allowlist.
+   */
+  | 'reply_text';
 
 export interface FeishuCapabilityRequest {
   operation: FeishuCapabilityOperation;
@@ -617,6 +622,46 @@ function validateGenericApiRequest(params: Record<string, unknown>): {
 }
 
 /**
+ * Send one uuid-deduplicated reply. A resolved rate-limit envelope is retried
+ * like a thrown one and stays a definitive (not uncertain) failure once
+ * retries run out. An ambiguous transport failure may hide an accepted
+ * reply: Feishu dedupes the uuid for an hour, so one replay either returns
+ * that reply or creates it; only a successful replay resolves the doubt.
+ */
+async function sendReplyWithReplay<T>(
+  operation: string,
+  send: () => Promise<T>,
+): Promise<T> {
+  const sendChecked = async () => {
+    const result = await send();
+    if (classifyFeishuError(result).kind === 'rate_limited') {
+      const code = feishuErrorCode(result);
+      throw Object.assign(
+        new DefinitiveFeishuCapabilityError(
+          `${operation} failed (code=${code}, msg=${optionalString(record(result).msg) || 'rate limited'})`,
+        ),
+        { code },
+      );
+    }
+    return result;
+  };
+  try {
+    return await withCapabilityRateLimitRetry(sendChecked);
+  } catch (error) {
+    if (
+      classifyFeishuError(error).kind !== 'transient' ||
+      definitiveFeishuPreAcceptanceFailure(error)
+    )
+      throw error;
+    try {
+      return await withCapabilityRateLimitRetry(sendChecked);
+    } catch {
+      throw error;
+    }
+  }
+}
+
+/**
  * Execute one operation using the already authenticated Client owned by the
  * exact inbound Bot connection. The runner receives data, never credentials.
  */
@@ -810,39 +855,7 @@ export async function executeFeishuCapability(
             uuid,
           },
         });
-      const sendChecked = async () => {
-        const result = await send();
-        // A resolved rate-limit envelope is retried like a thrown one, and
-        // stays a definitive (not uncertain) failure once retries run out.
-        if (classifyFeishuError(result).kind === 'rate_limited') {
-          const code = feishuErrorCode(result);
-          throw Object.assign(
-            new DefinitiveFeishuCapabilityError(
-              `send_card failed (code=${code}, msg=${optionalString(record(result).msg) || 'rate limited'})`,
-            ),
-            { code },
-          );
-        }
-        return result;
-      };
-      let response: Awaited<ReturnType<typeof send>>;
-      try {
-        response = await withCapabilityRateLimitRetry(sendChecked);
-      } catch (error) {
-        // An ambiguous transport failure may hide an accepted reply. Feishu
-        // dedupes the uuid for an hour, so one replay either returns that
-        // reply or creates it; only a successful replay resolves the doubt.
-        if (
-          classifyFeishuError(error).kind !== 'transient' ||
-          definitiveFeishuPreAcceptanceFailure(error)
-        )
-          throw error;
-        try {
-          response = await withCapabilityRateLimitRetry(sendChecked);
-        } catch {
-          throw error;
-        }
-      }
+      const response = await sendReplyWithReplay('send_card', send);
       assertApiSuccess('send_card', response);
       return {
         operation: request.operation,
@@ -851,6 +864,38 @@ export async function executeFeishuCapability(
           rootId: response.data?.root_id,
           threadId: response.data?.thread_id,
         },
+      };
+    }
+
+    case 'reply_text': {
+      const messageId = optionalString(params.messageId);
+      const text = optionalString(params.text);
+      if (!messageId || !text) {
+        throw new DefinitiveFeishuCapabilityError(
+          'reply_text needs messageId and text',
+        );
+      }
+      await assertMessageInCurrentChat(client, context, messageId);
+      const content = JSON.stringify({ text });
+      const uuid =
+        request.providerUuid ??
+        feishuCapabilityUuid(`reply_text:${chatId}:${messageId}:${content}`);
+      const response = await sendReplyWithReplay('reply_text', () =>
+        client.im.v1.message.reply({
+          path: { message_id: messageId },
+          data: {
+            msg_type: 'text',
+            content,
+            // A quote in the main chat: a thread would hide the reply.
+            reply_in_thread: false,
+            uuid,
+          },
+        }),
+      );
+      assertApiSuccess('reply_text', response);
+      return {
+        operation: request.operation,
+        data: { messageId: response.data?.message_id },
       };
     }
 

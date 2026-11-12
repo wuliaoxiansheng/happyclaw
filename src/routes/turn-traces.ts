@@ -12,23 +12,15 @@
 import { Hono } from 'hono';
 
 import { authMiddleware } from '../middleware/auth.js';
-import { canAccessGroup } from '../group-acl.js';
+import { canViewGroup, canViewHostGroup } from '../guest-access.js';
 import { getAgent, getRegisteredGroup, getTurnTrace } from '../db.js';
-import {
-  hasHostExecutionPermission,
-  isHostExecutionGroup,
-  type Variables,
-} from '../web-context.js';
+import { isHostExecutionGroup, type Variables } from '../web-context.js';
 import type { AuthUser } from '../types.js';
 import { presentTurnTrace, resolveTurnTraceExposure } from '../turn-trace.js';
-import {
-  resolveMessageExecutionGroup,
-  resolveMessageQueryJids,
-} from './groups.js';
+import { agentIdOfJid, stripVirtualJidSuffix } from '../utils.js';
+import { resolveMessageExecutionGroup } from './groups.js';
 
 const turnTraceRoutes = new Hono<{ Variables: Variables }>();
-
-const AGENT_JID_MARKER = '#agent:';
 
 turnTraceRoutes.get('/:jid/turn-traces/:turnId', authMiddleware, (c) => {
   // Per-user content, like the message list itself.
@@ -39,10 +31,8 @@ turnTraceRoutes.get('/:jid/turn-traces/:turnId', authMiddleware, (c) => {
   // DELETE /:jid/messages/:messageId does.
   const chatJid = c.req.param('jid');
   const turnId = c.req.param('turnId');
-  const agentSep = chatJid.indexOf(AGENT_JID_MARKER);
-  const groupJid = agentSep >= 0 ? chatJid.slice(0, agentSep) : chatJid;
-  const agentId =
-    agentSep >= 0 ? chatJid.slice(agentSep + AGENT_JID_MARKER.length) : null;
+  const groupJid = stripVirtualJidSuffix(chatJid);
+  const agentId = agentIdOfJid(chatJid);
 
   const physicalGroup = getRegisteredGroup(groupJid);
   if (!physicalGroup) return c.json({ error: 'Group not found' }, 404);
@@ -52,14 +42,14 @@ turnTraceRoutes.get('/:jid/turn-traces/:turnId', authMiddleware, (c) => {
   const authUser = c.get('user') as AuthUser;
   const principal = { id: authUser.id, role: authUser.role };
   if (
-    !canAccessGroup(principal, physicalGroup) ||
-    !canAccessGroup(principal, executionGroup)
+    !canViewGroup(principal, physicalGroup) ||
+    !canViewGroup(principal, executionGroup)
   ) {
     return c.json({ error: 'Group not found' }, 404);
   }
   if (
     isHostExecutionGroup(executionGroup) &&
-    !hasHostExecutionPermission(authUser)
+    !canViewHostGroup(authUser, executionGroup)
   ) {
     return c.json(
       { error: 'Insufficient permissions for host execution mode' },
@@ -79,19 +69,14 @@ turnTraceRoutes.get('/:jid/turn-traces/:turnId', authMiddleware, (c) => {
   const exposure = resolveTurnTraceExposure(executionGroup.folder, {
     agentKind,
   });
-  if (!exposure.visible) return c.json({ error: 'Trace not found' }, 404);
 
-  // A trace is stored under the chat its messages live in. The client names
-  // that chat, but a home group's history also merges its IM chats, so look
-  // there as well when it named the workspace itself.
-  const candidates = agentId
-    ? [chatJid]
-    : [chatJid, ...resolveMessageQueryJids(chatJid, physicalGroup).slice(1)];
-  for (const candidate of candidates) {
-    const record = getTurnTrace(candidate, turnId);
-    if (record) return c.json(presentTurnTrace(record, exposure));
-  }
-  return c.json({ error: 'Trace not found' }, 404);
+  // A trace is stored under the chat its messages live in, the one named.
+  const record = getTurnTrace(chatJid, turnId);
+  // At `hidden`, a turn without progress statements shows nothing.
+  const presented = record ? presentTurnTrace(record, exposure) : null;
+  return presented
+    ? c.json(presented)
+    : c.json({ error: 'Trace not found' }, 404);
 });
 
 export default turnTraceRoutes;

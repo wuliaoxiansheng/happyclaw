@@ -74,7 +74,8 @@ describe('ThinkingBlock', () => {
       <ThinkingBlock text="" durationMs={3400} />,
     );
     expect(html).toContain('已思考 3.4 秒');
-    expect(html).not.toContain('<button');
+    // The row does not open; its one button explains the missing text.
+    expect(html).not.toContain('aria-expanded');
   });
 
   it('says the model returned no reasoning text when it thought for a while', () => {
@@ -84,7 +85,7 @@ describe('ThinkingBlock', () => {
     expect(html).toContain('已思考 13 秒');
     expect(html).toContain('模型未返回思考内容');
     expect(html).toContain('data-hc-no-summary');
-    expect(html).not.toContain('<button');
+    expect(html).not.toContain('aria-expanded');
   });
 
   it('claims nothing about the model when the text is only withheld', () => {
@@ -214,7 +215,7 @@ describe('SubAgentCard', () => {
     );
     expect(html).toContain('检查移动端滚动');
     expect(html).toContain('已读完 3 个文件');
-    expect(html).toContain('执行中');
+    expect(html).toContain('运行中');
     expect(html).toContain('子 Agent：');
     expect(html).toContain('aria-expanded="false"');
     expect(html).not.toContain('读取 a.ts');
@@ -436,7 +437,9 @@ describe('ProcessSteps', () => {
     );
     expect(html).toContain('23s');
     expect(html).toContain('模型未返回思考内容');
-    expect(html).not.toContain('<button');
+    // The row does not open; its one button explains the missing text.
+    expect(html).not.toContain('aria-expanded');
+    expect(html).toContain('data-hc-no-summary');
   });
 
   it('shows a failed tool with its reason, in the error color', () => {

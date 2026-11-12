@@ -24,6 +24,8 @@ import {
   query,
   HookCallback,
   PostCompactHookInput,
+  SessionStartHookInput,
+  UserPromptSubmitHookInput,
   PreCompactHookInput,
   createSdkMcpServer,
   type Query,
@@ -33,12 +35,16 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import { detectImageMimeTypeFromBase64Strict } from './image-detector.js';
 import { isClaudeAttachmentPassDisabled } from './claude-attachments.js';
-import { RUNNER_DISALLOWED_BUILTIN_TOOLS } from './builtin-tool-policy.js';
 import { createBrowserIntegrityGuard } from './browser-integrity.js';
+import {
+  RUNNER_DISALLOWED_BUILTIN_TOOLS,
+  teamDisallowedTools,
+  runnerCanUseTool,
+  silenceShadowedCanUseToolWarning,
+} from './builtin-tool-policy.js';
 import { pluginLoadWarnings } from './sdk-init-audit.js';
 import { classifyPreInitErrorResult } from './startup-failure.js';
 import { pruneProcessedHistoryImagesInTranscript as pruneProcessedHistoryImagesInTranscriptFile } from './history-image-prune.js';
-import { getChannelFromJid } from './channel-prefixes.js';
 
 import type {
   ContainerInput,
@@ -50,10 +56,7 @@ import type {
   StreamEvent,
   ChannelTurnContext,
 } from './types.js';
-import {
-  formatChannelTurnContextForPrompt,
-  normalizeChannelTurnContext,
-} from './types.js';
+import { normalizeChannelTurnContext } from './types.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 export type { StreamEventType, StreamEvent } from './types.js';
 
@@ -72,6 +75,13 @@ import {
 } from './session-history.js';
 import { StreamEventProcessor } from './stream-processor.js';
 import {
+  ActiveTurnStopper,
+  consumeInterruptSentinel,
+  consumeStopAfterSteer,
+  discardInterruptSentinel,
+  type InterruptReason,
+} from './turn-interrupt.js';
+import {
   acknowledgeHappyClawOwnerProfileFirstWake,
   activateMcpChannelTurn,
   createMcpTools,
@@ -81,11 +91,14 @@ import {
   type WorkspaceMemorySnapshot,
 } from './mcp-tools.js';
 import { HappyClawFirstWakeAcknowledger } from './owner-profile-first-wake.js';
+import { createSerializedAsyncTrigger } from './workspace-memory-context.js';
 import {
-  createSerializedAsyncTrigger,
-  loadWorkspaceMemoryTurnContext,
-} from './workspace-memory-context.js';
-import { loadHappyClawOwnerProfileTurnContext } from './owner-profile-context.js';
+  decorateUserTurn,
+  memoryKey,
+  TurnNoteLedger,
+  type TurnNoteSources,
+  type TurnNotes,
+} from './turn-notes.js';
 import {
   createWorkspaceMemoryWriteGuard,
   WORKSPACE_MEMORY_WRITE_GUARD_MATCHER,
@@ -107,7 +120,6 @@ import {
   partitionIpcMessagesForLogicalTurn,
   requeueIpcInputMessages,
   resolveLogicalQueryInputTurnId,
-  scheduledGroupRunIdFromIpcMessages,
   shouldAcceptIpcMessagesDuringQuery,
   type IpcDeliveryReceipt,
   type IpcInputMessage,
@@ -117,12 +129,14 @@ import {
   buildClaudeRuntimeEnv,
   type ClaudeRuntimeEnv,
 } from './claude-runtime-env.js';
+import { pinBoundProviderSettings } from './provider-env-pin.js';
+import { webFetchPreflightSettings } from './web-fetch-preflight.js';
 import {
   resolveClaudeProviderRuntime,
   resolveClaudeQueryModelRuntime,
   resolveProviderReportedModelTier,
 } from './provider-runtime.js';
-import { resolveAgentSdkEffort } from './agent-effort.js';
+import { resolveRunSdkEffort } from './agent-effort.js';
 import {
   resolveAssistantErrorAttemptBoundary,
   decideProviderLimitAction,
@@ -158,8 +172,12 @@ import { createTranscriptUsageLoader } from './transcript-usage.js';
 import {
   buildHappyClawPromptPlan,
   hasBackgroundTaskTools,
+  SESSION_PROMPTS,
+  type BackgroundTasksPromptId,
   type PromptPlan,
+  type RolePromptId,
 } from './prompt-plan.js';
+import { sessionKind } from './session-kind.js';
 import {
   buildHappyClawSystemPrompt,
   withHappyClawSubagentContract,
@@ -172,10 +190,10 @@ import {
 import { assessContextBudget } from './context-budget.js';
 import {
   findClaudeMdExcludeLeaks,
-  resolveManagedHostClaudeMdExcludes,
+  resolveHostClaudeMdExcludes,
 } from './claude-memory-policy.js';
 import {
-  anchorAgentProfileToUserTurn,
+  escapeAttribute,
   resolveAgentTurnAnchor,
   shouldAnchorInitialAgentTurn,
 } from './agent-turn-contract.js';
@@ -189,6 +207,20 @@ import {
   shouldFailIncompleteQueryExit,
 } from './background-task-drain.js';
 import { IpcInputClaimStore } from './ipc-input-claims.js';
+import { QueryStartupTiming } from './query-timing.js';
+import { QueryCacheUsage } from './cache-rate.js';
+import { ReplyShapeTracker } from './reply-shape.js';
+import {
+  buildSilentStopContinuationPrompt,
+  decideSilentStop,
+  MAX_SILENT_STOP_CONTINUES,
+} from './silent-stop.js';
+import { ToolLoopDetector } from './tool-loop-detector.js';
+import {
+  type CliSecretFiles,
+  sweepOrphanCliSecretDirs,
+  writeCliSecretFiles,
+} from './cli-secret-files.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
@@ -228,6 +260,9 @@ let compactionAwaitingCompletion = false;
 // Module-level session ID so SIGTERM handler can emit it before exit.
 // Updated in main() whenever a query returns a new session.
 let latestSessionId: string | undefined;
+// Per-turn notes (memory, Owner Profile, channel, Agent anchor) already in
+// the current Claude session.
+const turnNotes = new TurnNoteLedger();
 // Durable identity of the SDK input turn that currently owns runner output.
 // writeOutput snapshots it into every frame so direct status/error/session
 // frames cannot silently lose correlation just because they bypass emit().
@@ -319,9 +354,13 @@ const SECURITY_RULES = loadPrompt('security-rules.md');
 const INTERACTION_GUIDELINES = loadPrompt('interaction.md');
 const ASSISTANT_OUTPUT_GUIDELINES = loadPrompt('output.assistant.md');
 const PROACTIVE_OUTPUT_GUIDELINES = loadPrompt('output.proactive.md');
-const TASK_OUTPUT_GUIDELINES = loadPrompt('output.task.md');
 const WEB_FETCH_GUIDELINES = loadPrompt('web-fetch.md');
-const BACKGROUND_TASK_GUIDELINES = loadPrompt('background-tasks.md');
+const BACKGROUND_TASK_GUIDELINES: Record<BackgroundTasksPromptId, string> = {
+  'background-tasks': loadPrompt('background-tasks.md'),
+  'background-tasks.team': loadPrompt('background-tasks.team.md'),
+  'background-tasks.multi': loadPrompt('background-tasks.multi.md'),
+  'background-tasks.delegated': loadPrompt('background-tasks.delegated.md'),
+};
 const ASSISTANT_DELIVERY_CONTRACT = loadPrompt(
   'delivery-contract.assistant.md',
 );
@@ -332,6 +371,13 @@ const AGENT_BUILDER_GUIDELINES = loadPrompt('agent-builder.md');
 const MEMORY_SYSTEM_WORKSPACE = loadPrompt('memory-system.workspace.md');
 const HAPPYCLAW_PLATFORM_IDENTITY = loadPrompt('identity.happyclaw.md');
 const HAPPYCLAW_PLATFORM_BOOTSTRAP = loadPrompt('bootstrap.happyclaw.md');
+const RUNTIME_ADAPTATION = loadPrompt('runtime-adaptation.md');
+const RUNTIME_BASELINE = loadPrompt('runtime-baseline.md');
+const ROLE_PROMPTS: Record<RolePromptId, string> = {
+  'team-router': loadPrompt('team-router.md'),
+  'team-worker': loadPrompt('team-worker.md'),
+  'delegated-worker': loadPrompt('delegated-worker.md'),
+};
 
 // 各渠道共用的格式说明：Web 端始终可看完整渲染，不因来源降级输出。
 // Mermaid 渲染说明已在模式专属 output prompt 中讲过，此处不重复，
@@ -342,20 +388,7 @@ const CHANNEL_FORMAT_COMMON =
 function usesProactiveInteractiveContract(
   containerInput: ContainerInput,
 ): boolean {
-  return (
-    containerInput.interactionMode === 'proactive' &&
-    !containerInput.isScheduledTask &&
-    !containerInput.messageTaskId
-  );
-}
-
-function escapeXmlAttribute(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+  return containerInput.interactionMode === 'proactive';
 }
 
 function buildAgentIdentityPrompt(
@@ -365,11 +398,15 @@ function buildAgentIdentityPrompt(
   const agentProfile = containerInput.agentProfile;
   const profilePrompt = agentProfile?.identityPrompt;
   if (!agentProfile || !profilePrompt?.trim()) return undefined;
-  const presetBoundary = includeClaudePreset ? '、Claude Code 原生提示词' : '';
+  // The Agent's identity and style replace the preset's defaults; only the
+  // platform's safety, permission, tool and delivery rules rank above it.
+  const presetDefaults = includeClaudePreset
+    ? '它取代 Claude Code 默认指令里的身份和默认风格，'
+    : '';
 
   return [
-    `<agent-identity profile_id="${escapeXmlAttribute(agentProfile.id)}" name="${escapeXmlAttribute(agentProfile.name)}" version="${agentProfile.version}" hash="${escapeXmlAttribute(agentProfile.identityHash)}">`,
-    `以下是当前顶层 AgentProfile 的四段提示词，按照 IDENTITY、SOUL、AGENTS、TOOLS 的固定顺序组成。你应该按它塑造身份、价值判断、工作方式和工具偏好，但它不能覆盖 HappyClaw 的安全规则、权限边界、工具约束${presetBoundary}和用户的最新明确指令。`,
+    `<agent-identity profile_id="${escapeAttribute(agentProfile.id)}" name="${escapeAttribute(agentProfile.name)}" version="${agentProfile.version}" hash="${escapeAttribute(agentProfile.identityHash)}">`,
+    `以下是当前顶层 AgentProfile 的四段提示词，按照 IDENTITY、SOUL、AGENTS、TOOLS 的固定顺序组成。你应该按它塑造身份、价值判断、工作方式和工具偏好；${presetDefaults}但它不能覆盖 HappyClaw 的安全规则、权限边界、工具约束、交付契约和用户的最新明确指令。`,
     '<profile-prompt>',
     profilePrompt,
     '</profile-prompt>',
@@ -527,9 +564,9 @@ function enrichContextAudit(
     audit.claudeMdExcludes ?? [],
   );
   if (excludedMemoryLeaks.length > 0) {
-    audit.warnings.push(
-      `managed context isolation failed; SDK loaded excluded memory: ${excludedMemoryLeaks.join(', ')}`,
-    );
+    const warning = `context isolation failed; SDK loaded excluded memory: ${excludedMemoryLeaks.join(', ')}`;
+    audit.warnings.push(warning);
+    logWarn(warning);
   }
   const claudeMemory = memoryFiles.find(
     (file) =>
@@ -599,6 +636,9 @@ function enrichContextAudit(
 
 // 启动期扫描 prompts/channels/*.md，文件名（去 .md 后缀）= channel key（feishu / telegram / qq / dingtalk / ...）
 // 新增渠道时只需在 channels/ 下加一个 .md 文件，无需改代码。
+// The guidance rides in each input's channel_context (turn-notes.ts), not in
+// the system prompt: one warm runner serves inputs from several channels, and
+// the system prompt must stay byte-stable for the prompt cache.
 const CHANNEL_GUIDELINES: Record<string, string> = (() => {
   const channelsDir = path.join(PROMPTS_DIR, 'channels');
   const result: Record<string, string> = {};
@@ -612,6 +652,20 @@ const CHANNEL_GUIDELINES: Record<string, string> = (() => {
   }
   return result;
 })();
+
+/**
+ * Format guidance for an input from this channel; none for the Web, and none
+ * for a team role, whose section covers the format and which has no
+ * send_image/send_file the guidance points at.
+ */
+function channelFormatFor(
+  context: ChannelTurnContext | undefined,
+  teamRole: ContainerInput['teamRole'],
+): string | undefined {
+  if (teamRole) return undefined;
+  const guidelines = context && CHANNEL_GUIDELINES[context.provider];
+  return guidelines ? `${guidelines}\n${CHANNEL_FORMAT_COMMON}` : undefined;
+}
 
 /**
  * 规范化图片 MIME：
@@ -789,7 +843,7 @@ class MessageStream {
       filteredImages = valid.length > 0 ? valid : undefined;
     }
 
-    // 每条 user message 前置当前本地时间，让 agent 能正确推理相对时间 / schedule_task 的
+    // 每条 user message 前置当前本地时间，让 agent 能正确推理相对时间 / 自动化的
     // once/cron 取值（#563）。刻意放在 user message（缓存前缀之后的未缓存区）而非 system
     // prompt：① 不会因每 turn 时间不同而击穿整段 system+历史的 prompt cache；② 长会话里
     // 每个 turn 都拿到新鲜时间，而非会话启动那一刻的陈旧时间。
@@ -930,6 +984,14 @@ function logWarn(message: string): void {
   console.error(`[agent-runner:warn] ${message}`);
 }
 
+/**
+ * Routine lines kept for production diagnosis (such as per-query timing).
+ * The host logs this prefix at info level instead of debug.
+ */
+function logInfo(message: string): void {
+  console.error(`[agent-runner:info] ${message}`);
+}
+
 const CLAUDE_CLI_STDERR_LINE_LIMIT = 2_000;
 
 /** Claude Code stderr is rare and diagnostic, so surface it at warn. */
@@ -946,30 +1008,17 @@ function generateTurnId(): string {
   return `ipc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/**
- * Normalize isMain/isHome/isAdminHome flags for backward compatibility.
- * If the host sends the old `isMain` field, treat it as isHome=true + isAdminHome=true.
- */
+/** Home capabilities belong to every session of the Home workspace. */
 function normalizeHomeFlags(input: ContainerInput): {
   isHome: boolean;
   isAdminHome: boolean;
 } {
-  if (input.isHome !== undefined) {
-    return { isHome: !!input.isHome, isAdminHome: !!input.isAdminHome };
-  }
-  // Legacy: isMain was the only flag
-  const legacy = !!input.isMain;
-  return { isHome: legacy, isAdminHome: legacy };
+  return { isHome: !!input.isHome, isAdminHome: !!input.isAdminHome };
 }
 
-function resolveAgentBuilderEnabled(
-  input: ContainerInput,
-  isHome: boolean,
-): boolean {
-  return (
-    input.agentBuilderEnabled ??
-    (isHome && !input.agentId && !input.isScheduledTask)
-  );
+/** Agent Builder is a host decision for each session; absent means off. */
+function resolveAgentBuilderEnabled(input: ContainerInput): boolean {
+  return input.agentBuilderEnabled === true;
 }
 
 /**
@@ -1043,11 +1092,43 @@ function getSessionSummary(
 }
 
 /**
- * Archive the full transcript to conversations/ before compaction.
- * Also flush any accumulated streaming text as a compact_partial message
- * so users don't lose the response that was being generated.
- * Finally, trim the JSONL file to remove already-compacted history.
+ * Claude Code runs SessionStart (source compact) after a compaction and
+ * before PostCompact; its additionalContext lands after the summary, where
+ * the interrupted turn continues, and survives a resume (Claude CLI 2.1.296).
  */
+const restoreTurnNotesAfterCompaction: HookCallback = async (input) => {
+  const start = input as SessionStartHookInput;
+  if (start.source !== 'compact' || start.agent_id) return {};
+  const additionalContext = turnNotes.restoreAfterCompaction();
+  return additionalContext
+    ? {
+        hookSpecificOutput: {
+          hookEventName: 'SessionStart' as const,
+          additionalContext,
+        },
+      }
+    : {};
+};
+
+/**
+ * UserPromptSubmit runs for every streamed user message, before system/init,
+ * and its additionalContext rides with that prompt (Claude CLI 2.1.296). A
+ * prompt planned against another session gets its notes in full there.
+ */
+const restoreTurnNotesOnSessionChange: HookCallback = async (input) => {
+  const prompt = input as UserPromptSubmitHookInput;
+  if (prompt.agent_id) return {};
+  const additionalContext = turnNotes.restoreOnSessionChange(prompt.session_id);
+  return additionalContext
+    ? {
+        hookSpecificOutput: {
+          hookEventName: 'UserPromptSubmit' as const,
+          additionalContext,
+        },
+      }
+    : {};
+};
+
 /** Ends the main Agent's compaction phase; subagent compactions never start it. */
 function createPostCompactHook(onCompactionEnd: () => void): HookCallback {
   return async (input) => {
@@ -1056,6 +1137,12 @@ function createPostCompactHook(onCompactionEnd: () => void): HookCallback {
   };
 }
 
+/**
+ * Archive the full transcript to conversations/ before compaction.
+ * Also flush any accumulated streaming text as a compact_partial message
+ * so users don't lose the response that was being generated.
+ * Finally, trim the JSONL file to remove already-compacted history.
+ */
 function createPreCompactHook(deps: {
   emit: (output: ContainerOutput) => void;
   getFullText: () => string;
@@ -1185,7 +1272,7 @@ const TRANSCRIPT_UUID_RE =
  * 消息重放给 for-await 消费者，且消息上没有 isReplay 标记（实测 string-prompt
  * 模式下干净会话 resume 会重放上一轮 assistant + result；streaming 模式下
  * 带孤儿后台任务的会话 resume 会合成 init/result 对）。收集旧 transcript
- *（主会话 + subagents，含嵌套子目录）里已有消息的 uuid，for-await 中命中即
+ *（主 Agent 与 subagents 的 transcript，含嵌套子目录）里已有消息的 uuid，for-await 中命中即
  * 跳过——否则重放的旧 assistant 文本会混进 assistantTextTracker 造成回复
  * 重复历史内容。
  * 注意：result 不写入 transcript（CLI 重放时现场合成、uuid 全新），无法用
@@ -1325,7 +1412,6 @@ function shouldClose(): boolean {
 
 const IPC_INPUT_DRAIN_SENTINEL = path.join(IPC_INPUT_DIR, '_drain');
 
-const IPC_INPUT_INTERRUPT_SENTINEL = path.join(IPC_INPUT_DIR, '_interrupt');
 const INTERRUPT_GRACE_WINDOW_MS = 10_000;
 let lastInterruptRequestedAt = 0;
 let activeInterruptQueryRunId: string | undefined;
@@ -1355,33 +1441,25 @@ function isInterruptRelatedError(err: unknown): boolean {
 }
 
 /**
- * Check for _interrupt sentinel (graceful query interruption).
+ * Check for _interrupt sentinel (graceful query interruption) and say why
+ * the host interrupted; null when there is no current interrupt.
  */
-function shouldInterrupt(): boolean {
-  if (fs.existsSync(IPC_INPUT_INTERRUPT_SENTINEL)) {
-    let sentinelQueryRunId = '';
-    try {
-      sentinelQueryRunId = fs
-        .readFileSync(IPC_INPUT_INTERRUPT_SENTINEL, 'utf8')
-        .trim();
-      fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
-    } catch {
-      /* ignore */
-    }
-    if (
-      sentinelQueryRunId &&
-      activeInterruptQueryRunId &&
-      sentinelQueryRunId !== activeInterruptQueryRunId
-    ) {
-      log(
-        `Ignoring interrupt for stale query ${sentinelQueryRunId} (active ${activeInterruptQueryRunId})`,
-      );
-      return false;
-    }
-    markInterruptRequested();
-    return true;
+function shouldInterrupt(): InterruptReason | null {
+  const interrupt = consumeInterruptSentinel(IPC_INPUT_DIR);
+  if (!interrupt) return null;
+  const sentinelQueryRunId = interrupt.queryRunId;
+  if (
+    sentinelQueryRunId &&
+    activeInterruptQueryRunId &&
+    sentinelQueryRunId !== activeInterruptQueryRunId
+  ) {
+    log(
+      `Ignoring interrupt for stale query ${sentinelQueryRunId} (active ${activeInterruptQueryRunId})`,
+    );
+    return null;
   }
-  return false;
+  markInterruptRequested();
+  return interrupt.reason;
 }
 
 /**
@@ -1423,7 +1501,6 @@ function drainIpcInput(): IpcDrainResult {
             images: data.images,
             queryRunId:
               typeof data.queryRunId === 'string' ? data.queryRunId : undefined,
-            taskId: typeof data.taskId === 'string' ? data.taskId : undefined,
             sourceJid:
               typeof data.sourceJid === 'string' ? data.sourceJid : undefined,
             channelContext: normalizeChannelTurnContext(
@@ -1590,17 +1667,8 @@ function waitForIpcMessage(): Promise<
       if (messages.length > 0) {
         const combinedText = messages.map((m) => m.text).join('\n');
         const allImages = messages.flatMap((m) => m.images || []);
-        // If any drained message carries a taskId, attribute the combined turn
-        // to it (take the last one — later messages supersede earlier in a batch).
-        let combinedTaskId: string | undefined;
-        for (let i = messages.length - 1; i >= 0; i--) {
-          if (messages[i].taskId) {
-            combinedTaskId = messages[i].taskId;
-            break;
-          }
-        }
-        // Same convention for sourceJid: per-channel MCP tools should see the
-        // chat the most recent message arrived from.
+        // Per-channel MCP tools should see the chat the most recent message
+        // arrived from.
         let combinedSourceJid = latestIpcInputMessage(messages)?.sourceJid;
         if (!combinedSourceJid) {
           for (let i = messages.length - 1; i >= 0; i--) {
@@ -1620,7 +1688,6 @@ function waitForIpcMessage(): Promise<
         resolve({
           text: combinedText,
           images: allImages.length > 0 ? allImages : undefined,
-          taskId: combinedTaskId,
           sourceJid: combinedSourceJid,
           channelContext: combinedChannelContext,
           messages,
@@ -1713,14 +1780,6 @@ function nonNegativeNumber(value: unknown): number {
   return Number.isFinite(number) ? Math.max(0, number) : 0;
 }
 
-function decorateChannelUserTurn(
-  message: string,
-  context: ChannelTurnContext | undefined,
-): string {
-  const channelBlock = formatChannelTurnContextForPrompt(context);
-  return channelBlock ? `${channelBlock}\n\n${message}` : message;
-}
-
 /**
  * Run a single query and stream results via writeOutput.
  * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
@@ -1770,6 +1829,7 @@ async function runQueryAttempt(
     CLAUDE_PROVIDER_RUNTIME,
     PROVIDER_FALLBACK_MODELS.activeModelOverride,
   );
+  turnNotes.beginQuery(sessionId, resumeAt);
   const stream = new MessageStream();
   // Track messages piped into this query.  When the query is interrupted,
   // these messages would otherwise be lost (consumed by the aborted query).
@@ -1803,14 +1863,6 @@ async function runQueryAttempt(
     activeOutputInputTurnId = currentInputTurnId;
     if (mcpToolsContext) {
       mcpToolsContext.currentInputTurnId = currentInputTurnId;
-      if (currentMessage) {
-        mcpToolsContext.currentTaskId = currentMessage.taskId ?? null;
-        mcpToolsContext.currentScheduledTaskRunId =
-          scheduledGroupRunIdFromIpcMessages(
-            currentMessages,
-            currentMessage.taskId,
-          );
-      }
     }
     if (currentMessage) {
       if (currentMessage.queryRunId) {
@@ -1822,7 +1874,6 @@ async function runQueryAttempt(
         currentMessage.sourceJid,
         currentMessage.channelContext,
       );
-      containerInput.messageTaskId = currentMessage.taskId ?? undefined;
     }
     if (mcpToolsContext) {
       mcpToolsContext.currentQueryRunId = containerInput.queryRunId;
@@ -1830,36 +1881,45 @@ async function runQueryAttempt(
     }
   };
   activateCurrentInputTurn(coldInputTurnId);
-  const [workspaceMemoryTurn, ownerProfileTurn] = mcpToolsContext
+  const [memorySnapshot, ownerProfile] = mcpToolsContext
     ? await Promise.all([
-        loadWorkspaceMemoryTurnContext(prompt, (query) =>
-          fetchWorkspaceMemorySnapshot(mcpToolsContext, query),
+        fetchWorkspaceMemorySnapshot(
+          mcpToolsContext,
+          prompt,
+          turnNotes.memoryHeld(),
         ),
-        loadHappyClawOwnerProfileTurnContext(() =>
-          fetchHappyClawOwnerProfileTurn(mcpToolsContext),
-        ),
+        fetchHappyClawOwnerProfileTurn(mcpToolsContext),
       ])
-    : [
-        { snapshot: null, block: '' },
-        { result: null, block: '' },
-      ];
+    : [null, null];
   const firstWakeAcknowledger = new HappyClawFirstWakeAcknowledger();
   firstWakeAcknowledger.register(
     activeOutputInputTurnId || coldInputTurnId,
-    ownerProfileTurn.result,
+    ownerProfile,
   );
-  if (mcpToolsContext && !workspaceMemoryTurn.snapshot) {
+  if (mcpToolsContext && !memorySnapshot) {
     logWarn(
       'Workspace memory snapshot unavailable; continuing this turn without durable memory context',
     );
   }
+  /**
+   * Trace a turn's memory: what was retrieved for it, which of those it
+   * carries (the others are already in the conversation), and what it
+   * withdraws.
+   */
   const emitWorkspaceMemoryRecall = (
     workspaceMemorySnapshot: WorkspaceMemorySnapshot,
+    notes: Pick<TurnNotes, 'sentMemory' | 'withdrawnMemory'> | undefined,
     inputTurnId: string,
     queryRunId: string | undefined = containerInput.queryRunId,
   ): void => {
     if (!emitOutput) return;
     const trace = workspaceMemorySnapshot.retrievalTrace;
+    const sent = notes?.sentMemory ?? [];
+    const withdrawn = notes?.withdrawnMemory ?? [];
+    const sentKeys = sent.map(memoryKey);
+    const inContext = trace.itemRevisions
+      .map(memoryKey)
+      .filter((key) => !sentKeys.includes(key));
     writeOutput({
       status: 'stream',
       result: null,
@@ -1870,26 +1930,62 @@ async function runQueryAttempt(
         isSynthetic: true,
         displayLevel: 'detail',
         title: 'Workspace memory snapshot',
-        summary: `revision ${workspaceMemorySnapshot.storeRevision}; ${trace.itemRevisions.length} item(s)`,
-        detail: trace.itemRevisions
-          .map((item) => `${item.id}@${item.revision}`)
-          .slice(0, 10)
-          .join(', '),
+        summary: `revision ${workspaceMemorySnapshot.storeRevision}; ${trace.itemRevisions.length} retrieved, ${sent.length} sent${withdrawn.length ? `, ${withdrawn.length} withdrawn` : ''}`,
+        detail: [
+          sentKeys.length ? `sent: ${sentKeys.slice(0, 10).join(', ')}` : '',
+          inContext.length
+            ? `already in context: ${inContext.slice(0, 10).join(', ')}`
+            : '',
+          withdrawn.length
+            ? `withdrawn: ${withdrawn
+                .slice(0, 10)
+                .map((item) => `${item.id} (${item.status})`)
+                .join(', ')}`
+            : '',
+        ]
+          .filter(Boolean)
+          .join('; '),
         queryRunId,
         turnId: containerInput.turnId,
         sessionId,
       },
     });
     log(
-      `Workspace memory snapshot revision=${workspaceMemorySnapshot.storeRevision} items=${trace.itemRevisions.length} generatedAt=${trace.generatedAt}`,
+      `Workspace memory snapshot revision=${workspaceMemorySnapshot.storeRevision} items=${trace.itemRevisions.length} sent=${sent.length} withdrawn=${withdrawn.length} generatedAt=${trace.generatedAt}`,
     );
   };
-  if (workspaceMemoryTurn.snapshot) {
-    emitWorkspaceMemoryRecall(
-      workspaceMemoryTurn.snapshot,
-      activeOutputInputTurnId || coldInputTurnId,
+  /**
+   * Push one user turn with the notes its context still lacks, and trace its
+   * memory. Notes are staged only for a message the stream accepts.
+   */
+  const pushUserTurn = (
+    text: string,
+    turnImages: Array<{ data: string; mimeType?: string }> | undefined,
+    uuid: UUID,
+    sources: TurnNoteSources,
+    traceInputTurnId: string,
+    traceQueryRunId?: string,
+  ): string[] => {
+    let notes: TurnNotes | undefined;
+    const rejected = stream.push(
+      text,
+      turnImages,
+      (message) => {
+        notes = turnNotes.stage(uuid, sources);
+        return decorateUserTurn(message, notes);
+      },
+      uuid,
     );
-  }
+    if (sources.memory) {
+      emitWorkspaceMemoryRecall(
+        sources.memory,
+        notes,
+        traceInputTurnId,
+        traceQueryRunId,
+      );
+    }
+    return rejected;
+  };
   const pipedMessagesDuringQuery = ipcDeliveryTracker.unacknowledgedMessages;
   const providerFallbackTurns = new ProviderFallbackTurnLedger({
     prompt,
@@ -1902,38 +1998,35 @@ async function runQueryAttempt(
   let lastAssistantUuid: string | undefined;
   const durableInputCompletion = new DurableInputTurnCompletion();
   const assistantTextTracker = new AssistantTextTracker();
+  const replyShape = new ReplyShapeTracker();
+  const toolLoops = new ToolLoopDetector();
   let canonicalAssistantUuid: string | undefined;
   const agentTurnAnchor = resolveAgentTurnAnchor(
     containerInput.agentProfile,
     CLAUDE_PROVIDER_RUNTIME.endpointKind,
   );
-  const anchorUserTurn = (message: string): string =>
-    anchorAgentProfileToUserTurn(agentTurnAnchor, message);
-  const decorateInitialUserTurn = (message: string): string => {
-    const withChannelContext = decorateChannelUserTurn(
-      message,
-      containerInput.channelContext,
-    );
-    const withWorkspaceMemory = workspaceMemoryTurn.block
-      ? `${workspaceMemoryTurn.block}\n\n${withChannelContext}`
-      : withChannelContext;
-    const withOwnerProfile = ownerProfileTurn.block
-      ? `${ownerProfileTurn.block}\n\n${withWorkspaceMemory}`
-      : withWorkspaceMemory;
-    return shouldAnchorInitialAgentTurn(emitOutput, sourceKindOverride)
-      ? anchorUserTurn(withOwnerProfile)
-      : withOwnerProfile;
-  };
   const initialSdkUuid = randomUUID();
   ipcDeliveryTracker.bindSdkMessageUuid(
     ipcDeliveryTracker.currentTurnMessages,
     initialSdkUuid,
   );
-  const initialRejected = stream.push(
+  const initialRejected = pushUserTurn(
     prompt,
     images,
-    decorateInitialUserTurn,
     initialSdkUuid,
+    {
+      memory: memorySnapshot,
+      ownerProfile,
+      channelContext: containerInput.channelContext,
+      channelFormat: channelFormatFor(
+        containerInput.channelContext,
+        containerInput.teamRole,
+      ),
+      anchor: shouldAnchorInitialAgentTurn(emitOutput, sourceKindOverride)
+        ? agentTurnAnchor
+        : undefined,
+    },
+    activeOutputInputTurnId || coldInputTurnId,
   );
   const decorateStreamEvent = (event: StreamEvent): StreamEvent => ({
     ...event,
@@ -1941,6 +2034,9 @@ async function runQueryAttempt(
     turnId: containerInput.turnId,
     sessionId: newSessionId || sessionId,
   });
+  /** Correlation fields ending each diagnostic log line of this query. */
+  const logCorrelation = (): string =>
+    `turnId=${containerInput.turnId ?? '-'} inputTurnId=${outputCorrelation.currentInputTurnId} queryRunId=${containerInput.queryRunId ?? '-'}`;
   const emit = (output: ContainerOutput): void => {
     if (output.streamEvent) {
       output = outputCorrelation.correlate({
@@ -2063,6 +2159,8 @@ async function runQueryAttempt(
     });
   };
   let firstResponseWatchdog: SdkFirstResponseWatchdog | undefined;
+  let queryTiming: QueryStartupTiming | undefined;
+  let queryCache: QueryCacheUsage | undefined;
 
   // 如果有图片被拒绝，立即通知用户
   for (const reason of initialRejected) {
@@ -2141,6 +2239,8 @@ async function runQueryAttempt(
   let sawPendingBackgroundTasks = false;
   let backgroundSummaryForceAttempts = 0;
   const MAX_BACKGROUND_SUMMARY_FORCE_ATTEMPTS = 2;
+  // Silent-stop continuations spent on the current input (see silent-stop.ts).
+  let silentStopContinues = 0;
   // Per-message assistant usage is the primary Kaboo-compatible ledger. The
   // reconciler differences each result's cumulative modelUsage against a
   // per-session baseline (persisted next to the transcript, so a resumed
@@ -2271,38 +2371,37 @@ async function runQueryAttempt(
   // 这里主动 query.interrupt() 中止那个卡住的工具调用，让 for-await 自然结束、runner 回到
   // waitForIpcMessage() 保持 warm——不杀整个 runner。interrupt 引发的 SDK 错误由 catch 分支
   // 通过 postResultInterruptRequested 归类为 non-fatal（不退避、不上报为失败）。
+  const activeTurnStopper = new ActiveTurnStopper({
+    activeSubAgentTaskIds: () => processor.getActiveSubAgentTaskIds(),
+    isQueryFinished: () => queryFinished,
+    log,
+  });
   /**
-   * Stop the active SDK turn without re-running input queued behind it.
-   *
-   * On interrupt Claude Code at once starts the next message already written
-   * to it (verified with 2.1.296, even after the input stream ended), while
-   * the runner requeues every later accepted turn for its next query; such a
-   * turn would run twice, once unseen in this superseded process. With later
-   * turns queued in the CLI the process is closed instead, and an interrupt
-   * receipt that still lists queued input closes it as well.
+   * Interrupt the active turn (see ActiveTurnStopper). Only an explicit stop
+   * from the host (`reason` 'stop') closes the query when a sub-agent
+   * outlasts the interrupt.
    */
   const stopActiveTurn = (
     activeQuery: Pick<Query, 'interrupt' | 'close'>,
-    reason: string,
+    label: string,
     turnsQueuedInCli = ipcDeliveryTracker.laterTurnMessages.length,
+    reason?: InterruptReason,
+  ): void =>
+    activeTurnStopper.stop(activeQuery, label, turnsQueuedInCli, reason);
+  // IPC polling stops once a steer interrupts the query, so a stop the user
+  // sends while it winds down is watched for on its own.
+  let stopAfterSteerWatcher: { close: () => void } | undefined;
+  const watchForStopAfterSteer = (
+    activeQuery: Pick<Query, 'interrupt' | 'close'>,
   ): void => {
-    if (turnsQueuedInCli > 0) {
-      log(
-        `${reason}: closing the query, ${turnsQueuedInCli} later input(s) are queued in Claude Code`,
-      );
-      activeQuery.close();
-      return;
-    }
-    activeQuery
-      .interrupt()
-      .then((receipt) => {
-        if (!receipt?.still_queued?.length) return;
-        log(
-          `${reason}: closing the query, the interrupt left ${receipt.still_queued.length} queued input(s)`,
-        );
-        activeQuery.close();
-      })
-      .catch((err: unknown) => log(`${reason} interrupt failed: ${err}`));
+    stopAfterSteerWatcher = createIpcWatcher(() => {
+      if (!consumeStopAfterSteer(IPC_INPUT_DIR, activeInterruptQueryRunId)) {
+        return;
+      }
+      stopAfterSteerWatcher?.close();
+      log('Interrupt sentinel (stop) detected after a steer');
+      activeTurnStopper.requireSubAgentsToEnd(activeQuery, 'Stop after steer');
+    });
   };
 
   const interruptQueryForShutdown = (reason: string) => {
@@ -2312,6 +2411,25 @@ async function runQueryAttempt(
     postResultInterruptRequested = true;
     log(`${reason}, interrupting current query before closing stream`);
     stopActiveTurn(activeQuery, `${reason} (shutdown)`);
+  };
+
+  /**
+   * Ask the model for more in the same SDK stream instead of publishing the
+   * Result just received: the input keeps its receipt, card and turn until
+   * the Result that answers this prompt settles them.
+   */
+  const continueInStream = (prompt: string, label: string): boolean => {
+    assistantTextTracker.reset();
+    canonicalAssistantUuid = undefined;
+    suspectTruncatedTail = undefined;
+    const rejected = stream.push(prompt);
+    if (rejected.length > 0) {
+      log(`${label} prompt was rejected: ${rejected.join('; ')}`);
+      return false;
+    }
+    containerInput.turnId = generateTurnId();
+    resultReceivedAt = null;
+    return true;
   };
 
   const pollIpcDuringQuery = async (): Promise<void> => {
@@ -2329,8 +2447,11 @@ async function runQueryAttempt(
       ipcQueryWatcher.close();
       return;
     }
-    if (shouldInterrupt()) {
-      log('Interrupt sentinel detected, interrupting current query');
+    const interruptReason = shouldInterrupt();
+    if (interruptReason) {
+      log(
+        `Interrupt sentinel detected (${interruptReason}), interrupting current query`,
+      );
       cancelBackgroundResultCompletion();
       clearBackgroundProtocolDebtWatchdog();
       interruptedDuringQuery = true;
@@ -2355,7 +2476,13 @@ async function runQueryAttempt(
       emitResultUsage({}, containerInput.turnId || generateTurnId());
       lastInterruptRequestedAt = Date.now();
       if (queryRef) {
-        stopActiveTurn(queryRef, 'Interrupt sentinel', turnsQueuedInCli);
+        stopActiveTurn(
+          queryRef,
+          'Interrupt sentinel',
+          turnsQueuedInCli,
+          interruptReason,
+        );
+        if (interruptReason === 'steer') watchForStopAfterSteer(queryRef);
       }
       stream.end();
       ipcPolling = false;
@@ -2471,30 +2598,24 @@ async function runQueryAttempt(
           containerInput.currentSourceJid ||
           containerInput.chatJid,
       );
-      const [workspaceMemoryTurn, ownerProfileTurn] = mcpToolsContext
+      const [memorySnapshot, ownerProfile] = mcpToolsContext
         ? await Promise.all([
-            loadWorkspaceMemoryTurnContext(msg.text, (query) =>
-              fetchWorkspaceMemorySnapshot(mcpToolsContext, query),
+            fetchWorkspaceMemorySnapshot(
+              mcpToolsContext,
+              msg.text,
+              turnNotes.memoryHeld(),
             ),
-            loadHappyClawOwnerProfileTurnContext(() =>
-              fetchHappyClawOwnerProfileTurn(
-                mcpToolsContext,
-                8_000,
-                msg.receipt?.deliveryId,
-              ),
+            fetchHappyClawOwnerProfileTurn(
+              mcpToolsContext,
+              8_000,
+              msg.receipt?.deliveryId,
             ),
           ])
-        : [
-            { snapshot: null, block: '' },
-            { result: null, block: '' },
-          ];
+        : [null, null];
       if (msg.receipt?.deliveryId) {
-        firstWakeAcknowledger.register(
-          msg.receipt.deliveryId,
-          ownerProfileTurn.result,
-        );
+        firstWakeAcknowledger.register(msg.receipt.deliveryId, ownerProfile);
       }
-      if (mcpToolsContext && !workspaceMemoryTurn.snapshot) {
+      if (mcpToolsContext && !memorySnapshot) {
         logWarn(
           'Workspace memory snapshot unavailable for warm turn; continuing without durable memory context',
         );
@@ -2504,35 +2625,27 @@ async function runQueryAttempt(
       // requeued by the caller; never emit a recall trace or push it into an
       // ended SDK stream.
       if (!ipcPolling || stream.ended) return;
-      if (workspaceMemoryTurn.snapshot) {
-        emitWorkspaceMemoryRecall(
-          workspaceMemoryTurn.snapshot,
-          msg.receipt?.deliveryId ||
-            outputCorrelation.currentInputTurnId ||
-            containerInput.turnId ||
-            generateTurnId(),
-          msg.queryRunId || containerInput.queryRunId,
-        );
-      }
       const sdkUuid = randomUUID();
       ipcDeliveryTracker.bindSdkMessageUuid([msg], sdkUuid);
-      const rejected = stream.push(
+      const rejected = pushUserTurn(
         msg.text,
         msg.images,
-        (message) => {
-          const withChannelContext = decorateChannelUserTurn(
-            message,
-            queuedChannelContext,
-          );
-          const withWorkspaceMemory = workspaceMemoryTurn.block
-            ? `${workspaceMemoryTurn.block}\n\n${withChannelContext}`
-            : withChannelContext;
-          const withOwnerProfile = ownerProfileTurn.block
-            ? `${ownerProfileTurn.block}\n\n${withWorkspaceMemory}`
-            : withWorkspaceMemory;
-          return anchorUserTurn(withOwnerProfile);
-        },
         sdkUuid,
+        {
+          memory: memorySnapshot,
+          ownerProfile,
+          channelContext: queuedChannelContext,
+          channelFormat: channelFormatFor(
+            queuedChannelContext,
+            containerInput.teamRole,
+          ),
+          anchor: agentTurnAnchor,
+        },
+        msg.receipt?.deliveryId ||
+          outputCorrelation.currentInputTurnId ||
+          containerInput.turnId ||
+          generateTurnId(),
+        msg.queryRunId || containerInput.queryRunId,
       );
       for (const reason of rejected) {
         emit({
@@ -2621,17 +2734,7 @@ async function runQueryAttempt(
     }, backgroundProtocolDebtWatchdog.remainingMs(BACKGROUND_PROTOCOL_DEBT_TIMEOUT_MS));
   };
 
-  const { isHome } = normalizeHomeFlags(containerInput);
-  const agentBuilderEnabled = resolveAgentBuilderEnabled(
-    containerInput,
-    isHome,
-  );
-  const channel =
-    containerInput.channelContext?.provider ||
-    getChannelFromJid(
-      containerInput.currentSourceJid || containerInput.chatJid,
-    );
-  const channelGuidelines = CHANNEL_GUIDELINES[channel] ?? '';
+  const agentBuilderEnabled = resolveAgentBuilderEnabled(containerInput);
   const memoryPromptName = 'memory-system.workspace' as const;
   const hasMemoryTools = allowedTools.some(
     (tool) =>
@@ -2670,6 +2773,8 @@ async function runQueryAttempt(
     if (inputTurnCompleted) {
       clearBackgroundProtocolDebtWatchdog();
       if (!candidate.suspectTruncated) compactionAwaitingCompletion = false;
+      silentStopContinues = 0;
+      toolLoops.reset();
     }
     const ipcReceipts = inputTurnCompleted
       ? ipcDeliveryTracker.completeAnsweredTurns()
@@ -2687,7 +2792,7 @@ async function runQueryAttempt(
       status: 'success',
       // Proactive SDK text is control-plane only; user-visible speech must
       // cross the send_message delivery boundary. Preserve the completed text
-      // only for internal diagnostics and scheduled-result extraction. Public
+      // only for internal diagnostics and automation result extraction. Public
       // interactive hosts must never project it as a fallback message.
       result: proactiveInteractiveContract ? null : candidate.finalText,
       ...(proactiveInteractiveContract &&
@@ -2713,6 +2818,7 @@ async function runQueryAttempt(
 
     containerInput.turnId = generateTurnId();
     if (inputTurnCompleted) {
+      turnNotes.commitAnswered(candidate.completedAssistantUuid);
       providerFallbackTurns.completeHealthyTurn({
         sessionId: newSessionId || sessionId,
         resumeAt: candidate.completedAssistantUuid,
@@ -2761,11 +2867,19 @@ async function runQueryAttempt(
   };
   // The reference person-like runtime supplies its own complete system prompt
   // instead of inheriting Claude Code's Assistant-oriented preset. Proactive
-  // mode follows that boundary while preserving the same SDK tools.
+  // mode follows that boundary while preserving the same SDK tools; without
+  // the preset, runtime-baseline carries the working basics it would give.
   const includeClaudePreset =
     !proactiveInteractiveContract &&
     (containerInput.agentProfile?.includeClaudePreset ?? true);
+  const sessionPrompts = SESSION_PROMPTS[sessionKind(containerInput)];
+  const teamPrompt = sessionPrompts.role
+    ? { id: sessionPrompts.role, text: ROLE_PROMPTS[sessionPrompts.role] }
+    : undefined;
   const promptPlan = buildHappyClawPromptPlan({
+    engine: includeClaudePreset
+      ? { id: 'runtime-adaptation', text: RUNTIME_ADAPTATION }
+      : { id: 'runtime-baseline', text: RUNTIME_BASELINE },
     platformIdentity: containerInput.agentProfile?.isDefault
       ? HAPPYCLAW_PLATFORM_IDENTITY
       : undefined,
@@ -2790,36 +2904,31 @@ async function runQueryAttempt(
           },
         }
       : {}),
-    ...(agentBuilderEnabled &&
-    !containerInput.isScheduledTask &&
-    !containerInput.messageTaskId
-      ? { agentBuilder: AGENT_BUILDER_GUIDELINES }
-      : {}),
-    output:
-      containerInput.isScheduledTask || containerInput.messageTaskId
-        ? TASK_OUTPUT_GUIDELINES
-        : proactiveInteractiveContract
-          ? PROACTIVE_OUTPUT_GUIDELINES
-          : ASSISTANT_OUTPUT_GUIDELINES,
+    ...(agentBuilderEnabled ? { agentBuilder: AGENT_BUILDER_GUIDELINES } : {}),
+    ...(teamPrompt ? { team: teamPrompt } : {}),
+    // A team role speaks through its work tools: its section replaces the
+    // output and delivery contracts, which are built on send_message.
+    ...(teamPrompt
+      ? {}
+      : {
+          output: proactiveInteractiveContract
+            ? PROACTIVE_OUTPUT_GUIDELINES
+            : ASSISTANT_OUTPUT_GUIDELINES,
+        }),
     ...(hasWebTools ? { web: WEB_FETCH_GUIDELINES } : {}),
     ...(backgroundTaskToolsAvailable
-      ? { backgroundTasks: BACKGROUND_TASK_GUIDELINES }
-      : {}),
-    ...(channelGuidelines
       ? {
-          channel: {
-            id: channel,
-            text: `${channelGuidelines}\n${CHANNEL_FORMAT_COMMON}`,
-          },
+          backgroundTasks:
+            BACKGROUND_TASK_GUIDELINES[sessionPrompts.backgroundTasks],
         }
       : {}),
-    ...(!containerInput.isScheduledTask && !containerInput.messageTaskId
-      ? {
+    ...(teamPrompt
+      ? {}
+      : {
           deliveryContract: proactiveInteractiveContract
             ? PROACTIVE_DELIVERY_CONTRACT
             : ASSISTANT_DELIVERY_CONTRACT,
-        }
-      : {}),
+        }),
   });
   for (const warning of promptPlan.warnings) log(`[WARN] ${warning}`);
   if (promptPlan.errors.length > 0) {
@@ -2871,13 +2980,23 @@ async function runQueryAttempt(
   // variables: they outrank the `autoCompactWindow` setting and apply to the
   // window Claude Code resolved for the model, 1M-native models included.
   const claudeRuntimeEnv: ClaudeRuntimeEnv = buildClaudeRuntimeEnv(process.env);
-  const flagSettings: Record<string, unknown> = {};
-  const claudeMdExcludes = resolveManagedHostClaudeMdExcludes({
+  // The bound connection outranks every settings file the CLI reads (the
+  // admin's, the workspace's project and local ones), in host and container
+  // mode alike.
+  const flagSettings: Record<string, unknown> = {
+    ...pinBoundProviderSettings({
+      ...process.env,
+      ...claudeRuntimeEnv,
+    }),
+    ...webFetchPreflightSettings(containerInput.webFetchPreflightPolicy),
+  };
+  const claudeMdExcludes = resolveHostClaudeMdExcludes({
     executionMode: contextAuditBase.executionMode,
     runtimePolicy: containerInput.agentProfile?.runtimePolicy,
     externalClaudeDir: contextAuditBase.externalClaudeDir,
     homeDir: process.env.HOME,
     projectRoot: contextAuditBase.projectRoot,
+    cwd: WORKSPACE_GROUP,
   });
   if (claudeMdExcludes.length > 0) {
     flagSettings.claudeMdExcludes = claudeMdExcludes;
@@ -2949,21 +3068,31 @@ async function runQueryAttempt(
   const effectiveDisallowedTools = [
     ...new Set([
       ...RUNNER_DISALLOWED_BUILTIN_TOOLS,
+      ...teamDisallowedTools(containerInput.teamRole),
       ...(disallowedTools ?? []),
     ]),
   ];
   const userMcpServers = activeAgentMcpPolicy.includeUserMcpServers
     ? loadUserMcpServers()
     : {};
+  // HappyClaw's own server wins a name clash, as it did when both shared one
+  // mcpServers object.
+  const { happyclaw: _shadowed, ...externalMcpServers } = userMcpServers;
+  // Flag settings carry the connection token and user MCP servers their
+  // credentials: they go to the CLI as 0600 files, not argv (see
+  // cli-secret-files.ts). Written inside the try so a failed write still
+  // closes the IPC watcher; removed in the finally below.
+  let cliSecretFiles: CliSecretFiles | undefined;
 
   try {
-    const agentEffort = resolveAgentSdkEffort(
-      containerInput.agentProfile?.runtimePolicy,
-    );
+    cliSecretFiles = writeCliSecretFiles(flagSettings, externalMcpServers);
+    const agentEffort = resolveRunSdkEffort(containerInput);
     log(
       agentEffort
-        ? `Agent effort override: ${agentEffort}`
-        : 'Agent effort: inherit Provider/SDK default',
+        ? `Run effort: ${agentEffort}`
+        : containerInput.launchEffort === null
+          ? 'Run effort: none (the model takes no effort)'
+          : 'Run effort: inherit Provider/SDK default',
     );
     if (Object.keys(claudeRuntimeEnv).length > 0) {
       log(
@@ -2990,6 +3119,9 @@ async function runQueryAttempt(
       ...(agentEffort ? { effort: agentEffort } : {}),
       permissionMode: 'bypassPermissions' as const,
       allowDangerouslySkipPermissions: true,
+      // Registers AskUserQuestion, which the CLI omits without a handler.
+      // bypassPermissions still approves ordinary calls before it is asked.
+      canUseTool: runnerCanUseTool,
       agentProgressSummaries: true,
       settingSources: activeAgentMcpPolicy.settingSources,
       // New hosts pass the canonical manifest. Undefined preserves compatibility
@@ -3003,17 +3135,15 @@ async function runQueryAttempt(
       // stream events: the card's sub-agent transcript advances block by block
       // instead of only filling in when the subagent completes.
       forwardSubagentText: true,
-      ...(Object.keys(flagSettings).length > 0
-        ? { settings: flagSettings as any }
+      settings: cliSecretFiles.settingsPath,
+      ...(cliSecretFiles.mcpConfigPath
+        ? { extraArgs: { 'mcp-config': cliSecretFiles.mcpConfigPath } }
         : {}),
       ...(userPlugins && { plugins: userPlugins }),
       ...(activeAgentMcpPolicy.strictMcpConfig
         ? { strictMcpConfig: true }
         : {}),
-      mcpServers: {
-        ...userMcpServers,
-        happyclaw: mcpServerConfig,
-      },
+      mcpServers: { happyclaw: mcpServerConfig },
       hooks: {
         PreToolUse: [
           {
@@ -3028,9 +3158,10 @@ async function runQueryAttempt(
         PostCompact: [
           {
             hooks: [
-              createPostCompactHook(() =>
-                firstResponseWatchdog?.endCompaction(),
-              ),
+              createPostCompactHook(() => {
+                firstResponseWatchdog?.endCompaction();
+                turnNotes.endCompaction();
+              }),
             ],
           },
         ],
@@ -3041,19 +3172,31 @@ async function runQueryAttempt(
                 emit,
                 getFullText: () => processor.getFullText(),
                 resetFullText: () => processor.resetFullTextAccumulator(),
-                onCompactionStart: () =>
+                onCompactionStart: () => {
                   firstResponseWatchdog?.beginCompaction(
                     SDK_COMPACTION_RESPONSE_TIMEOUT_MS,
-                  ),
+                  );
+                  turnNotes.beginCompaction();
+                },
               }),
             ],
           },
         ],
+        SessionStart: [
+          { matcher: 'compact', hooks: [restoreTurnNotesAfterCompaction] },
+        ],
+        UserPromptSubmit: [{ hooks: [restoreTurnNotesOnSessionChange] }],
       },
     });
     log(
       `Subagent runtime contract: ${sdkCompat.audit.enabled ? 'enabled' : 'disabled'} (${sdkCompat.audit.hash.slice(0, 12)})`,
     );
+    queryTiming = new QueryStartupTiming({
+      mode: sessionId ? 'resume' : 'fresh',
+      source: sourceKindOverride ?? 'input',
+      queryRunId: containerInput.queryRunId,
+    });
+    queryCache = new QueryCacheUsage(containerInput.queryRunId);
     const q = query({
       prompt: stream,
       options: sdkCompat.options,
@@ -3097,6 +3240,7 @@ async function runQueryAttempt(
         `Cancelled ${cancelledInputs.length} IPC input message(s) as the superseded turn started`,
       );
       suppressOutputAfterInterrupt = true;
+      // A query that has not started has no sub-agents to wait for.
       stopActiveTurn(q, 'Immediate interrupt call');
       stream.end();
       ipcPolling = false;
@@ -3207,6 +3351,9 @@ async function runQueryAttempt(
     };
     for await (const message of q) {
       firstResponseWatchdog.observe(message.type);
+      const timingLine = queryTiming.observe(message);
+      if (timingLine) logInfo(timingLine);
+      queryCache.observe(message);
       if (message.type === 'system') {
         const frame = message as {
           subtype?: string;
@@ -3690,6 +3837,14 @@ async function runQueryAttempt(
         }
       }
 
+      if (message.type === 'assistant') {
+        for (const hit of toolLoops.observeAssistantMessage(message)) {
+          logWarn(
+            `[tool-loop] suspected rule=${hit.rule} tool=${hit.tool} count=${hit.count} distinct=${hit.distinct} scope=${hit.scope} ${logCorrelation()}`,
+          );
+        }
+      }
+
       // ── 子 Agent 消息转 StreamEvent ──
       if (processor.processSubAgentMessage(message as any)) {
         continue;
@@ -3729,15 +3884,20 @@ async function runQueryAttempt(
             processor.observeBackgroundNotificationActivity();
             clearBackgroundProtocolDebtWatchdog();
           }
-          const msgContent = (
-            assistantMsg.message as Record<string, unknown> | undefined
-          )?.content;
+          const assistantBody = assistantMsg.message as
+            | Record<string, unknown>
+            | undefined;
+          replyShape.observe(assistantBody);
+          const msgContent = assistantBody?.content;
           if (Array.isArray(msgContent)) {
-            // 以整条 AssistantMessage 为原子分类：只要含 top-level
-            // tool_use，该消息全部 text 都是过程旁白；完全不含工具的消息
+            // 以整次模型响应（message.id）为原子分类：只要含 top-level
+            // tool_use，该响应全部 text 都是过程旁白；完全不含工具的响应
             // 才能在 SDK Result 缺失时作为候选正文。
             const sawText = assistantTextTracker.addContentBlocks(
               msgContent as Array<{ type: string; text?: string }>,
+              typeof assistantBody?.id === 'string'
+                ? assistantBody.id
+                : undefined,
             );
             if (sawText) {
               canonicalAssistantUuid = assistantMsg.uuid as string;
@@ -3749,6 +3909,7 @@ async function runQueryAttempt(
 
       if (message.type === 'system' && message.subtype === 'init') {
         newSessionId = message.session_id;
+        turnNotes.bindSession(newSessionId);
         log(`Session initialized: ${newSessionId}`);
         // Mark transport ready and drain any IPC messages that arrived before init.
         sdkTransportReady = true;
@@ -3770,6 +3931,7 @@ async function runQueryAttempt(
 
       if (message.type === 'result') {
         resultCount++;
+        const resultShape = replyShape.take();
         const textResult =
           'result' in message ? (message as { result?: string }).result : null;
         const resultSubtype = message.subtype;
@@ -3777,9 +3939,9 @@ async function runQueryAttempt(
           `Result #${resultCount}: subtype=${resultSubtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
         );
         const resultMsg = message as unknown as Record<string, unknown>;
-        ipcDeliveryTracker.observeAnsweredSdkUuids(
-          sdkResultAnsweredUserMessageUuids(resultMsg),
-        );
+        const answeredSdkUuids = sdkResultAnsweredUserMessageUuids(resultMsg);
+        ipcDeliveryTracker.observeAnsweredSdkUuids(answeredSdkUuids);
+        turnNotes.observeAnswered(answeredSdkUuids);
         const limitDecision = decideProviderLimitAction({
           result: textResult ?? null,
           canFallback: PROVIDER_FALLBACK_MODELS.canActivateFallback,
@@ -3969,6 +4131,11 @@ async function runQueryAttempt(
         // 完全不含 top-level tool_use 的 AssistantMessage；旁白绝不兜底。
         processor.processResult(textResult);
         const pickedFinalText = assistantTextTracker.pickFinalText(textResult);
+        if (emitOutput && !pickedFinalText?.trim()) {
+          logWarn(
+            `[reply-shape] empty final reply reason=${resultShape.reason} ${resultShape.summary} stop_reason=${String(resultMsg.stop_reason ?? '-')} terminal_reason=${String(resultMsg.terminal_reason ?? '-')} num_turns=${String(resultMsg.num_turns ?? '-')} ${logCorrelation()}`,
+          );
+        }
         const finalText =
           proactiveInteractiveContract &&
           isProactiveFinalDeliveredSentinel(pickedFinalText) &&
@@ -4006,7 +4173,6 @@ async function runQueryAttempt(
           })
         ) {
           backgroundSummaryForceAttempts++;
-          const forcePrompt = buildBackgroundTaskSummaryPrompt();
           log(
             `Result #${resultCount} looked like a stale background-task wait reply after all tasks settled; forcing final summary (${backgroundSummaryForceAttempts}/${MAX_BACKGROUND_SUMMARY_FORCE_ATTEMPTS})`,
           );
@@ -4021,17 +4187,60 @@ async function runQueryAttempt(
               displayLevel: 'primary',
             },
           });
-          assistantTextTracker.reset();
-          canonicalAssistantUuid = undefined;
-          suspectTruncatedTail = undefined;
-          const rejected = stream.push(forcePrompt);
-          if (rejected.length === 0) {
-            containerInput.turnId = generateTurnId();
-            resultReceivedAt = null;
+          if (
+            continueInStream(
+              buildBackgroundTaskSummaryPrompt(),
+              'Forced background summary',
+            )
+          ) {
             continue;
           }
-          log(
-            `Forced background summary prompt was rejected: ${rejected.join('; ')}`,
+        }
+        // Silent stop: the model ended after thinking without a reply.
+        const silentStop = decideSilentStop({
+          emitOutput,
+          isError: resultMsg.is_error === true,
+          stopping:
+            closedDuringQuery ||
+            interruptedDuringQuery ||
+            postResultInterruptRequested ||
+            stream.ended,
+          continuationPrevented,
+          proactive: proactiveInteractiveContract,
+          blockingBackgroundWork:
+            processor.getBlockingBackgroundProtocolCount(),
+          laterInputs:
+            ipcDeliveryTracker.laterTurnMessages.length +
+            nonNegativeNumber(resultMsg.queued_turn_count),
+          finalText,
+          reason: resultShape.reason,
+          stopReason: resultMsg.stop_reason as string | null | undefined,
+          attempts: silentStopContinues,
+        });
+        if (silentStop === 'continue') {
+          const correlation = logCorrelation();
+          // Bill the empty call with its own Result; the continuation's
+          // Result then covers only what follows it.
+          emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
+          if (
+            continueInStream(
+              buildSilentStopContinuationPrompt(),
+              'Silent-stop continuation',
+            )
+          ) {
+            silentStopContinues++;
+            logWarn(
+              `[silent-stop] result #${resultCount} ended after thinking without a reply; asking for the reply (${silentStopContinues}/${MAX_SILENT_STOP_CONTINUES}) ${correlation}`,
+            );
+            continue;
+          }
+        } else if (silentStop === 'exhausted') {
+          logWarn(
+            `[silent-stop] result #${resultCount} ended after thinking again; continuations used up (${silentStopContinues}/${MAX_SILENT_STOP_CONTINUES}), publishing the empty reply ${logCorrelation()}`,
+          );
+        } else if (silentStop === 'stop_reason') {
+          logWarn(
+            `[silent-stop] result #${resultCount} ended after thinking with stop_reason=${String(resultMsg.stop_reason)}; skipped, publishing the empty reply ${logCorrelation()}`,
           );
         }
         if (suspectTruncated && finalText) {
@@ -4337,6 +4546,12 @@ async function runQueryAttempt(
     throw err;
   } finally {
     queryFinished = true;
+    activeTurnStopper.dispose();
+    stopAfterSteerWatcher?.close();
+    const timingLine = queryTiming?.finish();
+    if (timingLine) logInfo(timingLine);
+    const cacheLine = queryCache?.finish();
+    if (cacheLine) logInfo(cacheLine);
     firstResponseWatchdog?.clear();
     clearBackgroundProtocolDebtWatchdog();
     backgroundResultGate.dispose();
@@ -4347,6 +4562,7 @@ async function runQueryAttempt(
     // 定时器，以及旧 watcher 抢先 drain 本应进入新 query 的 IPC 消息。
     ipcPolling = false;
     ipcQueryWatcher.close();
+    cliSecretFiles?.dispose();
   }
 }
 
@@ -4452,6 +4668,13 @@ function forceExitWithSafetyNet(code: number): never {
 }
 
 async function main(): Promise<void> {
+  // SIGKILL gives a Runner no chance to remove its CLI secret files.
+  const sweptCliSecretDirs = sweepOrphanCliSecretDirs();
+  if (sweptCliSecretDirs > 0) {
+    log(
+      `Removed ${sweptCliSecretDirs} CLI secret file director(ies) left by killed Runners`,
+    );
+  }
   let containerInput: ContainerInput;
 
   try {
@@ -4508,13 +4731,10 @@ async function main(): Promise<void> {
   let sessionId = containerInput.sessionId;
   latestSessionId = sessionId;
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
-  const agentBuilderEnabled = resolveAgentBuilderEnabled(
-    containerInput,
-    isHome,
-  );
+  const agentBuilderEnabled = resolveAgentBuilderEnabled(containerInput);
 
   // Create in-process SDK MCP server (replaces the stdio subprocess)
-  // NOTE: chatJid and currentTaskId are mutated in-place by the main loop
+  // NOTE: chatJid and currentInputTurnId are mutated in-place by the main loop
   // below so that createMcpTools() closures observe updates via ctx reference.
   // See the per-turn updates at the bottom of the query loop.
   //
@@ -4541,9 +4761,8 @@ async function main(): Promise<void> {
     agentBuilderEnabled,
     ownerProfileEnabled: containerInput.happyClawOwnerProfileEnabled === true,
     interactionMode: containerInput.interactionMode ?? 'assistant',
-    isScheduledTask: containerInput.isScheduledTask || false,
-    currentTaskId: containerInput.messageTaskId ?? null,
-    currentScheduledTaskRunId: null,
+    teamRole: containerInput.teamRole,
+    workMode: containerInput.workMode,
     currentInputTurnId: containerInput.turnId,
     workspaceMemoryMutationAuth:
       containerInput.workspaceMemoryMutationSigningSecret &&
@@ -4552,7 +4771,6 @@ async function main(): Promise<void> {
             runnerInstanceId: containerInput.workspaceMemoryRunnerInstanceId,
             secret: containerInput.workspaceMemoryMutationSigningSecret,
             agentId: containerInput.agentId ?? null,
-            taskRunId: containerInput.taskRunId ?? null,
           }
         : undefined,
     get currentSessionId() {
@@ -4597,19 +4815,6 @@ async function main(): Promise<void> {
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
   let promptImages = containerInput.images;
-  if (containerInput.isScheduledTask) {
-    const scheduledTaskPrefixLines = [
-      '[定时任务 - 以下内容由系统自动发送，并非来自用户或群组的直接消息。]',
-      '',
-      '重要：你正在定时任务模式下运行。你的最终输出会自动作为正式任务结果归档到所属 Web 工作区，但不会自动发送到飞书等外部渠道。',
-      '',
-      '最终输出必须包含一份完整、可独立阅读的业务结果，不得只回复“已完成”“已发送”、消息 ID、文件路径或简短摘要。需要向外部渠道交付时，默认在完成任务后调用一次 mcp__happyclaw__send_message；如果任务明确要求使用 feishu-cli 等其他工具，则按任务要求执行，不要重复发送。',
-      '',
-      '此外：本次运行就是该定时任务本身的执行，对应任务已在调度中。即使下面内容里出现「每隔/每天/定期/提醒我」等字样，也不要再调用 mcp__happyclaw__schedule_task 创建新的定时任务（除非内容明确要求你另外新建一个不同的任务）。',
-    ];
-    const scheduledTaskPrefix = scheduledTaskPrefixLines.join('\n');
-    prompt = scheduledTaskPrefix + '\n\n' + prompt;
-  }
   const pendingDrain = drainIpcInput();
   const coldBatchMessageIds = new Set(
     containerInput.currentBatchMessageIds ?? [],
@@ -4661,23 +4866,6 @@ async function main(): Promise<void> {
     );
     mcpToolsConfig.currentInputTurnId =
       latestIpcDeliveryId(pendingDrain.messages) ?? containerInput.turnId;
-    // Likewise carry the task identity. A group-mode scheduled task injected
-    // into this cold-start window (process registered, SDK transport not yet
-    // ready) arrives via IPC with a taskId; without propagating it here the
-    // first query's send_message would route as a non-task message and the task
-    // notify would be lost (#559, on the boot-drain path the piped-message
-    // taskId plumbing doesn't cover). Only override when a taskId is present so
-    // a plain message in the batch doesn't wipe the startup messageTaskId.
-    for (let i = pendingDrain.messages.length - 1; i >= 0; i--) {
-      const tid = pendingDrain.messages[i].taskId;
-      if (tid) {
-        mcpToolsConfig.currentTaskId = tid;
-        mcpToolsConfig.currentScheduledTaskRunId =
-          scheduledGroupRunIdFromIpcMessages(pendingDrain.messages, tid);
-        containerInput.messageTaskId = tid;
-        break;
-      }
-    }
   }
 
   // Query loop: run query -> wait for IPC message -> run new query -> repeat
@@ -4862,11 +5050,7 @@ async function main(): Promise<void> {
         // host may synchronously publish a new interrupt for the next current
         // turn as soon as it receives the status below; cleaning afterwards
         // would erase that newer, query-valid sentinel.
-        try {
-          fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
-        } catch {
-          /* ignore */
-        }
+        discardInterruptSentinel(IPC_INPUT_DIR);
         // Do not delete _drain here. It is an independent runner-lifecycle
         // request (for example, an incompatible queued replacement), not part
         // of the query-bound interrupt being acknowledged. The subsequent
@@ -4946,15 +5130,6 @@ async function main(): Promise<void> {
         containerInput.turnId = generateTurnId();
         mcpToolsConfig.currentInputTurnId =
           latestIpcDeliveryId(nextMessage.messages) ?? containerInput.turnId;
-        // See main-loop comment: reset task attribution for this new turn.
-        mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
-        mcpToolsConfig.currentScheduledTaskRunId =
-          scheduledGroupRunIdFromIpcMessages(
-            nextMessage.messages,
-            nextMessage.taskId,
-          );
-        containerInput.messageTaskId =
-          mcpToolsConfig.currentTaskId ?? undefined;
         setCurrentChannelTurn(
           containerInput,
           nextMessage.sourceJid,
@@ -5077,11 +5252,7 @@ async function main(): Promise<void> {
           if (autoContResult.interruptedDuringQuery) {
             log('WARN: Auto-continue query was interrupted by user');
             resumeAt = undefined;
-            try {
-              fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
-            } catch {
-              /* ignore */
-            }
+            discardInterruptSentinel(IPC_INPUT_DIR);
             clearInterruptRequested();
             if (autoContResult.pipedMessagesDuringQuery.length > 0) {
               requeueIpcInputMessages(
@@ -5248,11 +5419,7 @@ async function main(): Promise<void> {
         if (contResult.interruptedDuringQuery) {
           log('WARN: Truncation-continue query was interrupted by user');
           resumeAt = undefined;
-          try {
-            fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
-          } catch {
-            /* ignore */
-          }
+          discardInterruptSentinel(IPC_INPUT_DIR);
           clearInterruptRequested();
           if (contResult.pipedMessagesDuringQuery.length > 0) {
             requeueIpcInputMessages(
@@ -5330,18 +5497,6 @@ async function main(): Promise<void> {
       containerInput.turnId = generateTurnId();
       mcpToolsConfig.currentInputTurnId =
         latestIpcDeliveryId(nextMessage.messages) ?? containerInput.turnId;
-      // Clear per-turn task attribution: the previous query may have been a
-      // scheduled-task turn, but this new IPC message is a regular follow-up
-      // unless it explicitly carried a taskId (see nextMessage.taskId below).
-      // Forgetting to clear would cause regular user replies to be broadcast
-      // to the task's notify channels, hijacking later conversation.
-      mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
-      mcpToolsConfig.currentScheduledTaskRunId =
-        scheduledGroupRunIdFromIpcMessages(
-          nextMessage.messages,
-          nextMessage.taskId,
-        );
-      containerInput.messageTaskId = mcpToolsConfig.currentTaskId ?? undefined;
       setCurrentChannelTurn(
         containerInput,
         nextMessage.sourceJid,
@@ -5470,6 +5625,7 @@ process.on('unhandledRejection', (reason: unknown) => {
   console.error('Unhandled rejection:', reason);
   process.exit(1);
 });
+silenceShadowedCanUseToolWarning();
 main().catch((err) => {
   console.error('Fatal error in main():', err);
   process.exit(1);

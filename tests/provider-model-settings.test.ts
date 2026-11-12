@@ -1,97 +1,45 @@
 import { describe, expect, test } from 'vitest';
 
-import { isOneMillionContextModel as backendIsOneMillion } from '../src/runtime-config.js';
 import {
-  buildDefaultProviderEnv,
-  buildProviderModel,
-  isOneMillionContextModel,
-  parseProviderModel,
-} from '../web/src/utils/provider-model.js';
+  CONNECTION_MODEL_ENV_KEYS,
+  splitOneMillionSuffix,
+  withOneMillionSuffix,
+} from '../web/src/lib/model-providers.js';
+import { buildDefaultProviderEnv } from '../web/src/utils/provider-model.js';
 
 describe('third-party provider model settings', () => {
   test('parses the one-million context suffix from an existing model', () => {
-    expect(parseProviderModel('  glm-5.2[1m]  ')).toEqual({
+    expect(splitOneMillionSuffix('  glm-5.2[1m]  ')).toEqual({
       model: 'glm-5.2',
-      oneMillionContext: true,
+      oneMillion: true,
     });
   });
 
   test('normalizes duplicate or mixed-case suffixes', () => {
-    expect(buildProviderModel('qwen3.7-max[1M][1m]', true)).toBe(
+    expect(withOneMillionSuffix('qwen3.7-max[1M][1m]', true)).toBe(
       'qwen3.7-max[1m]',
     );
   });
 
   test('removes the suffix when one-million context is disabled', () => {
-    expect(buildProviderModel('MiniMax-M3[1m]', false)).toBe('MiniMax-M3');
+    expect(withOneMillionSuffix('MiniMax-M3[1m]', false)).toBe('MiniMax-M3');
   });
 
   test('does not create a suffix without a model name', () => {
-    expect(buildProviderModel(' ', true)).toBe('');
+    expect(withOneMillionSuffix(' ', true)).toBe('');
   });
 
-  test('shows all managed values for a one-million context provider', () => {
+  test('prefills only the three runtime defaults, none of the model keys', () => {
+    const rows = buildDefaultProviderEnv();
     expect(
-      Object.fromEntries(
-        buildDefaultProviderEnv('glm-5.2', true).map(({ key, value }) => [
-          key,
-          value,
-        ]),
-      ),
+      Object.fromEntries(rows.map(({ key, value }) => [key, value])),
     ).toEqual({
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2[1m]',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5.2[1m]',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5.2[1m]',
-      CLAUDE_CODE_SUBAGENT_MODEL: 'glm-5.2[1m]',
-      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-      CLAUDE_CODE_EFFORT_LEVEL: 'max',
-      CLAUDE_CODE_NO_FLICKER: '1',
       API_TIMEOUT_MS: '3000000',
+      CLAUDE_CODE_NO_FLICKER: '1',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     });
-  });
-
-  test('keeps model-derived rows pending until a model is entered', () => {
-    const rows = buildDefaultProviderEnv('', false);
-
-    expect(rows.filter((row) => row.source === 'model')).toHaveLength(4);
-    expect(rows.filter((row) => row.source === 'model')).toSatisfy((items) =>
-      items.every((row) => row.value === ''),
-    );
-    expect(
-      rows.find((row) => row.key === 'CLAUDE_CODE_AUTO_COMPACT_WINDOW')?.value,
-    ).toBe('200000');
-  });
-
-  test('prefills the 1M compact window only for an explicit [1m] model, like the backend', () => {
-    const window = (model: string, oneMillionContext = false) =>
-      buildDefaultProviderEnv(model, oneMillionContext).find(
-        (row) => row.key === 'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
-      )?.value;
-    // A gateway capped at 200K cannot be detected, so 1M-native Claude IDs
-    // keep the conservative default unless the provider opts into [1m].
-    expect(window('claude-sonnet-5-5')).toBe('200000');
-    expect(window('claude-sonnet-5-5', true)).toBe('1000000');
-    expect(window('claude-haiku-4-5')).toBe('200000');
-    expect(window('glm-5.2')).toBe('200000');
-
-    for (const model of [
-      'claude-fable-5-1',
-      'claude-opus-5-5',
-      'claude-opus-4-7',
-      'claude-opus-4-6',
-      'claude-sonnet-5-5',
-      'claude-sonnet-4-5-20250929',
-      'claude-haiku-5-5',
-      'claude-haiku-5',
-      'claude-haiku-4-5',
-      'glm-5.2',
-      'glm-5.2[1m]',
-      'deepseek-v4',
-    ]) {
-      expect(isOneMillionContextModel(model), model).toBe(
-        backendIsOneMillion(model),
-      );
+    for (const { key } of rows) {
+      expect(CONNECTION_MODEL_ENV_KEYS as readonly string[]).not.toContain(key);
     }
   });
 });

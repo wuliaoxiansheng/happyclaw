@@ -1,31 +1,34 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import {
+  legacyHostSkillPolicy,
+  type HostSkillPolicy,
+} from './agent-profile-identity.js';
 import { DATA_DIR } from './config.js';
+import { logger } from './logger.js';
 import { loadManagedMcpLayers, resolveManagedMcpPolicy } from './mcp-utils.js';
 import { getEffectiveExternalDir } from './runtime-config.js';
 import { validateSkillId, validateSkillPath } from './skill-utils.js';
 import type { AgentProfileRuntimePolicy, AuthUser } from './types.js';
 
-export type HostSkillPolicy = NonNullable<
-  AgentProfileRuntimePolicy['skills']['host']
->;
+export type { HostSkillPolicy };
 
 /**
- * Resolve the optional host Skill policy after the effective context source is
- * known. Missing is intentionally a compatibility sentinel for profiles
- * persisted before host Skills became independently configurable.
+ * Resolve the host Skill policy after the effective context source is known.
+ * Every active profile carries an explicit value since schema v84; the legacy
+ * fallback only guards a row that bypassed it.
  */
 export function resolveHostSkillPolicy(runtimePolicy: {
   context?: { source?: string };
   skills?: { host?: HostSkillPolicy };
 }): HostSkillPolicy {
-  return (
-    runtimePolicy.skills?.host ??
-    (runtimePolicy.context?.source === 'host_claude'
-      ? { mode: 'inherit', ids: [] }
-      : { mode: 'disabled', ids: [] })
+  if (runtimePolicy.skills?.host) return runtimePolicy.skills.host;
+  logger.warn(
+    { contextSource: runtimePolicy.context?.source ?? null },
+    'Agent profile has no explicit host Skill policy; using the legacy fallback',
   );
+  return legacyHostSkillPolicy(runtimePolicy.context?.source);
 }
 
 export function requestsHostClaudeContext(
@@ -126,7 +129,10 @@ export function validateRuntimePolicyReferences(
 }
 
 export function hasInvalidRuntimePolicyReferences(
-  invalid: ReturnType<typeof validateRuntimePolicyReferences>,
+  invalid: Pick<
+    ReturnType<typeof validateRuntimePolicyReferences>,
+    'skills' | 'host_skills' | 'mcp'
+  >,
 ): boolean {
   return (
     invalid.skills.length + invalid.host_skills.length + invalid.mcp.length > 0

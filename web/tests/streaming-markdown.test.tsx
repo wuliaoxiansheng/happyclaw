@@ -36,13 +36,6 @@ describe('StreamingMarkdown', () => {
     expect(html).not.toContain('gamma');
     expect(streamed(`${table}ta |\n`)).toContain('gamma');
   });
-
-  it('marks where the reply continues only when asked', () => {
-    expect(
-      renderToStaticMarkup(<StreamingMarkdown content="正在写" caret />),
-    ).toContain('data-streaming-caret="true"');
-    expect(streamed('正在写')).not.toContain('data-streaming-caret');
-  });
 });
 
 describe('FinalMarkdown', () => {

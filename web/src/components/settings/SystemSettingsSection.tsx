@@ -7,7 +7,6 @@ import { api } from '../../api/client';
 import { useAuthStore } from '../../stores/auth';
 import { useChatStore } from '../../stores/chat';
 import { useGroupsStore } from '../../stores/groups';
-import { useTasksStore } from '../../stores/tasks';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
@@ -19,6 +18,14 @@ import {
 } from './SettingsFormControls';
 import type { HostIntegrationSettings, SystemSettings } from './types';
 import { getErrorMessage } from './types';
+import { apiErrorBody } from '../../utils/error';
+import { useIsSingleUserHost } from '../../lib/deployment-mode';
+import {
+  WORKSPACE_ROOT_SOURCE_LABELS,
+  workspaceRootProblemMessage,
+} from '../../lib/workspace-root';
+import { Callout } from '@/components/capabilities/capability-ui';
+import { DeploymentModeSettings } from './DeploymentModeSettings';
 
 type NumericSettingKey =
   | 'containerTimeout'
@@ -39,12 +46,16 @@ interface FieldConfig {
   max: number;
   step: number;
   validate?: (value: number) => string | null;
+  /** Governs Docker only; hidden in single-user host mode. */
+  containerOnly?: boolean;
 }
 
 interface FieldGroup {
   scope: 'runtime' | 'security';
   title: string;
   description: string;
+  /** Replaces `description` in single-user host mode. */
+  singleUserHostDescription?: string;
   fields: FieldConfig[];
 }
 
@@ -54,6 +65,8 @@ const fieldGroups: FieldGroup[] = [
     title: '运行资源',
     description:
       'Docker 容器使用显式容量上限；宿主机模式仅对同一会话串行，不限制不同会话并发。正在运行的任务不会被中断。',
+    singleUserHostDescription:
+      '单人宿主机模式下运行器都是宿主机进程：同一会话串行，不限制不同会话并发。正在运行的任务不会被中断。',
     fields: [
       {
         key: 'containerTimeout',
@@ -101,6 +114,7 @@ const fieldGroups: FieldGroup[] = [
         min: 1,
         max: 100,
         step: 1,
+        containerOnly: true,
       },
     ],
   },
@@ -237,7 +251,7 @@ function NumberSettingField({
               onBlur={onBlur}
               aria-invalid={!!error}
               aria-describedby={`${descriptionId}${error ? ` ${errorId}` : ''}`}
-              className="min-w-0 tabular-nums sm:w-28 pointer-coarse:min-h-11"
+              className="min-w-0 tabular-nums sm:w-28"
             />
             <span className="w-8 shrink-0 text-caption text-muted-foreground">
               {field.unit}
@@ -262,6 +276,7 @@ export function SystemSettingsSection({
   const canManage = useAuthStore((state) =>
     state.hasPermission('manage_system_config'),
   );
+  const singleUserHost = useIsSingleUserHost();
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [values, setValues] = useState<Record<
     NumericSettingKey,
@@ -281,6 +296,8 @@ export function SystemSettingsSection({
   // fallbackModel 是自由字符串，独立于数值 field 抽象；仅在 runtime scope 展示。
   const [fallbackModel, setFallbackModel] = useState('');
   const [initialFallbackModel, setInitialFallbackModel] = useState('');
+  // 访客开关同样独立于数值 field 抽象；仅在 security scope 展示。
+  const [allowMemberGuests, setAllowMemberGuests] = useState(false);
 
   const loadSettings = useCallback(async () => {
     if (!canManage) return;
@@ -294,6 +311,7 @@ export function SystemSettingsSection({
       setInitialValues(nextValues);
       setFallbackModel(data.fallbackModel ?? '');
       setInitialFallbackModel(data.fallbackModel ?? '');
+      setAllowMemberGuests(data.allowMemberGuests);
       setTouched({});
       setSubmitted(false);
     } catch (error) {
@@ -310,8 +328,20 @@ export function SystemSettingsSection({
   }, [loadSettings]);
 
   const activeGroups = useMemo(
-    () => fieldGroups.filter((group) => group.scope === scope),
-    [scope],
+    () =>
+      fieldGroups
+        .filter((group) => group.scope === scope)
+        .map((group) =>
+          singleUserHost
+            ? {
+                ...group,
+                description:
+                  group.singleUserHostDescription ?? group.description,
+                fields: group.fields.filter((field) => !field.containerOnly),
+              }
+            : group,
+        ),
+    [scope, singleUserHost],
   );
   const activeFields = useMemo(
     () => activeGroups.flatMap((group) => group.fields),
@@ -329,6 +359,12 @@ export function SystemSettingsSection({
 
   const fallbackModelDirty =
     scope === 'runtime' && fallbackModel.trim() !== initialFallbackModel.trim();
+  // Single-user host mode has no members to create guests.
+  const showMemberGuests = scope === 'security' && !singleUserHost;
+  const allowMemberGuestsDirty =
+    showMemberGuests &&
+    !!settings &&
+    allowMemberGuests !== settings.allowMemberGuests;
 
   const dirty = useMemo(
     () =>
@@ -337,8 +373,15 @@ export function SystemSettingsSection({
         activeFields.some(
           (field) => values[field.key] !== initialValues[field.key],
         )) ||
+      fallbackModelDirty ||
+      allowMemberGuestsDirty,
+    [
+      activeFields,
+      initialValues,
+      values,
       fallbackModelDirty,
-    [activeFields, initialValues, values, fallbackModelDirty],
+      allowMemberGuestsDirty,
+    ],
   );
 
   const handleSave = async () => {
@@ -353,6 +396,9 @@ export function SystemSettingsSection({
     if (scope === 'runtime') {
       payload.fallbackModel = fallbackModel.trim();
     }
+    if (showMemberGuests) {
+      payload.allowMemberGuests = allowMemberGuests;
+    }
 
     setSaving(true);
     try {
@@ -363,6 +409,7 @@ export function SystemSettingsSection({
       setInitialValues(nextValues);
       setFallbackModel(data.fallbackModel ?? '');
       setInitialFallbackModel(data.fallbackModel ?? '');
+      setAllowMemberGuests(data.allowMemberGuests);
       setTouched({});
       setSubmitted(false);
       toast.success('系统参数已保存，将应用于后续启动的任务');
@@ -438,6 +485,33 @@ export function SystemSettingsSection({
           </SettingsSection>
         ))}
 
+        {showMemberGuests && (
+          <SettingsSection
+            title="访客账号"
+            description="访客是只读账号，由所有者直接创建，不经过邀请码。管理员始终可以创建；每位所有者最多 20 个。"
+          >
+            <SettingsGroup>
+              <SettingsSwitchRow
+                label="允许普通成员创建访客"
+                htmlFor="system-setting-allowMemberGuests"
+                description={
+                  <span id="system-setting-allowMemberGuests-description">
+                    开启后，成员可以把自己的工作区以只读方式授权给访客。关闭时成员不能新建访客，已有的成员访客也无法登录和查看。
+                  </span>
+                }
+                control={
+                  <Switch
+                    id="system-setting-allowMemberGuests"
+                    checked={allowMemberGuests}
+                    onCheckedChange={setAllowMemberGuests}
+                    aria-describedby="system-setting-allowMemberGuests-description"
+                  />
+                }
+              />
+            </SettingsGroup>
+          </SettingsSection>
+        )}
+
         {scope === 'runtime' && (
           <SettingsSection
             title="额度墙回退模型"
@@ -459,6 +533,7 @@ export function SystemSettingsSection({
                 htmlFor="system-setting-fallbackModel"
                 control={
                   <Input
+                    variant="code"
                     id="system-setting-fallbackModel"
                     type="text"
                     value={fallbackModel}
@@ -500,7 +575,11 @@ export function HostIntegrationSettingsSection({
   scope?: 'main-agent' | 'host';
 }) {
   const isAdmin = useAuthStore((state) => state.user?.role === 'admin');
+  const singleUserHost = useIsSingleUserHost();
   const [settings, setSettings] = useState<HostIntegrationSettings | null>(
+    null,
+  );
+  const [workspaceRootError, setWorkspaceRootError] = useState<string | null>(
     null,
   );
   const [draft, setDraft] = useState<HostIntegrationSettings | null>(null);
@@ -553,6 +632,12 @@ export function HostIntegrationSettingsSection({
     );
   }
 
+  /** Absent on servers older than the setting. */
+  const hasWorkspaceRoot = settings.workspaceRootEffective !== undefined;
+  const workspaceRootChanged =
+    hasWorkspaceRoot &&
+    (draft.workspaceRoot ?? '').trim() !== (settings.workspaceRoot ?? '');
+
   const dirty =
     scope === 'main-agent'
       ? draft.mainAgentContextSource !== settings.mainAgentContextSource ||
@@ -562,7 +647,8 @@ export function HostIntegrationSettingsSection({
           settings.mainAgentAutoCompactPercentage
       : draft.externalClaudeDir !== settings.externalClaudeDir ||
         draft.pluginAutoScan !== settings.pluginAutoScan ||
-        draft.adminHostOnlyMode !== settings.adminHostOnlyMode;
+        draft.adminHostOnlyMode !== settings.adminHostOnlyMode ||
+        workspaceRootChanged;
 
   const mainAutoCompactError = (() => {
     if (
@@ -589,15 +675,27 @@ export function HostIntegrationSettingsSection({
     try {
       const adminHostOnlyModeChanged =
         draft.adminHostOnlyMode !== settings.adminHostOnlyMode;
+      // Only what the form edits: the route is strict, and the derived
+      // fields (effective root, mode and their sources) are read-only.
       const data = await api.put<HostIntegrationSettings>(
         '/api/config/host-integration',
-        draft,
+        {
+          externalClaudeDir: draft.externalClaudeDir,
+          pluginAutoScan: draft.pluginAutoScan,
+          adminHostOnlyMode: draft.adminHostOnlyMode,
+          mainAgentContextSource: draft.mainAgentContextSource,
+          mainAgentAutoCompactWindow: draft.mainAgentAutoCompactWindow,
+          mainAgentAutoCompactPercentage: draft.mainAgentAutoCompactPercentage,
+          ...(workspaceRootChanged
+            ? { workspaceRoot: (draft.workspaceRoot ?? '').trim() }
+            : {}),
+        },
       );
+      setWorkspaceRootError(null);
       if (adminHostOnlyModeChanged) {
         await Promise.allSettled([
           useChatStore.getState().loadGroups(),
           useGroupsStore.getState().loadGroups(),
-          useTasksStore.getState().loadTasks(),
         ]);
       }
       setSettings(data);
@@ -615,6 +713,10 @@ export function HostIntegrationSettingsSection({
             : '宿主机集成设置已保存',
       );
     } catch (error) {
+      if (apiErrorBody(error)?.code === 'WORKSPACE_ROOT_INVALID') {
+        setWorkspaceRootError(getErrorMessage(error, '工作区根目录不可用。'));
+        return;
+      }
       toast.error(
         getErrorMessage(error, '宿主机集成设置保存失败，请稍后重试。'),
       );
@@ -787,7 +889,7 @@ export function HostIntegrationSettingsSection({
                         }}
                         aria-invalid={!!mainAutoCompactError}
                         aria-describedby={`main-agent-auto-compact-percentage-description${mainAutoCompactError ? ' main-agent-auto-compact-percentage-error' : ''}`}
-                        className="min-w-0 tabular-nums sm:w-28 pointer-coarse:min-h-11"
+                        className="min-w-0 tabular-nums sm:w-28"
                       />
                       <span className="w-8 shrink-0 text-caption text-muted-foreground">
                         %
@@ -819,6 +921,14 @@ export function HostIntegrationSettingsSection({
         是否继承宿主机 Claude Code 配置，请在对应智能体的设置中管理。
       </div>
 
+      {settings.deploymentMode !== undefined && (
+        <DeploymentModeSettings
+          settings={settings}
+          // The draft keeps its unsaved edits; the mode is read from settings.
+          onSaved={setSettings}
+        />
+      )}
+
       <div className="space-y-3">
         <SettingsGroup>
           <SettingsSwitchRow
@@ -826,16 +936,17 @@ export function HostIntegrationSettingsSection({
             htmlFor="admin-host-only-mode"
             description={
               <span id="admin-host-only-mode-description">
-                开启后，管理员拥有的工作区和定时任务会统一迁移到宿主机，并禁止再选择
-                Docker；普通成员仍固定使用
-                Docker。关闭后不会自动把已有工作区迁回
-                Docker。宿主机工作区暂不支持网页终端。
+                {singleUserHost
+                  ? '单人宿主机模式下始终开启：所有工作区和自动化都在宿主机上运行。'
+                  : '开启后，管理员拥有的工作区和自动化会统一迁移到宿主机，并禁止再选择 Docker；普通成员仍固定使用 Docker。关闭后不会自动把已有工作区迁回 Docker。'}
+                宿主机工作区暂不支持网页终端。
               </span>
             }
             control={
               <Switch
                 id="admin-host-only-mode"
-                checked={draft.adminHostOnlyMode}
+                checked={singleUserHost || draft.adminHostOnlyMode}
+                disabled={singleUserHost}
                 onCheckedChange={(checked) =>
                   setDraft((current) =>
                     current
@@ -847,6 +958,20 @@ export function HostIntegrationSettingsSection({
               />
             }
           />
+
+          {hasWorkspaceRoot && (
+            <WorkspaceRootRow
+              settings={settings}
+              value={draft.workspaceRoot ?? ''}
+              error={workspaceRootError}
+              onChange={(value) => {
+                setWorkspaceRootError(null);
+                setDraft((current) =>
+                  current ? { ...current, workspaceRoot: value } : current,
+                );
+              }}
+            />
+          )}
 
           <SettingsRow
             label="宿主机 Claude 目录"
@@ -872,7 +997,8 @@ export function HostIntegrationSettingsSection({
                 }
                 placeholder="留空使用 ~/.claude"
                 aria-describedby="host-integration-claude-dir-description"
-                className="font-mono sm:w-72 pointer-coarse:min-h-11"
+                variant="code"
+                className="font-mono sm:w-72"
               />
             }
           />
@@ -922,5 +1048,101 @@ export function HostIntegrationSettingsSection({
         </SettingsGroup>
       </SettingsSection>
     </div>
+  );
+}
+
+/**
+ * 工作区根目录: the stored value is edited, the effective one is the
+ * placeholder; '' saves back to the default.
+ */
+function WorkspaceRootRow({
+  settings,
+  value,
+  error,
+  onChange,
+}: {
+  settings: HostIntegrationSettings;
+  value: string;
+  error: string | null;
+  onChange: (value: string) => void;
+}) {
+  // null: neither the requested root nor the fallback can be used.
+  const effective = settings.workspaceRootEffective ?? null;
+  const source = settings.workspaceRootSource ?? 'default';
+  const fallbackReason = settings.workspaceRootFallbackReason;
+  const fallbackWarning = settings.workspaceRootFallbackWarning;
+  const describedBy = [
+    'host-integration-workspace-root-description',
+    error && 'host-integration-workspace-root-error',
+  ]
+    .filter(Boolean)
+    .join(' ');
+  return (
+    <SettingsRow
+      label="工作区根目录"
+      htmlFor="host-integration-workspace-root"
+      description={
+        <span id="host-integration-workspace-root-description">
+          没有指定目录的新宿主机工作区建在这里的同名子目录中；已有工作区和
+          Docker 工作区不受影响。留空恢复默认。
+        </span>
+      }
+      control={
+        <Input
+          id="host-integration-workspace-root"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={effective ?? ''}
+          aria-describedby={describedBy}
+          aria-invalid={!!error}
+          variant="code"
+          className="font-mono sm:w-72"
+        />
+      }
+    >
+      <div className="space-y-2">
+        <p
+          data-testid="workspace-root-effective"
+          className="text-caption break-all text-muted-foreground"
+        >
+          {effective ? (
+            <>
+              当前生效：
+              <span className="font-mono text-foreground">{effective}</span>（
+              {WORKSPACE_ROOT_SOURCE_LABELS[source]}）
+            </>
+          ) : (
+            <>
+              当前没有可用的根目录，新工作区暂时放在
+              <span className="font-mono text-foreground">
+                data/groups/&lt;文件夹&gt;
+              </span>
+              。
+            </>
+          )}
+        </p>
+        {fallbackReason && (
+          <Callout tone="warning" role="status">
+            原本要用的目录不能用：{workspaceRootProblemMessage(fallbackReason)}
+            {effective && '已改用上面的目录。'}
+          </Callout>
+        )}
+        {fallbackWarning && (
+          <Callout tone="warning">
+            备用目录 ~/happyclaw-workspaces 也不能用：
+            {workspaceRootProblemMessage(fallbackWarning)}
+          </Callout>
+        )}
+        {error && (
+          <p
+            id="host-integration-workspace-root-error"
+            role="alert"
+            className="text-caption text-error"
+          >
+            {error}
+          </p>
+        )}
+      </div>
+    </SettingsRow>
   );
 }

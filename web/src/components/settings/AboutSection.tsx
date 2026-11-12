@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Bug, ExternalLink } from 'lucide-react';
 import { BugReportDialog } from '@/components/common/BugReportDialog';
 import { Button } from '@/components/ui/button';
+import { useIsGuest } from '../../stores/auth';
 import { SettingsGroup, SettingsRow, SettingsSection } from './SettingsLayout';
 
 function ExternalAnchor({
@@ -16,7 +17,7 @@ function ExternalAnchor({
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      className="inline-flex items-center gap-1 rounded-sm text-body font-medium text-foreground underline-offset-4 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring/50"
+      className="inline-flex items-center gap-1 rounded-sm text-body font-medium text-foreground underline-offset-4 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring/50 phone:min-h-11"
     >
       {children}
       <ExternalLink className="size-3 text-muted-foreground" />
@@ -26,6 +27,7 @@ function ExternalAnchor({
 
 export function AboutSection() {
   const [showBugReport, setShowBugReport] = useState(false);
+  const isGuest = useIsGuest();
 
   return (
     <div className="space-y-8">
@@ -61,25 +63,29 @@ export function AboutSection() {
           label="作者"
           control={<span className="text-body text-foreground">riba2534</span>}
         />
-        <SettingsRow
-          label="问题反馈"
-          control={
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setShowBugReport(true)}
-            >
-              <Bug className="size-3.5" />
-              报告问题
-            </Button>
-          }
-        />
+        {!isGuest && (
+          <SettingsRow
+            label="问题反馈"
+            control={
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setShowBugReport(true)}
+              >
+                <Bug className="size-3.5" />
+                报告问题
+              </Button>
+            }
+          />
+        )}
       </SettingsGroup>
 
-      <BugReportDialog
-        open={showBugReport}
-        onClose={() => setShowBugReport(false)}
-      />
+      {!isGuest && (
+        <BugReportDialog
+          open={showBugReport}
+          onClose={() => setShowBugReport(false)}
+        />
+      )}
 
       {/* 灵感来源 */}
       <SettingsSection title="灵感来源">

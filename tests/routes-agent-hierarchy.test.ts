@@ -76,6 +76,7 @@ beforeAll(() => {
       resumeGroupsAfterMutation: vi.fn(),
       listDescendantJids: (jid: string) =>
         [...activeRuntimes.keys()].filter((key) => key.startsWith(`${jid}#`)),
+      getStatus: () => ({ groups: [] }),
       stopGroup,
     },
   } as unknown as Parameters<typeof setWebDeps>[0]);

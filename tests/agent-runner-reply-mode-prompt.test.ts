@@ -10,14 +10,14 @@ const read = (relativePath: string) =>
 describe('Agent Runner reply-mode prompt contract', () => {
   test('injects one explicit contract into every public interactive Agent', () => {
     const runner = read('container/agent-runner/src/index.ts');
-    const start = runner.indexOf('...(!containerInput.isScheduledTask');
+    const start = runner.indexOf(
+      'deliveryContract: proactiveInteractiveContract',
+    );
     const end = runner.indexOf('});', start);
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
 
     const selection = runner.slice(start, end);
-    expect(selection).toContain('!containerInput.messageTaskId');
-    expect(selection).toContain('proactiveInteractiveContract');
     expect(selection).toContain('PROACTIVE_DELIVERY_CONTRACT');
     expect(selection).toContain('ASSISTANT_DELIVERY_CONTRACT');
     expect(selection).not.toContain('containerInput.agentId');
@@ -42,15 +42,12 @@ describe('Agent Runner reply-mode prompt contract', () => {
     expect(proactive).toContain(
       '`mcp__happyclaw__send_message` is the only way',
     );
-    // The tool descriptions must gate on the same three conditions as the
-    // prompt selector in the runner, including `currentTaskId`: a
-    // message-triggered task run takes the task contract, not the interactive
-    // Proactive one. Asserting the named predicate rather than an inline
-    // expression keeps the two sides from drifting apart again.
-    expect(tools).toContain('const usesProactiveInteractiveContract =');
-    expect(tools).toContain("ctx.interactionMode === 'proactive' &&");
-    expect(tools).toContain('!ctx.isScheduledTask &&');
-    expect(tools).toContain('!ctx.currentTaskId');
+    // The tool descriptions must gate on the same condition as the prompt
+    // selector in the runner. Asserting the named predicate rather than an
+    // inline expression keeps the two sides from drifting apart.
+    expect(tools).toContain(
+      "const usesProactiveInteractiveContract = ctx.interactionMode === 'proactive';",
+    );
     expect(tools).toContain("presentation: 'native'");
     expect(runner).toContain('!proactiveInteractiveContract &&');
     expect(runner).toContain(

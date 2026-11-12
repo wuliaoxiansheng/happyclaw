@@ -101,6 +101,7 @@ export default function BalanceCard() {
       {/* Redeem input — auto uppercase */}
       <div className="mt-4 flex gap-2">
         <Input
+          variant="code"
           type="text"
           placeholder="输入兑换码"
           aria-label="兑换码"
@@ -108,12 +109,12 @@ export default function BalanceCard() {
           onChange={(e) => setRedeemInput(e.target.value.toUpperCase())}
           onKeyDown={(e) => e.key === 'Enter' && handleRedeem()}
           maxLength={64}
-          className="flex-1 font-mono tracking-wider pointer-coarse:min-h-11"
+          className="flex-1 font-mono tracking-wider"
         />
         <Button
           onClick={handleRedeem}
           disabled={submitting || !redeemInput.trim()}
-          className="pointer-coarse:min-h-11"
+          className="phone:h-11"
         >
           {submitting ? '...' : '兑换'}
         </Button>

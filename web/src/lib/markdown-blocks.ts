@@ -5,7 +5,7 @@
 
 import { RAW_HTML_PATTERN } from './markdown/html-tags';
 
-const FENCE_PATTERN = /^ {0,3}(`{3,}|~{3,})/;
+export const FENCE_PATTERN = /^ {0,3}(`{3,}|~{3,})/;
 const LIST_ITEM_PATTERN = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)/;
 
 /**

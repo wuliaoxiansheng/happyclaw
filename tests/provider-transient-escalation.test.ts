@@ -135,12 +135,10 @@ describe('transient provider failure isolation', () => {
 });
 
 describe('model_not_found disposition', () => {
-  test('an explicitly pinned configuration fails terminally without quarantine', () => {
+  test('fails terminally without quarantine: there is nothing to fail over to', () => {
     resetPool();
     const output = missingModel('pinned');
-    expect(applyProviderFailureDisposition(output, 'provider-a', false)).toBe(
-      true,
-    );
+    expect(applyProviderFailureDisposition(output, 'provider-a')).toBe(true);
     expect(output.providerFailureNotice).toBe(
       PROVIDER_MODEL_CONFIG_USER_NOTICE,
     );
@@ -148,30 +146,5 @@ describe('model_not_found disposition', () => {
     expect(providerPool.isModelQuarantined('provider-a', 'primary-model')).toBe(
       false,
     );
-  });
-
-  test('an automatic pool fences only the failed provider/model pair and fails over', () => {
-    resetPool();
-    const first = missingModel('automatic-a');
-    expect(applyProviderFailureDisposition(first, 'provider-a', true)).toBe(
-      false,
-    );
-    expect(first.inputTurnCompleted).toBe(false);
-    expect(providerPool.getHealthStatus('provider-a').healthy).toBe(true);
-    expect(providerPool.isModelQuarantined('provider-a', 'primary-model')).toBe(
-      true,
-    );
-    expect(providerPool.isModelQuarantined('provider-b', 'primary-model')).toBe(
-      false,
-    );
-
-    const second = missingModel('automatic-b');
-    expect(applyProviderFailureDisposition(second, 'provider-b', true)).toBe(
-      true,
-    );
-    expect(second.providerFailureNotice).toBe(
-      PROVIDER_MODEL_CONFIG_USER_NOTICE,
-    );
-    expect(providerPool.getHealthStatus('provider-b').healthy).toBe(true);
   });
 });

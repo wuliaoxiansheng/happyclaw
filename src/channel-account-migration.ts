@@ -14,6 +14,7 @@ import { parseChannelAddress } from './channel-address.js';
 import {
   channelAccountSecretRef,
   deleteChannelAccountSecret,
+  loadChannelAccountSecret,
   saveChannelAccountSecret,
   type ChannelAccountSecret,
 } from './channel-account-secrets.js';
@@ -78,7 +79,25 @@ export function ensureLegacyDefaultChannelAccount(input: {
   }
 }
 
-/** Compatibility write path for old /api/config/user-im/:provider routes. */
+/**
+ * Account options edited in the channel-account settings. A legacy config
+ * holds at most a copy from when it seeded the account, and the legacy routes
+ * resave that copy on every write, so a legacy save cannot tell a change from
+ * a stale value: an account that has the option keeps its own.
+ */
+const ACCOUNT_OPTION_KEYS: Partial<Record<ChannelProvider, readonly string[]>> =
+  {
+    feishu: ['domain'],
+    telegram: ['streamingMode'],
+    dingtalk: ['streamingMode'],
+    discord: ['streamingMode'],
+  };
+
+/**
+ * Compatibility write path for old /api/config/user-im/:provider routes. The
+ * legacy config replaces the credentials it manages; the account's own
+ * options survive.
+ */
 export function syncDefaultChannelAccountCredentials(input: {
   ownerUserId: string;
   provider: ChannelProvider;
@@ -87,7 +106,12 @@ export function syncDefaultChannelAccountCredentials(input: {
   enabled: boolean;
 }): ChannelAccount {
   const account = ensureLegacyDefaultChannelAccount(input);
-  saveChannelAccountSecret(account.secret_ref, input.secret);
+  const current = loadChannelAccountSecret(account.secret_ref);
+  const secret: ChannelAccountSecret = { ...input.secret };
+  for (const key of ACCOUNT_OPTION_KEYS[input.provider] ?? []) {
+    if (current?.[key] !== undefined) secret[key] = current[key];
+  }
+  saveChannelAccountSecret(account.secret_ref, secret);
   updateChannelAccountAuthStatus(account.id, 'authorized');
   return (
     updateChannelAccount(account.id, input.ownerUserId, {

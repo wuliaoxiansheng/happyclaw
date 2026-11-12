@@ -30,14 +30,11 @@ export type CodexGatewayRunnerKind = 'container' | 'host' | 'sdk-query';
 export interface CodexGatewayRunnerOwner {
   kind: CodexGatewayRunnerKind;
   groupFolder?: string | null;
-  agentId?: string | null;
-  taskRunId?: string | null;
   /**
-   * The logical Session this runner serves: the namespace conversation-level
-   * choices (model, effort) are stored under. Differs from agentId only for
-   * runners that borrow another namespace.
+   * The session this runner serves: the namespace conversation-level choices
+   * (model, effort) are stored under.
    */
-  sessionAgentId?: string | null;
+  agentId?: string | null;
   /**
    * Explicit Agent reasoning effort for this runner. Undefined means the Agent
    * inherits, so the provider-level CODEX_REASONING_EFFORT applies.
@@ -147,9 +144,8 @@ export function updateLiveSessionEffort(
     const { owner } = grant;
     if (
       owner.kind === 'sdk-query' ||
-      owner.taskRunId ||
       owner.groupFolder !== conversation.groupFolder ||
-      (owner.sessionAgentId ?? owner.agentId ?? null) !== sessionAgentId ||
+      (owner.agentId ?? null) !== sessionAgentId ||
       (conversation.providerId && grant.providerId !== conversation.providerId)
     ) {
       continue;

@@ -129,9 +129,12 @@ describe('buildClaudeEnvLines', () => {
     expect(lines).toContain('ANTHROPIC_CUSTOM_HEADERS=x-one: 1\nx-two: 2');
   });
 
-  test('derives managed Claude Code defaults for third-party models', () => {
+  test('third-party tiers, sub-agent and window follow the turn model', () => {
     const lines = buildClaudeEnvLines(
-      config({ anthropicModel: 'glm-5.2[1m]' }),
+      config({
+        anthropicModel: 'glm-5.2',
+        models: [{ id: 'glm-5.2', contextWindow: 1_000_000 }],
+      }),
       NO_CUSTOM_ENV,
     );
 
@@ -139,11 +142,100 @@ describe('buildClaudeEnvLines', () => {
     expect(lines).toContain('ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5.2[1m]');
     expect(lines).toContain('ANTHROPIC_DEFAULT_SONNET_MODEL=glm-5.2[1m]');
     expect(lines).toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL=glm-5.2[1m]');
-    expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000');
-    expect(lines).toContain('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1');
-    expect(lines).toContain('CLAUDE_CODE_EFFORT_LEVEL=max');
-    expect(lines).toContain('CLAUDE_CODE_NO_FLICKER=1');
+    expect(lines).toContain('CLAUDE_CODE_SUBAGENT_MODEL=glm-5.2[1m]');
+    // 1M is what `[1m]` already gives: no compact window.
+    expect(
+      lines.some((line) => line.startsWith('CLAUDE_CODE_AUTO_COMPACT_WINDOW=')),
+    ).toBe(false);
+  });
+
+  test('roles pick other models of the connection, each with its own window', () => {
+    const lines = buildClaudeEnvLines(
+      config({
+        anthropicModel: 'k3',
+        models: [
+          { id: 'k3', contextWindow: 256_000 },
+          { id: 'k3-mini' },
+          { id: 'k3-long', contextWindow: 1_000_000 },
+        ],
+        roles: { smallFast: 'k3-mini', subagent: 'k3-long' },
+      }),
+      NO_CUSTOM_ENV,
+    );
+
+    // Above 200K needs `[1m]` to lift the ceiling, the compact window
+    // brings it back down to the model's.
+    expect(lines).toContain('ANTHROPIC_MODEL=k3[1m]');
+    expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=256000');
+    expect(lines).toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL=k3-mini');
+    expect(lines).toContain('CLAUDE_CODE_SUBAGENT_MODEL=k3-long[1m]');
+    expect(lines).toContain('ANTHROPIC_DEFAULT_OPUS_MODEL=k3[1m]');
+    expect(lines).toContain('ANTHROPIC_DEFAULT_SONNET_MODEL=k3[1m]');
+  });
+
+  test('a model with no known window gets neither [1m] nor a compact window', () => {
+    const lines = buildClaudeEnvLines(
+      config({ anthropicModel: 'k3' }),
+      NO_CUSTOM_ENV,
+    );
+    expect(lines).toContain('ANTHROPIC_MODEL=k3');
+    expect(
+      lines.some((line) => line.startsWith('CLAUDE_CODE_AUTO_COMPACT_WINDOW=')),
+    ).toBe(false);
+  });
+
+  test('injects nothing implicitly: no effort, no timeout, no traffic flags', () => {
+    const lines = buildClaudeEnvLines(
+      config({ anthropicModel: 'k3' }),
+      NO_CUSTOM_ENV,
+    );
+    for (const key of [
+      'CLAUDE_CODE_EFFORT_LEVEL',
+      'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+      'CLAUDE_CODE_NO_FLICKER',
+      'API_TIMEOUT_MS',
+    ]) {
+      expect(lines.some((line) => line.startsWith(`${key}=`))).toBe(false);
+    }
+  });
+
+  test('connection env: non-empty values only, model keys never', () => {
+    const lines = buildClaudeEnvLines(config({ anthropicModel: 'k3' }), {
+      API_TIMEOUT_MS: '3000000',
+      CLAUDE_CODE_NO_FLICKER: '',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '   ',
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '999999',
+      CLAUDE_CODE_EFFORT_LEVEL: 'low',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'stale',
+      CUSTOM_FLAG: 'kept',
+    });
+
     expect(lines).toContain('API_TIMEOUT_MS=3000000');
+    expect(lines).toContain('CUSTOM_FLAG=kept');
+    for (const key of [
+      'CLAUDE_CODE_NO_FLICKER',
+      'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+      'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+      'CLAUDE_CODE_EFFORT_LEVEL',
+    ]) {
+      expect(lines.some((line) => line.startsWith(`${key}=`))).toBe(false);
+    }
+    expect(lines).toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL=k3');
+  });
+
+  test('a pass-through relay without a model only gets the roles it names', () => {
+    const lines = buildClaudeEnvLines(
+      config({ anthropicModel: '', roles: {} }),
+      NO_CUSTOM_ENV,
+    );
+    expect(
+      lines.some(
+        (line) =>
+          line.startsWith('ANTHROPIC_MODEL=') ||
+          line.startsWith('ANTHROPIC_DEFAULT_') ||
+          line.startsWith('CLAUDE_CODE_SUBAGENT_MODEL='),
+      ),
+    ).toBe(false);
   });
 
   test.each([
@@ -161,13 +253,6 @@ describe('buildClaudeEnvLines', () => {
       expect(lines).toContain('ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-6-sol');
       expect(lines).toContain('ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-6-sol');
       expect(lines).toContain('CLAUDE_CODE_SUBAGENT_MODEL=gpt-6-sol');
-      // An explicit provider mapping still wins.
-      expect(
-        buildClaudeEnvLines(
-          config({ anthropicBaseUrl, anthropicModel: 'gpt-6-sol' }),
-          { ANTHROPIC_DEFAULT_HAIKU_MODEL: 'gpt-6-luna' },
-        ),
-      ).toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-6-luna');
     },
   );
 
@@ -198,7 +283,8 @@ describe('buildClaudeEnvLines', () => {
         agentEffort: 'max',
       }),
     ).toBe('low');
-    // Other third-party gateways keep every tier on the provider model.
+    // Other third-party gateways keep every tier on the provider model; a
+    // window the registry knows is only a suggestion, so no `[1m]`.
     expect(
       buildClaudeEnvLines(
         config({
@@ -210,61 +296,52 @@ describe('buildClaudeEnvLines', () => {
     ).toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-6-sol');
   });
 
-  test('defaults the compact window to 1M only for an explicit [1m] model', () => {
-    const windowFor = (anthropicModel: string) =>
-      buildClaudeEnvLines(config({ anthropicModel }), NO_CUSTOM_ENV).find(
-        (line) => line.startsWith('CLAUDE_CODE_AUTO_COMPACT_WINDOW='),
-      );
-    for (const model of ['claude-opus-4-6[1m]', 'glm-5.2[1M]']) {
-      expect(windowFor(model)).toBe('CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000');
-    }
-    // 1M-native Claude IDs keep 200K: Claude Code cannot see a gateway
-    // capped at 200K, which would fail with "Prompt is too long".
-    for (const model of [
-      'claude-sonnet-5',
-      'anthropic/claude-sonnet-5-20260101',
-      'claude-opus-4-7',
-      'claude-fable-5-1',
-      'claude-haiku-4-5-20251001',
-      'glm-5.2',
-      'k3',
-    ]) {
-      expect(windowFor(model)).toBe('CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000');
-    }
-  });
+  test('official: [1m] only for a declared window, never from the registry', () => {
+    const official = (patch: Partial<ClaudeProviderConfig>) =>
+      buildClaudeEnvLines(config({ anthropicBaseUrl: '', ...patch }), {
+        CLAUDE_CODE_EFFORT_LEVEL: 'low',
+        CUSTOM_FLAG: 'kept',
+      });
 
-  test('uses defaults but lets provider settings override third-party values', () => {
-    const lines = buildClaudeEnvLines(config({ anthropicModel: 'k3' }), {
-      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '999999',
-      CLAUDE_CODE_EFFORT_LEVEL: 'low',
-      CUSTOM_FLAG: 'kept',
+    // claude-sonnet-5 is 1M in the registry; that is the billed opt-in.
+    const registry = official({ anthropicModel: 'claude-sonnet-5' });
+    expect(registry).toContain('ANTHROPIC_MODEL=claude-sonnet-5');
+    expect(registry).toContain('CUSTOM_FLAG=kept');
+    const declared = official({
+      anthropicModel: 'claude-sonnet-5',
+      models: [{ id: 'claude-sonnet-5', contextWindow: 1_000_000 }],
     });
-
-    expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=999999');
-    expect(lines).toContain('CLAUDE_CODE_EFFORT_LEVEL=low');
-    expect(lines).not.toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000');
-    expect(lines).not.toContain('CLAUDE_CODE_EFFORT_LEVEL=max');
-    expect(lines).toContain('CUSTOM_FLAG=kept');
-  });
-
-  test('keeps runtime tuning customizable for official providers', () => {
-    const lines = buildClaudeEnvLines(
-      config({ anthropicBaseUrl: '', anthropicModel: 'sonnet' }),
-      { CLAUDE_CODE_EFFORT_LEVEL: 'low' },
-    );
-
-    expect(lines).toContain('CLAUDE_CODE_EFFORT_LEVEL=low');
-    expect(lines).not.toContain('CLAUDE_CODE_EFFORT_LEVEL=max');
-    expect(lines).not.toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000');
+    expect(declared).toContain('ANTHROPIC_MODEL=claude-sonnet-5[1m]');
+    // A name a session or Agent saved with `[1m]` keeps its 1M opt-in,
+    // even when the connection lists the model without a window.
+    const saved = official({
+      anthropicModel: 'claude-sonnet-4-5[1m]',
+      models: [{ id: 'claude-sonnet-4-5' }],
+    });
+    expect(saved).toContain('ANTHROPIC_MODEL=claude-sonnet-4-5[1m]');
+    for (const lines of [registry, declared, saved]) {
+      for (const prefix of [
+        'ANTHROPIC_DEFAULT_',
+        'CLAUDE_CODE_SUBAGENT_MODEL=',
+        'CLAUDE_CODE_AUTO_COMPACT_WINDOW=',
+        'CLAUDE_CODE_EFFORT_LEVEL=',
+      ]) {
+        expect(lines.some((line) => line.startsWith(prefix))).toBe(false);
+      }
+    }
   });
 
   test('prevents workspace overrides from replacing third-party managed values', () => {
     const lines = buildContainerEnvLines(
-      config({ anthropicModel: 'glm-5.2[1m]' }),
+      config({
+        anthropicModel: 'glm-5.2',
+        models: [{ id: 'glm-5.2', contextWindow: 1_000_000 }],
+      }),
       {
         customEnv: {
           ANTHROPIC_DEFAULT_OPUS_MODEL: 'stale-model',
           CLAUDE_CODE_AUTO_COMPACT_WINDOW: '42',
+          API_TIMEOUT_MS: '1',
           HAPPYCLAW_FALLBACK_MODEL: 'workspace-fallback',
           PROJECT_ENV: 'kept',
         },
@@ -273,9 +350,9 @@ describe('buildClaudeEnvLines', () => {
     );
 
     expect(lines).toContain('ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5.2[1m]');
-    expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000');
     expect(lines).not.toContain('ANTHROPIC_DEFAULT_OPUS_MODEL=stale-model');
     expect(lines).not.toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=42');
+    expect(lines).not.toContain('API_TIMEOUT_MS=1');
     expect(lines).not.toContain('HAPPYCLAW_FALLBACK_MODEL=workspace-fallback');
     expect(lines).toContain('PROJECT_ENV=kept');
   });
@@ -344,6 +421,32 @@ describe('buildClaudeEnvLines', () => {
     expect(thirdParty).toContain('HAPPYCLAW_CLAUDE_ENDPOINT_KIND=custom');
     expect(thirdParty).not.toContain('HAPPYCLAW_CLAUDE_ENDPOINT_KIND=official');
     expect(official).toContain('HAPPYCLAW_CLAUDE_ENDPOINT_KIND=official');
+  });
+
+  test('clears every routing and credential key a parent shell left, keeping network config', () => {
+    // HappyClaw started from an admin shell that runs its own Claude Code on Bedrock.
+    const env: Record<string, string | undefined> = {
+      CLAUDE_CODE_USE_BEDROCK: '1',
+      CLAUDE_CODE_USE_VERTEX: '1',
+      AWS_BEARER_TOKEN_BEDROCK: 'admin-bedrock',
+      ANTHROPIC_BEDROCK_BASE_URL: 'https://bedrock.admin.test',
+      ANTHROPIC_VERTEX_BASE_URL: 'https://vertex.admin.test',
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'admin-fable',
+      CLAUDE_CODE_OAUTH_REFRESH_TOKEN: 'admin-refresh',
+      ANTHROPIC_IDENTITY_TOKEN_FILE: '/home/admin/token',
+      CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '60',
+      HTTPS_PROXY: 'http://proxy.test:3128',
+      NODE_EXTRA_CA_CERTS: '/etc/ssl/corp.pem',
+      AWS_PROFILE: 'admin',
+      PATH: '/usr/bin',
+    };
+    clearInheritedClaudeProviderEnv(env);
+    expect(env).toEqual({
+      HTTPS_PROXY: 'http://proxy.test:3128',
+      NODE_EXTRA_CA_CERTS: '/etc/ssl/corp.pem',
+      AWS_PROFILE: 'admin',
+      PATH: '/usr/bin',
+    });
   });
 
   test('clears inherited provider values before host-mode config is applied', () => {

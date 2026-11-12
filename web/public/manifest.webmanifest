@@ -5,8 +5,8 @@
   "start_url": "./chat",
   "display": "standalone",
   "display_override": ["standalone"],
-  "background_color": "#FAF9F5",
-  "theme_color": "#0d9488",
+  "background_color": "#faf9f5",
+  "theme_color": "#faf9f5",
   "lang": "zh-CN",
   "scope": "./",
   "id": "./",
@@ -22,10 +22,39 @@
       "type": "image/png"
     },
     {
+      "src": "icons/icon-192-maskable.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
       "src": "icons/icon-512-maskable.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable"
+    }
+  ],
+  "launch_handler": {
+    "client_mode": ["focus-existing", "auto"]
+  },
+  "shortcuts": [
+    {
+      "name": "自动化",
+      "short_name": "自动化",
+      "description": "查看和管理自动化",
+      "url": "./automations"
+    },
+    {
+      "name": "记忆",
+      "short_name": "记忆",
+      "description": "查看工作区记忆",
+      "url": "./memory"
+    },
+    {
+      "name": "设置",
+      "short_name": "设置",
+      "description": "账户和系统设置",
+      "url": "./settings"
     }
   ]
 }

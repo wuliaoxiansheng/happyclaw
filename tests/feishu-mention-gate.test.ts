@@ -176,6 +176,30 @@ describe('evaluateMentionGate', () => {
     );
     expect(seen).toEqual({ chatJid: CHAT, sender: SENDER });
   });
+
+  test('an input addressed to the Bot by structure counts as mentioned', () => {
+    // A click on the Bot's own card: no @mention, even without a bot open_id.
+    expect(
+      evaluateMentionGate(input({ addressedToBot: true, botOpenId: '' })),
+    ).toEqual({ allow: true });
+    // Owner and disabled checks still apply.
+    expect(
+      evaluateMentionGate(
+        input({
+          addressedToBot: true,
+          isGroupOwnerMessage: (_chat, sender) => sender === OWNER,
+        }),
+      ),
+    ).toEqual({ allow: false, reason: 'not_owner' });
+    expect(
+      evaluateMentionGate(
+        input({
+          addressedToBot: true,
+          conversationPlan: { disabled: true, allowWithoutMention: false },
+        }),
+      ),
+    ).toEqual({ allow: false, reason: 'disabled' });
+  });
 });
 
 describe('stripLeadingBotMention', () => {

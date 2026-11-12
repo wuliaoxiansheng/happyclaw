@@ -23,6 +23,25 @@ vi.mock('../src/logger.js', () => ({
 
 const { IMConnectionManager } = await import('../src/im-manager.js');
 
+describe('IMConnectionManager WeCom inbound wiring', () => {
+  test('connectUserWeCom forwards the workspace folder resolver', async () => {
+    const manager = new IMConnectionManager();
+    const connect = vi.spyOn(manager, 'connectChannel').mockResolvedValue(true);
+    const resolveGroupFolder = vi.fn(() => 'workspace-1');
+
+    await manager.connectUserWeCom(
+      route.owner,
+      { botId: 'bot-1', secret: 'secret-1' },
+      vi.fn(),
+      { accountId: route.accountId, resolveGroupFolder },
+    );
+
+    const opts = connect.mock.calls[0]?.[3];
+    // Without it every inbound image/file is reported as "未注册群组".
+    expect(opts?.resolveGroupFolder).toBe(resolveGroupFolder);
+  });
+});
+
 describe('IMConnectionManager WeCom public media routing', () => {
   test('sendImage and sendFile use the connected WeCom provider methods', async () => {
     const sendImage = vi.fn(async () => undefined);

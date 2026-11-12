@@ -113,6 +113,9 @@ export function applyFollowUpTransition<T extends TimelineMessageLike>(
  * Queued follow-ups can be edited before they run, and the edit lands only in
  * the queue. Carry the queue's content onto the hidden message rows so a
  * released row shows what was actually sent instead of the original text.
+ * A row the server moved back into the queue (an input waiting for a
+ * usage-limit reset) takes the queue's status and leaves the transcript
+ * until it is released again.
  */
 export function syncFollowUpContent<
   T extends TimelineMessageLike & {
@@ -121,16 +124,26 @@ export function syncFollowUpContent<
   },
 >(
   messages: readonly T[],
-  items: readonly { id: string; content: string; attachments?: string }[],
+  items: readonly {
+    id: string;
+    content: string;
+    attachments?: string;
+    delivery_status?: 'queued' | 'promoting';
+  }[],
 ): T[] {
   if (items.length === 0 || messages.length === 0) return messages as T[];
   const byId = new Map(items.map((item) => [item.id, item]));
   let changed = false;
   const updated = messages.map((message) => {
     const item = byId.get(message.id);
+    const status =
+      item?.delivery_status && item.delivery_status !== message.delivery_status
+        ? item.delivery_status
+        : undefined;
     if (
       !item ||
-      (message.content === item.content &&
+      (!status &&
+        message.content === item.content &&
         (item.attachments === undefined ||
           message.attachments === item.attachments))
     ) {
@@ -143,6 +156,7 @@ export function syncFollowUpContent<
       ...(item.attachments !== undefined
         ? { attachments: item.attachments }
         : {}),
+      ...(status ? { delivery_status: status } : {}),
     } as T;
   });
   return changed ? updated : (messages as T[]);

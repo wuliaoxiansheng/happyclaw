@@ -22,12 +22,9 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
+  ResponsiveMenu,
+  type MenuAction,
+} from '@/components/common/ResponsiveMenu';
 import {
   Select,
   SelectContent,
@@ -56,10 +53,27 @@ interface UserListTabProps extends TabNotification {
 }
 
 export function RoleBadge({ role }: { role: string }) {
+  if (role === 'guest') {
+    return <Badge variant="neutral">{ROLE_LABELS.guest}</Badge>;
+  }
   return (
     <Badge variant="outline" dot={role === 'admin' ? 'primary' : 'muted'}>
       {ROLE_LABELS[role] || role}
     </Badge>
+  );
+}
+
+/** Guests show who created them next to the role. */
+function UserRole({ user }: { user: UserPublic }) {
+  return (
+    <span className="inline-flex min-w-0 flex-wrap items-center gap-1">
+      <RoleBadge role={user.role} />
+      {user.role === 'guest' && user.guest_owner_username && (
+        <span className="truncate text-caption text-muted-foreground">
+          由 @{user.guest_owner_username} 创建
+        </span>
+      )}
+    </span>
   );
 }
 
@@ -215,69 +229,77 @@ export function UserListTab({
     if (!canOperateTargetUser(user)) return null;
     const isSelf = user.id === currentUser?.id;
     if (!isAdmin && isSelf) return null;
+    const statusAction: MenuAction =
+      user.status === 'active'
+        ? {
+            label: '禁用',
+            icon: ShieldOff,
+            onSelect: () => void changeStatus(user, 'disabled'),
+          }
+        : user.status === 'disabled'
+          ? {
+              label: '启用',
+              icon: ShieldCheck,
+              onSelect: () => void changeStatus(user, 'active'),
+            }
+          : {
+              label: '恢复',
+              icon: Undo2,
+              onSelect: () => void handleRestore(user),
+            };
+    const name = user.display_name || user.username;
     return (
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
+      <ResponsiveMenu
+        title={`${name} 的操作`}
+        groups={[
+          [
+            ...(isAdmin
+              ? [
+                  {
+                    label: '修改密码',
+                    icon: KeyRound,
+                    onSelect: () => {
+                      setEditingUser(null);
+                      setPasswordUser(user);
+                    },
+                  },
+                ]
+              : []),
+            ...(isSelf
+              ? []
+              : [
+                  {
+                    label: '编辑',
+                    icon: Edit3,
+                    onSelect: () => startEdit(user),
+                  },
+                  statusAction,
+                ]),
+          ],
+          isSelf
+            ? []
+            : [
+                {
+                  label: '撤销全部会话',
+                  icon: LogOut,
+                  onSelect: () => void handleRevokeAll(user),
+                },
+                {
+                  label: '删除',
+                  icon: Trash2,
+                  destructive: true,
+                  onSelect: () => void handleDelete(user),
+                },
+              ],
+        ]}
+        trigger={
           <IconButton
-            label={`${user.display_name || user.username} 的操作`}
+            label={`${name} 的操作`}
             icon={<MoreHorizontal />}
             hideTooltip
           />
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-40">
-          {isAdmin && (
-            <DropdownMenuItem
-              onSelect={() => {
-                setEditingUser(null);
-                setPasswordUser(user);
-              }}
-            >
-              <KeyRound />
-              修改密码
-            </DropdownMenuItem>
-          )}
-          {!isSelf && (
-            <>
-              <DropdownMenuItem onSelect={() => startEdit(user)}>
-                <Edit3 />
-                编辑
-              </DropdownMenuItem>
-              {user.status === 'active' ? (
-                <DropdownMenuItem
-                  onSelect={() => void changeStatus(user, 'disabled')}
-                >
-                  <ShieldOff />
-                  禁用
-                </DropdownMenuItem>
-              ) : user.status === 'disabled' ? (
-                <DropdownMenuItem
-                  onSelect={() => void changeStatus(user, 'active')}
-                >
-                  <ShieldCheck />
-                  启用
-                </DropdownMenuItem>
-              ) : (
-                <DropdownMenuItem onSelect={() => void handleRestore(user)}>
-                  <Undo2 />
-                  恢复
-                </DropdownMenuItem>
-              )}
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onSelect={() => void handleRevokeAll(user)}>
-                <LogOut />
-                撤销全部会话
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                variant="destructive"
-                onSelect={() => void handleDelete(user)}
-              >
-                <Trash2 />
-                删除
-              </DropdownMenuItem>
-            </>
-          )}
-        </DropdownMenuContent>
-      </DropdownMenu>
+        }
+      />
     );
   };
 
@@ -306,7 +328,7 @@ export function UserListTab({
             </div>
           )}
           <div className="mt-1.5 flex flex-wrap items-center gap-1 sm:hidden">
-            <RoleBadge role={user.role} />
+            <UserRole user={user} />
             <StatusBadges user={user} />
           </div>
         </div>
@@ -315,7 +337,7 @@ export function UserListTab({
     {
       key: 'role',
       header: '角色',
-      cell: (user) => <RoleBadge role={user.role} />,
+      cell: (user) => <UserRole user={user} />,
       className: 'hidden sm:table-cell',
       headerClassName: 'hidden sm:table-cell',
     },
@@ -377,6 +399,7 @@ export function UserListTab({
             <SelectItem value="all">全部角色</SelectItem>
             <SelectItem value="admin">管理员</SelectItem>
             <SelectItem value="member">成员</SelectItem>
+            <SelectItem value="guest">访客</SelectItem>
           </SelectContent>
         </Select>
         <Select

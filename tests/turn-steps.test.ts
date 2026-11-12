@@ -4,7 +4,11 @@ import type {
   StreamEvent,
   StreamEventType,
 } from '../src/stream-event.types.js';
-import { MAX_STEPS, type StreamingStep } from '../src/stream-steps.js';
+import {
+  MAX_STEPS,
+  QUESTION_DEFERRED_MARK,
+  type StreamingStep,
+} from '../src/stream-steps.js';
 import { capTailByBytes } from '../src/stream-trace.js';
 import { THINKING_OMITTED_MARKER } from '../src/thinking-text.js';
 import {
@@ -557,7 +561,7 @@ describe('TurnStepRecorder', () => {
     expect(recorder.isEmpty).toBe(false);
   });
 
-  test('a narration the host composes is not recorded', () => {
+  test('a narration the host composes is recorded as a commentary step', () => {
     const steps = record(
       [
         [0, ev('thinking_delta', { text: '想' })],
@@ -567,8 +571,50 @@ describe('TurnStepRecorder', () => {
       30,
       { proactive: true },
     );
-    expect(steps.map((s) => s.kind)).toEqual(['thinking', 'tool']);
-    expect(JSON.stringify(steps)).not.toContain('我先读文件');
+    expect(steps.map((s) => [s.kind, s.commentary, s.text])).toEqual([
+      ['thinking', undefined, '想'],
+      ['text', true, '我先读文件。'],
+      ['tool', undefined, undefined],
+    ]);
+  });
+
+  test('does not create a duplicate task step for local_bash, monitor, or mcp_task', () => {
+    const steps = record(
+      [
+        [
+          0,
+          ev('tool_use_start', {
+            toolName: 'Bash',
+            toolUseId: 'bash-bg',
+            toolInputSummary: 'npm run dev',
+          }),
+        ],
+        [
+          10,
+          ev('task_start', {
+            taskId: 'bash-bg',
+            toolUseId: 'bash-bg',
+            taskType: 'local_bash',
+            taskDescription: 'Run dev server',
+          }),
+        ],
+        [
+          20,
+          ev('task_updated', {
+            taskId: 'bash-bg',
+            toolUseId: 'bash-bg',
+            taskPatch: { is_backgrounded: true },
+          }),
+        ],
+      ],
+      30,
+    );
+    expect(steps).toHaveLength(1);
+    expect(steps[0]).toMatchObject({
+      kind: 'tool',
+      toolName: 'Bash',
+      toolUseId: 'bash-bg',
+    });
   });
 });
 
@@ -816,6 +862,60 @@ describe('viewSteps and capStepsThinkingBytes', () => {
     const shown = viewSteps(steps, { includeThinking: true, proactive: true });
     expect(shown.map((s) => s.id)).toEqual(['thinking-0', 'tool-1']);
     expect(shown[0].text).toBe('**读取配置**\n\n先看一下。');
+  });
+
+  test('a proactive Workspace keeps commentary steps at full and strips them at activity', () => {
+    const withCommentary: StreamingStep[] = [
+      ...steps,
+      {
+        id: 'note-1',
+        kind: 'text',
+        at: 4,
+        endedAt: 4,
+        status: 'done',
+        text: '正在拉取最新数据。',
+        commentary: true,
+      },
+    ];
+    const full = viewSteps(withCommentary, {
+      includeThinking: true,
+      proactive: true,
+    });
+    expect(full.map((s) => s.id)).toEqual(['thinking-0', 'tool-1', 'note-1']);
+    expect(full[2]).toMatchObject({
+      kind: 'text',
+      commentary: true,
+      text: '正在拉取最新数据。',
+    });
+
+    const activity = viewSteps(withCommentary, {
+      includeThinking: false,
+      proactive: true,
+    });
+    expect(activity.map((s) => s.id)).toEqual(['thinking-0', 'tool-1']);
+  });
+
+  test('a proactive Workspace keeps memory write receipts on done memory write steps', () => {
+    const memSteps: StreamingStep[] = [
+      {
+        id: 'tool-mem-1',
+        kind: 'tool',
+        at: 1,
+        endedAt: 2,
+        status: 'done',
+        toolUseId: 'mem-1',
+        toolName: 'mcp__happyclaw__workspace_memory_remember',
+        resultPreview:
+          '{"result":"remembered","id":"wmi_1","title":"记住的偏好"}',
+      },
+    ];
+    const shown = viewSteps(memSteps, {
+      includeThinking: false,
+      proactive: true,
+    });
+    expect(shown[0].resultPreview).toBe(
+      '{"result":"remembered","id":"wmi_1","title":"记住的偏好"}',
+    );
   });
 
   test('the thinking text is cut from the oldest step, keeping its title and times', () => {
@@ -1141,6 +1241,28 @@ describe('the size of a stored step', () => {
 });
 
 describe('parseStoredSteps', () => {
+  test('keeps how a call ended without a result of its own', () => {
+    const base = {
+      id: 'tool-1',
+      kind: 'tool',
+      at: 1,
+      endedAt: 2,
+      status: 'error',
+      toolUseId: 'b',
+      toolName: 'Bash',
+    };
+    const [stopped, denied, other] = parseStoredSteps(
+      JSON.stringify([
+        { ...base, outcome: 'stopped' },
+        { ...base, id: 'tool-2', outcome: 'denied' },
+        { ...base, id: 'tool-3', outcome: 'exploded' },
+      ]),
+    );
+    expect(stopped.outcome).toBe('stopped');
+    expect(denied.outcome).toBe('denied');
+    expect(other.outcome).toBeUndefined();
+  });
+
   test('reads what was stored and nothing else', () => {
     const stored: StreamingStep[] = [
       {
@@ -1239,5 +1361,62 @@ describe('parseStoredSteps', () => {
         ]),
       ).map((s) => s.id),
     ).toEqual(['ok']);
+  });
+});
+
+describe('a question for the reader', () => {
+  const toolInput = {
+    questions: [
+      {
+        question: '周末去哪？',
+        header: '周末',
+        multiSelect: false,
+        options: [{ label: '爬山' }, { label: '看展' }],
+      },
+    ],
+  };
+  const turn: Array<[number, StreamEvent]> = [
+    [10, ev('tool_use_start', { toolUseId: 'q', toolName: 'AskUserQuestion' })],
+    [
+      20,
+      ev('tool_progress', {
+        toolUseId: 'q',
+        toolName: 'AskUserQuestion',
+        toolInput,
+      }),
+    ],
+    [
+      30,
+      ev('tool_result', {
+        toolUseId: 'q',
+        toolResult: `${QUESTION_DEFERRED_MARK} The answer is the next message.`,
+        toolIsError: true,
+      }),
+    ],
+  ];
+
+  test('is stored with its questions and read back with them', () => {
+    const steps = record(turn, 40);
+    expect(steps[0]).toMatchObject({
+      toolName: 'AskUserQuestion',
+      status: 'done',
+      questions: [{ question: '周末去哪？', options: ['爬山', '看展'] }],
+    });
+    const stored = parseStoredSteps(JSON.stringify(steps));
+    expect(stored[0].questions).toEqual(steps[0].questions);
+    // A stored row cannot attach questions to another tool.
+    const forged = parseStoredSteps(
+      JSON.stringify([{ ...steps[0], toolName: 'Bash' }]),
+    );
+    expect(forged[0].questions).toBeUndefined();
+  });
+
+  test('is not shown by a proactive Workspace, which never sends tool input', () => {
+    const steps = record(turn, 40);
+    const [shown] = viewSteps(steps, {
+      includeThinking: true,
+      proactive: true,
+    });
+    expect(shown.questions).toBeUndefined();
   });
 });

@@ -1,13 +1,37 @@
 import * as React from 'react';
 import { DropdownMenu as DropdownMenuPrimitive } from 'radix-ui';
+import { useControllableState } from 'radix-ui/internal';
 
 import { cn } from '@/lib/utils';
 import { CheckIcon, ChevronRightIcon } from 'lucide-react';
 
+/** Lets the trigger open the menu from a tap's click (see the trigger). */
+const DropdownMenuOpenContext = React.createContext<
+  ((open: boolean) => void) | null
+>(null);
+
 function DropdownMenu({
+  open: openProp,
+  defaultOpen = false,
+  onOpenChange,
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Root>) {
-  return <DropdownMenuPrimitive.Root data-slot="dropdown-menu" {...props} />;
+  const [open, setOpen] = useControllableState({
+    prop: openProp,
+    defaultProp: defaultOpen,
+    onChange: onOpenChange,
+    caller: 'DropdownMenu',
+  });
+  return (
+    <DropdownMenuOpenContext.Provider value={setOpen}>
+      <DropdownMenuPrimitive.Root
+        data-slot="dropdown-menu"
+        open={open}
+        onOpenChange={setOpen}
+        {...props}
+      />
+    </DropdownMenuOpenContext.Provider>
+  );
 }
 
 function DropdownMenuPortal({
@@ -18,12 +42,60 @@ function DropdownMenuPortal({
   );
 }
 
+/**
+ * Radix opens a menu on pointerdown. For a finger that means a scroll that
+ * starts on the trigger opens it, so touch and pen open when the tap ends
+ * instead: on its pointerup, which a scroll replaces with pointercancel.
+ * Not on the click: iOS Safari sends none for a touch whose pointerdown was
+ * cancelled, and cancelling it is what keeps Radix from opening. The mouse
+ * is unchanged.
+ */
 function DropdownMenuTrigger({
+  onPointerDown,
+  onPointerUp,
+  onPointerCancel,
+  onClick,
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Trigger>) {
+  const setOpen = React.useContext(DropdownMenuOpenContext);
+  // Set by a touch pointerdown on the closed trigger, spent by the tap's
+  // end (its pointerup, or a click should none come).
+  const tapRef = React.useRef(false);
+  const endTap = (event: React.SyntheticEvent) => {
+    if (!tapRef.current) return;
+    tapRef.current = false;
+    if (!event.defaultPrevented && !props.disabled) setOpen?.(true);
+  };
   return (
     <DropdownMenuPrimitive.Trigger
       data-slot="dropdown-menu-trigger"
+      onPointerDown={(event) => {
+        onPointerDown?.(event);
+        tapRef.current = false;
+        if (
+          !setOpen ||
+          event.defaultPrevented ||
+          event.pointerType === 'mouse' ||
+          event.currentTarget.getAttribute('data-state') === 'open'
+        ) {
+          return;
+        }
+        // Skips Radix's own pointerdown toggle.
+        event.preventDefault();
+        tapRef.current = true;
+      }}
+      onPointerUp={(event) => {
+        onPointerUp?.(event);
+        endTap(event);
+      }}
+      onPointerCancel={(event) => {
+        onPointerCancel?.(event);
+        tapRef.current = false;
+      }}
+      onClick={(event) => {
+        onClick?.(event);
+        endTap(event);
+      }}
       {...props}
     />
   );
@@ -74,7 +146,7 @@ function DropdownMenuItem({
       data-inset={inset}
       data-variant={variant}
       className={cn(
-        "group/dropdown-menu-item relative flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-sm outline-hidden pointer-coarse:py-2 select-none transition-colors duration-100 hover:bg-surface-hover hover:text-foreground focus:bg-surface-hover focus:text-foreground data-[highlighted]:bg-surface-hover data-[highlighted]:text-foreground not-data-[variant=destructive]:hover:**:text-foreground not-data-[variant=destructive]:focus:**:text-foreground not-data-[variant=destructive]:data-[highlighted]:**:text-foreground data-inset:pl-7 data-[variant=destructive]:text-destructive data-[variant=destructive]:hover:bg-destructive/10 data-[variant=destructive]:hover:text-destructive data-[variant=destructive]:focus:bg-destructive/10 data-[variant=destructive]:focus:text-destructive data-[variant=destructive]:data-[highlighted]:bg-destructive/10 data-[variant=destructive]:data-[highlighted]:text-destructive dark:data-[variant=destructive]:hover:bg-destructive/20 dark:data-[variant=destructive]:focus:bg-destructive/20 dark:data-[variant=destructive]:data-[highlighted]:bg-destructive/20 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 data-[variant=destructive]:*:[svg]:text-destructive",
+        "group/dropdown-menu-item relative flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-sm outline-hidden pointer-coarse:min-h-11 pointer-coarse:py-2 select-none transition-colors duration-100 hover:bg-surface-hover hover:text-foreground focus:bg-surface-hover focus:text-foreground data-[highlighted]:bg-surface-hover data-[highlighted]:text-foreground not-data-[variant=destructive]:hover:**:text-foreground not-data-[variant=destructive]:focus:**:text-foreground not-data-[variant=destructive]:data-[highlighted]:**:text-foreground data-inset:pl-7 data-[variant=destructive]:text-destructive data-[variant=destructive]:hover:bg-destructive/10 data-[variant=destructive]:hover:text-destructive data-[variant=destructive]:focus:bg-destructive/10 data-[variant=destructive]:focus:text-destructive data-[variant=destructive]:data-[highlighted]:bg-destructive/10 data-[variant=destructive]:data-[highlighted]:text-destructive dark:data-[variant=destructive]:hover:bg-destructive/20 dark:data-[variant=destructive]:focus:bg-destructive/20 dark:data-[variant=destructive]:data-[highlighted]:bg-destructive/20 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 data-[variant=destructive]:*:[svg]:text-destructive",
         className,
       )}
       {...props}
@@ -96,7 +168,7 @@ function DropdownMenuCheckboxItem({
       data-slot="dropdown-menu-checkbox-item"
       data-inset={inset}
       className={cn(
-        "relative flex cursor-pointer items-center gap-1.5 rounded-md py-1 pr-8 pl-2 text-sm outline-hidden pointer-coarse:py-2 select-none transition-colors duration-100 hover:bg-surface-hover hover:text-foreground focus:bg-surface-hover focus:text-foreground focus:**:text-foreground data-[highlighted]:bg-surface-hover data-[highlighted]:text-foreground data-inset:pl-7 data-disabled:pointer-events-none data-disabled:cursor-not-allowed data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        "relative flex cursor-pointer items-center gap-1.5 rounded-md py-1 pr-8 pl-2 text-sm outline-hidden pointer-coarse:min-h-11 pointer-coarse:py-2 select-none transition-colors duration-100 hover:bg-surface-hover hover:text-foreground focus:bg-surface-hover focus:text-foreground focus:**:text-foreground data-[highlighted]:bg-surface-hover data-[highlighted]:text-foreground data-inset:pl-7 data-disabled:pointer-events-none data-disabled:cursor-not-allowed data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className,
       )}
       checked={checked}
@@ -139,7 +211,7 @@ function DropdownMenuRadioItem({
       data-slot="dropdown-menu-radio-item"
       data-inset={inset}
       className={cn(
-        "relative flex cursor-pointer items-center gap-1.5 rounded-md py-1 pr-8 pl-2 text-sm outline-hidden pointer-coarse:py-2 select-none transition-colors duration-100 hover:bg-surface-hover hover:text-foreground focus:bg-surface-hover focus:text-foreground focus:**:text-foreground data-[highlighted]:bg-surface-hover data-[highlighted]:text-foreground data-inset:pl-7 data-disabled:pointer-events-none data-disabled:cursor-not-allowed data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        "relative flex cursor-pointer items-center gap-1.5 rounded-md py-1 pr-8 pl-2 text-sm outline-hidden pointer-coarse:min-h-11 pointer-coarse:py-2 select-none transition-colors duration-100 hover:bg-surface-hover hover:text-foreground focus:bg-surface-hover focus:text-foreground focus:**:text-foreground data-[highlighted]:bg-surface-hover data-[highlighted]:text-foreground data-inset:pl-7 data-disabled:pointer-events-none data-disabled:cursor-not-allowed data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className,
       )}
       {...props}
@@ -225,7 +297,7 @@ function DropdownMenuSubTrigger({
       data-slot="dropdown-menu-sub-trigger"
       data-inset={inset}
       className={cn(
-        "flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-sm outline-hidden pointer-coarse:py-2 select-none transition-colors duration-100 hover:bg-surface-hover hover:text-foreground focus:bg-surface-hover focus:text-foreground data-[highlighted]:bg-surface-hover data-[highlighted]:text-foreground data-open:bg-surface-hover data-open:text-foreground data-inset:pl-7 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        "flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-sm outline-hidden pointer-coarse:min-h-11 pointer-coarse:py-2 select-none transition-colors duration-100 hover:bg-surface-hover hover:text-foreground focus:bg-surface-hover focus:text-foreground data-[highlighted]:bg-surface-hover data-[highlighted]:text-foreground data-open:bg-surface-hover data-open:text-foreground data-inset:pl-7 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className,
       )}
       {...props}

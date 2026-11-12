@@ -1,3 +1,4 @@
+import { PhoneBarButton } from '../components/layout/PhonePageHeader';
 import { useEffect, useRef, useState } from 'react';
 import { useMonitorStore } from '../stores/monitor';
 import { useAuthStore } from '../stores/auth';
@@ -9,10 +10,7 @@ import {
   GroupStatusCard,
   type MonitorGroupStatus,
 } from '../components/monitor/GroupStatusCard';
-import {
-  ProviderSwitcher,
-  type SimpleProvider,
-} from '../components/monitor/ProviderSwitcher';
+import { ProviderSwitcher } from '../components/monitor/ProviderSwitcher';
 import {
   RefreshCw,
   AlertTriangle,
@@ -28,6 +26,7 @@ import {
   PageHeader,
   type DataTableColumn,
 } from '@/components/common';
+import { PhonePageHeader } from '@/components/layout/PhonePageHeader';
 import {
   SettingsGroup,
   SettingsRow,
@@ -38,7 +37,6 @@ import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { cn } from '@/lib/utils';
 import { wsManager } from '../api/ws';
-import { api } from '@/api/client';
 import { useVisibleInterval } from '../hooks/useVisibleInterval';
 
 type ClaudeStatusIndicator = 'none' | 'minor' | 'major' | 'critical';
@@ -54,9 +52,24 @@ const CLAUDE_STATUS_DOT: Record<
 };
 
 /** Refresh control, also rendered in the settings header when embedded. */
-export function MonitorRefreshButton() {
+export function MonitorRefreshButton({
+  compact = false,
+}: {
+  /** An icon button for the phone's top bar. */
+  compact?: boolean;
+}) {
   const loading = useMonitorStore((s) => s.loading);
   const loadStatus = useMonitorStore((s) => s.loadStatus);
+  if (compact) {
+    return (
+      <PhoneBarButton
+        label="刷新"
+        icon={<RefreshCw className={cn('size-5', loading && 'animate-spin')} />}
+        onClick={loadStatus}
+        disabled={loading}
+      />
+    );
+  }
   return (
     <Button variant="outline" onClick={loadStatus} disabled={loading}>
       <RefreshCw className={cn(loading && 'animate-spin')} />
@@ -84,8 +97,9 @@ export function MonitorPage({ embedded = false }: MonitorPageProps) {
   const canManageSystem = useAuthStore((s) =>
     s.hasPermission('manage_system_config'),
   );
+  // Single-user host mode uses no Docker and reports its fields as null.
+  const hostOnly = status?.dockerRequired === null;
   const logEndRef = useRef<HTMLDivElement>(null);
-  const [providers, setProviders] = useState<SimpleProvider[]>([]);
   const [claudeStatus, setClaudeStatus] = useState<{
     description: string;
     indicator: ClaudeStatusIndicator | null;
@@ -161,22 +175,6 @@ export function MonitorPage({ embedded = false }: MonitorPageProps) {
     };
   }, [loadStatus]);
 
-  // Fetch providers once for all ProviderSwitcher instances
-  useEffect(() => {
-    api
-      .get<{
-        providers: Array<{ id: string; name: string; enabled: boolean }>;
-      }>('/api/config/claude/providers')
-      .then((data) =>
-        setProviders(
-          data.providers
-            .filter((p) => p.enabled)
-            .map(({ id, name }) => ({ id, name })),
-        ),
-      )
-      .catch(() => {});
-  }, []);
-
   // Auto-scroll pull logs to bottom
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -232,7 +230,6 @@ export function MonitorPage({ embedded = false }: MonitorPageProps) {
             groupFolder={group.groupFolder}
             currentProviderId={group.selectedProviderId}
             currentProviderName={group.selectedProviderName}
-            providers={providers}
           />
         ) : (
           <span className="text-muted-foreground">-</span>
@@ -262,9 +259,9 @@ export function MonitorPage({ embedded = false }: MonitorPageProps) {
       {status && (
         <>
           <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-3">
-            <ContainerStatus status={status} />
+            <ContainerStatus status={status} hostOnly={hostOnly} />
             <QueueStatus status={status} />
-            <SystemInfo status={status} />
+            <SystemInfo status={status} hostOnly={hostOnly} />
           </div>
 
           <SettingsSection title="服务状态">
@@ -302,8 +299,8 @@ export function MonitorPage({ embedded = false }: MonitorPageProps) {
                 }
               />
 
-              {/* Docker 镜像状态 */}
-              {status.dockerRequired === false ? (
+              {/* Docker 镜像状态：单人宿主机模式不用 Docker */}
+              {hostOnly ? null : status.dockerRequired === false ? (
                 <SettingsRow
                   label="Docker 镜像"
                   description={
@@ -417,11 +414,7 @@ export function MonitorPage({ embedded = false }: MonitorPageProps) {
               {/* 移动端：列表 */}
               <ListGroup className="lg:hidden">
                 {status.groups.map((group) => (
-                  <GroupStatusCard
-                    key={group.jid}
-                    group={group}
-                    providers={providers}
-                  />
+                  <GroupStatusCard key={group.jid} group={group} />
                 ))}
               </ListGroup>
 
@@ -443,10 +436,15 @@ export function MonitorPage({ embedded = false }: MonitorPageProps) {
 
   return (
     <PageContainer size="wide" className="space-y-6">
+      <PhonePageHeader
+        title="系统监控"
+        action={<MonitorRefreshButton compact />}
+      />
       <PageHeader
         title="系统监控"
         subtitle="实时监控系统状态（10秒自动刷新）"
         actions={<MonitorRefreshButton />}
+        className="phone:hidden"
       />
       {content}
     </PageContainer>

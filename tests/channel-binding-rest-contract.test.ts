@@ -16,8 +16,12 @@ describe('channel binding REST contract', () => {
 
     for (const source of [agents, config]) {
       expect(source).toContain('unbindChannelMount(');
-      expect(source).toContain(
+      // A workspace binding is a topic thread map, never a single session.
+      expect(source).not.toContain(
         "threadCapable ? 'thread_map' : 'single_session'",
+      );
+      expect(source).toMatch(
+        /conversationBindingPolicyError\(\s*getConversationKind\([^)]*\),\s*'workspace',/,
       );
       expect(source).toContain(
         'Native thread containers can only bind to a workspace',
@@ -72,15 +76,12 @@ describe('channel binding REST contract', () => {
   });
 
   test('chat UI uses distinct workspace and session mutation endpoints', () => {
-    const store = read('web/src/stores/chat.ts');
+    const policy = read('web/src/utils/im-binding-policy.ts');
     const dialog = read('web/src/components/chat/ImBindingDialog.tsx');
 
-    expect(store).toContain('bindWorkspaceImGroup: async');
-    expect(store).toContain(
-      '`/api/groups/${encodeURIComponent(jid)}/im-binding`',
-    );
-    expect(store).toContain(
-      '`/api/groups/${encodeURIComponent(jid)}/sessions/main/im-binding`',
+    expect(policy).toContain('`${workspacePath}/im-binding`');
+    expect(policy).toContain(
+      '`${workspacePath}/sessions/${encodeURIComponent(destination.sessionId!)}/im-binding`',
     );
     expect(dialog).toContain('buildImBindingRequest(group, destination,');
     expect(dialog).toContain('机器人身份');

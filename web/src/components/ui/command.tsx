@@ -76,7 +76,7 @@ function CommandInput({
       <CommandPrimitive.Input
         data-slot="command-input"
         className={cn(
-          'h-full min-w-0 flex-1 bg-transparent text-body-lg outline-hidden placeholder:text-faint-foreground disabled:cursor-not-allowed disabled:opacity-50',
+          'h-full min-w-0 flex-1 bg-transparent text-body-lg outline-hidden phone:text-base placeholder:text-faint-foreground disabled:cursor-not-allowed disabled:opacity-50',
           className,
         )}
         {...props}
@@ -155,7 +155,7 @@ function CommandItem({
     <CommandPrimitive.Item
       data-slot="command-item"
       className={cn(
-        "group/command-item relative flex h-9 cursor-pointer items-center gap-2.5 rounded-md px-2.5 text-body text-foreground outline-hidden select-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-surface-selected [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg]:text-muted-foreground [&_svg:not([class*='size-'])]:size-4 data-selected:[&_svg]:text-foreground",
+        "group/command-item relative flex h-9 cursor-pointer phone:h-11 items-center gap-2.5 rounded-md px-2.5 text-body text-foreground outline-hidden select-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-surface-selected [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg]:text-muted-foreground [&_svg:not([class*='size-'])]:size-4 data-selected:[&_svg]:text-foreground",
         className,
       )}
       {...props}

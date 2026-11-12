@@ -1,3 +1,4 @@
+import { PhoneBarButton } from '../components/layout/PhonePageHeader';
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import {
@@ -22,12 +23,14 @@ import type {
   UsageWindow,
 } from '../stores/usage';
 import { buildUsageQueryParams, usageQueryKey } from '../stores/usage';
+import { CacheHitRatePanel } from '../components/usage/CacheHitRatePanel';
 import { useAuthStore } from '../stores/auth';
 import { useBillingStore } from '../stores/billing';
 import { formatTokens } from '../components/billing/utils';
 import {
   TOKEN_SERIES,
   UsageTrendChart,
+  formatCost,
   type DailyUsagePoint,
   type UsageTrendMetric,
 } from '../components/usage/UsageTrendChart';
@@ -40,6 +43,7 @@ import {
   type DataTableColumn,
 } from '@/components/common';
 import { Button } from '@/components/ui/button';
+import { PhonePageHeader } from '@/components/layout/PhonePageHeader';
 import { Badge } from '@/components/ui/badge';
 import {
   Select,
@@ -76,8 +80,8 @@ const SOURCE_LABELS: Record<string, string> = {
   main: '主智能体',
   'main-agent': '主智能体',
   'custom-agent': '自定义智能体',
-  scheduled_task: '定时任务',
-  task: '定时任务',
+  scheduled_task: '自动化',
+  task: '自动化',
   automation: '自动化任务',
   chat: '网页对话',
   im: '消息渠道',
@@ -112,13 +116,6 @@ function parseQuery(params: URLSearchParams, isAdmin: boolean): UsageQuery {
     groupFolder: read('groupFolder'),
     source: read('source'),
   };
-}
-
-function formatCost(value: number): string {
-  if (value >= 1) return `$${value.toFixed(2)}`;
-  if (value >= 0.01) return `$${value.toFixed(3)}`;
-  if (value > 0) return `$${value.toFixed(4)}`;
-  return '$0.00';
 }
 
 function formatInteger(value: number): string {
@@ -515,6 +512,9 @@ export function UsagePage() {
     (visibleSummary?.runCount ?? 0) > 0 ||
     (visibleSummary?.totalTokens ?? 0) > 0;
 
+  const refresh = () =>
+    void Promise.all([loadStats(query), loadFilters(query)]);
+
   const handleExport = async () => {
     if (!visibleWindow || !hasExportableUsage) return;
     setExporting(true);
@@ -627,19 +627,48 @@ export function UsagePage() {
 
   return (
     <PageContainer size="wide" className="min-w-0 space-y-6">
+      <PhonePageHeader
+        title="用量分析"
+        action={
+          <PhoneBarButton
+            label={visibleLoading ? '正在刷新用量数据' : '刷新用量数据'}
+            icon={
+              <RefreshCw
+                className={cn(
+                  'size-5',
+                  visibleLoading && 'motion-safe:animate-spin',
+                )}
+              />
+            }
+            onClick={refresh}
+            disabled={visibleLoading}
+          />
+        }
+        menu={{
+          title: '用量操作',
+          groups: [
+            [
+              {
+                label: exporting ? '正在导出' : '导出 CSV',
+                icon: Download,
+                onSelect: () => void handleExport(),
+                disabled: exporting || !hasExportableUsage,
+              },
+            ],
+          ],
+        }}
+      />
       <div className="space-y-3">
         <PageHeader
           title="用量分析"
           subtitle="查看智能体运行、Token 与模型成本估算。模型估算费用用于分析资源消耗，不等同于账单扣费。"
-          className="max-sm:flex-col max-sm:items-stretch"
+          className="max-sm:flex-col max-sm:items-stretch phone:hidden"
           actions={
             <>
               <Button
                 variant="outline"
-                className="flex-1 pointer-coarse:min-h-11 sm:flex-none"
-                onClick={() =>
-                  void Promise.all([loadStats(query), loadFilters(query)])
-                }
+                className="flex-1 sm:flex-none"
+                onClick={refresh}
                 disabled={visibleLoading}
                 aria-label={
                   visibleLoading ? '正在刷新用量数据' : '刷新用量数据'
@@ -652,7 +681,7 @@ export function UsagePage() {
               </Button>
               <Button
                 variant="outline"
-                className="flex-1 pointer-coarse:min-h-11 sm:flex-none"
+                className="flex-1 sm:flex-none"
                 onClick={() => void handleExport()}
                 disabled={exporting || !hasExportableUsage}
               >
@@ -694,7 +723,7 @@ export function UsagePage() {
           />
           <Button
             variant="ghost"
-            className="ml-auto pointer-coarse:min-h-11 sm:hidden"
+            className="ml-auto sm:hidden"
             onClick={() => setFiltersOpen((open) => !open)}
             aria-expanded={filtersOpen}
             aria-controls="usage-filter-fields"
@@ -724,7 +753,7 @@ export function UsagePage() {
         {activeFilterCount > 0 && (
           <Button
             variant="ghost"
-            className="text-muted-foreground pointer-coarse:min-h-11 sm:ml-auto"
+            className="text-muted-foreground sm:ml-auto"
             onClick={clearFilters}
           >
             清除筛选
@@ -741,7 +770,7 @@ export function UsagePage() {
           </p>
           <Button
             variant="outline"
-            className="mt-3 pointer-coarse:min-h-11"
+            className="mt-3"
             onClick={() => void loadStats(query)}
           >
             <RefreshCw />
@@ -808,6 +837,8 @@ export function UsagePage() {
               summary={visibleSummary}
               cacheReadShare={cacheReadShare}
             />
+
+            <CacheHitRatePanel queryParams={queryKey} />
           </section>
 
           <section
@@ -883,11 +914,7 @@ export function UsagePage() {
                         setSortBy(value as AttributionSort)
                       }
                     >
-                      <SelectTrigger
-                        size="sm"
-                        aria-label="归因表排序指标"
-                        className="pointer-coarse:min-h-11"
-                      >
+                      <SelectTrigger size="sm" aria-label="归因表排序指标">
                         <span className="text-muted-foreground">排序</span>
                         <SelectValue />
                       </SelectTrigger>
@@ -900,7 +927,7 @@ export function UsagePage() {
                     <Button
                       variant="outline"
                       size="sm"
-                      className="pointer-coarse:min-h-11"
+                      className="phone:h-10"
                       onClick={() =>
                         setSortDirection((direction) =>
                           direction === 'desc' ? 'asc' : 'desc',
@@ -1003,7 +1030,7 @@ function FilterSelect({
         id={id}
         aria-label={label}
         className={cn(
-          'w-full min-w-0 pointer-coarse:min-h-11 sm:w-auto sm:max-w-56',
+          'w-full min-w-0 sm:w-auto sm:max-w-56',
           active && 'border-foreground/25 bg-surface-hover',
         )}
       >
@@ -1217,13 +1244,15 @@ function UsageTrendTable({
             },
           ];
   return (
-    <div className="max-h-[28rem] max-w-full overflow-x-auto overflow-y-auto rounded-xl bg-surface-raised ring-1 ring-surface-border">
+    // A phone grows the table instead of nesting a second scroller in the
+    // page; the table still scrolls sideways on its own.
+    <div className="max-h-[28rem] max-w-full overflow-x-auto overflow-y-auto rounded-xl bg-surface-raised ring-1 ring-surface-border phone:max-h-none phone:overflow-hidden">
       <DataTable
         framed={false}
         columns={columns}
         rows={data}
         rowKey={(row) => row.date}
-        className="[&_thead]:bg-muted/40"
+        className="phone:[&_tr>*:first-child]:bg-surface-raised [&_thead]:bg-muted/40"
       />
       <p className="sr-only">
         {metric === 'tokens'
@@ -1361,11 +1390,9 @@ function UsageEmptyState({
       className="bg-surface-raised ring-1 ring-surface-border"
       action={
         filtered ? (
-          <Button className="pointer-coarse:min-h-11" onClick={onClear}>
-            清除筛选
-          </Button>
+          <Button onClick={onClear}>清除筛选</Button>
         ) : (
-          <Button asChild className="pointer-coarse:min-h-11">
+          <Button asChild>
             <Link to="/chat">开始一次对话</Link>
           </Button>
         )

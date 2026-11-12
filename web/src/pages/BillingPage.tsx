@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { Navigate } from 'react-router-dom';
 import { PageContainer, PageHeader } from '@/components/common';
+import { useScrollEdgeFade } from '@/components/common/SegmentedControl';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
+import { PhonePageHeader } from '@/components/layout/PhonePageHeader';
 import { useAuthStore } from '../stores/auth';
 import { useBillingStore, type BillingPlan } from '../stores/billing';
 
@@ -50,32 +52,10 @@ function BillingTabs({
   label: string;
 }) {
   const listRef = useRef<HTMLDivElement>(null);
-  const [edges, setEdges] = useState({ start: false, end: false });
-
-  useEffect(() => {
-    const node = listRef.current;
-    if (!node) return;
-    const update = () => {
-      const maxScroll = node.scrollWidth - node.clientWidth;
-      const next = {
-        start: node.scrollLeft > 2,
-        end: node.scrollLeft < maxScroll - 2,
-      };
-      setEdges((current) =>
-        current.start === next.start && current.end === next.end
-          ? current
-          : next,
-      );
-    };
-    update();
-    node.addEventListener('scroll', update, { passive: true });
-    const observer = new ResizeObserver(update);
-    observer.observe(node);
-    return () => {
-      node.removeEventListener('scroll', update);
-      observer.disconnect();
-    };
-  }, []);
+  const fade = useScrollEdgeFade(
+    listRef,
+    tabs.map((tab) => tab.label).join('\n'),
+  );
 
   useEffect(() => {
     listRef.current
@@ -92,15 +72,7 @@ function BillingTabs({
           aria-label={label}
           className={cn(
             'h-10 w-full justify-start gap-4 overflow-x-auto overflow-y-hidden p-0 group-data-horizontal/tabs:h-10 [scrollbar-width:none]',
-            edges.start &&
-              edges.end &&
-              '[mask-image:linear-gradient(to_right,transparent,black_1.5rem,black_calc(100%-1.5rem),transparent)]',
-            edges.start &&
-              !edges.end &&
-              '[mask-image:linear-gradient(to_right,transparent,black_1.5rem)]',
-            !edges.start &&
-              edges.end &&
-              '[mask-image:linear-gradient(to_left,transparent,black_1.5rem)]',
+            fade,
           )}
         >
           {tabs.map(({ key, label: tabLabel }) => (
@@ -274,7 +246,8 @@ export default function BillingPage({
 
   return (
     <PageContainer size="wide" className="space-y-6">
-      <PageHeader title="账单" />
+      <PhonePageHeader title="账单" />
+      <PageHeader title="账单" className="phone:hidden" />
       {content}
     </PageContainer>
   );

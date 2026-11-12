@@ -143,7 +143,7 @@ describe('sub-agent answers stay on the host', () => {
     );
     expect(broadcaster).toMatch(/delete event\.taskResult/);
     expect(broadcaster.indexOf('delete event.taskResult')).toBeLessThan(
-      broadcaster.indexOf('safeBroadcast('),
+      broadcaster.indexOf('broadcastToGroupAudience('),
     );
   });
 });

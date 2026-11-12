@@ -335,3 +335,69 @@ describe('conversational Agent Builder', () => {
     expect(runtimeSafetyBlocked).toBe(false);
   });
 });
+
+describe('Agent Builder names', () => {
+  test('refuses a name another Agent of the owner (or HappyClaw) uses', () => {
+    db.createAgentProfile({ ownerUserId: userId, name: 'Taken Builder Name' });
+    for (const name of ['happyclaw', 'TAKEN builder name']) {
+      expect(() =>
+        builder.prepareAgentBuilderDraft(actor(`turn-name-${name}`), {
+          definition: definition(name),
+        }),
+      ).toThrow(db.AgentProfileNameTakenError);
+    }
+    expect(() =>
+      builder.prepareAgentBuilderDraft(actor('turn-name-message'), {
+        definition: definition('happyclaw'),
+      }),
+    ).toThrow('Ask the user for a different name');
+  });
+
+  test('publication re-checks the name and leaves the draft publishable', async () => {
+    const prepared = builder.prepareAgentBuilderDraft(actor('turn-race-1'), {
+      definition: definition('Raced Name'),
+    });
+    // Another Agent takes the name between preparation and confirmation.
+    db.createAgentProfile({ ownerUserId: userId, name: 'raced name' });
+    await expect(
+      builder.publishAgentBuilderDraft(
+        actor('turn-race-2', prepared.preview.confirmation_phrase),
+        prepared.draft.id,
+        prepared.draft.revision,
+      ),
+    ).rejects.toThrow(db.AgentProfileNameTakenError);
+    expect(db.getAgentProfile(prepared.draft.id)).toBeUndefined();
+    expect(
+      builder.getAgentBuilderDraftForBuilder(userId, prepared.draft.id).state,
+    ).toBe('ready');
+  });
+
+  test('an update may keep its own name but not take another one', async () => {
+    const target = db.createAgentProfile({
+      ownerUserId: userId,
+      name: 'Builder Target',
+    });
+    db.createAgentProfile({ ownerUserId: userId, name: 'Builder Other' });
+    expect(() =>
+      builder.prepareAgentBuilderDraft(actor('turn-update-name-1'), {
+        targetAgentProfileId: target.id,
+        expectedAgentVersion: target.version,
+        definition: definition('builder other'),
+      }),
+    ).toThrow(db.AgentProfileNameTakenError);
+    const prepared = builder.prepareAgentBuilderDraft(
+      actor('turn-update-name-2'),
+      {
+        targetAgentProfileId: target.id,
+        expectedAgentVersion: target.version,
+        definition: definition('Builder Target'),
+      },
+    );
+    const published = await builder.publishAgentBuilderDraft(
+      actor('turn-update-name-3', prepared.preview.confirmation_phrase),
+      prepared.draft.id,
+      prepared.draft.revision,
+    );
+    expect(published.profile.name).toBe('Builder Target');
+  });
+});

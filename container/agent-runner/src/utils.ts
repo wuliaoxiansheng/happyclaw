@@ -425,38 +425,62 @@ export interface AssistantContentBlock {
 }
 
 /**
- * Turn 内 assistant 文本按 AssistantMessage 边界分类。
+ * Turn 内 assistant 文本按模型响应边界分类。
  *
- * 只要一整条 top-level AssistantMessage 含 tool_use，该消息里的所有 text
- * 都是过程旁白——无论 block 顺序是 [text, tool_use]、[tool_use, text]，
- * 或 text/tool 交错。只有整条消息完全不含 top-level tool_use 时，它的完整
- * text 才能成为 SDK Result 缺失时的候选答案。
+ * 只要一次模型响应含 top-level tool_use，它的所有 text 都是过程旁白——无论
+ * block 顺序是 [text, tool_use]、[tool_use, text]，或 text/tool 交错。只有
+ * 完全不含 top-level tool_use 的响应，其完整 text 才能成为 SDK Result 缺失时
+ * 的候选答案。
+ *
+ * Claude Code 把一次响应按内容块拆成多条 AssistantMessage（共享 message.id），
+ * 旁白 text 帧会先于同一响应的 tool_use 帧到达，因此以 message.id 为原子单位：
+ * 同 id 的 text 按到达顺序拼接，一旦该 id 出现 tool_use，候选退回到该响应开始
+ * 前的值。没有 message.id 时每条 AssistantMessage 自成一个响应。
  */
 export class AssistantTextTracker {
   private answerCandidate = '';
+  /** The response whose frames are still arriving. */
+  private response:
+    | { id: string; text: string; hasTool: boolean; candidateBefore: string }
+    | undefined;
 
   /**
-   * 原子处理一整条 top-level AssistantMessage 的 content blocks。
-   * 返回该消息是否含文本（调用方据此更新 canonical uuid）。
+   * 处理一条 top-level AssistantMessage 的 content blocks；`messageId` 是其
+   * API message.id。返回该帧是否含文本（调用方据此更新 canonical uuid）。
    */
-  addContentBlocks(blocks: AssistantContentBlock[]): boolean {
-    let messageText = '';
-    let hasTopLevelTool = false;
+  addContentBlocks(
+    blocks: AssistantContentBlock[],
+    messageId?: string,
+  ): boolean {
+    let frameText = '';
+    let frameHasTool = false;
     for (const block of blocks) {
       if (
         block.type === 'text' &&
         typeof block.text === 'string' &&
         block.text
       ) {
-        messageText += block.text;
+        frameText += block.text;
       } else if (block.type === 'tool_use') {
-        hasTopLevelTool = true;
+        frameHasTool = true;
       }
     }
-    if (!hasTopLevelTool && messageText.trim()) {
-      this.answerCandidate = messageText;
+    if (!messageId || this.response?.id !== messageId) {
+      this.response = {
+        id: messageId ?? '',
+        text: '',
+        hasTool: false,
+        candidateBefore: this.answerCandidate,
+      };
     }
-    return messageText.length > 0;
+    const response = this.response;
+    response.text += frameText;
+    response.hasTool ||= frameHasTool;
+    this.answerCandidate =
+      !response.hasTool && response.text.trim()
+        ? response.text
+        : response.candidateBefore;
+    return frameText.length > 0;
   }
 
   /**
@@ -472,6 +496,7 @@ export class AssistantTextTracker {
   /** mid-query follow-up 产生第二条 result 时与 turnId 一起重置。 */
   reset(): void {
     this.answerCandidate = '';
+    this.response = undefined;
   }
 }
 

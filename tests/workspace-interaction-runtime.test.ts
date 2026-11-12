@@ -16,23 +16,12 @@ import {
 } from '../src/workspace-interaction-runtime.js';
 
 describe('workspace interaction runtime policy', () => {
-  test('proactive applies to public main and conversation loops only', () => {
+  test('proactive applies to conversation sessions only', () => {
     expect(
-      resolveRuntimeInteractionMode('proactive', { agentKind: 'main' }),
-    ).toBe('proactive');
-    expect(
-      resolveRuntimeInteractionMode('proactive', {
-        agentKind: 'conversation',
-      }),
+      resolveRuntimeInteractionMode('proactive', { agentKind: 'conversation' }),
     ).toBe('proactive');
     expect(
       resolveRuntimeInteractionMode('proactive', { agentKind: 'spawn' }),
-    ).toBe('assistant');
-    expect(
-      resolveRuntimeInteractionMode('proactive', {
-        agentKind: 'main',
-        scheduledTask: true,
-      }),
     ).toBe('assistant');
   });
 
@@ -157,7 +146,6 @@ describe('workspace interaction runtime policy', () => {
   test('uses the IPC-file mode frozen before a workspace mode switch', () => {
     expect(
       resolveFrozenIpcInteractionMode('proactive', {
-        scheduledTask: false,
         spawnAgent: false,
       }),
     ).toEqual({
@@ -167,7 +155,6 @@ describe('workspace interaction runtime policy', () => {
     });
     expect(
       resolveFrozenIpcInteractionMode('persona', {
-        scheduledTask: false,
         spawnAgent: false,
       }),
     ).toEqual({
@@ -177,7 +164,6 @@ describe('workspace interaction runtime policy', () => {
     });
     expect(
       resolveFrozenIpcInteractionMode(undefined, {
-        scheduledTask: false,
         spawnAgent: false,
       }),
     ).toEqual({
@@ -187,7 +173,6 @@ describe('workspace interaction runtime policy', () => {
     });
     expect(
       resolveFrozenIpcInteractionMode('malformed', {
-        scheduledTask: false,
         spawnAgent: false,
       }),
     ).toMatchObject({ mode: 'assistant', valid: false });
@@ -208,22 +193,14 @@ describe('workspace interaction runtime policy', () => {
     expect(watcher).not.toContain('getWorkspaceInteractionMode');
   });
 
-  test('scheduled and spawn IPC can never opt into proactive delivery', () => {
+  test('spawn IPC can never opt into proactive delivery', () => {
     expect(
       resolveFrozenIpcInteractionMode('proactive', {
-        scheduledTask: true,
-        spawnAgent: false,
-      }).mode,
-    ).toBe('assistant');
-    expect(
-      resolveFrozenIpcInteractionMode('proactive', {
-        scheduledTask: false,
         spawnAgent: true,
       }).mode,
     ).toBe('assistant');
     expect(
       resolveFrozenIpcInteractionMode('persona', {
-        scheduledTask: false,
         spawnAgent: true,
       }).mode,
     ).toBe('assistant');
@@ -327,13 +304,7 @@ describe('workspace interaction runtime policy', () => {
     expect(helper).toContain("sender: '__system__'");
     expect(helper).toContain('sendSystemMessage(');
     expect(source).toContain(
-      'await notifyProactiveTailInterruption(ipcReplyTurnTracker.inputTurnId)',
-    );
-    expect(source).toContain(
       'await notifyProactiveAgentTailInterruption(activeAgentInputTurnId)',
-    );
-    expect(source).toContain(
-      'healthyInputTurnCompleted: healthyCompletedInputTurns.has(inputTurnId)',
     );
     expect(source).toContain(
       'healthyAgentCompletedInputTurns.has(inputTurnId)',

@@ -46,6 +46,7 @@ vi.mock('../src/config.js', async (importOriginal) => ({
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   AppType: { SelfBuild: 'SelfBuild' },
+  Domain: { Feishu: 0, Lark: 1 },
   LoggerLevel: { info: 'info' },
   defaultHttpInstance: { defaults: { timeout: 0 } },
   Client: class {
@@ -1333,6 +1334,64 @@ describe('intake lanes (inbound P2-1, optional part)', () => {
     releaseLookup();
     await Promise.all([slowA, laterB]);
     expect(executed).toEqual(['om_one_lane_a', 'om_one_lane_b']);
+  });
+});
+
+describe('chat reachability probe (binding health check)', () => {
+  test('only a received refusal reports the chat as gone', async () => {
+    const { connection } = await connect(`probe-${Date.now()}`);
+    controls.chatGet.mockResolvedValueOnce({ data: { name: '下帖子' } });
+    expect(await connection.probeChat('oc_probe_ok')).toBe('reachable');
+
+    controls.chatGet.mockRejectedValueOnce(
+      Object.assign(new Error('connect EHOSTUNREACH 198.18.0.16:443'), {
+        code: 'EHOSTUNREACH',
+      }),
+    );
+    expect(await connection.probeChat('oc_probe_offline')).toBe('unknown');
+
+    controls.chatGet.mockRejectedValueOnce({
+      code: 'ERR_BAD_REQUEST',
+      response: { status: 400, data: { code: 99991672, msg: 'scope' } },
+    });
+    expect(await connection.probeChat('oc_probe_scope')).toBe('unknown');
+
+    controls.chatGet.mockRejectedValueOnce({
+      code: 'ERR_BAD_REQUEST',
+      response: { status: 400, data: { code: 232011, msg: 'not in chat' } },
+    });
+    expect(await connection.probeChat('oc_probe_gone')).toBe('gone');
+
+    // A refusal the SDK resolves instead of throwing is read the same way.
+    controls.chatGet.mockResolvedValueOnce({
+      code: 232011,
+      msg: 'not in chat',
+    });
+    expect(await connection.probeChat('oc_probe_gone_resolved')).toBe('gone');
+    controls.chatGet.mockResolvedValueOnce({ code: 232034, msg: 'disabled' });
+    expect(await connection.probeChat('oc_probe_app_off')).toBe('unknown');
+    controls.chatGet.mockRejectedValueOnce({
+      code: 'ERR_BAD_REQUEST',
+      response: { status: 407, data: '<html>proxy</html>' },
+    });
+    expect(await connection.probeChat('oc_probe_proxy')).toBe('unknown');
+
+    // Feishu still describes a dissolved chat; its status says it is gone.
+    controls.chatGet.mockResolvedValueOnce({
+      code: 0,
+      data: { name: '已解散', chat_status: 'dissolved' },
+    });
+    expect(await connection.probeChat('oc_probe_dissolved')).toBe('gone');
+    controls.chatGet.mockResolvedValueOnce({
+      code: 0,
+      data: { name: '解散并保留', chat_status: 'dissolved_save' },
+    });
+    expect(await connection.probeChat('oc_probe_dissolved_save')).toBe('gone');
+    controls.chatGet.mockResolvedValueOnce({
+      code: 0,
+      data: { name: '正常', chat_status: 'normal' },
+    });
+    expect(await connection.probeChat('oc_probe_normal')).toBe('reachable');
   });
 });
 

@@ -64,16 +64,11 @@ beforeAll(() => {
 });
 
 describe('evaluateWsSpawnCommandAccess - virtual JID ACL (ClawQA UF-852-1)', () => {
-  test('stripVirtualJidSuffix strips both #agent: and #task: suffixes', () => {
+  test('stripVirtualJidSuffix strips the #agent: session suffix', () => {
     const agentVirtualJid = `${BASE_JID}#agent:agent-uuid-123`;
-    const taskVirtualJid = `${BASE_JID}#task:task-uuid-456`;
 
     expect(stripVirtualJidSuffix(agentVirtualJid)).toBe(BASE_JID);
-    expect(stripVirtualJidSuffix(taskVirtualJid)).toBe(BASE_JID);
     expect(stripVirtualJidSuffix(BASE_JID)).toBe(BASE_JID);
-
-    // Note: stripRuntimeJidSuffix only strips #agent:, so stripVirtualJidSuffix
-    // is required to avoid missing #task: virtual JIDs.
   });
 
   test('non-owner on #agent: virtual JID is denied', () => {
@@ -99,10 +94,11 @@ describe('evaluateWsSpawnCommandAccess - virtual JID ACL (ClawQA UF-852-1)', () 
     });
   });
 
-  test('owner on #task: virtual JID is granted', () => {
+  test('a legacy #task: JID names no session and is denied even for the owner', () => {
     const jid = `${BASE_JID}#task:task-uuid-456`;
     expect(evaluateWsSpawnCommandAccess(OWNER, jid)).toEqual({
-      dispatched: true,
+      dispatched: false,
+      reason: 'access',
     });
   });
 

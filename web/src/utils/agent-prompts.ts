@@ -9,13 +9,6 @@ export interface AgentPromptParts {
   tools_prompt: string;
 }
 
-export const EMPTY_AGENT_PROMPTS: AgentPromptParts = {
-  identity_prompt: '',
-  soul_prompt: '',
-  agents_prompt: '',
-  tools_prompt: '',
-};
-
 export const DEFAULT_AGENT_PROMPTS: AgentPromptParts = {
   identity_prompt:
     '你是一个专注、可靠的工作智能体。围绕用户交付的目标行动，并清楚说明自己的职责边界。',
@@ -71,6 +64,19 @@ export const AGENT_PROMPT_SECTIONS: Array<{
       '例如：搜索文件优先使用 rg；只在用户明确要求时发送外部消息；不在日志中输出凭据。',
   },
 ];
+
+/** The server's per-section limit, counted like String#length. */
+export const AGENT_PROMPT_MAX_CHARS = 20000;
+
+/** The first section over the limit, as a message naming it. */
+export function promptLengthError(parts: AgentPromptParts): string | null {
+  const over = AGENT_PROMPT_SECTIONS.find(
+    (section) => parts[section.field].length > AGENT_PROMPT_MAX_CHARS,
+  );
+  return over
+    ? `${over.title}（${over.eyebrow}）超过 ${AGENT_PROMPT_MAX_CHARS} 字上限（当前 ${parts[over.field].length} 字）`
+    : null;
+}
 
 export function estimatePromptTokens(value: string): number {
   if (!value.trim()) return 0;

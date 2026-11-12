@@ -5,12 +5,16 @@
  * The shared reducer (`stream-steps`) owns the steps themselves.
  */
 import { describeToolCall } from '../components/chat/ToolActivityCard';
-import { SPEECH_TOOL_NAME } from './process-visibility';
+import {
+  countToolStates,
+  describeProblems,
+} from '../components/chat/tool-status';
+import { SPEECH_TOOL_NAME, isProgressStep } from './process-visibility';
+import { formatRunElapsed } from './run-phase';
 import {
   TIMELINE_ROWS,
   railSteps,
   summarizeSteps,
-  type StepSummary,
   type StreamingStep,
 } from './stream-steps';
 
@@ -159,6 +163,9 @@ export function groupProcessSteps(
 /** Rows a settled card lists before the older ones fold into one line. */
 export const SETTLED_TIMELINE_ROWS = 30;
 
+/** Rows a process card at work lists, after cindy: the latest five. */
+export const LIVE_TIMELINE_ROWS = 5;
+
 export interface ProcessView {
   /** Items folded out of sight, oldest first. */
   folded: ProcessItem[];
@@ -278,12 +285,17 @@ export function formatSpanZh(ms: number | undefined): string {
 
 // ── what the card lists ─────────────────────────────────────────────────
 
-/** The steps the reader is meant to see: the commentary only when asked for. */
+/**
+ * The steps the reader is meant to see: the commentary only when asked for,
+ * the progress statements the Agent sent always.
+ */
 export function visibleSteps(
   steps: readonly StreamingStep[],
   commentary: boolean,
 ): StreamingStep[] {
-  return commentary ? [...steps] : steps.filter((step) => step.kind !== 'text');
+  return commentary
+    ? [...steps]
+    : steps.filter((step) => step.kind !== 'text' || isProgressStep(step));
 }
 
 /** The steps the timeline lists, and a finished run is summed up from. */
@@ -301,48 +313,49 @@ export function hasListedSteps(steps: readonly StreamingStep[]): boolean {
   return summarizedSteps(steps).length > 0;
 }
 
-// ── the summary of a finished run ───────────────────────────────────────
+// ── the summary of a reply's process ────────────────────────────────────
 
 /**
- * "已处理 14 秒 · 4 个工具 · 4 段思考"; with reasoning only "已思考 14 秒", with
- * tools only "已使用 4 个工具", and the failures counted at the end.
+ * "已工作 14s": the one line a folded process card says, the live card's once
+ * its answer is being written and the finished reply's alike (cindy's "Worked
+ * for"). The span of the listed steps, or the total given when they carry no
+ * times; "已工作" when neither says.
  */
-export function describeSettled(
-  counts: StepSummary,
-  spanMs?: number,
-  dropped = 0,
-): string {
-  const tools = counts.tools + counts.tasks;
-  const span = formatSpanZh(spanMs);
-  let text: string;
-  if (tools > 0 && counts.thinking > 0) {
-    text = `已处理${span ? ` ${span}` : ''} · ${tools} 个工具 · ${counts.thinking} 段思考`;
-  } else if (tools > 0) {
-    text = `已使用 ${tools} 个工具`;
-  } else if (counts.thinking > 0) {
-    text = `已思考${span ? ` ${span}` : ''}`;
-  } else if (counts.commentary > 0) {
-    text = `${counts.commentary} 条过程说明`;
-  } else {
-    text = '已处理';
-  }
-  const failed = counts.failed > 0 ? `${text} · ${counts.failed} 个失败` : text;
-  // The steps dropped at the cap are not counted above, and not said to be.
-  return dropped > 0 ? `${failed} · 另有较早 ${dropped} 步` : failed;
-}
-
-/** The one-line summary of the steps of a finished run. */
-export function summarizeSettled(
+export function describeWork(
   steps: readonly StreamingStep[],
   durationMs?: number,
+): string {
+  const span = processSpanMs(summarizedSteps(steps), durationMs);
+  return span == null
+    ? '已工作'
+    : `已工作 ${formatRunElapsed(Math.max(1, Math.round(span / 1000)))}`;
+}
+
+/**
+ * "2 个工具 · 2 段思考 · 1 个失败": what an opened process holds, said at its
+ * head now that its header only says how long it took. A sub-agent counts as a
+ * tool; the steps dropped at the cap are not counted, and said to be.
+ */
+export function describeWorkCounts(
+  steps: readonly StreamingStep[],
   dropped = 0,
 ): string {
   const listed = summarizedSteps(steps);
-  return describeSettled(
-    summarizeSteps(listed),
-    processSpanMs(listed, durationMs),
-    dropped,
-  );
+  const counts = summarizeSteps(listed);
+  const tools = counts.tools + counts.tasks;
+  const parts: string[] = [];
+  if (tools > 0) parts.push(`${tools} 个工具`);
+  if (counts.thinking > 0) parts.push(`${counts.thinking} 段思考`);
+  if (parts.length === 0 && counts.commentary > 0) {
+    const progress = listed.filter(isProgressStep).length;
+    if (progress > 0) parts.push(`${progress} 条进展`);
+    if (counts.commentary > progress) {
+      parts.push(`${counts.commentary - progress} 条过程说明`);
+    }
+  }
+  parts.push(...describeProblems(countToolStates(listed, false)));
+  if (dropped > 0) parts.push(`另有较早 ${dropped} 步`);
+  return parts.join(' · ');
 }
 
 // ── what a call was given ───────────────────────────────────────────────

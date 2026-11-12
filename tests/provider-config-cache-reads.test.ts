@@ -64,14 +64,12 @@ function seedProviders(): void {
     type: 'official',
     anthropicApiKey: 'fake-official-key',
     customEnv: { FOO: 'bar' },
-    enabled: true,
   });
   runtimeConfig.createProvider({
     name: 'Gateway',
     type: 'third_party',
     anthropicBaseUrl: 'https://gateway.example.test',
     anthropicAuthToken: 'fake-gateway-token',
-    enabled: true,
   });
   const official = runtimeConfig
     .getProviders()
@@ -106,7 +104,7 @@ describe('provider config read cache', () => {
     const reads = countReads();
     for (let i = 0; i < 50; i++) {
       expect(runtimeConfig.getProviders()).toEqual(first);
-      runtimeConfig.getBalancingConfig();
+      runtimeConfig.readLegacyModelDefaults();
       runtimeConfig.resolveProviderById(first[1].id);
     }
     expect(reads.configReads()).toBe(0);
@@ -122,10 +120,10 @@ describe('provider config read cache', () => {
     expect(runtimeConfig.getProviderById(gateway.id)?.name).toBe(
       'Renamed gateway',
     );
-    runtimeConfig.setProviderEnabled(official.id, false);
-    expect(runtimeConfig.getProviderById(official.id)?.enabled).toBe(false);
-    runtimeConfig.saveBalancingConfig({ unhealthyThreshold: 7 });
-    expect(runtimeConfig.getBalancingConfig().unhealthyThreshold).toBe(7);
+    runtimeConfig.updateProvider(official.id, { customEnv: { FOO: 'baz' } });
+    expect(runtimeConfig.getProviderById(official.id)?.customEnv).toEqual({
+      FOO: 'baz',
+    });
     runtimeConfig.updateProviderSecrets(gateway.id, {
       anthropicAuthToken: 'fake-rotated-token',
     });
@@ -144,14 +142,14 @@ describe('provider config read cache', () => {
     providers[0].customEnv.INJECTED = '1';
     providers[0].claudeOAuthCredentials!.scopes.push('mutated');
     providers.push({ ...providers[1], id: 'ghost' });
-    runtimeConfig.getBalancingConfig().unhealthyThreshold = 999;
+    runtimeConfig.readLegacyModelDefaults().enabledIds.push('ghost');
 
     const again = runtimeConfig.getProviders();
     expect(again).toHaveLength(2);
     expect(again[0].name).toBe('Official');
     expect(again[0].customEnv).toEqual({ FOO: 'bar' });
     expect(again[0].claudeOAuthCredentials?.scopes).toEqual(['a', 'b']);
-    expect(runtimeConfig.getBalancingConfig().unhealthyThreshold).not.toBe(999);
+    expect(runtimeConfig.readLegacyModelDefaults().enabledIds).toEqual([]);
   });
 
   test('picks up an external rewrite of the file', () => {

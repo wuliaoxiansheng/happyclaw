@@ -21,6 +21,7 @@ vi.mock('../src/middleware/auth.js', () => ({
 }));
 vi.mock('../src/db.js', () => ({
   listAgentProfilesForUser: () => customProfiles,
+  registerMainAgentContextSettingsReader: () => {},
 }));
 
 const routes = (await import('../src/routes/skills.js')).default;

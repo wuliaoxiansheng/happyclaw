@@ -9,22 +9,19 @@ function read(relativePath: string): string {
 }
 
 describe('Agent effort runtime contracts', () => {
-  test('normal conversations and isolated scheduled tasks forward runtime policy', () => {
-    const main = read('src/index.ts');
-    const scheduler = read('src/task-scheduler.ts');
-
-    expect(main).toMatch(
-      /function toContainerAgentProfile[\s\S]*runtimePolicy: profile\.runtime_policy/,
-    );
-    expect(scheduler).toMatch(
+  test('conversations forward runtime policy', () => {
+    expect(read('src/runner-agent-profile.ts')).toMatch(
       /function toRunnerAgentProfile[\s\S]*runtimePolicy: profile\.runtime_policy/,
     );
+    for (const caller of ['src/index.ts']) {
+      expect(read(caller)).toContain('agentProfile: toRunnerAgentProfile(');
+    }
   });
 
-  test('host and container starts remove Provider effort only for explicit Agents', () => {
+  test('host and container starts write the launch effort of the resolved connection', () => {
     const host = read('src/container-runner.ts');
     const calls = host.match(
-      /removeProviderEffortEnv\(envLines, agentEffort\)/g,
+      /applyLaunchEffortEnv\(\s*envLines,\s*resolveAgentSdkEffort\([^)]*\),\s*(resolvedProvider|hostPoolResult)\s*\?\s*\(\1\.(?:resolved\.)?launchEffort \?\? null\)\s*:\s*undefined,\s*\)/g,
     );
     expect(calls).toHaveLength(2);
   });
@@ -39,6 +36,18 @@ describe('Agent effort runtime contracts', () => {
     ).toHaveLength(2);
     expect(read('container/agent-runner/src/index.ts')).not.toContain(
       'sessionEffort',
+    );
+  });
+
+  test('host and container starts hand the launch effort to the runner', () => {
+    const host = read('src/container-runner.ts');
+    expect(
+      host.match(
+        /input = prepareLaunchInput\(input, (?:hostPoolResult|poolResult)\);/g,
+      ),
+    ).toHaveLength(2);
+    expect(read('container/agent-runner/src/index.ts')).toContain(
+      'const agentEffort = resolveRunSdkEffort(containerInput);',
     );
   });
 

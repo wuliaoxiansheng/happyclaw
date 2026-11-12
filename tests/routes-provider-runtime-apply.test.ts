@@ -17,6 +17,8 @@ const tmpDir = fs.mkdtempSync(
   path.join(os.tmpdir(), 'happyclaw-provider-runtime-apply-'),
 );
 
+const auth = vi.hoisted(() => ({ role: 'admin' as 'admin' | 'member' }));
+
 vi.mock('../src/config.js', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   DATA_DIR: tmpDir,
@@ -38,7 +40,7 @@ vi.mock('../src/middleware/auth.ts', async (importOriginal) => {
         id: 'provider-runtime-admin',
         username: 'provider-runtime-admin',
         display_name: 'Provider Runtime Admin',
-        role: 'admin',
+        role: auth.role,
         status: 'active',
         permissions: [],
         must_change_password: false,
@@ -131,6 +133,7 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  auth.role = 'admin';
   fs.rmSync(path.join(tmpDir, 'config'), { recursive: true, force: true });
   fs.rmSync(path.join(tmpDir, 'container-env'), {
     recursive: true,
@@ -149,8 +152,186 @@ afterAll(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+describe('connection WebFetch policy API', () => {
+  function bindPolicyQueue() {
+    const folder = unique('webfetch-policy');
+    const jid = `web:${folder}`;
+    const group = registerWorkspace(jid, folder);
+    const queue = {
+      listDescendantJids: () => [],
+      pauseGroupsForMutation: vi.fn(() => ({ id: 9 })),
+      resumeGroupsAfterMutation: vi.fn(),
+      stopGroup: vi.fn(async () => {}),
+      drainProviderRunnersForCredentialRefresh: vi.fn((_id: string) => 0),
+    };
+    const sessionId = unique('preserved-session');
+    const sessions = { [folder]: sessionId };
+    db.setSession(folder, sessionId);
+    bindDeps({ [jid]: group }, queue, sessions);
+    return { folder, sessionId, sessions, queue };
+  }
+
+  function createPolicyProvider(webFetchPreflightPolicy?: 'check' | 'skip') {
+    return runtimeConfig.createProvider({
+      name: unique('policy-connection'),
+      type: 'third_party',
+      anthropicBaseUrl: 'https://webfetch.example.test',
+      anthropicAuthToken: 'test-policy-key',
+      anthropicModel: 'test-model',
+      webFetchPreflightPolicy,
+    });
+  }
+
+  test.each([
+    [undefined, 'skip', 1],
+    ['skip', 'check', 1],
+    [undefined, 'check', 0],
+    ['skip', 'skip', 0],
+  ] as const)(
+    'saving %s as %s drains this connection %i times after persistence and keeps its session',
+    async (from, to, drains) => {
+      const { folder, sessionId, sessions, queue } = bindPolicyQueue();
+      const target = createPolicyProvider(from);
+      const other = createPolicyProvider();
+      db.setSessionProviderId(folder, '', target.id);
+      queue.drainProviderRunnersForCredentialRefresh.mockImplementation(
+        (id: string) => {
+          expect(
+            runtimeConfig.toPublicProvider(runtimeConfig.getProviderById(id)!)
+              .webFetchPreflightPolicy,
+          ).toBe(to);
+          return 1;
+        },
+      );
+      const response = await patchProvider(target.id, {
+        webFetchPreflightPolicy: to,
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        provider: { id: target.id, webFetchPreflightPolicy: to },
+        applied: { success: true, persisted: true, stoppedCount: 0 },
+      });
+      expect(
+        runtimeConfig.getProviderById(other.id)!.webFetchPreflightPolicy,
+      ).toBeUndefined();
+      expect(queue.drainProviderRunnersForCredentialRefresh.mock.calls).toEqual(
+        Array(drains).fill([target.id]),
+      );
+      expect(queue.pauseGroupsForMutation).not.toHaveBeenCalled();
+      expect(queue.stopGroup).not.toHaveBeenCalled();
+      expect(db.getSession(folder)).toBe(sessionId);
+      expect(sessions[folder]).toBe(sessionId);
+    },
+  );
+
+  test.each(['official', 'third_party'] as const)(
+    'creation persists skip for %s connections',
+    async (type) => {
+      bindPolicyQueue();
+      const response = await app.request('/api/config/claude/providers', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: unique('created-policy'),
+          type,
+          ...(type === 'official'
+            ? { anthropicApiKey: 'test-key' }
+            : {
+                anthropicBaseUrl: 'https://test.example.test',
+                anthropicAuthToken: 'test-key',
+              }),
+          webFetchPreflightPolicy: 'skip',
+        }),
+      });
+      expect(response.status).toBe(201);
+      const created = await response.json();
+      expect(created.webFetchPreflightPolicy).toBe('skip');
+      expect(
+        runtimeConfig.getProviderById(created.id)!.webFetchPreflightPolicy,
+      ).toBe('skip');
+    },
+  );
+
+  test('lists a connection without a stored policy as check without rewriting it', async () => {
+    bindPolicyQueue();
+    const target = createPolicyProvider();
+    const file = path.join(tmpDir, 'config', 'claude-provider.json');
+    const original = fs.readFileSync(file, 'utf8');
+    const response = await app.request('/api/config/claude/providers');
+    expect(response.status).toBe(200);
+    const listed = await response.json();
+    expect(
+      listed.providers.find((item: { id: string }) => item.id === target.id),
+    ).toMatchObject({ webFetchPreflightPolicy: 'check' });
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+  });
+
+  test('rejects invalid policies and unauthorized users before saving or draining', async () => {
+    const { queue } = bindPolicyQueue();
+    const target = createPolicyProvider();
+    for (const policy of ['off', 'disabled', true, null]) {
+      expect(
+        (await patchProvider(target.id, { webFetchPreflightPolicy: policy }))
+          .status,
+      ).toBe(400);
+    }
+    auth.role = 'member';
+    expect(
+      (await patchProvider(target.id, { webFetchPreflightPolicy: 'skip' }))
+        .status,
+    ).toBe(403);
+    expect(
+      runtimeConfig.getProviderById(target.id)!.webFetchPreflightPolicy,
+    ).toBeUndefined();
+    expect(
+      queue.drainProviderRunnersForCredentialRefresh,
+    ).not.toHaveBeenCalled();
+  });
+
+  test('a persistence failure drains no runner and keeps the saved value', async () => {
+    const { queue } = bindPolicyQueue();
+    const target = createPolicyProvider();
+    const write = vi.spyOn(fs, 'writeFileSync').mockImplementationOnce(() => {
+      throw new Error('simulated disk failure');
+    });
+    try {
+      expect(
+        (await patchProvider(target.id, { webFetchPreflightPolicy: 'skip' }))
+          .status,
+      ).toBe(400);
+    } finally {
+      write.mockRestore();
+    }
+    expect(
+      runtimeConfig.getProviderById(target.id)!.webFetchPreflightPolicy,
+    ).toBeUndefined();
+    expect(
+      queue.drainProviderRunnersForCredentialRefresh,
+    ).not.toHaveBeenCalled();
+  });
+
+  test('mixed protocol and policy edits keep the existing stop and session invalidation path', async () => {
+    const { folder, queue } = bindPolicyQueue();
+    const target = createPolicyProvider();
+    db.setSessionProviderId(folder, '', target.id);
+    const response = await patchProvider(target.id, {
+      anthropicBaseUrl: 'https://new.example.test',
+      webFetchPreflightPolicy: 'skip',
+    });
+    expect(response.status).toBe(200);
+    expect(queue.stopGroup).toHaveBeenCalled();
+    expect(
+      queue.drainProviderRunnersForCredentialRefresh,
+    ).not.toHaveBeenCalled();
+    expect(db.getSession(folder)).toBeUndefined();
+    expect(
+      runtimeConfig.getProviderById(target.id)!.webFetchPreflightPolicy,
+    ).toBe('skip');
+  });
+});
+
 describe('provider runtime apply is a lossless configuration mutation', () => {
-  test('lists independent model switches with no default until one is chosen', async () => {
+  test('lists connections with no default, pool or health', async () => {
     bindDeps(
       {},
       {
@@ -164,313 +345,57 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       name: unique('initial-model'),
       type: 'official',
       anthropicApiKey: 'initial-key',
-      enabled: true,
     });
     const replacement = runtimeConfig.createProvider({
-      name: unique('disabled-model'),
+      name: unique('second-model'),
       type: 'third_party',
       anthropicBaseUrl: 'https://replacement.example.test',
       anthropicAuthToken: 'replacement-token',
       anthropicModel: 'replacement-model',
-      enabled: false,
     });
     const response = await app.request('/api/config/claude/providers');
     expect(response.status).toBe(200);
     const body = await response.json();
-    expect(body.defaultModelConfigId).toBeNull();
+    expect(body).not.toHaveProperty('defaultModelConfigId');
+    expect(body).not.toHaveProperty('balancing');
     expect(body.providers).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: initial.id, enabled: true }),
-        expect.objectContaining({ id: replacement.id, enabled: false }),
+        expect.objectContaining({ id: initial.id, roles: {} }),
+        expect.objectContaining({
+          id: replacement.id,
+          models: [{ id: 'replacement-model' }],
+        }),
       ]),
     );
   });
 
-  describe('default model', () => {
-    const stopGroup = vi.fn(async () => {});
-    // A registered workspace makes every applied change stop its runner, so
-    // "stops nothing" assertions can actually fail.
-    const workspaces = () => ({
-      'web:default-model': registerWorkspace(
-        'web:default-model',
-        'default-model',
-      ),
+  test('the default, enable, balancing and health routes are gone', async () => {
+    const target = runtimeConfig.createProvider({
+      name: unique('gone-routes'),
+      type: 'official',
+      anthropicApiKey: 'gone-key',
     });
-
-    beforeEach(() => {
-      stopGroup.mockClear();
-      bindDeps(workspaces(), {
-        listDescendantJids: () => [],
-        pauseGroupsForMutation: () => ({ id: 12 }),
-        resumeGroupsAfterMutation: vi.fn(),
-        stopGroup,
+    const json = { 'content-type': 'application/json' };
+    for (const [method, url, body] of [
+      ['PUT', '/api/config/claude/default', { modelConfigId: target.id }],
+      ['PUT', '/api/config/claude/balancing', { strategy: 'failover' }],
+      ['POST', `/api/config/claude/providers/${target.id}/reset-health`, {}],
+      ['GET', '/api/config/claude/providers/health', undefined],
+    ] as const) {
+      const response = await app.request(url, {
+        method,
+        headers: json,
+        ...(body ? { body: JSON.stringify(body) } : {}),
       });
-    });
-
-    async function putDefault(modelConfigId: unknown): Promise<Response> {
-      return app.request('/api/config/claude/default', {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ modelConfigId }),
-      });
+      expect(response.status, `${method} ${url}`).toBe(404);
     }
-
-    async function listedDefault(): Promise<string | null> {
-      const response = await app.request('/api/config/claude/providers');
-      return (await response.json()).defaultModelConfigId;
-    }
-
-    test('sets, reports and clears the default', async () => {
-      const first = runtimeConfig.createProvider({
-        name: unique('default-a'),
-        type: 'official',
-        anthropicApiKey: 'a-key',
-        enabled: true,
-      });
-      runtimeConfig.createProvider({
-        name: unique('default-b'),
-        type: 'official',
-        anthropicApiKey: 'b-key',
-        enabled: true,
-      });
-
-      const set = await putDefault(first.id);
-      expect(set.status).toBe(200);
-      // A real change stops the workspace's runner so the next turn restarts
-      // on the new default.
-      expect(stopGroup).toHaveBeenCalled();
-      expect(await set.json()).toMatchObject({
-        defaultModelConfigId: first.id,
-        provider: { id: first.id },
-        applied: { success: true },
-      });
-      expect(await listedDefault()).toBe(first.id);
-
-      const cleared = await putDefault(null);
-      expect(cleared.status).toBe(200);
-      expect(await cleared.json()).toMatchObject({
-        defaultModelConfigId: null,
-        provider: null,
-      });
-      expect(await listedDefault()).toBeNull();
-    });
-
-    test('choosing a disabled configuration switches it on', async () => {
-      runtimeConfig.createProvider({
-        name: unique('pool-member'),
-        type: 'official',
-        anthropicApiKey: 'member-key',
-        enabled: true,
-      });
-      const spare = runtimeConfig.createProvider({
-        name: unique('spare'),
-        type: 'official',
-        anthropicApiKey: 'spare-key',
-        enabled: false,
-      });
-
-      const response = await putDefault(spare.id);
-      expect(response.status).toBe(200);
-      expect(await response.json()).toMatchObject({
-        provider: { id: spare.id, enabled: true },
-      });
-      expect(
-        runtimeConfig.getProviders().find((item) => item.id === spare.id),
-      ).toMatchObject({ enabled: true });
-    });
-
-    test('rejects an unknown or credential-less target before stopping a runner', async () => {
-      const bare = runtimeConfig.createProvider({
-        name: unique('no-credential'),
-        type: 'official',
-        enabled: false,
-      });
-
-      const missing = await putDefault('does-not-exist');
-      expect(missing.status).toBe(400);
-      expect(await missing.json()).toMatchObject({
-        error: expect.stringContaining('未找到'),
-      });
-      const noCredential = await putDefault(bare.id);
-      expect(noCredential.status).toBe(400);
-      expect(await noCredential.json()).toMatchObject({
-        error: expect.stringContaining('凭据'),
-      });
-      for (const bad of [undefined, '', '   ', 7]) {
-        expect((await putDefault(bad)).status).toBe(400);
-      }
-      expect(stopGroup).not.toHaveBeenCalled();
-      expect(await listedDefault()).toBeNull();
-    });
-
-    test('choosing the current default again changes nothing and stops nothing', async () => {
-      const only = runtimeConfig.createProvider({
-        name: unique('default-repeat'),
-        type: 'official',
-        anthropicApiKey: 'repeat-key',
-        enabled: true,
-      });
-      expect((await putDefault(only.id)).status).toBe(200);
-      stopGroup.mockClear();
-
-      const again = await putDefault(only.id);
-      expect(again.status).toBe(200);
-      expect(await again.json()).toMatchObject({
-        defaultModelConfigId: only.id,
-        applied: { stoppedCount: 0 },
-      });
-      expect(stopGroup).not.toHaveBeenCalled();
-    });
-
-    test('the default cannot be switched off, and says how to', async () => {
-      const chosen = runtimeConfig.createProvider({
-        name: unique('default-locked'),
-        type: 'official',
-        anthropicApiKey: 'locked-key',
-        enabled: true,
-      });
-      runtimeConfig.createProvider({
-        name: unique('default-other'),
-        type: 'official',
-        anthropicApiKey: 'other-key',
-        enabled: true,
-      });
-      expect((await putDefault(chosen.id)).status).toBe(200);
-      stopGroup.mockClear();
-
-      const refused = await setProviderEnabled(chosen.id, false);
-      expect(refused.status).toBe(400);
-      expect(await refused.json()).toMatchObject({
-        error: expect.stringContaining('取消默认'),
-      });
-      expect(stopGroup).not.toHaveBeenCalled();
-      expect(
-        runtimeConfig.getProviders().find((item) => item.id === chosen.id),
-      ).toMatchObject({ enabled: true });
-
-      expect((await putDefault(null)).status).toBe(200);
-      expect((await setProviderEnabled(chosen.id, false)).status).toBe(200);
-    });
-
-    test('deleting the default returns to the automatic pool', async () => {
-      const chosen = runtimeConfig.createProvider({
-        name: unique('default-doomed'),
-        type: 'official',
-        anthropicApiKey: 'doomed-key',
-        enabled: true,
-      });
-      runtimeConfig.createProvider({
-        name: unique('default-survivor'),
-        type: 'official',
-        anthropicApiKey: 'survivor-key',
-        enabled: true,
-      });
-      expect((await putDefault(chosen.id)).status).toBe(200);
-
-      expect((await deleteProvider(chosen.id)).status).toBe(200);
-      expect(await listedDefault()).toBeNull();
-      expect(runtimeConfig.getDefaultModelConfigId()).toBeNull();
-    });
-
-    test('the list does not present a default that lost its credential', async () => {
-      const chosen = runtimeConfig.createProvider({
-        name: unique('default-uncredentialed'),
-        type: 'official',
-        anthropicApiKey: 'soon-gone',
-        enabled: true,
-      });
-      runtimeConfig.createProvider({
-        name: unique('default-credentialed'),
-        type: 'official',
-        anthropicApiKey: 'stays',
-        enabled: true,
-      });
-      expect((await putDefault(chosen.id)).status).toBe(200);
-      expect(await listedDefault()).toBe(chosen.id);
-
-      runtimeConfig.updateProviderSecrets(chosen.id, {
-        clearAnthropicApiKey: true,
-      });
-
-      // Runtime already treats it as no default; the page must agree, and
-      // nothing may still guard it as if it were one.
-      expect(runtimeConfig.getUsableDefaultProvider()).toBeNull();
-      expect(runtimeConfig.getDefaultModelConfigId()).toBeNull();
-      expect(await listedDefault()).toBeNull();
-      expect((await setProviderEnabled(chosen.id, false)).status).toBe(200);
-      const deleted = await deleteProvider(chosen.id);
-      expect(deleted.status).toBe(200);
-      expect(await deleted.json()).toMatchObject({ defaultCleared: false });
-    });
-
-    test('deleting the default says so; deleting another configuration does not', async () => {
-      const chosen = runtimeConfig.createProvider({
-        name: unique('default-told'),
-        type: 'official',
-        anthropicApiKey: 'told-key',
-        enabled: true,
-      });
-      const other = runtimeConfig.createProvider({
-        name: unique('default-untold'),
-        type: 'official',
-        anthropicApiKey: 'untold-key',
-        enabled: true,
-      });
-      expect((await putDefault(chosen.id)).status).toBe(200);
-
-      const deletedOther = await deleteProvider(other.id);
-      expect(deletedOther.status).toBe(200);
-      expect(await deletedOther.json()).toMatchObject({
-        ok: true,
-        defaultCleared: false,
-      });
-      expect(await listedDefault()).toBe(chosen.id);
-
-      const deletedDefault = await deleteProvider(chosen.id);
-      expect(deletedDefault.status).toBe(200);
-      expect(await deletedDefault.json()).toMatchObject({
-        ok: true,
-        defaultCleared: true,
-      });
-      expect(await listedDefault()).toBeNull();
-    });
-
-    test('other edits keep the default', async () => {
-      const chosen = runtimeConfig.createProvider({
-        name: unique('default-edited'),
-        type: 'third_party',
-        anthropicBaseUrl: 'https://edited.example.test',
-        anthropicAuthToken: 'edited-token',
-        anthropicModel: 'edited-model',
-        enabled: true,
-      });
-      runtimeConfig.createProvider({
-        name: unique('default-neighbour'),
-        type: 'official',
-        anthropicApiKey: 'neighbour-key',
-        enabled: true,
-      });
-      expect((await putDefault(chosen.id)).status).toBe(200);
-
-      expect(
-        (await patchProvider(chosen.id, { anthropicModel: 'edited-model-2' }))
-          .status,
-      ).toBe(200);
-      const created = await app.request('/api/config/claude/providers', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          name: unique('default-newcomer'),
-          type: 'official',
-          anthropicApiKey: 'newcomer-key',
-        }),
-      });
-      expect(created.status).toBeLessThan(300);
-      expect(await listedDefault()).toBe(chosen.id);
-    });
+    expect((await setProviderEnabled(target.id, true)).status).toBe(404);
+    expect(runtimeConfig.readLegacyModelDefaults().defaultModelConfigId).toBe(
+      null,
+    );
   });
 
-  test('allows disabling an Agent model but still blocks deleting it', async () => {
+  test("blocks deleting an Agent's connection", async () => {
     bindDeps(
       {},
       {
@@ -484,13 +409,11 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       name: unique('agent-model-target'),
       type: 'official',
       anthropicApiKey: 'target-key',
-      enabled: true,
     });
     runtimeConfig.createProvider({
       name: unique('agent-model-fallback'),
       type: 'official',
       anthropicApiKey: 'fallback-key',
-      enabled: true,
     });
     const profile = db.createAgentProfile({
       ownerUserId: 'provider-runtime-admin',
@@ -498,11 +421,6 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       modelConfigId: target.id,
     });
 
-    const disableResponse = await setProviderEnabled(target.id, false);
-    expect(disableResponse.status).toBe(200);
-    expect(await disableResponse.json()).toMatchObject({
-      provider: { id: target.id, enabled: false },
-    });
     const deleteResponse = await deleteProvider(target.id);
     expect(deleteResponse.status).toBe(400);
     expect(await deleteResponse.json()).toMatchObject({
@@ -511,8 +429,8 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     expect(
       runtimeConfig
         .getProviders()
-        .find((provider) => provider.id === target.id),
-    ).toMatchObject({ enabled: false });
+        .some((provider) => provider.id === target.id),
+    ).toBe(true);
 
     expect(db.archiveAgentProfile(profile.id, 'provider-runtime-admin')).toBe(
       'ok',
@@ -522,14 +440,14 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
   test('keeps a capacity-queued descendant task instead of dropping it', async () => {
     const folder = unique('queued-work');
     const jid = `web:${folder}`;
-    const descendantJid = `${jid}#task:scheduled`;
+    const descendantJid = `${jid}#agent:queued`;
     const group = registerWorkspace(jid, folder);
     const queue = new GroupQueue();
     liveQueue = queue;
     queue.setSerializationKeyResolver((candidate) => {
-      const taskSeparator = candidate.indexOf('#task:');
-      if (taskSeparator >= 0) {
-        return `${folder}#task:${candidate.slice(taskSeparator + 6)}`;
+      const agentSeparator = candidate.indexOf('#agent:');
+      if (agentSeparator >= 0) {
+        return `${folder}#${candidate.slice(agentSeparator + 7)}`;
       }
       return candidate === jid ? folder : candidate;
     });
@@ -543,7 +461,7 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     expect(
       queue.enqueueTask(
         descendantJid,
-        'scheduled',
+        'queued',
         async () => {
           runs += 1;
         },
@@ -754,64 +672,7 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     ).toBe('persisted-model');
   });
 
-  test('retries a persisted provider toggle idempotently instead of reversing it', async () => {
-    const folder = unique('toggle-retry');
-    const jid = `web:${folder}`;
-    const group = registerWorkspace(jid, folder);
-    let stopCalls = 0;
-    const blockGroupsForRuntimeSafety = vi.fn();
-    const unblockGroupsForRuntimeSafety = vi.fn();
-    bindDeps(
-      { [jid]: group },
-      {
-        listDescendantJids: () => [],
-        pauseGroupsForMutation: () => ({ id: 6 }),
-        resumeGroupsAfterMutation: vi.fn(),
-        blockGroupsForRuntimeSafety,
-        unblockGroupsForRuntimeSafety,
-        stopGroup: vi.fn(async () => {
-          stopCalls += 1;
-          if (stopCalls === 2) {
-            throw new Error('simulated post-toggle stop failure');
-          }
-        }),
-      },
-    );
-    const target = runtimeConfig.createProvider({
-      name: unique('toggle-target'),
-      type: 'official',
-      anthropicApiKey: 'target-key',
-      enabled: true,
-    });
-    runtimeConfig.createProvider({
-      name: unique('toggle-fallback'),
-      type: 'official',
-      anthropicApiKey: 'fallback-key',
-      enabled: true,
-    });
-
-    const firstResponse = await setProviderEnabled(target.id, false);
-    expect(firstResponse.status).toBe(503);
-    expect(firstResponse.ok).toBe(false);
-    expect(
-      runtimeConfig.getProviders().find((item) => item.id === target.id)
-        ?.enabled,
-    ).toBe(false);
-    expect(blockGroupsForRuntimeSafety).toHaveBeenCalled();
-
-    const retryResponse = await setProviderEnabled(target.id, false);
-    expect(retryResponse.status).toBe(200);
-    expect(
-      runtimeConfig.getProviders().find((item) => item.id === target.id)
-        ?.enabled,
-    ).toBe(false);
-    expect(unblockGroupsForRuntimeSafety).toHaveBeenCalledWith(
-      [jid],
-      'provider-config-mutation',
-    );
-  });
-
-  test('unblocks a restarted workspace after a disabled provider repairs pending session cleanup', async () => {
+  test('unblocks a restarted workspace after an exact retry repairs pending session cleanup', async () => {
     const folder = unique('disabled-provider-repair');
     const jid = `web:${folder}`;
     const group = registerWorkspace(jid, folder);
@@ -853,8 +714,6 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       anthropicModel: 'persisted-model',
     });
     expect(failedPatch.status).toBe(503);
-    const disableResponse = await setProviderEnabled(target.id, false);
-    expect(disableResponse.status).toBe(200);
 
     const restartedQueue = new GroupQueue();
     liveQueue = restartedQueue;

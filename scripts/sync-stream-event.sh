@@ -44,10 +44,47 @@ for target in \
   sync_file "$SRC_CP" "$target"
 done
 
+# --- Claude environment HappyClaw owns (backend strip + Runner pin) ---
+SRC_PE="$ROOT/shared/claude-provider-env.ts"
+for target in \
+  "$ROOT/src/claude-provider-env.ts" \
+  "$ROOT/container/agent-runner/src/claude-provider-env.ts" \
+; do
+  sync_file "$SRC_PE" "$target"
+done
+
 # --- Reply step list + reasoning text helpers (2 targets each: backend + web) ---
 # The backend records a settled turn's ordered steps with the very reducer the
 # Web renders live, so the two cannot drift. Not needed by the agent-runner.
 for name in thinking-text stream-steps; do
   sync_file "$ROOT/shared/$name.ts" "$ROOT/src/$name.ts"
   sync_file "$ROOT/shared/$name.ts" "$ROOT/web/src/lib/$name.ts"
+done
+
+# --- Session list order (backend + web): Web lists and IM /list agree ---
+sync_file "$ROOT/shared/session-order.ts" "$ROOT/src/session-order.ts"
+sync_file "$ROOT/shared/session-order.ts" "$ROOT/web/src/lib/session-order.ts"
+
+# --- Model connection presets, model lists and upstream errors (backend + web) ---
+# The server validates and tests connections with the same rules the Web uses
+# to guide the user through adding one.
+sync_file "$ROOT/shared/model-providers.ts" "$ROOT/src/model-providers.ts"
+sync_file "$ROOT/shared/model-providers.ts" "$ROOT/web/src/lib/model-providers.ts"
+
+# --- Automations: validation, labels and the per-run context (all three) ---
+sync_file "$ROOT/shared/automation.ts" "$ROOT/src/automation.ts"
+sync_file "$ROOT/shared/automation.ts" "$ROOT/web/src/lib/automation.ts"
+sync_file "$ROOT/shared/automation.ts" "$ROOT/container/agent-runner/src/automation.ts"
+
+# --- Workspace root problems: the server's checks and the Web's words ---
+sync_file "$ROOT/shared/workspace-root-problems.ts" "$ROOT/src/workspace-root-problems.ts"
+sync_file "$ROOT/shared/workspace-root-problems.ts" "$ROOT/web/src/lib/workspace-root-problems.ts"
+
+# --- Team mode shapes (3 targets: backend, web and agent-runner) ---
+for target in \
+  "$ROOT/src/work-items.ts" \
+  "$ROOT/web/src/work-items.ts" \
+  "$ROOT/container/agent-runner/src/work-items.ts" \
+; do
+  sync_file "$ROOT/shared/work-items.ts" "$target"
 done

@@ -25,7 +25,7 @@ import {
 } from '../src/agent-output-parser.js';
 import {
   applyFallbackModelToEnvLines,
-  resolvePoolTierEnv,
+  fallbackLaunchModel,
 } from '../src/container-runner.js';
 import { SDK_DEFAULT_MODEL_TIER } from '../src/provider-pool.js';
 
@@ -386,12 +386,25 @@ describe('provider model fallback lifecycle', () => {
     expect(cleared).toEqual(['KEEP_ME=yes']);
   });
 
-  test('an explicit Agent pin keeps fallback inside its account in a multi-provider install', () => {
-    expect(resolvePoolTierEnv(undefined, 3, 'fallback-model', true)).toEqual({
-      runnerFallbackModel: 'fallback-model',
-    });
-    expect(resolvePoolTierEnv(undefined, 3, 'fallback-model', false)).toEqual(
-      {},
+  test('the fallback model is named for the connection it runs on', () => {
+    const relay = {
+      anthropicBaseUrl: 'https://relay.example',
+      anthropicModel: 'glm-5',
+      models: [{ id: 'glm-5' }, { id: 'kimi-long', contextWindow: 500_000 }],
+    } as never;
+    // A window above Claude Code's default needs `[1m]`, as for the turn's model.
+    expect(fallbackLaunchModel('kimi-long', relay)).toBe('kimi-long[1m]');
+    expect(fallbackLaunchModel('glm-5', relay)).toBe('glm-5');
+    // Official: only a declared window counts, never the registry's.
+    const official = {
+      anthropicBaseUrl: '',
+      anthropicModel: 'claude-opus-4-7',
+      models: [],
+    } as never;
+    expect(fallbackLaunchModel('claude-opus-4-7', official)).toBe(
+      'claude-opus-4-7',
     );
+    expect(fallbackLaunchModel('fallback-model', null)).toBe('fallback-model');
+    expect(fallbackLaunchModel('  ', relay)).toBeUndefined();
   });
 });

@@ -7,6 +7,7 @@ import {
   ShieldAlert,
 } from 'lucide-react';
 import type { StreamingTraceEvent } from '../../stores/chat';
+import { ClampedDetail } from './ClampedDetail';
 
 /**
  * Distinct top-level tool calls in a trace, for the collapsed
@@ -112,9 +113,11 @@ export const TracePanel = memo(function TracePanel({
         />
       </button>
       {expanded && (
-        <div
+        <ClampedDetail
           id={panelId}
-          className="mt-1 max-h-72 space-y-3 overflow-y-auto overscroll-contain border-l-2 border-surface-border py-1 pl-3"
+          title="执行详情"
+          maxHeightClass="max-h-72"
+          className="mt-1 space-y-3 border-l-2 border-surface-border py-1 pl-3"
         >
           {groups.map((group) => (
             <div key={group.key}>
@@ -132,7 +135,7 @@ export const TracePanel = memo(function TracePanel({
               </div>
             </div>
           ))}
-        </div>
+        </ClampedDetail>
       )}
     </div>
   );
@@ -208,7 +211,11 @@ export const PermissionAlert = memo(function PermissionAlert({
         <ShieldAlert className="size-3.5" />
         权限被拒绝 ({denied.length})
       </div>
-      <div className="space-y-0.5 max-h-28 overflow-y-auto">
+      <ClampedDetail
+        title="权限被拒绝"
+        maxHeightClass="max-h-28"
+        className="space-y-0.5"
+      >
         {denied.slice(-10).map((item) => (
           <div
             key={item.id}
@@ -223,7 +230,7 @@ export const PermissionAlert = memo(function PermissionAlert({
             )}
           </div>
         ))}
-      </div>
+      </ClampedDetail>
     </div>
   );
 });

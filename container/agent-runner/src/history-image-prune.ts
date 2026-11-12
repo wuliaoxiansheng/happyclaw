@@ -77,7 +77,9 @@ function findImageReference(...values: unknown[]): string | null {
 }
 
 function hasHistoryArchiveMarker(value: unknown): boolean {
-  return collectTextFragments(value).some((text) => HISTORY_ARCHIVE_PATTERN.test(text));
+  return collectTextFragments(value).some((text) =>
+    HISTORY_ARCHIVE_PATTERN.test(text),
+  );
 }
 
 function formatHistoryArchiveMarker(timestamp: unknown): string | null {
@@ -126,7 +128,8 @@ function buildPlaceholderText(
 
   const base64Data = getImageBase64(block);
   const mediaType = getImageMediaType(block);
-  const dimensions = base64Data && getImageDimensions ? getImageDimensions(base64Data) : null;
+  const dimensions =
+    base64Data && getImageDimensions ? getImageDimensions(base64Data) : null;
   if (dimensions && mediaType) {
     return `${PRUNED_HISTORY_IMAGE_MARKER.slice(0, -1)} (原 ${dimensions.width}×${dimensions.height} ${mediaType})]`;
   }
@@ -183,9 +186,17 @@ function pruneImageBlocksInValue(
     };
   }
 
-  if (value && typeof value === 'object' && 'content' in (value as Record<string, unknown>)) {
+  if (
+    value &&
+    typeof value === 'object' &&
+    'content' in (value as Record<string, unknown>)
+  ) {
     const record = value as Record<string, unknown>;
-    const nested = pruneImageBlocksInValue(record.content, imageReference, getImageDimensions);
+    const nested = pruneImageBlocksInValue(
+      record.content,
+      imageReference,
+      getImageDimensions,
+    );
     if (nested.didMutate) {
       return {
         value: { ...record, content: nested.value },
@@ -233,6 +244,12 @@ export function pruneProcessedHistoryImagesInTranscriptContent(
   content: string,
   options: TranscriptPruneOptions = {},
 ): TranscriptContentPruneResult {
+  // Only a `"type":"image"` block can be pruned; skip parsing every line when
+  // the transcript has none.
+  if (!content.includes('"image"')) {
+    return { content, didMutate: false, prunedImages: 0 };
+  }
+
   const lines = content.split('\n');
   const parsedLines: TranscriptLine[] = lines.map((line, index) => {
     if (!line.trim()) {

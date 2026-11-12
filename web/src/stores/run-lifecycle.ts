@@ -1,8 +1,15 @@
+import { sessionIdOf } from '../lib/session-jid';
+
 export interface ClientActiveRun {
   chatJid: string;
   runId: string;
   startedAt: string;
   phase: 'preparing' | 'running';
+  /**
+   * The input whose turn already ended in place (its final, or a proactive
+   * turn's reply) while the run is still closing.
+   */
+  answered?: string;
 }
 
 export type ClientActiveRuns = Record<string, ClientActiveRun>;
@@ -39,6 +46,17 @@ export function applyRunFinished(
   return { runs, applied: true };
 }
 
+/** The turn of `inputTurnId` ended in place while its run still closes. */
+export function markRunAnswered(
+  current: ClientActiveRuns,
+  chatJid: string,
+  inputTurnId: string | null | undefined,
+): ClientActiveRuns {
+  const run = current[chatJid];
+  if (!run || !inputTurnId || run.answered === inputTurnId) return current;
+  return { ...current, [chatJid]: { ...run, answered: inputTurnId } };
+}
+
 /** Reconnect snapshots are authoritative for server-owned query attempts. */
 export function runsFromAuthoritativeSnapshot(
   runs: ClientActiveRun[],
@@ -69,39 +87,16 @@ export function shouldApplyRunScopedPayload(
 }
 
 /**
- * Split queued chat JIDs into main-conversation and conversation-Agent wait
- * keys.
+ * The sessions whose chats have a queued message: their wait keys.
  *
  * A queued message sits behind a busy runner and has no run identity yet, so
  * it can never enter `activeRuns` — nothing would ever deliver its terminal.
  * It still has to show a wait state, otherwise reloading mid-queue presents an
  * idle composer and invites the user to send the same message twice.
  */
-export function waitKeysForQueuedChats(queuedChatJids: string[]): {
-  waiting: string[];
-  agentWaiting: string[];
-} {
-  const waiting: string[] = [];
-  const agentWaiting: string[] = [];
-  const marker = '#agent:';
-  for (const jid of queuedChatJids) {
-    const markerIndex = jid.indexOf(marker);
-    if (markerIndex >= 0) {
-      agentWaiting.push(jid.slice(markerIndex + marker.length));
-    } else {
-      waiting.push(jid);
-    }
-  }
-  return { waiting, agentWaiting };
-}
-
-/** A reconnect replacement must discard the prior attempt's local stream. */
-export function shouldDiscardStreamForAuthoritativeRun(
-  previous: ClientActiveRuns,
-  authoritative: ClientActiveRuns,
-  chatJid: string,
-): boolean {
-  const next = authoritative[chatJid];
-  if (!next) return true;
-  return previous[chatJid]?.runId !== next.runId;
+export function waitKeysForQueuedChats(queuedChatJids: string[]): string[] {
+  return queuedChatJids.flatMap((jid) => {
+    const sessionId = sessionIdOf(jid);
+    return sessionId ? [sessionId] : [];
+  });
 }

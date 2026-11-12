@@ -30,10 +30,12 @@ import {
 import {
   projectSdkStreamEventForWeb,
   publishesFrameworkAnswer,
-  shouldBroadcastTaskAgentStatus,
 } from '../src/workspace-interaction-runtime.js';
 import { ProactiveCommentaryRelay } from '../src/process-commentary.js';
 import { TurnTraceTracker } from '../src/turn-trace.js';
+import { resolveContainerOutputInputTurnId } from '../src/channel-output-correlation.js';
+import { buildSubagentCheckpointContext } from '../src/subagent-checkpoint.js';
+import { StreamEventProcessor } from '../container/agent-runner/src/stream-processor.js';
 import { createRuntimeSourceHarness } from './helpers/runtime-source.js';
 
 const paths = vi.hoisted(() => ({ root: '' }));
@@ -57,8 +59,15 @@ const db = await import('../src/db.js');
 const store = await import('../src/channel-reliability-store.js');
 const { ChannelTurnRuntime } = await import('../src/channel-turn-runtime.js');
 
+// A started Turn heartbeats on a timer. Stop every one before the store closes:
+// a tick after that throws, an unhandled error in a long run of this file.
+const startedRuntimes = vi.spyOn(ChannelTurnRuntime, 'start');
+
 beforeAll(() => db.initDatabase());
 afterAll(() => {
+  for (const started of startedRuntimes.mock.results) {
+    if (started.type === 'return') started.value.dispose();
+  }
   db.closeDatabase();
   fs.rmSync(paths.root, { recursive: true, force: true });
 });
@@ -153,7 +162,6 @@ function agentRun(name: string) {
     // workspace-interaction-runtime.test.ts; these runs only settle Turns.
     projectSdkStreamEventForWeb: () => null,
     resolveProcessVisibility: () => 'full',
-    shouldBroadcastTaskAgentStatus: () => false,
     turnTraces: {
       observe: vi.fn(),
       persist: vi.fn(() => false),
@@ -173,6 +181,7 @@ function agentRun(name: string) {
     getFailedChannelOutboxForTurn: store.getFailedChannelOutboxForTurn,
     setSession: vi.fn(),
     setSessionInteractionMode: vi.fn(),
+    broadcastContextUsage: vi.fn(),
     resetIdleTimer: vi.fn(),
     feedStreamEventToCard: vi.fn(),
     reduceStreamEvent: vi.fn(),
@@ -220,6 +229,7 @@ function agentRun(name: string) {
   });
   return {
     globals,
+    harness,
     runtime,
     inputId,
     virtualChatJid,
@@ -773,103 +783,6 @@ describe('startup repair: a withdrawn input is never re-run after a restart', ()
   });
 });
 
-describe('main Session path (processGroupMessages)', () => {
-  test('a recall stop settles the input: card deleted, Turn cancelled, cursor committed', async () => {
-    const inputId = `om_main_${crypto.randomBytes(4).toString('hex')}`;
-    const chatJid = 'web:main-recall';
-    const imJid = 'feishu:oc_main#account:bot';
-    const runtime = ChannelTurnRuntime.start({
-      provider: 'feishu',
-      accountId: 'bot',
-      sourceJid: imJid,
-      chatId: 'oc_main',
-      externalMessageId: inputId,
-    });
-    const card = fakeCard(['om_main_card']);
-    const advanceCursors = vi.fn();
-    const executeFeishuCapability = vi.fn(async () => ({}));
-    const clearProcessingIndicatorForInput = vi.fn(async () => {});
-    const globals: Record<string, any> = {
-      logger,
-      chatJid,
-      lastProcessed: { id: inputId, timestamp: '2026-10-10T14:18:08.000Z' },
-      ipcReplyTurnTracker: { inputTurnId: inputId, delivered: false },
-      channelTurnRuntimes: new Map([[inputId, runtime]]),
-      channelStreamingSessionsByInput: new Map(),
-      mainRecalledInputIds: new Set<string>(),
-      channelOutboxScopesByInput: new Map([[inputId, { token: 'scope-1' }]]),
-      mainAdmissionKey: 'main-admission',
-      activeChannelOutboxScopes: { unbind: vi.fn() },
-      cursorCommittedInputTurns: new Set<string>(),
-      streamingSession: card,
-      streamingSessionJid: imJid,
-      activeDurableCardLifecycle: {},
-      streamingAccumulatedText: 'partial',
-      streamingAccumulatedThinking: 'thinking',
-      sentReply: false,
-      advanceCursors,
-      flushAcknowledgedIpcForJid: vi.fn(),
-      clearStreamingSnapshot: vi.fn(),
-      unregisterStreamingSession: vi.fn(),
-      clearProcessingIndicatorForInput,
-      getChannelType,
-      isStreamingSessionSettled,
-      getMessageChannelTurnContext: () => ({
-        provider: 'feishu',
-        chat: { id: 'oc_main' },
-      }),
-      imManager: { executeFeishuCapability },
-      getUncertainChannelOutboxForTurn: store.getUncertainChannelOutboxForTurn,
-      getFailedChannelOutboxForTurn: store.getFailedChannelOutboxForTurn,
-    };
-    const harness = createRuntimeSourceHarness(globals);
-    harness.install('settleInterruptedChannelTurn');
-    harness.install('discardRecalledStreamingCard');
-    harness.install('commitCursor', 'processGroupMessages');
-    harness.install('settleMainRecalledInput', 'processGroupMessages');
-    await globals.settleMainRecalledInput(inputId);
-    expect(card.abort.mock.calls).toEqual([[]]);
-    expect(executeFeishuCapability).toHaveBeenCalledWith(
-      imJid,
-      expect.anything(),
-      { operation: 'recall_message', params: { messageId: 'om_main_card' } },
-    );
-    expect(globals.streamingSession).toBeUndefined();
-    expect(globals.sentReply).toBe(true);
-    expect(store.getChannelTurnRun(runtime.runId)?.status).toBe('cancelled');
-    expect(advanceCursors).toHaveBeenCalledWith(
-      chatJid,
-      expect.objectContaining({ id: inputId }),
-    );
-    expect(clearProcessingIndicatorForInput).toHaveBeenCalledWith(inputId);
-    // Late side effects of the withdrawn input find no outbox scope (S1).
-    expect(globals.activeChannelOutboxScopes.unbind).toHaveBeenCalledWith(
-      'main-admission',
-      { token: 'scope-1' },
-    );
-    expect(globals.channelOutboxScopesByInput.has(inputId)).toBe(false);
-    expect(globals.mainRecalledInputIds.has(inputId)).toBe(true);
-  });
-
-  test('the main output handler settles recall before projecting and closes interrupted Turns (loop wiring)', () => {
-    const main = fs.readFileSync('src/index.ts', 'utf8');
-    const callbackStart = main.indexOf('output = await runAgent(');
-    const callback = main.slice(callbackStart, callbackStart + 60_000);
-    const recallAt = callback.search(/takeRecallStop\(\s*chatJid,/);
-    expect(recallAt).toBeGreaterThan(0);
-    expect(recallAt).toBeLessThan(
-      callback.indexOf('await activateMainProjectionForInput('),
-    );
-    const interruptCommit = callback.indexOf(
-      'commitCursor(interruptedInputId);',
-    );
-    expect(interruptCommit).toBeGreaterThan(0);
-    expect(
-      callback.indexOf('settleInterruptedChannelTurn(', interruptCommit),
-    ).toBeGreaterThan(interruptCommit);
-  });
-});
-
 describe('startup order', () => {
   test('the withdrawn-turn repair runs before reconciliation and replay', () => {
     const main = fs.readFileSync('src/index.ts', 'utf8');
@@ -878,8 +791,10 @@ describe('startup order', () => {
     );
     expect(repairAt).toBeGreaterThan(main.indexOf('  loadState();'));
     // Before follow-up recovery (which can start Runners) and replay.
-    expect(repairAt).toBeLessThan(main.indexOf('  recoverDurableFollowUps();'));
-    expect(repairAt).toBeLessThan(main.indexOf('  recoverPendingMessages();'));
+    expect(repairAt).toBeLessThan(main.indexOf('  recoverDurableFollowUps('));
+    expect(repairAt).toBeLessThan(
+      main.indexOf('  recoverConversationAgents();'),
+    );
     const discardAt = main.indexOf(
       'await discardWithdrawnTurnCardsAfterConnect(withdrawnTurnCardCleanups);',
     );
@@ -890,201 +805,114 @@ describe('startup order', () => {
   });
 });
 
-/** The real processGroupMessages output handler for one claimed input. */
-function mainRun(name: string, options: { steered?: boolean } = {}) {
-  const inputId = `om_mainrun_${name}_${crypto.randomBytes(4).toString('hex')}`;
-  const chatJid = `web:main-run-${name}`;
-  const imJid = `feishu:oc_mainrun_${name}#account:bot`;
-  const runtime = ChannelTurnRuntime.start({
-    provider: 'feishu',
-    accountId: 'bot',
-    sourceJid: imJid,
-    chatId: `oc_mainrun_${name}`,
-    externalMessageId: inputId,
-  });
-  const advanceCursors = vi.fn();
-  const card = fakeCard([`om_card_${name}`]);
-  const globals: Record<string, any> = {
-    crypto,
-    logger,
-    ASSISTANT_NAME: 'Assistant',
-    chatJid,
-    group: { name: 'Main fixture' },
-    effectiveGroup: { folder: `main-${name}`, created_by: 'user-1' },
-    lastProcessed: { id: inputId, timestamp: '2026-10-10T14:18:08.000Z' },
-    missedMessages: [{ id: inputId }],
-    ipcReplyTurnTracker: { inputTurnId: inputId, delivered: false },
-    interactionMode: 'assistant',
-    channelTurnRuntimes: new Map([[inputId, runtime]]),
-    channelStreamingSessionsByInput: new Map(),
-    channelOutboxScopesByInput: new Map(),
-    cursorCommittedInputTurns: new Set<string>(),
-    mainRecalledInputIds: new Set<string>(),
-    mainRecallSuppression: false,
-    recallStoppedSessions: new Map(),
-    RECALL_STOP_TTL_MS: 10 * 60 * 1000,
-    streamingSession: card,
-    streamingSessionJid: imJid,
-    streamingAccumulatedText: '',
-    streamingAccumulatedThinking: '',
-    streamInterrupted: false,
-    streamSteered: false,
-    sentReply: false,
-    heldCardParts: [],
-    activeSessionId: 'sdk-session',
-    shutdownSavedJids: new Set<string>(),
-    inputUsageProjection: new InputUsageProjection(inputId),
-    turnOutputCoordinators: new Map(),
-    steeringTransitions: { shouldSuppressOutput: () => false },
-    resolveSteeringInterrupt: () => options.steered === true,
-    rememberScheduledGroupRuns: vi.fn(),
-    activateMainProjectionForInput: vi.fn(async () => {}),
-    publishesFrameworkAnswer,
-    buildStoppedReply,
-    buildSteeredReply,
-    advanceCursors,
-    flushAcknowledgedIpcForJid: vi.fn(),
-    clearStreamingSnapshot: vi.fn(),
-    clearProcessingIndicatorForInput: vi.fn(async () => {}),
-    getUncertainChannelOutboxForTurn: store.getUncertainChannelOutboxForTurn,
-    getFailedChannelOutboxForTurn: store.getFailedChannelOutboxForTurn,
-    resolveContainerOutputInputTurnId: (output: any, fallback: string) =>
-      output.inputTurnId ?? fallback,
-    sendMessage: vi.fn(async () => 'msg-id'),
-    bindTurnOutputCoordinator: () => ({
-      reduceStreamEvent: () => ({ visibleAnswerChanged: false }),
-    }),
-    // The Web projection of the stream is covered by
-    // workspace-interaction-runtime.test.ts; these runs only settle Turns.
-    projectSdkStreamEventForWeb: () => null,
-    resolveProcessVisibility: () => 'full',
-    shouldBroadcastTaskAgentStatus: () => false,
-    turnTraces: {
-      observe: vi.fn(),
-      persist: vi.fn(() => false),
-      discard: vi.fn(),
-    },
-    persistProactiveTurnTrace: vi.fn(),
-    commentaryRelay: new ProactiveCommentaryRelay(),
-    broadcastMessageTrace: vi.fn(),
-    broadcastStreamEvent: vi.fn(),
-    isStreamingSessionSettled,
-    feedStreamEventToCard: vi.fn(),
-    heldCardBaseText: () => '',
-    buildWebTraceUrl: () => null,
-    resetIdleTimer: vi.fn(),
-    TRUNCATION_EXHAUSTED_STATUS: '__truncation_exhausted__',
-    mainAdmissionKey: `main-admission-${name}`,
-    activeChannelOutboxScopes: { unbind: vi.fn() },
-    activeDurableCardLifecycle: undefined,
-    unregisterStreamingSession: vi.fn(),
-    getChannelType,
-    getMessageChannelTurnContext: () => ({
-      provider: 'feishu',
-      chat: { id: `oc_mainrun_${name}` },
-    }),
-    imManager: { executeFeishuCapability: vi.fn(async () => ({})) },
-    writeUsageRecords: vi.fn(() => ({ providerEstimatedCostUSD: 0.01 })),
-    registeredGroups: {},
-    markMainOutputSettled: vi.fn(),
-  };
-  const harness = createRuntimeSourceHarness(globals);
-  for (const fn of [
-    'takeRecallStop',
-    'settleInterruptedChannelTurn',
-    'discardRecalledStreamingCard',
-  ]) {
-    harness.install(fn);
+describe('session sub-agent checkpoints (behavioural)', () => {
+  /** A session run that follows its sub-agent Tasks the way production does. */
+  function checkpointRun(name: string) {
+    const run = agentRun(name);
+    const running = new Map<string, Set<string>>();
+    Object.assign(run.globals, {
+      runningSubagentTasksByLane: running,
+      NON_SUBAGENT_TASK_TYPES: new Set(['local_bash', 'monitor', 'mcp_task']),
+      upsertSubagentCheckpoint: db.upsertSubagentCheckpoint,
+      nonSubagentTaskIds: new Set<string>(),
+      subagentTaskInputMessageId: () => run.inputId,
+    });
+    run.harness.install('trackSubagentTaskEvent');
+    // The runner's processor turns the SDK frames into what the Host reads.
+    const frames: unknown[] = [];
+    const processor = new StreamEventProcessor(
+      (output) => frames.push({ ...output, inputTurnId: run.inputId }),
+      () => {},
+    );
+    const forward = async () => {
+      for (const frame of frames.splice(0)) await run.output(frame);
+    };
+    const folder = run.globals.effectiveGroup.folder as string;
+    const rows = () =>
+      db.listSubagentCheckpointsForInputs(folder, run.virtualChatJid, [
+        run.inputId,
+      ]);
+    return { run, running, processor, forward, rows };
   }
-  harness.install('commitCursor', 'processGroupMessages');
-  harness.install('settleMainRecalledInput', 'processGroupMessages');
-  harness.installMainOutput();
-  return {
-    globals,
-    runtime,
-    inputId,
-    card,
-    advanceCursors,
-    output: (value: unknown) => globals.handleMainOutput(value),
-    interrupted: () =>
-      globals.handleMainOutput({
-        status: 'stream',
-        result: null,
-        inputTurnId: inputId,
-        streamEvent: { eventType: 'status', statusText: 'interrupted' },
-      }),
-  };
-}
 
-describe('main Session interrupt settlement (behavioural)', () => {
-  test('/break before any text: Turn cancelled at the interrupt, stop marker on the card', async () => {
-    const run = mainRun('break');
-    await run.interrupted();
-    expect(store.getChannelTurnRun(run.runtime.runId)).toMatchObject({
-      status: 'cancelled',
-      error: 'Input interrupted by explicit stop',
+  test('/break: a sub-agent the stop ended is handed back as unfinished on replay', async () => {
+    const { run, running, processor, forward, rows } =
+      checkpointRun('break-subagent');
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'sdk-task-1',
+      tool_use_id: 'toolu_audit',
+      description: 'Audit the deploy scripts',
+      task_type: 'local_agent',
     });
-    expect(run.globals.channelTurnRuntimes.has(run.inputId)).toBe(false);
-    expect(run.advanceCursors).toHaveBeenCalledWith(
-      run.globals.chatJid,
-      expect.objectContaining({ id: run.inputId }),
+    await forward();
+    // A running sub-agent holds the lane's idle container.
+    expect([...(running.get(run.virtualChatJid) ?? [])]).toEqual([
+      'toolu_audit',
+    ]);
+    await run.interrupted();
+    // The SDK reports the sub-agent the stop ended as stopped.
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'sdk-task-1',
+      tool_use_id: 'toolu_audit',
+      status: 'stopped',
+      summary: 'Stopped by the user',
+    });
+    await forward();
+
+    expect(running.get(run.virtualChatJid)?.size ?? 0).toBe(0);
+    expect(rows()).toMatchObject([
+      { taskId: 'toolu_audit', status: 'stopped' },
+    ]);
+    const handedBack = buildSubagentCheckpointContext(rows())!;
+    expect(handedBack).toMatchObject({ completed: 0, unfinished: 1 });
+    expect(handedBack.context).toContain(
+      '<subagent_task id="toolu_audit" state="unfinished" description="Audit the deploy scripts">\n<note>上次运行中被停止：Stopped by the user</note>',
     );
-    expect(run.card.abort).toHaveBeenCalledWith('已停止');
-    expect(run.globals.sendMessage).not.toHaveBeenCalled();
   });
 
-  test('recall: usage is billed, the card is deleted and nothing else is published', async () => {
-    const run = mainRun('recall');
-    run.globals.recallStoppedSessions.set(run.globals.chatJid, {
-      messageId: run.inputId,
-      at: Date.now(),
+  test('a finished sub-agent keeps its answer; shell tasks are no sub-agents', async () => {
+    const { processor, forward, rows } = checkpointRun('done-subagent');
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'sdk-shell',
+      tool_use_id: 'toolu_shell',
+      description: 'npm test',
+      task_type: 'local_bash',
     });
-    await run.output({
-      status: 'stream',
-      result: null,
-      inputTurnId: run.inputId,
-      streamEvent: {
-        eventType: 'usage',
-        usage: {
-          eventId: 'evt-main-recall',
-          inputTokens: 1000,
-          outputTokens: 10,
-          cacheReadInputTokens: 0,
-          cacheCreationInputTokens: 0,
-          reasoningTokens: 0,
-          costUSD: 0.01,
-          batchIndex: 0,
-          batchCount: 1,
-        },
-      },
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'sdk-task-2',
+      tool_use_id: 'toolu_review',
+      description: 'Review the patch',
+      task_type: 'local_agent',
     });
-    expect(run.globals.writeUsageRecords).toHaveBeenCalledTimes(1);
-    expect(run.globals.activateMainProjectionForInput).not.toHaveBeenCalled();
-    expect(run.card.abort.mock.calls).toEqual([[]]);
-    expect(run.globals.imManager.executeFeishuCapability).toHaveBeenCalled();
-    expect(store.getChannelTurnRun(run.runtime.runId)?.status).toBe(
-      'cancelled',
-    );
-    // A final that beat the interrupt is bookkeeping only.
-    await run.output({
-      status: 'success',
-      result: 'answer to the recalled message',
-      inputTurnId: run.inputId,
-      inputTurnCompleted: true,
+    await forward();
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'sdk-shell',
+      tool_use_id: 'toolu_shell',
+      status: 'completed',
+      summary: 'tests passed',
     });
-    expect(run.globals.markMainOutputSettled).toHaveBeenCalledTimes(1);
-    expect(run.globals.sendMessage).not.toHaveBeenCalled();
-  });
-
-  test('steer: the superseded Turn closes at the interrupt; the card completes', async () => {
-    const run = mainRun('steer', { steered: true });
-    await run.interrupted();
-    expect(store.getChannelTurnRun(run.runtime.runId)).toMatchObject({
-      status: 'cancelled',
-      error: 'Input superseded by explicit steer',
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'sdk-task-2',
+      tool_use_id: 'toolu_review',
+      status: 'completed',
+      summary: 'Looks good',
     });
-    expect(run.card.abort).not.toHaveBeenCalled();
-    expect(run.card.complete).toHaveBeenCalled();
+    await forward();
+    expect(rows()).toMatchObject([
+      { taskId: 'toolu_review', status: 'completed', summary: 'Looks good' },
+    ]);
   });
 });
 
@@ -1138,13 +966,41 @@ describe('settleInterruptedChannelTurn', () => {
   });
 });
 
+type Level = 'hidden' | 'activity' | 'full';
+
+/** A session run with the real Web projection, narration, traces and a card. */
+function sessionWith(
+  name: string,
+  mode: 'assistant' | 'proactive',
+  level: Level,
+) {
+  const run = agentRun(name);
+  const traceStore = vi.fn();
+  Object.assign(run.globals, {
+    interactionMode: mode,
+    agentStreamingSession: fakeCard([`om_card_${name}`]),
+    projectSdkStreamEventForWeb,
+    resolveProcessVisibility: () => (mode === 'proactive' ? level : 'full'),
+    commentaryRelay: new ProactiveCommentaryRelay(),
+    turnTraces: new TurnTraceTracker({
+      mode,
+      getVisibility: () => level,
+      store: traceStore,
+    }),
+    broadcastStreamEvent: vi.fn(),
+  });
+  const broadcasts = () =>
+    (run.globals.broadcastStreamEvent as ReturnType<typeof vi.fn>).mock.calls
+      .map(([, event]) => event)
+      .filter((event) => event.eventType !== 'usage');
+  return { run, traceStore, broadcasts };
+}
+
 /**
  * Process visibility at the host: the real output handlers decide, per event,
  * what the Web is told and what an IM card is fed.
  */
 describe('process visibility in the real output handlers (behavioural)', () => {
-  type Level = 'hidden' | 'activity' | 'full';
-
   async function streamThrough(
     handler: (output: unknown) => Promise<unknown>,
     inputId: string,
@@ -1183,34 +1039,12 @@ describe('process visibility in the real output handlers (behavioural)', () => {
     { eventType: 'context_audit', title: 'Agent Context' },
   ];
 
-  function mainWith(
-    name: string,
-    mode: 'assistant' | 'proactive',
-    level: Level,
-  ) {
-    const run = mainRun(name);
-    const traceStore = vi.fn();
-    Object.assign(run.globals, {
-      interactionMode: mode,
-      projectSdkStreamEventForWeb,
-      shouldBroadcastTaskAgentStatus,
-      resolveProcessVisibility: () => (mode === 'proactive' ? level : 'full'),
-      commentaryRelay: new ProactiveCommentaryRelay(),
-      turnTraces: new TurnTraceTracker({
-        mode,
-        getVisibility: () => level,
-        store: traceStore,
-      }),
-    });
-    const broadcasts = () =>
-      (run.globals.broadcastStreamEvent as ReturnType<typeof vi.fn>).mock.calls
-        .map(([, event]) => event)
-        .filter((event) => event.eventType !== 'usage');
-    return { run, traceStore, broadcasts };
-  }
-
   test('a hidden proactive workspace shows the spinner and nothing of the process', async () => {
-    const { run, broadcasts } = mainWith('vis-hidden', 'proactive', 'hidden');
+    const { run, broadcasts } = sessionWith(
+      'vis-hidden',
+      'proactive',
+      'hidden',
+    );
     await streamThrough(run.output, run.inputId, PROCESS);
     expect(broadcasts().map((e) => e.eventType)).toEqual([
       'status',
@@ -1220,7 +1054,7 @@ describe('process visibility in the real output handlers (behavioural)', () => {
   });
 
   test("activity adds the structure of the work, never the model's words", async () => {
-    const { run, broadcasts } = mainWith(
+    const { run, broadcasts } = sessionWith(
       'vis-activity',
       'proactive',
       'activity',
@@ -1244,7 +1078,7 @@ describe('process visibility in the real output handlers (behavioural)', () => {
   });
 
   test('full also streams the reasoning summary, still not the answer text', async () => {
-    const { run, broadcasts } = mainWith('vis-full', 'proactive', 'full');
+    const { run, broadcasts } = sessionWith('vis-full', 'proactive', 'full');
     await streamThrough(run.output, run.inputId, PROCESS);
     const types = broadcasts().map((e) => e.eventType);
     expect(types).toContain('thinking_delta');
@@ -1254,7 +1088,7 @@ describe('process visibility in the real output handlers (behavioural)', () => {
   });
 
   test('full adds the narration a tool call followed, ahead of that call, and no other model text', async () => {
-    const { run, broadcasts } = mainWith('vis-note', 'proactive', 'full');
+    const { run, broadcasts } = sessionWith('vis-note', 'proactive', 'full');
     await streamThrough(run.output, run.inputId, PROCESS);
     const sent = broadcasts();
     const types = sent.map((e) => e.eventType);
@@ -1274,7 +1108,7 @@ describe('process visibility in the real output handlers (behavioural)', () => {
 
   test('the text that ends a turn is never narration, at any level', async () => {
     for (const level of ['hidden', 'activity', 'full'] as const) {
-      const { run, broadcasts } = mainWith(
+      const { run, broadcasts } = sessionWith(
         `vis-end-${level}`,
         'proactive',
         level,
@@ -1291,7 +1125,7 @@ describe('process visibility in the real output handlers (behavioural)', () => {
   });
 
   test('an Assistant workspace is unchanged: all of it goes to the Web and the card', async () => {
-    const { run, broadcasts } = mainWith(
+    const { run, broadcasts } = sessionWith(
       'vis-assistant',
       'assistant',
       'hidden',
@@ -1310,7 +1144,7 @@ describe('process visibility in the real output handlers (behavioural)', () => {
       ['proactive', 'activity', false, true],
       ['proactive', 'full', true, true],
     ] as const) {
-      const { run, traceStore } = mainWith(
+      const { run, traceStore } = sessionWith(
         `trace-${mode}-${level}`,
         mode,
         level,
@@ -1331,23 +1165,22 @@ describe('process visibility in the real output handlers (behavioural)', () => {
     }
   });
 
-  test('Task tabs follow the task events: sent unless a proactive workspace is hidden', async () => {
-    for (const [mode, level, expected] of [
-      ['assistant', 'hidden', true],
-      ['proactive', 'hidden', false],
-      ['proactive', 'activity', true],
-      ['proactive', 'full', true],
+  test('sub-agent tasks are checkpointed whatever the Web is shown', async () => {
+    for (const [mode, level] of [
+      ['assistant', 'hidden'],
+      ['proactive', 'hidden'],
+      ['proactive', 'full'],
     ] as const) {
-      const { run } = mainWith(`task-${mode}-${level}`, mode, level);
+      const { run } = sessionWith(`task-${mode}-${level}`, mode, level);
+      const upsertSubagentCheckpoint = vi.fn();
       Object.assign(run.globals, {
-        queryTaskIds: new Set<string>(),
-        getAgent: () => undefined,
-        createAgent: vi.fn(),
-        updateAgentInfo: vi.fn(),
-        upsertSubagentCheckpoint: vi.fn(),
-        taskInputMessageId: () => run.inputId,
-        broadcastAgentStatus: vi.fn(),
+        runningSubagentTasksByLane: new Map(),
+        NON_SUBAGENT_TASK_TYPES: new Set(['local_bash']),
+        upsertSubagentCheckpoint,
+        nonSubagentTaskIds: new Set<string>(),
+        subagentTaskInputMessageId: () => run.inputId,
       });
+      run.harness.install('trackSubagentTaskEvent');
       await streamThrough(run.output, run.inputId, [
         {
           eventType: 'task_start',
@@ -1356,18 +1189,19 @@ describe('process visibility in the real output handlers (behavioural)', () => {
           taskDescription: '审查',
         },
       ]);
-      // the task row is written whatever the Web is shown
-      expect(run.globals.createAgent, `${mode}/${level}`).toHaveBeenCalled();
-      expect(
-        (run.globals.broadcastAgentStatus as ReturnType<typeof vi.fn>).mock
-          .calls.length > 0,
-        `${mode}/${level}`,
-      ).toBe(expected);
+      expect(upsertSubagentCheckpoint, `${mode}/${level}`).toHaveBeenCalledWith(
+        expect.objectContaining({
+          taskId: 'task-1',
+          chatJid: run.virtualChatJid,
+          inputMessageId: run.inputId,
+          description: '审查',
+        }),
+      );
     }
   });
 
   test('the visibility is read per event, so a change reaches a running turn', async () => {
-    const { run, broadcasts } = mainWith('vis-live', 'proactive', 'hidden');
+    const { run, broadcasts } = sessionWith('vis-live', 'proactive', 'hidden');
     let level: Level = 'hidden';
     run.globals.resolveProcessVisibility = () => level;
     await streamThrough(run.output, run.inputId, [
@@ -1445,68 +1279,6 @@ describe('process visibility in the real output handlers (behavioural)', () => {
         `${mode}/${level}`,
       ).toBe(mode === 'assistant');
     }
-  });
-
-  test("a proactive turn's trace is hung on the chats its utterances live in", () => {
-    const globals: Record<string, any> = {
-      chatJid: 'web:proactive-trace-home',
-      resolveIpcOutputWorkspaceJid: (jid: string) =>
-        jid === 'web:proactive-trace-home' ? null : 'web:proactive-trace-home',
-      getLastAgentMessageIdForTurn: db.getLastAgentMessageIdForTurn,
-      broadcastMessageTrace: vi.fn(),
-      logger: { warn: vi.fn() },
-      turnTraces: new TurnTraceTracker({
-        mode: 'proactive',
-        getVisibility: () => 'activity',
-      }),
-    };
-    const harness = createRuntimeSourceHarness(globals);
-    harness.install('announceTurnTrace');
-    harness.install('persistProactiveTurnTrace', 'processGroupMessages');
-    const persist = globals.persistProactiveTurnTrace as (id: string) => void;
-    const collect = (turnId: string) =>
-      globals.turnTraces.observe(turnId, {
-        eventType: 'tool_use_start',
-        toolName: 'Bash',
-        toolUseId: `tool-${turnId}`,
-      });
-
-    db.ensureChatExists('web:proactive-trace-home');
-    db.storeMessageDirect(
-      'utterance-1',
-      'web:proactive-trace-home',
-      'happyclaw-agent',
-      'Agent',
-      '一句话',
-      '2026-10-12T02:00:00.000Z',
-      true,
-      { meta: { turnId: 'turn-spoke', sourceKind: 'sdk_send_message' } },
-    );
-    collect('turn-spoke');
-    persist('turn-spoke');
-    expect(
-      db.getTurnTrace('web:proactive-trace-home', 'turn-spoke'),
-    ).toBeDefined();
-    // The utterance went out mid-turn without `has_trace`: the clients are
-    // told which message carries the trace now that it exists.
-    expect(globals.broadcastMessageTrace).toHaveBeenCalledTimes(1);
-    expect(globals.broadcastMessageTrace).toHaveBeenCalledWith(
-      'web:proactive-trace-home',
-      'utterance-1',
-      'turn-spoke',
-    );
-
-    // a silent turn left no message to hang a trace on
-    collect('turn-silent');
-    persist('turn-silent');
-    expect(
-      db.getTurnTrace('web:proactive-trace-home', 'turn-silent'),
-    ).toBeUndefined();
-    expect(globals.broadcastMessageTrace).toHaveBeenCalledTimes(1);
-    globals.turnTraces.observe('turn-silent', {
-      eventType: 'status',
-      statusText: 'requesting',
-    });
   });
 
   test("a Runtime Session's trace is announced for the session's own message", () => {
@@ -1595,5 +1367,123 @@ describe('process visibility in the real output handlers (behavioural)', () => {
     // The trace is stored all the same, and the failure is only logged.
     expect(db.getTurnTrace(session, 'turn-s3')).toBeDefined();
     expect(globals.logger.warn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('every Web stream frame names the input it answers (behavioural)', () => {
+  // The final row's `turn_id` is the input a turn answers. A warm turn's
+  // presentation `turnId` is the Runner's own, so the Web pairs its live card
+  // with the final by `inputTurnId`, which must be that same input.
+  type Broadcast = [string, Record<string, any>, string?];
+  const sent = (globals: Record<string, any>) =>
+    (globals.broadcastStreamEvent as ReturnType<typeof vi.fn>).mock
+      .calls as Broadcast[];
+  const frame = (inputTurnId: string | undefined, turnId: string) => ({
+    status: 'stream',
+    result: null,
+    ...(inputTurnId ? { inputTurnId } : {}),
+    streamEvent: { eventType: 'text_delta', text: '答案', turnId },
+  });
+
+  function session(name: string) {
+    const { run } = sessionWith(name, 'assistant', 'hidden');
+    Object.assign(run.globals, {
+      resolveContainerOutputInputTurnId,
+      rejectedAgentInputTurns: new Set<string>(),
+    });
+    run.harness.install('agentScopeForOutput', 'processAgentConversation');
+    // Where the final row takes its `turn_id` from.
+    const finalTurnId = (output: Record<string, unknown>) =>
+      run.globals.agentScopeForOutput({ ...output, status: 'success' })
+        .inputId as string;
+    return { run, finalTurnId };
+  }
+
+  // `host` stands for the input the host gave the Runner (`lastProcessed`).
+  test.each([
+    {
+      name: 'cold',
+      label:
+        'a cold start: the host input, which is also the presentation turn',
+      input: 'host',
+      turn: 'host',
+    },
+    {
+      name: 'warm',
+      label: "a warm turn: the delivery it answers, not the Runner's own turn",
+      input: 'delivery-warm',
+      turn: 'presentation-warm',
+    },
+    {
+      name: 'legacy',
+      label: 'an older Runner without an input id: the host input it was given',
+      input: undefined,
+      turn: 'presentation-legacy',
+    },
+  ])('$label', async ({ name, input, turn }) => {
+    const { run, finalTurnId } = session(`input-${name}`);
+    const host = (id: string | undefined) => (id === 'host' ? run.inputId : id);
+    const output = frame(host(input), host(turn)!);
+    await run.output(output);
+    const [[, event]] = sent(run.globals);
+    // The presentation turn is left as it is; the input is added beside it.
+    expect(event.turnId).toBe(host(turn));
+    expect(event.inputTurnId).toBe(host(input) ?? run.inputId);
+    expect(event.inputTurnId).toBe(finalTurnId(output));
+  });
+
+  test("a proactive turn's narration names its input too", async () => {
+    const { run } = sessionWith('input-note', 'proactive', 'full');
+    for (const streamEvent of [
+      { eventType: 'status', statusText: 'requesting', turnId: 'p-note' },
+      { eventType: 'text_delta', text: '先看目录', turnId: 'p-note' },
+      {
+        eventType: 'tool_use_start',
+        toolName: 'Bash',
+        toolUseId: 'tool-note',
+        turnId: 'p-note',
+      },
+    ]) {
+      await run.output({
+        status: 'stream',
+        result: null,
+        inputTurnId: 'delivery-note',
+        streamEvent,
+      });
+    }
+    const events = sent(run.globals).map(([, event]) => event);
+    expect(events.map((e) => e.eventType)).toEqual([
+      'status',
+      'commentary',
+      'tool_use_start',
+    ]);
+    for (const event of events) {
+      expect(event.inputTurnId, event.eventType).toBe('delivery-note');
+    }
+  });
+
+  test('a Runtime Session: the delivery it answers, addressed to the session', async () => {
+    for (const [name, inputTurnId, turnId] of [
+      ['session-cold', undefined, undefined],
+      ['session-warm', 'delivery-session', 'presentation-session'],
+    ] as const) {
+      const run = agentRun(`input-${name}`);
+      Object.assign(run.globals, {
+        projectSdkStreamEventForWeb,
+        resolveContainerOutputInputTurnId,
+        rejectedAgentInputTurns: new Set<string>(),
+        broadcastStreamEvent: vi.fn(),
+      });
+      run.harness.install('agentScopeForOutput', 'processAgentConversation');
+      const output = frame(inputTurnId, turnId ?? run.inputId);
+      await run.output(output);
+      const [[, event, agentId]] = sent(run.globals);
+      expect(agentId, name).toBe(run.globals.agentId);
+      expect(event.inputTurnId, name).toBe(inputTurnId ?? run.inputId);
+      expect(event.inputTurnId, name).toBe(
+        run.globals.agentScopeForOutput({ ...output, status: 'success' })
+          .inputId,
+      );
+    }
   });
 });

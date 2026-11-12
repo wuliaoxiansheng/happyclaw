@@ -4,45 +4,37 @@ import {
   channelConversationJid,
   parseChannelAddress,
 } from './channel-address.js';
+import { channelTurnScope } from './channel-turn-registry.js';
 
 export interface AgentBuilderTurnContext {
   chatJid: string;
   messageId: string;
   /** Host-issued identity used by the runner for this cold/warm input turn. */
   runtimeTurnId: string;
-  scheduledTaskId: string | null;
+  /** automation_runs.id when the input is an automation run's prompt. */
+  automationRunId: string | null;
 }
 
 /**
- * Keep owner-turn authorization isolated per workspace runtime session.
- * The main session retains the historical folder key; conversation sessions
- * get their own namespace so concurrent chats cannot borrow confirmations.
+ * Keep owner-turn authorization isolated per session, so concurrent chats of
+ * one workspace cannot borrow each other's confirmations.
  */
 export function agentBuilderTurnScope(
   folder: string,
-  runtimeAgentId?: string | null,
+  runtimeAgentId: string,
 ): string {
-  return runtimeAgentId
-    ? `${folder}\u0000conversation:${runtimeAgentId}`
-    : folder;
+  return channelTurnScope(folder, runtimeAgentId);
 }
 
 export function getAgentBuilderRuntimeRejection(input: {
-  isScheduledTask: boolean;
-  isolatedTaskId?: string | null;
-  runtimeAgentId?: string | null;
   runtimeAgentKind?: 'task' | 'conversation' | 'spawn' | null;
   runtimeAgentFolder?: string | null;
   sourceFolder: string;
   sourceProfileIsDefault: boolean;
 }): string | null {
-  if (input.isScheduledTask || input.isolatedTaskId) {
-    return 'Agent Builder is unavailable for scheduled or isolated task runs';
-  }
   if (
-    input.runtimeAgentId &&
-    (input.runtimeAgentKind !== 'conversation' ||
-      input.runtimeAgentFolder !== input.sourceFolder)
+    input.runtimeAgentKind !== 'conversation' ||
+    input.runtimeAgentFolder !== input.sourceFolder
   ) {
     return 'Agent Builder is only available to ordinary main-Agent conversations';
   }
@@ -208,7 +200,38 @@ export interface AgentBuilderPersistedInput {
   source_jid: string | null;
   is_from_me: number;
   source_kind: string | null;
-  task_id: string | null;
+  automation_run_id: string | null;
+}
+
+/**
+ * An automation run's input: unattended, never the owner speaking, whatever
+ * sender it carries. Decided from host-persisted fields only.
+ */
+export function isAutomationTurnInput(
+  turn: Pick<AgentBuilderTurnContext, 'automationRunId'>,
+  input: Pick<AgentBuilderPersistedInput, 'source_kind' | 'automation_run_id'>,
+): boolean {
+  return (
+    !!turn.automationRunId ||
+    !!input.automation_run_id ||
+    input.source_kind === 'automation_prompt'
+  );
+}
+
+/**
+ * An input no person typed in this turn: an automation run's, or one the host
+ * composed for a team-mode session (assignment, follow-up copy, report). It
+ * never counts as the owner speaking, so Skill changes are refused and
+ * Workspace Memory writes become proposals.
+ */
+export function isUnattendedTurnInput(
+  turn: Pick<AgentBuilderTurnContext, 'automationRunId'>,
+  input: Pick<AgentBuilderPersistedInput, 'source_kind' | 'automation_run_id'>,
+): boolean {
+  return (
+    isAutomationTurnInput(turn, input) ||
+    input.source_kind === 'work_item_input'
+  );
 }
 
 export function isAgentBuilderOwnerInput(
@@ -287,6 +310,13 @@ export function isOwnerProfileOwnerInput(
  * Runner-supplied chat/turn/task claims are not authorization inputs because
  * Agents intentionally have full Bash and write access to their IPC mount.
  */
+/** The (non-empty) batch whose every turn carries this runtimeTurnId. */
+function batchNamedBy(
+  runtimeTurnId: string,
+): (batch: AgentBuilderTurnContext[]) => boolean {
+  return (batch) => batch.every((turn) => turn.runtimeTurnId === runtimeTurnId);
+}
+
 export class AgentBuilderTurnRegistry {
   private readonly active = new Map<string, AgentBuilderTurnContext[]>();
   private readonly queued = new Map<string, AgentBuilderTurnContext[][]>();
@@ -295,14 +325,14 @@ export class AgentBuilderTurnRegistry {
     folder: string,
     chatJid: string,
     messageId: string,
-    scheduledTaskId?: string | null,
+    automationRunId?: string | null,
   ): void {
     this.startBatch(folder, [
       {
         chatJid,
         messageId,
         runtimeTurnId: messageId,
-        scheduledTaskId: scheduledTaskId ?? null,
+        automationRunId: automationRunId ?? null,
       },
     ]);
   }
@@ -333,10 +363,11 @@ export class AgentBuilderTurnRegistry {
     this.queued.set(folder, queued);
   }
 
+  /** Returns the batch promoted to active by this call (a copy), else []. */
   clearCompleted(
     folder: string,
     completed: Array<{ chatJid: string; messageId: string }>,
-  ): void {
+  ): AgentBuilderTurnContext[] {
     const key = (item: { chatJid: string; messageId: string }) =>
       `${item.chatJid}\u0000${item.messageId}`;
     const completedKeys = new Set(completed.map(key));
@@ -347,7 +378,7 @@ export class AgentBuilderTurnRegistry {
       queued.some((batch) =>
         batch.some((turn) => completedKeys.has(key(turn))),
       );
-    if (!recognized) return;
+    if (!recognized) return [];
 
     this.active.delete(folder);
     const remaining = queued
@@ -357,11 +388,45 @@ export class AgentBuilderTurnRegistry {
     if (next) this.active.set(folder, next);
     if (remaining.length > 0) this.queued.set(folder, remaining);
     else this.queued.delete(folder);
+    return (next ?? []).map((turn) => ({ ...turn }));
   }
 
   delete(folder: string): void {
     this.active.delete(folder);
     this.queued.delete(folder);
+  }
+
+  /**
+   * Every turn handed to the runner up to and including the batch with this
+   * runtimeTurnId (the active batch or one already piped behind it), or []
+   * when no delivered batch carries it. A runner answers a piped batch
+   * before the host promotes it, and that answer's context holds every
+   * batch before it.
+   */
+  deliveredTurnsThrough(
+    folder: string,
+    runtimeTurnId: string | null | undefined,
+  ): AgentBuilderTurnContext[] {
+    if (!runtimeTurnId) return [];
+    const batches = this.deliveredBatches(folder);
+    const through = batches.findIndex(batchNamedBy(runtimeTurnId));
+    if (through < 0) return [];
+    return batches
+      .slice(0, through + 1)
+      .flat()
+      .map((turn) => ({ ...turn }));
+  }
+
+  private deliveredBatches(folder: string): AgentBuilderTurnContext[][] {
+    return [
+      this.active.get(folder) ?? [],
+      ...(this.queued.get(folder) ?? []),
+    ].filter((batch) => batch.length > 0);
+  }
+
+  /** The batch executing right now in this runtime scope (a copy). */
+  activeBatch(folder: string): AgentBuilderTurnContext[] {
+    return (this.active.get(folder) ?? []).map((turn) => ({ ...turn }));
   }
 
   /**
@@ -377,7 +442,7 @@ export class AgentBuilderTurnRegistry {
       chatJid: string,
       messageId: string,
     ) => AgentBuilderPersistedInput | null,
-  ): 'interactive' | 'scheduled' | 'unknown' {
+  ): 'interactive' | 'automation' | 'unknown' {
     const active = this.active.get(folder);
     if (
       !active?.length ||
@@ -392,14 +457,9 @@ export class AgentBuilderTurnRegistry {
     }));
     if (observed.some(({ input }) => !input)) return 'unknown';
     if (
-      observed.some(
-        ({ turn, input }) =>
-          turn.scheduledTaskId !== null ||
-          input!.task_id !== null ||
-          input!.source_kind === 'scheduled_task_prompt',
-      )
+      observed.some(({ turn, input }) => isUnattendedTurnInput(turn, input!))
     ) {
-      return 'scheduled';
+      return 'automation';
     }
     return 'interactive';
   }
@@ -430,12 +490,10 @@ export class AgentBuilderTurnRegistry {
       if (
         !input ||
         input.is_from_me !== 0 ||
-        turn.scheduledTaskId !== null ||
-        input.task_id !== null ||
-        input.source_kind === 'scheduled_task_prompt'
+        isUnattendedTurnInput(turn, input)
       ) {
         throw new Error(
-          'Agent Builder is unavailable for scheduled or non-human turns',
+          'Agent Builder is unavailable for automation or non-human turns',
         );
       }
       if (!isOwnerInput(input)) {
@@ -483,12 +541,10 @@ export class AgentBuilderTurnRegistry {
       if (
         !input ||
         input.is_from_me !== 0 ||
-        turn.scheduledTaskId !== null ||
-        input.task_id !== null ||
-        input.source_kind === 'scheduled_task_prompt'
+        isUnattendedTurnInput(turn, input)
       ) {
         throw new Error(
-          'Owner Profile is unavailable for scheduled or non-human turns',
+          'Owner Profile is unavailable for automation or non-human turns',
         );
       }
       if (!isOwnerInput(input)) {
@@ -523,14 +579,8 @@ export class AgentBuilderTurnRegistry {
     if (!runtimeTurnId) {
       throw new Error('Owner Profile requires an admitted conversation turn');
     }
-    const batches = [
-      ...(this.active.has(folder) ? [this.active.get(folder)!] : []),
-      ...(this.queued.get(folder) ?? []),
-    ];
-    const exact = batches.find(
-      (batch) =>
-        batch.length > 0 &&
-        batch.every((turn) => turn.runtimeTurnId === runtimeTurnId),
+    const exact = this.deliveredBatches(folder).find(
+      batchNamedBy(runtimeTurnId),
     );
     if (!exact) {
       throw new Error('Owner Profile requires an admitted conversation turn');
@@ -543,9 +593,7 @@ export class AgentBuilderTurnRegistry {
       if (
         !input ||
         input.is_from_me !== 0 ||
-        turn.scheduledTaskId !== null ||
-        input.task_id !== null ||
-        input.source_kind === 'scheduled_task_prompt' ||
+        isUnattendedTurnInput(turn, input) ||
         !isOwnerInput(input)
       ) {
         throw new Error(

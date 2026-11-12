@@ -95,6 +95,7 @@ describe('Feishu CLI runtime identity binding', () => {
       accountId: 'account-current',
       appId: 'cli_current',
       appSecret: 'secret-current',
+      brand: 'feishu',
     });
   });
 
@@ -210,6 +211,44 @@ describe('Feishu CLI runtime identity binding', () => {
     expect(lines).toEqual([
       'FEISHU_PROFILE=workspace',
       'KEEP=yes',
+      'FEISHU_APP_ID=cli_current',
+      'FEISHU_APP_SECRET=secret-current',
+    ]);
+  });
+
+  test('pins a Lark Bot to the international OpenAPI host', () => {
+    const binding = resolveFeishuCliRuntimeBinding(
+      { ownerUserId: 'owner-1', channelContext: context() },
+      dependencies(account(), {
+        appId: 'cli_current',
+        appSecret: 'secret-current',
+        domain: 'lark',
+      }),
+    );
+    expect(binding?.brand).toBe('lark');
+    const lines = ['FEISHU_BASE_URL=https://open.feishu.cn', 'KEEP=yes'];
+
+    applyFeishuCliBindingToEnvLines(lines, binding);
+
+    expect(lines).toEqual([
+      'KEEP=yes',
+      'FEISHU_APP_ID=cli_current',
+      'FEISHU_APP_SECRET=secret-current',
+      'FEISHU_BASE_URL=https://open.larksuite.com',
+    ]);
+  });
+
+  test('keeps an inherited OpenAPI host for a Feishu Bot', () => {
+    const binding = resolveFeishuCliRuntimeBinding(
+      { ownerUserId: 'owner-1', channelContext: context() },
+      dependencies(),
+    );
+    const lines = ['FEISHU_BASE_URL=https://open.feishu.cn'];
+
+    applyFeishuCliBindingToEnvLines(lines, binding);
+
+    expect(lines).toEqual([
+      'FEISHU_BASE_URL=https://open.feishu.cn',
       'FEISHU_APP_ID=cli_current',
       'FEISHU_APP_SECRET=secret-current',
     ]);

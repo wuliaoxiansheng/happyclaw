@@ -6,7 +6,22 @@ import {
   isGlobalStopEscape,
   parseQueuedImageAttachments,
   queuedFollowUpLabel,
+  withoutUploadedFiles,
+  withUploadedFiles,
 } from './composer-helpers';
+
+describe('uploaded-file announcement', () => {
+  test('lists the workspace paths ahead of the text and strips back off', () => {
+    const message = withUploadedFiles('请总结', ['docs/a.pdf', 'b.md']);
+    expect(message).toBe(
+      '[我上传了以下文件到工作区，请查看并使用]\n- docs/a.pdf\n- b.md\n\n请总结',
+    );
+    expect(withoutUploadedFiles(message)).toBe('请总结');
+    expect(withoutUploadedFiles(withUploadedFiles('', ['a.pdf']))).toBe('');
+    expect(withUploadedFiles('只有文字', [])).toBe('只有文字');
+    expect(withoutUploadedFiles('普通消息')).toBe('普通消息');
+  });
+});
 
 describe('composerTextAfterSend', () => {
   test('clears the composer when nothing was typed during the send', () => {

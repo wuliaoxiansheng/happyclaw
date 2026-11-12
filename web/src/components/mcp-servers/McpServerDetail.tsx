@@ -286,6 +286,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
           {isHttp ? (
             <Field label="URL">
               <Input
+                variant="code"
                 value={editUrl}
                 onChange={(event) => setEditUrl(event.target.value)}
                 className="font-mono"
@@ -295,6 +296,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
             <>
               <Field label="命令">
                 <Input
+                  variant="code"
                   value={editCommand}
                   onChange={(event) => setEditCommand(event.target.value)}
                   className="font-mono"
@@ -305,6 +307,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
                   {editArgs.map((arg, index) => (
                     <div key={index} className="flex gap-2">
                       <Input
+                        variant="code"
                         value={arg}
                         onChange={(event) =>
                           setEditArgs(
@@ -385,6 +388,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
                     className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_auto] gap-2"
                   >
                     <Input
+                      variant="code"
                       value={row.key}
                       onChange={(event) =>
                         setSecretRows(
@@ -399,6 +403,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
                       className="font-mono"
                     />
                     <Input
+                      variant="code"
                       type="password"
                       value={row.value}
                       onChange={(event) =>

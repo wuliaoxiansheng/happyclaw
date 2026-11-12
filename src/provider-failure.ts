@@ -182,12 +182,6 @@ export class TransientRetryLedger {
     return true;
   }
 
-  /** Provider that owns the one authorized replay for this durable input. */
-  pinnedProfileId(inputTurnId: string | undefined): string | null {
-    if (!inputTurnId) return null;
-    return this.used.get(inputTurnId)?.profileId ?? null;
-  }
-
   clear(inputTurnId: string | undefined): void {
     if (inputTurnId) this.used.delete(inputTurnId);
   }

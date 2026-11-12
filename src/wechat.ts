@@ -16,7 +16,6 @@ import fs from 'fs';
 import path from 'node:path';
 import { fetch as undiciFetch, type Dispatcher } from 'undici';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
-import { notifyNewImMessage } from './message-notifier.js';
 import { logger } from './logger.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import {
@@ -27,6 +26,12 @@ import { downloadAndDecryptMedia, uploadMediaBuffer } from './wechat-crypto.js';
 import { createDedupCache } from './im-utils.js';
 import { weChatIlinkHeaders } from './wechat-onboarding.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
+import {
+  parseConnectorRuntimeControl,
+  projectChannelInbound,
+  runSessionBreak,
+  type ChannelFollowUpConnectOpts,
+} from './im-connector-follow-up.js';
 import { createWeChatHttpDispatcher } from './wechat-http.js';
 import { fetchWeChatDirect } from './wechat-direct-fetch.js';
 import {
@@ -42,6 +47,7 @@ import {
   weChatClientIdForChunk,
 } from './wechat-outbound.js';
 import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
+import { errorChain } from './im-send-retry-policy.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -131,7 +137,7 @@ export interface WeChatPhysicalDeliveryOptions {
   physicalOutput?: boolean;
 }
 
-export interface WeChatConnectOpts {
+export interface WeChatConnectOpts extends ChannelFollowUpConnectOpts {
   onReady?: () => void;
   onNewChat: (jid: string, name: string) => void;
   ignoreMessagesBefore?: number;
@@ -613,18 +619,6 @@ function providerGenerationSequence(msg: WeixinMessage): number | undefined {
   return undefined;
 }
 
-function errorChain(error: unknown): Array<Record<string, unknown>> {
-  const chain: Array<Record<string, unknown>> = [];
-  let current = error;
-  const seen = new Set<unknown>();
-  while (current && typeof current === 'object' && !seen.has(current)) {
-    seen.add(current);
-    chain.push(current as Record<string, unknown>);
-    current = (current as { cause?: unknown }).cause;
-  }
-  return chain;
-}
-
 export function classifyWeChatConnectionError(
   error: unknown,
 ): WeChatConnectionErrorCode {
@@ -1042,6 +1036,7 @@ export function createWeChatConnection(
     groupFolder: string | undefined,
     label: string,
     resolveFileName: (buffer: Buffer) => string,
+    routeJid: string,
   ): Promise<{ buffer: Buffer; savedPath?: string } | null> {
     if (!media?.encrypt_query_param || !media?.aes_key) {
       logger.debug(`WeChat ${label} missing media or aes_key, skipping`);
@@ -1073,8 +1068,13 @@ export function createWeChatConnection(
       try {
         const fileName = resolveFileName(buffer);
         savedPath =
-          (await saveDownloadedFile(groupFolder, 'wechat', fileName, buffer)) ??
-          undefined;
+          (await saveDownloadedFile(
+            groupFolder,
+            'wechat',
+            fileName,
+            buffer,
+            routeJid,
+          )) ?? undefined;
       } catch (err) {
         logger.warn({ err }, `Failed to save WeChat ${label} to disk`);
       }
@@ -1087,6 +1087,7 @@ export function createWeChatConnection(
     item: MessageItem,
     msgIdentifier: string,
     groupFolder: string | undefined,
+    routeJid: string,
   ): Promise<{
     attachmentEntry?: { type: string; data: string; mimeType: string };
     textPrefix?: string;
@@ -1112,6 +1113,7 @@ export function createWeChatConnection(
           };
           return `wechat_img_${msgIdentifier}${extMap[mimeType] ?? '.jpg'}`;
         },
+        routeJid,
       );
       if (!result) return { textPrefix: downloadFailed };
 
@@ -1151,6 +1153,7 @@ export function createWeChatConnection(
     kind: 'voice' | 'video',
     msgIdentifier: string,
     groupFolder: string | undefined,
+    routeJid: string,
   ): Promise<string | null> {
     const media =
       kind === 'video' ? item.video_item?.media : item.voice_item?.media;
@@ -1165,6 +1168,7 @@ export function createWeChatConnection(
           kind === 'video'
             ? `wechat_vid_${msgIdentifier}.mp4`
             : `wechat_voice_${msgIdentifier}${detectWeChatVoiceExtension(buffer)}`,
+        routeJid,
       );
       if (result?.savedPath) {
         return kind === 'video'
@@ -1181,6 +1185,7 @@ export function createWeChatConnection(
   async function processFileItem(
     item: MessageItem,
     groupFolder: string | undefined,
+    routeJid: string,
   ): Promise<string | null> {
     const fileName = item.file_item?.file_name || 'unknown_file';
     try {
@@ -1189,6 +1194,7 @@ export function createWeChatConnection(
         groupFolder,
         'file',
         () => fileName,
+        routeJid,
       );
       if (result?.savedPath) return `[文件: ${result.savedPath}]`;
       // CDN media unavailable, fall back to name-only label
@@ -1333,9 +1339,40 @@ export function createWeChatConnection(
         opts.onNewChat(jid, chatName);
       }
 
+      // iLink delivers 1:1 conversations only, so every message is directly
+      // addressed to the bot.
+      const items = msg.item_list ?? [];
+      const runtimeControl = parseConnectorRuntimeControl({
+        commandText: items
+          .filter((item) => item.type === MESSAGE_ITEM_TYPE_TEXT)
+          .map((item) => item.text_item?.text ?? '')
+          .join(''),
+        eligible: true,
+        hasAttachments: items.some(
+          (item) => item.type !== MESSAGE_ITEM_TYPE_TEXT,
+        ),
+      });
+      if (runtimeControl?.kind === 'break') {
+        const reply = await runSessionBreak(opts.onSessionBreak, {
+          sourceJid: jid,
+          targetJid,
+          senderImId: fromUserId,
+          chatType: 'p2p',
+        });
+        try {
+          await sendManagedText(fromUserId, reply);
+        } catch (err) {
+          logger.warn({ jid, err }, 'Failed to send WeChat /break reply');
+        }
+        return;
+      }
+      const requestedFollowUpMode =
+        runtimeControl?.kind === 'steer' ? ('steer' as const) : undefined;
+      if (runtimeControl?.kind === 'steer') content = runtimeControl.text;
+
       // Handle slash commands
       const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/i);
-      if (slashMatch && opts.onCommand) {
+      if (slashMatch && opts.onCommand && !requestedFollowUpMode) {
         const cmdBody = (
           slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
         ).trim();
@@ -1382,14 +1419,19 @@ export function createWeChatConnection(
         for (const item of msg.item_list) {
           if (item.type === MESSAGE_ITEM_TYPE_IMAGE) {
             mediaPromises.push(
-              processImageItem(item, msgId.slice(-8), groupFolder).then((r) => {
+              processImageItem(
+                item,
+                msgId.slice(-8),
+                groupFolder,
+                targetJid,
+              ).then((r) => {
                 if (r.attachmentEntry) imageAttachments.push(r.attachmentEntry);
                 if (r.textPrefix) textPrefixes.push(r.textPrefix);
               }),
             );
           } else if (item.type === MESSAGE_ITEM_TYPE_FILE) {
             mediaPromises.push(
-              processFileItem(item, groupFolder).then((label) => {
+              processFileItem(item, groupFolder, targetJid).then((label) => {
                 if (label) textPrefixes.push(label);
               }),
             );
@@ -1400,6 +1442,7 @@ export function createWeChatConnection(
                 'video',
                 msgId.slice(-8),
                 groupFolder,
+                targetJid,
               ).then((label) => {
                 if (label) textPrefixes.push(label);
               }),
@@ -1411,6 +1454,7 @@ export function createWeChatConnection(
                 'voice',
                 msgId.slice(-8),
                 groupFolder,
+                targetJid,
               ).then((label) => {
                 if (label) textPrefixes.push(label);
               }),
@@ -1460,9 +1504,8 @@ export function createWeChatConnection(
           sourceJid: jid,
         },
       );
-
-      opts.onMessagePersisted?.(
-        targetJid,
+      const followUp = projectChannelInbound(
+        opts,
         {
           id,
           chat_jid: targetJid,
@@ -1474,10 +1517,19 @@ export function createWeChatConnection(
           attachments: attachmentsJson,
           is_from_me: false,
         },
-        agentRouting?.agentId ?? undefined,
+        {
+          agentId: agentRouting?.agentId ?? undefined,
+          requestedMode: requestedFollowUpMode,
+        },
       );
-      notifyNewImMessage();
-
+      if (!followUp.shouldStartTurn) {
+        // Released by the host when the active run ends.
+        logger.info(
+          { jid, targetJid, disposition: followUp.disposition },
+          'WeChat message queued behind the active run',
+        );
+        return;
+      }
       if (agentRouting?.agentId) {
         opts.onAgentMessage?.(jid, agentRouting.agentId);
         logger.info(

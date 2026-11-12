@@ -5,7 +5,8 @@ import type { StreamingState } from '../../stores/chat';
 import type { ProcessVisibility } from '../../types';
 import { useRunElapsed } from '../../hooks/useRunElapsed';
 import { describeRunPhase, formatRunElapsed } from '../../lib/run-phase';
-import { scrubTaskStates } from '../../lib/process-visibility';
+import { isProgressStep, scrubTaskStates } from '../../lib/process-visibility';
+import { MemoryReceipts } from './MemoryReceipts';
 import { ProcessSteps } from './ProcessRows';
 import { TodoProgressPanel } from './TodoProgressPanel';
 import { describeToolCall } from './ToolActivityCard';
@@ -70,12 +71,24 @@ export function summarizeProcess(
   return { headline: parts.join(' · '), recent };
 }
 
+/** The summary line at `hidden`: the turn is at work, for this long. */
+function summarizeProgress(elapsedSeconds: number | null): ProcessSummary {
+  return {
+    headline:
+      elapsedSeconds == null
+        ? '正在处理'
+        : `正在处理 · ${formatRunElapsed(elapsedSeconds)}`,
+  };
+}
+
 /**
  * A proactive workspace's process, read-only: its summary line, then the steps
  * in the order they happened and the plan. Open while the turn runs, because
  * a workspace that shows its process is asked to be watched; the reader can
  * fold it. It never shows the model's reply text, nor a sub-agent's words;
  * reasoning and the narration before a tool call only at the `full` level.
+ * The progress the Agent sent shows at every level; at `hidden` it is all
+ * the panel lists, under a line that says only that the turn is at work.
  */
 /**
  * Whether the panel was last left open. The panel is rebuilt for every turn, so
@@ -92,8 +105,9 @@ export const ProcessPanel = memo(function ProcessPanel({
   streaming: StreamingState;
   groupJid: string;
   runtimeJid: string;
-  visibility: Exclude<ProcessVisibility, 'hidden'>;
+  visibility: ProcessVisibility;
 }) {
+  const progressOnly = visibility === 'hidden';
   const [expanded, setExpanded] = useState(() => panelLeftOpen);
   const toggle = () => {
     panelLeftOpen = !expanded;
@@ -101,7 +115,16 @@ export const ProcessPanel = memo(function ProcessPanel({
   };
   const bodyId = useId();
   const elapsed = useRunElapsed(runtimeJid);
-  const summary = summarizeProcess(streaming, elapsed);
+  const summary = progressOnly
+    ? summarizeProgress(elapsed)
+    : summarizeProcess(streaming, elapsed);
+  const steps = useMemo(
+    () =>
+      progressOnly
+        ? (streaming.steps ?? []).filter(isProgressStep)
+        : streaming.steps,
+    [progressOnly, streaming.steps],
+  );
   const taskStates = useMemo(
     () => scrubTaskStates(streaming.taskStates, visibility),
     [streaming.taskStates, visibility],
@@ -144,21 +167,22 @@ export const ProcessPanel = memo(function ProcessPanel({
       {expanded && (
         <div id={bodyId} className="mt-1 mb-2">
           <ProcessSteps
-            steps={streaming.steps}
-            stepsDropped={streaming.stepsDropped}
+            steps={steps}
+            stepsDropped={progressOnly ? 0 : streaming.stepsDropped}
             taskStates={taskStates}
-            activeTools={streaming.activeTools}
-            waiting={waiting}
+            activeTools={progressOnly ? [] : streaming.activeTools}
+            waiting={waiting && !progressOnly}
             waitingSince={streaming.phaseStartedAt}
-            hasContent={!!streaming.steps?.length}
+            hasContent={!!steps?.length}
             groupJid={groupJid}
             live
             commentary={visibility === 'full'}
             thinkingText={visibility === 'full'}
           />
-          {streaming.todos && streaming.todos.length > 0 && (
+          {!progressOnly && streaming.todos && streaming.todos.length > 0 && (
             <TodoProgressPanel todos={streaming.todos} />
           )}
+          <MemoryReceipts steps={steps ?? []} groupJid={groupJid} />
         </div>
       )}
     </div>

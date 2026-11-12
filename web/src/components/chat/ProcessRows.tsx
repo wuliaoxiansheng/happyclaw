@@ -15,13 +15,11 @@ import {
   FileText,
   FolderSearch,
   Globe,
-  Loader2,
   MessageSquare,
   Search,
   Sparkles,
   Terminal,
   Wrench,
-  X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -50,6 +48,7 @@ import {
 } from '../../lib/process-steps';
 import {
   TIMELINE_ROWS,
+  readStepQuestions,
   summarizeSteps,
   type StreamingStep,
 } from '../../lib/stream-steps';
@@ -64,8 +63,21 @@ import { useTick } from '../../hooks/useTick';
 import { formatElapsedMs } from '../../utils/format-elapsed';
 import { AskUserQuestionCard } from './AskUserQuestionCard';
 import { ModelWaitRow } from './ModelWaitRow';
-import { STATUS_LABELS, SubAgentBody, subAgentHasBody } from './SubAgentCard';
-import { ThinkingBody } from './ThinkingBlock';
+import { SubAgentBody, subAgentHasBody } from './SubAgentCard';
+import {
+  TOOL_STATE,
+  ToolStateIcon,
+  countToolStates,
+  describeProblems,
+  stepToolState,
+  taskToolState,
+  worstProblem,
+  type ToolState,
+} from './tool-status';
+import { NO_SUMMARY_EXPLANATION, ThinkingBody } from './ThinkingBlock';
+import { InfoTip } from '../common/InfoTip';
+import { ClampedDetail } from './ClampedDetail';
+import { useMediaQuery } from '../../hooks/useMediaQuery';
 import { describeToolName } from './ToolActivityCard';
 import { FinalMarkdown } from './StreamingMarkdown';
 import { WorkflowRunCard } from './WorkflowRunCard';
@@ -76,6 +88,9 @@ export const LATER_WAIT_DELAY_MS = 800;
 
 const EMPTY_TASKS: Record<string, StreamingTaskRuntimeState> = {};
 
+/** A finger, not a mouse: no hover, so no tooltip. */
+const COARSE_POINTER = '(pointer: coarse)';
+
 // ── one row ─────────────────────────────────────────────────────────────
 
 const ROW_CLASS =
@@ -84,24 +99,37 @@ const ROW_BUTTON_CLASS =
   'cursor-pointer transition-colors hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none';
 const ICON_CLASS = 'size-3.5 shrink-0';
 
-type Tone = 'quiet' | 'active' | 'error';
+type Tone = 'quiet' | 'active' | 'warning' | 'error';
 
 const ICON_TONE: Record<Tone, string> = {
   quiet: 'text-faint-foreground',
   active: 'text-muted-foreground',
+  warning: 'text-warning',
   error: 'text-error',
 };
 
+/** A row's tone for a call in this state. */
+function stateTone(state: ToolState): Tone {
+  if (state === 'running' || state === 'background') return 'active';
+  if (TOOL_STATE[state].quiet) return 'quiet';
+  return state === 'stopped' ? 'warning' : 'error';
+}
+
+/**
+ * A call's mark: its state's, or, when the state has nothing to say (done,
+ * never closed), the row's own mark for the kind of call it was.
+ */
+function StateIcon({ state, kind }: { state: ToolState; kind: LucideIcon }) {
+  return TOOL_STATE[state].quiet ? (
+    <RowIcon icon={kind} tone="quiet" />
+  ) : (
+    <ToolStateIcon state={state} />
+  );
+}
+
 function RowIcon({ icon: Icon, tone }: { icon: LucideIcon; tone: Tone }) {
   return (
-    <Icon
-      aria-hidden="true"
-      className={cn(
-        ICON_CLASS,
-        ICON_TONE[tone],
-        Icon === Loader2 && 'animate-spin motion-reduce:animate-none',
-      )}
-    />
+    <Icon aria-hidden="true" className={cn(ICON_CLASS, ICON_TONE[tone])} />
   );
 }
 
@@ -125,6 +153,8 @@ interface RowFrameProps {
   status?: string;
   /** The tooltip of the whole row. */
   title?: string;
+  /** What a touch reader opens the row to read when its text is cut short. */
+  more?: string;
   /** Present when the row opens: it is then a button. */
   open?: boolean;
   onToggle?: () => void;
@@ -155,6 +185,7 @@ function RowFrame({
   running = false,
   status,
   title,
+  more,
   open = false,
   onToggle,
   endChevron = true,
@@ -162,7 +193,47 @@ function RowFrame({
   panelId,
   children,
 }: RowFrameProps) {
-  const expandable = onToggle !== undefined;
+  // Touch has no tooltip: a row cut short opens to say all of it.
+  const coarse = useMediaQuery(COARSE_POINTER);
+  const rowRef = useRef<HTMLButtonElement & HTMLDivElement>(null);
+  const [cut, setCut] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const morePanelId = useId();
+  const measureCut = coarse && more != null && !onToggle;
+  useLayoutEffect(() => {
+    const row = rowRef.current;
+    if (!measureCut || !row) return;
+    // The row turns from a div into a button once it is found cut short:
+    // the effect then measures the button, and the div it left is ignored.
+    const measure = () => {
+      if (!row.isConnected) return;
+      setCut(
+        [...row.querySelectorAll<HTMLElement>('.truncate')].some(
+          (span) => span.scrollWidth > span.clientWidth + 1,
+        ),
+      );
+    };
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(row);
+    return () => observer.disconnect();
+  }, [measureCut, cut, more]);
+  const showMore = measureCut && cut;
+  const rowOpen = showMore ? moreOpen : open;
+  const toggle = showMore ? () => setMoreOpen((value) => !value) : onToggle;
+  const rowPanelId = showMore ? morePanelId : panelId;
+  const panel = showMore ? (
+    <p
+      data-hc-row-more=""
+      className="text-caption break-words whitespace-pre-wrap text-muted-foreground"
+    >
+      {more}
+    </p>
+  ) : (
+    children
+  );
+  const expandable = toggle !== undefined;
   const content = (
     <>
       {icon}
@@ -185,8 +256,8 @@ function RowFrame({
             className={cn(
               'min-w-0 flex-1 truncate',
               mono && 'font-mono text-caption',
-              tone === 'error'
-                ? 'text-error'
+              tone === 'error' || tone === 'warning'
+                ? ICON_TONE[tone]
                 : running
                   ? 'text-muted-foreground'
                   : 'text-faint-foreground',
@@ -213,7 +284,7 @@ function RowFrame({
           className={cn(
             ICON_CLASS,
             'text-faint-foreground transition-transform duration-150',
-            open && 'rotate-90',
+            rowOpen && 'rotate-90',
           )}
           aria-hidden="true"
         />
@@ -227,10 +298,11 @@ function RowFrame({
     <>
       {expandable ? (
         <button
+          ref={rowRef}
           type="button"
-          onClick={onToggle}
-          aria-expanded={open}
-          aria-controls={open ? panelId : undefined}
+          onClick={toggle}
+          aria-expanded={rowOpen}
+          aria-controls={rowOpen ? rowPanelId : undefined}
           data-hc-row={rowId}
           title={title}
           className={cn(ROW_CLASS, ROW_BUTTON_CLASS)}
@@ -238,14 +310,14 @@ function RowFrame({
           {content}
         </button>
       ) : (
-        <div title={title} className={ROW_CLASS}>
+        <div ref={rowRef} title={title} className={ROW_CLASS}>
           {content}
         </div>
       )}
-      {open && children && (
+      {rowOpen && panel && (
         // Under the label: the row's padding, the icon and its gap add up to 26px.
-        <div id={panelId} className="mb-1 ml-6.5">
-          {children}
+        <div id={rowPanelId} className="mb-1 ml-6.5">
+          {panel}
         </div>
       )}
     </>
@@ -293,12 +365,12 @@ const ThinkingRow = memo(function ThinkingRow({
   groupJid,
   thinkingText,
   titleInHeader,
-  bodyClassName,
+  thinkingMaxHeight,
 }: RowProps & {
   thinkingText: boolean;
   /** The card's headline says what this row's title would: the row does not. */
   titleInHeader: boolean;
-  bodyClassName?: string;
+  thinkingMaxHeight?: string;
 }) {
   const panelId = useId();
   const running = step.status === 'running' && live;
@@ -324,12 +396,15 @@ const ThinkingRow = memo(function ThinkingRow({
       grow={!!title}
       detail={
         noSummary ? (
-          <span
-            title="这个模型只返回加密的推理，不提供可读的思考摘要（ChatGPT 订阅的 GPT-6 系列多数如此）。"
-            data-hc-no-summary=""
-          >
-            模型未返回思考内容
-          </span>
+          <InfoTip content={NO_SUMMARY_EXPLANATION}>
+            <button
+              type="button"
+              data-hc-no-summary=""
+              className="cursor-help rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+            >
+              模型未返回思考内容
+            </button>
+          </InfoTip>
         ) : undefined
       }
       time={
@@ -353,7 +428,7 @@ const ThinkingRow = memo(function ThinkingRow({
         live={running}
         groupJid={groupJid}
         variant="row"
-        className={bodyClassName}
+        maxHeightClass={thinkingMaxHeight}
       />
     </RowFrame>
   );
@@ -408,8 +483,10 @@ const ToolStepRow = memo(function ToolStepRow({
   const { hint } = describeToolName(name, step.skillName);
   const { verb, param } = describeStepCall(step);
   const summary = cleanToolSummary(step.summary);
-  const running = step.status === 'running' && live;
+  const state = stepToolState(step, live);
+  const running = state === 'running';
   const failed = step.status === 'error';
+  const tone = stateTone(state);
   const output = toolOutput(step);
   const facts =
     step.status === 'running'
@@ -423,19 +500,13 @@ const ToolStepRow = memo(function ToolStepRow({
   const longSummary =
     !!summary &&
     (summary.length > LONG_SUMMARY_CHARS || summary.includes('\n'));
+  // Touch has no tooltip for a command cut short: an open row says it whole.
+  const coarse = useMediaQuery(COARSE_POINTER);
   const expandable = !!output || longSummary;
-  const icon = running
-    ? Loader2
-    : failed
-      ? X
-      : CATEGORY_ICON[toolCategory(name)];
   return (
     <RowFrame
       icon={
-        <RowIcon
-          icon={icon}
-          tone={failed ? 'error' : running ? 'active' : 'quiet'}
-        />
+        <StateIcon state={state} kind={CATEGORY_ICON[toolCategory(name)]} />
       }
       label={verb}
       detail={failure || param}
@@ -448,44 +519,42 @@ const ToolStepRow = memo(function ToolStepRow({
             ? undefined
             : durationLabel(step)
       }
-      tone={failed ? 'error' : running ? 'active' : 'quiet'}
+      tone={tone}
       running={running}
-      status={
-        running
-          ? '，运行中'
-          : unfinished(step, live)
-            ? '，未完成'
-            : failed
-              ? '，失败'
-              : '，已完成'
-      }
+      status={`，${TOOL_STATE[state].label}`}
       title={summary ?? hint}
+      more={summary}
       open={open && expandable}
       onToggle={expandable ? () => onToggle(step.id, !open) : undefined}
       rowId={step.id}
       panelId={panelId}
     >
       <div className="space-y-1 text-caption break-words">
-        {summary && (longSummary || !!failure) && (
-          <p
+        {summary && (longSummary || !!failure || (coarse && !!output)) && (
+          <ClampedDetail
+            title={verb}
+            maxHeightClass="max-h-32"
             className={cn(
-              'max-h-32 overflow-y-auto overscroll-contain whitespace-pre-wrap text-muted-foreground',
+              'whitespace-pre-wrap text-muted-foreground',
               name === 'Bash' && 'font-mono',
             )}
           >
             {summary}
-          </p>
+          </ClampedDetail>
         )}
         {output && (
-          <pre
+          <ClampedDetail
+            pre
+            title={`${verb} · 输出`}
+            maxHeightClass="max-h-40"
             tabIndex={0}
             className={cn(
-              'max-h-40 overflow-y-auto overscroll-contain rounded-sm font-mono text-label break-words whitespace-pre-wrap focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none',
-              failed ? 'text-error' : 'text-muted-foreground',
+              'rounded-sm font-mono text-label break-words whitespace-pre-wrap focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none',
+              failed ? ICON_TONE[tone] : 'text-muted-foreground',
             )}
           >
             {output}
-          </pre>
+          </ClampedDetail>
         )}
       </div>
     </RowFrame>
@@ -508,19 +577,17 @@ const ReadGroupRow = memo(
     const panelId = useId();
     const summary = summarizeGroup(group.steps);
     const running = live && summary.running > 0;
-    const failed = summary.failed > 0;
+    const counts = countToolStates(group.steps, live);
+    const problem = worstProblem(counts);
+    const state: ToolState = problem ?? (running ? 'running' : 'done');
     const span = processSpanMs(group.steps);
-    const label = `${describeGroup({ ...summary, running: running ? summary.running : 0 })}${
-      failed ? ` · ${summary.failed} 个失败` : ''
-    }`;
+    const label = [
+      describeGroup({ ...summary, running: running ? summary.running : 0 }),
+      ...describeProblems(counts),
+    ].join(' · ');
     return (
       <RowFrame
-        icon={
-          <RowIcon
-            icon={running ? Loader2 : failed ? X : FolderSearch}
-            tone={failed ? 'error' : running ? 'active' : 'quiet'}
-          />
-        }
+        icon={<StateIcon state={state} kind={FolderSearch} />}
         label={label}
         grow
         time={
@@ -530,15 +597,15 @@ const ReadGroupRow = memo(
               ? formatElapsedMs(span) || undefined
               : undefined
         }
-        tone={failed ? 'error' : running ? 'active' : 'quiet'}
+        tone={stateTone(state)}
         running={running}
         status={
           running
             ? '，运行中'
             : !live && summary.running > 0
               ? '，未完成'
-              : failed
-                ? '，有失败'
+              : problem
+                ? `，${TOOL_STATE[problem].label}`
                 : '，已完成'
         }
         open={open}
@@ -587,16 +654,22 @@ const TextRow = memo(function TextRow({
   return (
     <RowFrame
       icon={<RowIcon icon={MessageSquare} tone="quiet" />}
-      label={open ? '过程说明' : stripInlineMarkdown(text)}
+      label={
+        open ? (step.progress ? '进展' : '过程说明') : stripInlineMarkdown(text)
+      }
       grow
       open={open}
       onToggle={() => onToggle(step.id, !open)}
       rowId={step.id}
       panelId={panelId}
     >
-      <div className="max-h-48 overflow-y-auto overscroll-contain text-muted-foreground [&_[data-markdown-root]]:text-label [&_[data-markdown-root]]:text-muted-foreground">
+      <ClampedDetail
+        title={step.progress ? '进展' : '过程说明'}
+        maxHeightClass="max-h-48"
+        className="text-muted-foreground [&_[data-markdown-root]]:text-label [&_[data-markdown-root]]:text-muted-foreground"
+      >
         <FinalMarkdown content={text} variant="docs" groupJid={groupJid} />
-      </div>
+      </ClampedDetail>
     </RowFrame>
   );
 });
@@ -616,14 +689,11 @@ const TaskRow = memo(function TaskRow({
   }
   // Without the sub-agent's details (a reconnect rebuilt the step but not the
   // card) it is a row of its own, with nothing to open.
-  const status = task?.status ?? step.status;
-  const running = live && (status === 'running' || status === 'backgrounded');
-  const failed = status === 'error';
+  const state = taskToolState(step, task, live);
+  const running = state === 'running' || state === 'background';
+  const failed = !running && !TOOL_STATE[state].quiet;
   const canOpen = !!task && subAgentHasBody(task);
-  // Not over, yet its card is no longer the live one.
-  const notDone =
-    !live && (task ? task.status === 'running' : step.status === 'running');
-  const tone: Tone = failed ? 'error' : running ? 'active' : 'quiet';
+  const tone = stateTone(state);
   const detail = task
     ? [task.subagentType, task.lastToolName, task.latestSummary]
         .filter(Boolean)
@@ -635,12 +705,13 @@ const TaskRow = memo(function TaskRow({
     formatTaskUsage(task?.usage);
   return (
     <RowFrame
-      icon={<RowIcon icon={running ? Loader2 : failed ? X : Bot} tone={tone} />}
+      icon={<StateIcon state={state} kind={Bot} />}
       label={task?.title ?? step.title ?? '子 Agent'}
       detail={detail}
       facts={facts ? <FactsText text={facts} plain={failed} /> : undefined}
       // The facts are cut short in a narrow row: the whole of them is here.
       title={facts ?? undefined}
+      more={facts ?? undefined}
       time={
         running
           ? elapsedLabel(now, step.at)
@@ -650,15 +721,7 @@ const TaskRow = memo(function TaskRow({
       }
       tone={tone}
       running={running}
-      status={`，子 Agent，${
-        notDone
-          ? '未完成'
-          : task
-            ? STATUS_LABELS[task.status]
-            : failed
-              ? '失败'
-              : '已完成'
-      }`}
+      status={`，子 Agent，${TOOL_STATE[state].label}`}
       open={open && canOpen}
       onToggle={canOpen ? () => onToggle(step.id, !open) : undefined}
       rowId={step.id}
@@ -691,7 +754,7 @@ function FoldedRow({
   const parts = [`较早 ${folded.length + dropped} 步`];
   if (sum.tools + sum.tasks > 0) parts.push(`${sum.tools + sum.tasks} 个工具`);
   if (sum.thinking > 0) parts.push(`${sum.thinking} 段思考`);
-  if (sum.failed > 0) parts.push(`${sum.failed} 个失败`);
+  parts.push(...describeProblems(countToolStates(folded)));
   return (
     <RowFrame
       icon={
@@ -734,8 +797,8 @@ export interface ProcessTimelineProps {
    * does not say it again.
    */
   titleInHeader?: boolean;
-  /** Extra classes for the open reasoning text of a row. */
-  bodyClassName?: string;
+  /** The height (`max-h-*`) of a row's open reasoning text. */
+  thinkingMaxHeight?: string;
   /** The reader opened or closed a row. */
   onInteract?: () => void;
   /** Under the list, on the same line down the left. */
@@ -758,7 +821,7 @@ export const ProcessTimeline = memo(function ProcessTimeline({
   live,
   maxRows = TIMELINE_ROWS,
   titleInHeader = false,
-  bodyClassName,
+  thinkingMaxHeight,
   onInteract,
   after,
 }: ProcessTimelineProps) {
@@ -800,9 +863,27 @@ export const ProcessTimeline = memo(function ProcessTimeline({
       ?.focus({ preventScroll: true });
   });
 
+  const latestCommentaryId = useMemo(
+    () =>
+      [...steps]
+        .reverse()
+        .find((s) => s.kind === 'text' && s.commentary && !!s.text?.trim())?.id,
+    [steps],
+  );
+
   const defaultOpen = (step: StreamingStep): boolean => {
     if (step.kind === 'tool') return toolOpensByDefault(step);
-    if (!live || step.status !== 'running') return false;
+    if (!live) return false;
+    if (
+      step.kind === 'text' &&
+      step.commentary &&
+      step.id === latestCommentaryId &&
+      !!step.text &&
+      (step.text.includes('\n') || step.text.length > 60)
+    ) {
+      return true;
+    }
+    if (step.status !== 'running') return false;
     return step.kind === 'thinking' && thinkingText && !!step.text?.trim();
   };
 
@@ -845,7 +926,7 @@ export const ProcessTimeline = memo(function ProcessTimeline({
             {...common}
             thinkingText={thinkingText}
             titleInHeader={titleInHeader}
-            bodyClassName={bodyClassName}
+            thinkingMaxHeight={thinkingMaxHeight}
           />
         );
         break;
@@ -915,8 +996,9 @@ export const ProcessTimeline = memo(function ProcessTimeline({
 // ── a question for the reader ───────────────────────────────────────────
 
 /**
- * The questions the model has put to the reader and waits on. They are not
- * rows: a card the reader has to answer must not scroll away or fold shut.
+ * The questions the model has put to the reader. They are not rows: a card
+ * the reader has to answer must not scroll away or fold shut. The step keeps
+ * them once the call returns, so they stay with the settled reply.
  */
 export function QuestionCards({
   steps,
@@ -929,15 +1011,24 @@ export function QuestionCards({
     .filter(isQuestionStep)
     .map((step) => ({
       id: step.id,
-      input: activeTools.find((tool) => tool.toolUseId === step.toolUseId)
-        ?.toolInput,
+      toolUseId: step.toolUseId ?? step.id,
+      questions:
+        step.questions ??
+        readStepQuestions(
+          activeTools.find((tool) => tool.toolUseId === step.toolUseId)
+            ?.toolInput,
+        ),
     }))
-    .filter((card) => card.input);
+    .filter((card) => card.questions);
   if (cards.length === 0) return null;
   return (
     <div className="mt-1 space-y-1.5">
       {cards.map((card) => (
-        <AskUserQuestionCard key={card.id} toolInput={card.input ?? {}} />
+        <AskUserQuestionCard
+          key={card.id}
+          toolUseId={card.toolUseId}
+          questions={card.questions ?? []}
+        />
       ))}
     </div>
   );

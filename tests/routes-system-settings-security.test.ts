@@ -175,6 +175,37 @@ describe('system settings capability boundaries', () => {
     ).toBe(403);
   });
 
+  test('storage sources are admin only', async () => {
+    asUser('member', ['manage_system_config']);
+    expect((await app.request('/api/config/storage-sources')).status).toBe(403);
+    for (const method of ['POST', 'PUT', 'DELETE']) {
+      expect(
+        (
+          await app.request('/api/config/storage-sources/nas', {
+            method,
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              type: 'nfs',
+              server: 'nas.lan',
+              exportPath: '/export',
+              allowReadWrite: true,
+            }),
+          })
+        ).status,
+      ).toBe(403);
+    }
+    asUser('admin');
+    expect(
+      (
+        await app.request('/api/config/storage-sources/Bad%20Id', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '{}',
+        })
+      ).status,
+    ).toBe(400);
+  });
+
   test('admin host update logs names but never the sensitive path', async () => {
     asUser('admin');
     const response = await app.request('/api/config/host-integration', {
@@ -310,38 +341,6 @@ describe('system settings capability boundaries', () => {
       executionMode: 'container',
       created_by: 'settings-member-owner',
     });
-    db.createTask({
-      id: 'settings-admin-container-task',
-      group_folder: 'settings-admin-container',
-      chat_jid: 'web:settings-admin-container',
-      prompt: 'admin policy migration',
-      schedule_type: 'cron',
-      schedule_value: '0 9 * * *',
-      context_mode: 'isolated',
-      execution_type: 'agent',
-      execution_mode: 'container',
-      next_run: new Date(Date.now() + 60_000).toISOString(),
-      status: 'active',
-      created_at: now,
-      created_by: 'settings-admin-owner',
-      notify_channels: null,
-    });
-    db.createTask({
-      id: 'settings-member-container-task',
-      group_folder: 'settings-member-container',
-      chat_jid: 'web:settings-member-container',
-      prompt: 'member remains isolated',
-      schedule_type: 'cron',
-      schedule_value: '0 9 * * *',
-      context_mode: 'isolated',
-      execution_type: 'agent',
-      execution_mode: 'container',
-      next_run: new Date(Date.now() + 60_000).toISOString(),
-      status: 'active',
-      created_at: now,
-      created_by: 'settings-member-owner',
-      notify_channels: null,
-    });
 
     stopGroup.mockClear();
     asUser('admin');
@@ -356,13 +355,7 @@ describe('system settings capability boundaries', () => {
       db.getRegisteredGroup('web:settings-admin-container')?.executionMode,
     ).toBe('host');
     expect(
-      db.getTaskById('settings-admin-container-task')?.execution_mode,
-    ).toBe('host');
-    expect(
       db.getRegisteredGroup('web:settings-member-container')?.executionMode,
-    ).toBe('container');
-    expect(
-      db.getTaskById('settings-member-container-task')?.execution_mode,
     ).toBe('container');
     expect(stopGroup).toHaveBeenCalledWith(
       'web:settings-admin-container',
@@ -525,22 +518,6 @@ describe('system settings capability boundaries', () => {
       executionMode: 'container',
       created_by: 'settings-promoted-admin',
     });
-    db.createTask({
-      id: 'settings-promoted-admin-task',
-      group_folder: 'settings-promoted-admin',
-      chat_jid: 'web:settings-promoted-admin',
-      prompt: 'promotion migration',
-      schedule_type: 'cron',
-      schedule_value: '0 10 * * *',
-      context_mode: 'isolated',
-      execution_type: 'agent',
-      execution_mode: 'container',
-      next_run: new Date(Date.now() + 60_000).toISOString(),
-      status: 'active',
-      created_at: now,
-      created_by: 'settings-promoted-admin',
-      notify_channels: null,
-    });
     db.setSession('settings-promoted-admin', 'promotion-initial-session');
 
     let targetStops = 0;
@@ -571,9 +548,6 @@ describe('system settings capability boundaries', () => {
     expect(
       db.getRegisteredGroup('web:settings-promoted-admin')?.executionMode,
     ).toBe('host');
-    expect(db.getTaskById('settings-promoted-admin-task')?.execution_mode).toBe(
-      'host',
-    );
     expect(db.getSession('settings-promoted-admin')).toBe(
       'promotion-late-session',
     );

@@ -28,8 +28,6 @@ const mocks = vi.hoisted(() => ({
   refresh: vi.fn(),
   chatgptPlan: null as string | null,
   chatgptRefreshError: null as { kind: string } | null,
-  /** The global default; null leaves the automatic pool in charge. */
-  defaultConfigId: null as string | null,
   workspaceEnv: {} as Record<string, string>,
 }));
 
@@ -81,10 +79,6 @@ vi.mock('../src/runtime-config.js', async (importOriginal) => {
   return {
     ...real,
     getContainerEnvConfig: () => mocks.workspaceEnv,
-    getUsableDefaultProvider: () =>
-      savedProviders().find(
-        (provider) => provider.id === mocks.defaultConfigId,
-      ) ?? null,
     getProviders: () => savedProviders(),
   };
 });
@@ -120,8 +114,14 @@ function savedProviders() {
       name: 'GLM',
       type: 'third_party',
       enabled: false,
-      anthropicModel: 'glm-5.3[1m]',
+      anthropicBaseUrl: 'https://glm.example.test',
+      anthropicModel: 'glm-5.3',
       anthropicAuthToken: 'glm-token',
+      models: [
+        { id: 'glm-5.3', contextWindow: 1_000_000 },
+        { id: 'glm-5.3-air', effort: 'low' },
+        { id: 'glm-5.3-legacy', hidden: true },
+      ],
       codexOAuthCredentials: null,
     },
     {
@@ -143,24 +143,52 @@ const { issueCodexGatewayToken, revokeCodexGatewayToken } =
   await import('../src/codex-gateway/runner-tokens.js');
 
 const OWNER_ID = 'alice';
+const ADMIN_ID = 'model-selection-admin';
+
+/** Bind a user's main Agent (its default profile) to a connection. */
+function bindMain(userId: string, modelConfigId: string | null): void {
+  const main = db.getOrCreateDefaultAgentProfile(userId);
+  db.updateAgentProfile(main.id, userId, { modelConfigId, model: null });
+}
+
+function bindOwnerMain(modelConfigId: string | null): void {
+  bindMain(OWNER_ID, modelConfigId);
+}
 const GROUP_JID = 'web:model-selection-group';
 const GROUP_FOLDER = 'model-selection-group';
 const AGENT_ID = 'agent-model-1';
+/** The session a request addresses unless it names another. */
+const SESSION_ID = 'agent-model-0';
+const SESSION_JID = `${GROUP_JID}#agent:${SESSION_ID}`;
 
 async function call(
   method: 'GET' | 'PUT',
   query = '',
   body?: unknown,
+  options: { session?: string | null } = {},
 ): Promise<{ status: number; body: any }> {
+  const session = options.session === undefined ? SESSION_ID : options.session;
+  const scopedQuery =
+    method === 'GET' && session && !query.includes('agentId=')
+      ? `${query ? `${query}&` : '?'}agentId=${session}`
+      : query;
+  const scopedBody =
+    method === 'PUT' &&
+    session &&
+    body &&
+    typeof body === 'object' &&
+    !('agentId' in body)
+      ? { ...body, agentId: session }
+      : body;
   const res = await groupRoutes.request(
-    `/${encodeURIComponent(GROUP_JID)}/model-selection${query}`,
+    `/${encodeURIComponent(GROUP_JID)}/model-selection${scopedQuery}`,
     {
       method,
-      ...(body === undefined
+      ...(scopedBody === undefined
         ? {}
         : {
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body),
+            body: JSON.stringify(scopedBody),
           }),
     },
   );
@@ -171,6 +199,18 @@ beforeAll(() => {
   fs.mkdirSync(path.join(tmpDataDir, 'db'), { recursive: true });
   fs.mkdirSync(path.join(tmpDataDir, 'groups'), { recursive: true });
   db.initDatabase();
+  const at = new Date().toISOString();
+  db.createUser({
+    id: ADMIN_ID,
+    username: ADMIN_ID,
+    password_hash: 'test-only',
+    display_name: ADMIN_ID,
+    role: 'admin',
+    status: 'active',
+    created_at: at,
+    updated_at: at,
+    must_change_password: false,
+  });
   db.setRegisteredGroup(GROUP_JID, {
     name: 'Model Selection Group',
     folder: GROUP_FOLDER,
@@ -179,21 +219,26 @@ beforeAll(() => {
     created_by: OWNER_ID,
     is_home: false,
   } as any);
-  db.createAgent({
-    id: AGENT_ID,
-    group_folder: GROUP_FOLDER,
-    chat_jid: GROUP_JID,
-    name: 'Side conversation',
-    prompt: '',
-    status: 'idle',
-    kind: 'conversation',
-    created_by: OWNER_ID,
-    created_at: new Date().toISOString(),
-    completed_at: null,
-    result_summary: null,
-    last_im_jid: null,
-    spawned_from_jid: null,
-  } as any);
+  for (const [id, name] of [
+    [SESSION_ID, 'Conversation'],
+    [AGENT_ID, 'Side conversation'],
+  ]) {
+    db.createAgent({
+      id,
+      group_folder: GROUP_FOLDER,
+      chat_jid: GROUP_JID,
+      name,
+      prompt: '',
+      status: 'idle',
+      kind: 'conversation',
+      created_by: OWNER_ID,
+      created_at: new Date().toISOString(),
+      completed_at: null,
+      result_summary: null,
+      last_im_jid: null,
+      spawned_from_jid: null,
+    } as any);
+  }
   webContext.setWebDeps({
     queue: {
       drainRunnersForModelSelection: (
@@ -212,11 +257,11 @@ beforeEach(() => {
   mocks.permissions = [];
   mocks.chatgptPlan = null;
   mocks.chatgptRefreshError = null;
-  mocks.defaultConfigId = null;
+  bindOwnerMain(null);
   mocks.workspaceEnv = {};
   mocks.drainCalls = [];
   mocks.refresh.mockClear();
-  db.setSessionModelSelection(GROUP_FOLDER, null, null);
+  db.setSessionModelSelection(GROUP_FOLDER, SESSION_ID, null);
   db.setSessionModelSelection(GROUP_FOLDER, AGENT_ID, null);
 });
 
@@ -233,23 +278,38 @@ describe('GET /:jid/model-selection', () => {
     expect(body.selectedModelConfigId).toBeNull();
     expect(body.selectedModel).toBeNull();
     expect(body.selectedEffort).toBeNull();
-    expect(body.default).toMatchObject({ source: 'pool', enabledCount: 2 });
-    // Only ChatGPT configurations carry a model list; the others keep the
-    // shape older clients know.
+    // Nothing is bound: no pool, no single-enabled fallback.
+    expect(body.default).toEqual({
+      source: 'none',
+      modelConfigId: null,
+      connectionMissing: false,
+      model: null,
+      effort: null,
+    });
+    // A ChatGPT configuration offers its account catalog (`codex`); every
+    // other one offers its own model list with what each model takes.
     expect(body.options.map(({ codex, ...option }: any) => option)).toEqual([
       {
         id: 'official',
         name: 'Claude 官方',
         kind: 'official',
-        enabled: true,
         model: 'opus',
         usable: true,
+        models: [
+          {
+            id: 'opus',
+            efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+            defaultEffort: 'medium',
+            // Only a declared window counts; the registry's is a suggestion.
+            contextWindow: null,
+            effortsSource: 'registry',
+          },
+        ],
       },
       {
         id: 'chatgpt',
         name: 'ChatGPT 订阅',
         kind: 'codex',
-        enabled: true,
         model: 'gpt-6-sol',
         usable: true,
       },
@@ -257,17 +317,48 @@ describe('GET /:jid/model-selection', () => {
         id: 'glm',
         name: 'GLM',
         kind: 'third_party',
-        enabled: false,
-        model: 'glm-5.3[1m]',
+        model: 'glm-5.3',
         usable: true,
+        models: [
+          {
+            id: 'glm-5.3',
+            efforts: ['low', 'high', 'max'],
+            defaultEffort: 'high',
+            contextWindow: 1_000_000,
+            effortsSource: 'registry',
+          },
+          // Nothing is known about it: no effort is offered, claimed or sent.
+          {
+            id: 'glm-5.3-air',
+            efforts: [],
+            defaultEffort: null,
+            contextWindow: null,
+            effortsSource: 'none',
+          },
+          {
+            id: 'glm-5.3-legacy',
+            efforts: [],
+            defaultEffort: null,
+            contextWindow: null,
+            effortsSource: 'none',
+          },
+        ],
       },
       {
         id: 'copy',
         name: 'GLM (副本)',
         kind: 'third_party',
-        enabled: false,
         model: 'glm-5.3',
         usable: false,
+        models: [
+          {
+            id: 'glm-5.3',
+            efforts: ['low', 'high', 'max'],
+            defaultEffort: 'high',
+            contextWindow: null,
+            effortsSource: 'registry',
+          },
+        ],
       },
     ]);
     expect(
@@ -278,34 +369,81 @@ describe('GET /:jid/model-selection', () => {
     expect(JSON.stringify(body)).not.toContain('secret');
   });
 
-  test('reports the global default as what an unselected conversation runs on', async () => {
-    mocks.defaultConfigId = 'glm';
+  test("the workspace's Agent binding is what an unselected conversation runs on", async () => {
+    bindOwnerMain('glm');
     const { body } = await call('GET');
+    // The model's own default effort, never a blanket max.
     expect(body.default).toEqual({
-      source: 'default',
+      source: 'agent',
       modelConfigId: 'glm',
-      enabledCount: 2,
+      connectionMissing: false,
+      model: 'glm-5.3',
+      effort: 'high',
+    });
+    // The bound connection lost its key: the row says so, nothing else runs.
+    bindOwnerMain('copy');
+    expect((await call('GET')).body.default).toEqual({
+      source: 'agent',
+      modelConfigId: 'copy',
+      connectionMissing: true,
+      model: null,
+      effort: null,
     });
     expect(body.selectedModelConfigId).toBeNull();
   });
 
-  test('a Workspace that brings its own provider environment keeps it over the global default', async () => {
-    mocks.defaultConfigId = 'glm';
-    mocks.workspaceEnv = { anthropicBaseUrl: 'https://own.example.test' };
-    const { body } = await call('GET');
-    expect(body.default).toMatchObject({
-      source: 'workspace_env',
-      modelConfigId: null,
+  test('an unbound Agent follows the owner main, then the system main', async () => {
+    const custom = db.createAgentProfile({
+      ownerUserId: OWNER_ID,
+      name: `Unbound ${Math.random()}`,
     });
+    db.assignWorkspaceAgentProfile(GROUP_FOLDER, custom.id);
+    try {
+      bindOwnerMain('official');
+      expect((await call('GET')).body.default).toMatchObject({
+        source: 'owner_main',
+        modelConfigId: 'official',
+        model: 'opus',
+        effort: 'medium',
+      });
+      bindOwnerMain(null);
+      bindMain(ADMIN_ID, 'glm');
+      expect((await call('GET')).body.default).toMatchObject({
+        source: 'system_main',
+        modelConfigId: 'glm',
+      });
+    } finally {
+      bindMain(ADMIN_ID, null);
+      db.deleteWorkspaceAgentProfile(GROUP_FOLDER);
+    }
+  });
+
+  test('a Workspace that brings its own provider environment outranks inherited bindings', async () => {
+    const custom = db.createAgentProfile({
+      ownerUserId: OWNER_ID,
+      name: `Unbound ${Math.random()}`,
+    });
+    db.assignWorkspaceAgentProfile(GROUP_FOLDER, custom.id);
+    try {
+      bindOwnerMain('glm');
+      mocks.workspaceEnv = { anthropicBaseUrl: 'https://own.example.test' };
+      const { body } = await call('GET');
+      expect(body.default).toMatchObject({
+        source: 'workspace_env',
+        modelConfigId: null,
+      });
+    } finally {
+      db.deleteWorkspaceAgentProfile(GROUP_FOLDER);
+    }
   });
 
   test('a conversation pick is reported next to, not instead of, the default', async () => {
-    mocks.defaultConfigId = 'glm';
+    bindOwnerMain('glm');
     await call('PUT', '', { modelConfigId: 'official' });
     const { body } = await call('GET');
     expect(body.selectedModelConfigId).toBe('official');
     expect(body.default).toMatchObject({
-      source: 'default',
+      source: 'agent',
       modelConfigId: 'glm',
     });
   });
@@ -372,7 +510,7 @@ describe('GET /:jid/model-selection', () => {
   });
 
   test('reports the stored model and effort, reading what the user may not use as unset', async () => {
-    db.setSessionModelSelection(GROUP_FOLDER, null, 'chatgpt', OWNER_ID, {
+    db.setSessionModelSelection(GROUP_FOLDER, SESSION_ID, 'chatgpt', OWNER_ID, {
       model: 'gpt-6-astra',
       effort: 'xhigh',
     });
@@ -384,7 +522,7 @@ describe('GET /:jid/model-selection', () => {
     });
 
     // An effort chosen when the user could pick it, and no longer backed.
-    db.setSessionModelSelection(GROUP_FOLDER, null, 'chatgpt', OWNER_ID, {
+    db.setSessionModelSelection(GROUP_FOLDER, SESSION_ID, 'chatgpt', OWNER_ID, {
       model: 'gpt-6-astra',
       effort: 'ultra',
     });
@@ -396,15 +534,23 @@ describe('GET /:jid/model-selection', () => {
     expect(body.selectedEffort).toBe('ultra');
   });
 
-  test('a configuration that is not ChatGPT never reports a model or effort', async () => {
-    db.setSessionModelSelection(GROUP_FOLDER, null, 'glm', OWNER_ID, {
+  test('a model the list no longer offers, or an effort the model does not take, reads as unset', async () => {
+    // The stale model runs the default, which takes `high`.
+    db.setSessionModelSelection(GROUP_FOLDER, SESSION_ID, 'glm', OWNER_ID, {
       model: 'gpt-6-astra',
       effort: 'high',
     });
-    const { body } = await call('GET');
-    expect(body).toMatchObject({
+    expect((await call('GET')).body).toMatchObject({
       selectedModelConfigId: 'glm',
       selectedModel: null,
+      selectedEffort: 'high',
+    });
+    db.setSessionModelSelection(GROUP_FOLDER, SESSION_ID, 'glm', OWNER_ID, {
+      model: 'glm-5.3-air',
+      effort: 'high',
+    });
+    expect((await call('GET')).body).toMatchObject({
+      selectedModel: 'glm-5.3-air',
       selectedEffort: null,
     });
   });
@@ -417,15 +563,28 @@ describe('GET /:jid/model-selection', () => {
   test('rejects a session from another workspace', async () => {
     expect((await call('GET', '?agentId=missing')).status).toBe(404);
   });
+
+  test('a workspace has no pick of its own: no session is 400 session_required', async () => {
+    for (const result of [
+      await call('GET', '', undefined, { session: null }),
+      await call('PUT', '', { modelConfigId: 'glm' }, { session: null }),
+    ]) {
+      expect(result).toEqual({
+        status: 400,
+        body: { error: 'Session required', code: 'session_required' },
+      });
+    }
+    expect(mocks.drainCalls).toEqual([]);
+  });
 });
 
 describe('PUT /:jid/model-selection', () => {
-  test('pins the main conversation and drains its runners', async () => {
+  test('pins the addressed session and drains its runners', async () => {
     const { status, body } = await call('PUT', '', { modelConfigId: 'glm' });
     expect(status).toBe(200);
     expect(body.selectedModelConfigId).toBe('glm');
-    expect(db.getSessionModelSelection(GROUP_FOLDER, null)).toBe('glm');
-    expect(mocks.drainCalls).toEqual([{ jids: [GROUP_JID], target: 'glm' }]);
+    expect(db.getSessionModelSelection(GROUP_FOLDER, SESSION_ID)).toBe('glm');
+    expect(mocks.drainCalls).toEqual([{ jids: [SESSION_JID], target: 'glm' }]);
   });
 
   test('pins only the addressed Runtime Session', async () => {
@@ -435,7 +594,7 @@ describe('PUT /:jid/model-selection', () => {
     });
     expect(status).toBe(200);
     expect(db.getSessionModelSelection(GROUP_FOLDER, AGENT_ID)).toBe('chatgpt');
-    expect(db.getSessionModelSelection(GROUP_FOLDER, null)).toBeNull();
+    expect(db.getSessionModelSelection(GROUP_FOLDER, SESSION_ID)).toBeNull();
     expect(mocks.drainCalls).toEqual([
       { jids: [`${GROUP_JID}#agent:${AGENT_ID}`], target: 'chatgpt' },
     ]);
@@ -450,7 +609,7 @@ describe('PUT /:jid/model-selection', () => {
     const { body } = await call('PUT', '', { modelConfigId: null });
     expect(body.selectedModelConfigId).toBeNull();
     expect(mocks.drainCalls.at(-1)).toEqual({
-      jids: [GROUP_JID],
+      jids: [SESSION_JID],
       target: null,
     });
   });
@@ -459,24 +618,25 @@ describe('PUT /:jid/model-selection', () => {
     const { status, body } = await call('PUT', '', { modelConfigId: 'copy' });
     expect(status).toBe(400);
     expect(body.error).toContain('缺少凭据');
-    expect(db.getSessionModelSelection(GROUP_FOLDER, null)).toBeNull();
+    expect(db.getSessionModelSelection(GROUP_FOLDER, SESSION_ID)).toBeNull();
   });
 
   test('rejects an unknown configuration and non-owners', async () => {
     expect((await call('PUT', '', { modelConfigId: 'nope' })).status).toBe(404);
     mocks.userId = 'mallory';
     expect((await call('PUT', '', { modelConfigId: 'glm' })).status).toBe(404);
-    expect(db.getSessionModelSelection(GROUP_FOLDER, null)).toBeNull();
+    expect(db.getSessionModelSelection(GROUP_FOLDER, SESSION_ID)).toBeNull();
   });
 });
 
 describe('PUT /:jid/model-selection inside a ChatGPT configuration', () => {
-  const detail = () => db.getSessionModelSelectionDetail(GROUP_FOLDER, null);
+  const detail = () =>
+    db.getSessionModelSelectionDetail(GROUP_FOLDER, SESSION_ID);
   const live = (owner: Record<string, unknown> = {}) =>
     issueCodexGatewayToken('chatgpt', {
       kind: 'container',
       groupFolder: GROUP_FOLDER,
-      sessionAgentId: null,
+      agentId: SESSION_ID,
       ...owner,
     });
 
@@ -502,7 +662,7 @@ describe('PUT /:jid/model-selection inside a ChatGPT configuration', () => {
     });
     // A model is involved, so a runner already on this configuration is not
     // spared: it would keep running the old model.
-    expect(mocks.drainCalls).toEqual([{ jids: [GROUP_JID], target: null }]);
+    expect(mocks.drainCalls).toEqual([{ jids: [SESSION_JID], target: null }]);
   });
 
   test('a different model on the same configuration retires the runner; the same one does not', async () => {
@@ -511,7 +671,7 @@ describe('PUT /:jid/model-selection inside a ChatGPT configuration', () => {
     await call('PUT', '', { modelConfigId: 'chatgpt', model: 'gpt-6-astra' });
     expect(mocks.drainCalls).toEqual([]);
     await call('PUT', '', { modelConfigId: 'chatgpt', model: 'gpt-6-luna' });
-    expect(mocks.drainCalls).toEqual([{ jids: [GROUP_JID], target: null }]);
+    expect(mocks.drainCalls).toEqual([{ jids: [SESSION_JID], target: null }]);
     // Back to the configuration's own model.
     await call('PUT', '', { modelConfigId: 'chatgpt' });
     expect(mocks.drainCalls).toHaveLength(2);
@@ -566,7 +726,7 @@ describe('PUT /:jid/model-selection inside a ChatGPT configuration', () => {
         effort: 'high',
       });
       expect(mocks.drainCalls).toEqual([
-        { jids: [GROUP_JID], target: 'chatgpt' },
+        { jids: [SESSION_JID], target: 'chatgpt' },
       ]);
       expect(body.liveUpdated).toBe(1);
       expect(warm.grant.sessionEffort).toBe('high');
@@ -579,7 +739,7 @@ describe('PUT /:jid/model-selection inside a ChatGPT configuration', () => {
     const leaving = issueCodexGatewayToken('glm', {
       kind: 'container',
       groupFolder: GROUP_FOLDER,
-      sessionAgentId: null,
+      agentId: SESSION_ID,
       sessionEffort: 'low',
     });
     try {
@@ -592,7 +752,7 @@ describe('PUT /:jid/model-selection inside a ChatGPT configuration', () => {
 
   test('a Runtime Session is changed on its own', async () => {
     const main = live({ sessionEffort: 'low' });
-    const session = live({ sessionAgentId: AGENT_ID, sessionEffort: 'low' });
+    const session = live({ agentId: AGENT_ID, sessionEffort: 'low' });
     try {
       await call('PUT', '', {
         agentId: AGENT_ID,
@@ -700,20 +860,18 @@ describe('PUT /:jid/model-selection inside a ChatGPT configuration', () => {
     expect(mocks.drainCalls).toEqual([]);
   });
 
-  test('only a ChatGPT configuration has models and efforts to pick', async () => {
+  test('a model outside the list, an effort the model does not take, a model without a configuration are refused', async () => {
     const other = await call('PUT', '', {
       modelConfigId: 'glm',
       model: 'gpt-6-astra',
     });
     expect(other.status).toBe(400);
-    expect(other.body).toMatchObject({ code: 'MODEL_SELECTION_UNSUPPORTED' });
+    expect(other.body).toMatchObject({ code: 'MODEL_NOT_IN_CONNECTION' });
     const effortOnly = await call('PUT', '', {
-      modelConfigId: 'official',
-      effort: 'high',
+      modelConfigId: 'glm',
+      effort: 'medium',
     });
-    expect(effortOnly.body).toMatchObject({
-      code: 'MODEL_SELECTION_UNSUPPORTED',
-    });
+    expect(effortOnly.body).toMatchObject({ code: 'EFFORT_NOT_SUPPORTED' });
     const orphan = await call('PUT', '', {
       modelConfigId: null,
       model: 'gpt-6-astra',
@@ -738,5 +896,183 @@ describe('PUT /:jid/model-selection inside a ChatGPT configuration', () => {
     expect(refused.status).toBe(400);
     expect(detail()).toMatchObject({ model: 'gpt-6-astra', effort: 'high' });
     expect(mocks.drainCalls).toEqual([]);
+  });
+});
+
+describe('model-selection inside a configuration that is not ChatGPT', () => {
+  const detail = () =>
+    db.getSessionModelSelectionDetail(GROUP_FOLDER, SESSION_ID);
+
+  test('pins a model of its list, hidden ones included, and reports it', async () => {
+    const { status, body } = await call('PUT', '', {
+      modelConfigId: 'glm',
+      model: 'glm-5.3-air',
+    });
+    expect(status).toBe(200);
+    expect(body).toMatchObject({
+      selectedModelConfigId: 'glm',
+      selectedModel: 'glm-5.3-air',
+      selectedEffort: null,
+    });
+    expect(detail()).toEqual({
+      modelConfigId: 'glm',
+      model: 'glm-5.3-air',
+      effort: null,
+      updatedBy: OWNER_ID,
+    });
+    // A model is involved: a runner already on this configuration would keep
+    // running the old one.
+    expect(mocks.drainCalls).toEqual([{ jids: [SESSION_JID], target: null }]);
+
+    const hidden = await call('PUT', '', {
+      modelConfigId: 'glm',
+      model: 'glm-5.3-legacy',
+    });
+    expect(hidden.status).toBe(200);
+    expect(hidden.body.selectedModel).toBe('glm-5.3-legacy');
+  });
+
+  test('refuses a model the configuration does not offer and changes nothing', async () => {
+    const refused = await call('PUT', '', {
+      modelConfigId: 'glm',
+      model: 'glm-9',
+    });
+    expect(refused.status).toBe(400);
+    expect(refused.body).toMatchObject({ code: 'MODEL_NOT_IN_CONNECTION' });
+    expect(refused.body.error).toContain('glm-9');
+    expect(detail()).toBeNull();
+    expect(mocks.drainCalls).toEqual([]);
+  });
+
+  test('an effort goes with a model that takes it', async () => {
+    // glm-5.3-air has no known efforts, though it is configured to run low.
+    const refused = await call('PUT', '', {
+      modelConfigId: 'glm',
+      model: 'glm-5.3-air',
+      effort: 'low',
+    });
+    expect(refused.status).toBe(400);
+    expect(refused.body).toMatchObject({ code: 'EFFORT_NOT_SUPPORTED' });
+    expect(detail()).toBeNull();
+
+    // Without a model, the configuration's default model decides.
+    const accepted = await call('PUT', '', {
+      modelConfigId: 'glm',
+      effort: 'low',
+    });
+    expect(accepted.status).toBe(200);
+    expect(accepted.body).toMatchObject({
+      selectedModel: null,
+      selectedEffort: 'low',
+    });
+    expect(detail()).toMatchObject({ model: null, effort: 'low' });
+  });
+
+  test('an effort-only change retires the runner but keeps the model', async () => {
+    await call('PUT', '', { modelConfigId: 'glm', model: 'glm-5.3[1m]' });
+    mocks.drainCalls = [];
+    const raised = await call('PUT', '', {
+      modelConfigId: 'glm',
+      model: 'glm-5.3[1m]',
+      effort: 'max',
+    });
+    expect(raised.status).toBe(200);
+    expect(raised.body.drained).toBe(1);
+    // Every runner of the conversation, even one on this configuration.
+    expect(mocks.drainCalls).toEqual([{ jids: [SESSION_JID], target: null }]);
+    mocks.drainCalls = [];
+    await call('PUT', '', {
+      modelConfigId: 'glm',
+      model: 'glm-5.3[1m]',
+      effort: 'max',
+    });
+    expect(mocks.drainCalls).toEqual([]);
+  });
+
+  test('accepts a model id up to the shared length limit', async () => {
+    const tooLong = await call('PUT', '', {
+      modelConfigId: 'glm',
+      model: 'm'.repeat(201),
+    });
+    expect(tooLong.status).toBe(400);
+    expect(tooLong.body.error).toBe('Invalid request body');
+    // Within the limit, the configuration's list alone decides.
+    const unlisted = await call('PUT', '', {
+      modelConfigId: 'glm',
+      model: 'm'.repeat(200),
+    });
+    expect(unlisted.body).toMatchObject({ code: 'MODEL_NOT_IN_CONNECTION' });
+  });
+
+  test("an Agent model its connection dropped runs the connection's own: naming that is no change", async () => {
+    const main = db.getOrCreateDefaultAgentProfile(OWNER_ID);
+    db.updateAgentProfile(main.id, OWNER_ID, {
+      modelConfigId: 'glm',
+      model: 'glm-5.2-gone',
+    });
+    try {
+      await call('PUT', '', { modelConfigId: 'glm' });
+      mocks.drainCalls = [];
+      await call('PUT', '', { modelConfigId: 'glm', model: 'glm-5.3' });
+      expect(mocks.drainCalls).toEqual([]);
+    } finally {
+      bindOwnerMain(null);
+    }
+  });
+
+  test('naming the default model is no change, another model is', async () => {
+    await call('PUT', '', { modelConfigId: 'glm' });
+    expect(mocks.drainCalls).toEqual([{ jids: [SESSION_JID], target: 'glm' }]);
+    mocks.drainCalls = [];
+    await call('PUT', '', { modelConfigId: 'glm', model: 'glm-5.3[1m]' });
+    expect(mocks.drainCalls).toEqual([]);
+    await call('PUT', '', { modelConfigId: 'glm', model: 'glm-5.3-air' });
+    expect(mocks.drainCalls).toEqual([{ jids: [SESSION_JID], target: null }]);
+    // Back to the configuration's own model.
+    await call('PUT', '', { modelConfigId: 'glm' });
+    expect(mocks.drainCalls).toEqual([
+      { jids: [SESSION_JID], target: null },
+      { jids: [SESSION_JID], target: null },
+    ]);
+  });
+
+  test('reports a stored model only while the list still offers it', async () => {
+    db.setSessionModelSelection(GROUP_FOLDER, SESSION_ID, 'glm', OWNER_ID, {
+      model: 'glm-5.3-legacy',
+    });
+    expect((await call('GET')).body.selectedModel).toBe('glm-5.3-legacy');
+    db.setSessionModelSelection(GROUP_FOLDER, SESSION_ID, 'glm', OWNER_ID, {
+      model: 'glm-5.2',
+    });
+    expect((await call('GET')).body).toMatchObject({
+      selectedModelConfigId: 'glm',
+      selectedModel: null,
+    });
+  });
+
+  test("a conversation that ran the Agent's model is not spared on the Agent's configuration", async () => {
+    const profile = db.createAgentProfile({
+      ownerUserId: OWNER_ID,
+      name: 'GLM Agent',
+      modelConfigId: 'glm',
+      model: 'glm-5.3-air',
+    });
+    db.assignWorkspaceAgentProfile(GROUP_FOLDER, profile.id);
+    try {
+      // Unpicked, the conversation ran glm-5.3-air; picking GLM runs its
+      // default, so a runner already on GLM must go too.
+      await call('PUT', '', { modelConfigId: 'glm' });
+      expect(mocks.drainCalls).toEqual([{ jids: [SESSION_JID], target: null }]);
+
+      db.setSessionModelSelection(GROUP_FOLDER, SESSION_ID, null);
+      db.updateAgentProfile(profile.id, OWNER_ID, { model: null });
+      mocks.drainCalls = [];
+      await call('PUT', '', { modelConfigId: 'glm' });
+      expect(mocks.drainCalls).toEqual([
+        { jids: [SESSION_JID], target: 'glm' },
+      ]);
+    } finally {
+      db.deleteWorkspaceAgentProfile(GROUP_FOLDER);
+    }
   });
 });

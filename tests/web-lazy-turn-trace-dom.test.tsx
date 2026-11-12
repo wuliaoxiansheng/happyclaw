@@ -395,8 +395,11 @@ describe('in the timeline layout', () => {
     // The row is gone; the card says what it did and is open on the steps.
     expect(rowButton('处理过程')).toBeUndefined();
     expect(card()?.getAttribute('data-mode')).toBe('settled');
-    expect(summary()?.textContent).toBe('已处理 8 秒 · 1 个工具 · 2 段思考');
+    expect(summary()?.textContent).toBe('已工作 8s');
     expect(summary()?.getAttribute('aria-expanded')).toBe('true');
+    expect(card()?.querySelector('[data-hc-work-counts]')?.textContent).toBe(
+      '1 个工具 · 2 段思考',
+    );
     const list = container?.querySelector('[aria-label="处理步骤"]');
     const rows = [...(list?.querySelectorAll('[role="listitem"]') ?? [])];
     expect(rows.map((row) => row.textContent).join('|')).toMatch(
@@ -585,10 +588,14 @@ describe('in the timeline layout', () => {
     expect(rowButton('处理过程')).toBeUndefined();
   });
 
-  test('has none at the hidden level', () => {
+  test('at the hidden level, is there only for a reply the server flags', () => {
+    // The server flags a reply there only when its turn sent progress, which
+    // is all that level keeps.
     useChatStore.setState({ groups: { [JID]: proactive('hidden') } });
-    mount(reply({ source_kind: 'sdk_send_message' }));
+    mount(reply({ source_kind: 'sdk_send_message', has_trace: false }));
     expect(container?.textContent).not.toContain('处理过程');
+    mount(reply({ source_kind: 'sdk_send_message' }));
+    expect(rowButton('处理过程')).toBeTruthy();
   });
 
   test("is the classic layout's two rows when that is the reader's choice", () => {

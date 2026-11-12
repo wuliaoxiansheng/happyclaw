@@ -265,6 +265,7 @@ export function ContainerEnvPanel({
                       }
                       placeholder="KEY"
                       aria-label={`第 ${i + 1} 个变量名`}
+                      variant="code"
                       className="w-[40%] font-mono md:text-caption"
                     />
                     <span className="text-caption text-faint-foreground">
@@ -278,6 +279,7 @@ export function ContainerEnvPanel({
                       }
                       placeholder="value"
                       aria-label={`第 ${i + 1} 个变量值`}
+                      variant="code"
                       className="min-w-0 flex-1 font-mono md:text-caption"
                     />
                     <IconButton

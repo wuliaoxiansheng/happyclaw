@@ -1,4 +1,5 @@
 import {
+  Fragment,
   memo,
   useEffect,
   useId,
@@ -14,6 +15,7 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  GitBranch,
   MoreHorizontal,
   Pencil,
   Pin,
@@ -33,7 +35,7 @@ import { cn } from '@/lib/utils';
 import { EmojiAvatar } from '../../common/EmojiAvatar';
 import { useAuthStore, type AppearanceConfig } from '../../../stores/auth';
 import { useChatStore } from '../../../stores/chat';
-import { useGroupsStore } from '../../../stores/groups';
+import { isWorkspaceRunning, useGroupsStore } from '../../../stores/groups';
 import type { GroupEntry } from '../../../utils/group-utils';
 import {
   type AgentWorkspaceSection,
@@ -46,6 +48,11 @@ import {
   resolveAgentDisplayIdentity,
 } from '../../../utils/agent-identity';
 import { sidebarRowClass } from './SidebarItem';
+import { NewSessionDialog } from '../../chat/NewSessionDialog';
+import { useOpenedOnce } from '../../../lib/preloaded-component';
+import { ActionSheet } from '../../common/ActionSheet';
+import type { MenuAction } from '../../common/ResponsiveMenu';
+import { useIsPhone } from '../phone';
 
 const COLLAPSED_AGENTS_KEY = 'happyclaw:collapsed-agent-sections';
 
@@ -78,7 +85,7 @@ function persistAgentState(agentId: string, collapsed: boolean) {
  * assistant avatar exactly like chat messages do; a custom agent without its
  * own avatar shows its initial so agents stay distinguishable in the tree.
  */
-function sectionIdentity(
+export function sectionIdentity(
   section: AgentWorkspaceSection,
   appearance: AppearanceConfig | null,
   primary: boolean,
@@ -95,15 +102,7 @@ function sectionIdentity(
     avatarUrl: lead?.agent_profile_avatar_url,
     avatarEmoji: lead?.agent_profile_avatar_emoji,
     avatarColor: lead?.agent_profile_avatar_color,
-    mainAvatarUrl: primary ? appearance?.aiAvatarUrl : undefined,
-    mainAvatarEmoji:
-      primary && appearance?.aiAvatarMode === 'emoji'
-        ? appearance.aiAvatarEmoji
-        : undefined,
-    mainAvatarColor:
-      primary && appearance?.aiAvatarMode === 'emoji'
-        ? appearance.aiAvatarColor
-        : undefined,
+    appearance: primary ? appearance : null,
   });
   const ownAvatar = !!(
     lead?.agent_profile_avatar_url || lead?.agent_profile_avatar_emoji
@@ -112,7 +111,9 @@ function sectionIdentity(
 }
 
 /** Workspaces without an agent profile are grouped under a synthetic id. */
-function profileIdOf(section: AgentWorkspaceSection): string | undefined {
+export function profileIdOf(
+  section: AgentWorkspaceSection,
+): string | undefined {
   return section.id === '__default__' ? undefined : section.id;
 }
 
@@ -124,13 +125,22 @@ export interface WorkspaceActions {
   onClearHistory: (jid: string, name: string) => void;
   onDelete?: (jid: string, name: string) => void;
   onTogglePin?: (jid: string) => void;
-  /** Create a session in the workspace and open it (desktop tree). */
-  onCreateSession?: (group: GroupEntry) => Promise<void>;
+  /**
+   * Create a session in the workspace and open it; resolves whether it was
+   * created. Options come from the new-session dialog.
+   */
+  onCreateSession?: (
+    group: GroupEntry,
+    options?: { name?: string; worktree?: boolean },
+  ) => Promise<boolean>;
   /** Open the create-workspace dialog with this agent preselected. */
   onCreateWorkspace?: (agentProfileId: string) => void;
   /** Open the agent's settings. */
   onOpenAgent?: (agentProfileId: string) => void;
 }
+
+/** What a workspace row's ⋯ menu acts on. */
+export type WorkspaceMenuActions = Omit<WorkspaceActions, 'onSelect'>;
 
 interface WorkspaceTreeProps extends WorkspaceActions {
   variant: WorkspaceTreeVariant;
@@ -312,7 +322,7 @@ export const WorkspaceTree = memo(function WorkspaceTree({
   );
 });
 
-function AgentAvatar({
+export function AgentAvatar({
   identity,
   touch,
 }: {
@@ -426,8 +436,9 @@ function AgentGroup({
   const { directGroup, workspaces } = getAgentNavigationTargets(section);
   const runningCount = useGroupsStore(
     (s) =>
-      section.items.filter((item) => s.runnerStates[item.jid] === 'running')
-        .length,
+      section.items.filter((item) =>
+        isWorkspaceRunning(s.runnerStates, item.jid),
+      ).length,
   );
   // An agent that owns the home workspace opens it from its own row, like
   // the primary agent; otherwise the row only expands and collapses.
@@ -589,34 +600,16 @@ const WorkspaceRow = memo(function WorkspaceRow({
   actions: WorkspaceActions;
 }) {
   const currentUser = useAuthStore((s) => s.user);
-  const isRunning = useGroupsStore(
-    (s) => s.runnerStates[group.jid] === 'running',
+  const isRunning = useGroupsStore((s) =>
+    isWorkspaceRunning(s.runnerStates, group.jid),
   );
   const unread = useChatStore((s) => s.unreadReplies[group.jid] ?? 0);
   const touch = variant === 'mobile';
   const nested = !!renderSessions && !touch;
 
-  // Use the real name once renamed, otherwise the friendly home default.
-  const isDefaultName =
-    !group.name ||
-    group.name === 'Main' ||
-    group.name === `${currentUser?.username} Home`;
   const displayName =
-    label ?? (isHome && isDefaultName ? '我的工作区' : group.name);
+    label ?? workspaceDisplayName(group, isHome, currentUser?.username);
   const canModify = !!group.can_modify;
-  const canPin = !isHome && !!actions.onTogglePin;
-  const hasWorkspaceItems = canPin || canModify;
-  const hasAgentItems =
-    !!agentId && (!!actions.onCreateWorkspace || !!actions.onOpenAgent);
-  // Topic workspaces get their sessions from the channel; a session created
-  // here is an extra Web-only one, and the label says so.
-  const isTopicWorkspace =
-    group.conversation_nav_mode === 'vertical_threads' ||
-    group.conversation_source === 'native_thread' ||
-    group.conversation_source === 'feishu_thread';
-  const createLabel = isTopicWorkspace ? '新建 Web 会话' : '新建会话';
-  // The row stands for its agent, so name the workspace in its actions.
-  const noun = agentId ? '工作区' : '';
   const icon = identity ? (
     <AgentAvatar identity={identity} touch={touch} />
   ) : expanded ? (
@@ -676,69 +669,18 @@ const WorkspaceRow = memo(function WorkspaceRow({
         ) : null}
         {nested && canModify && actions.onCreateSession && (
           <CreateSessionButton
-            label={`${createLabel}（${displayName}）`}
+            label={`${createSessionLabel(group)}（${displayName}）`}
             onCreate={() => actions.onCreateSession!(group)}
           />
         )}
-        {(hasWorkspaceItems || hasAgentItems) && (
-          <RowMenu label={`${displayName}的更多操作`} touch={touch}>
-            {canPin && (
-              <DropdownMenuItem onClick={() => actions.onTogglePin!(group.jid)}>
-                <Pin />
-                {group.pinned_at ? '取消固定' : '固定'}
-              </DropdownMenuItem>
-            )}
-            {canModify && actions.onRename && (
-              <DropdownMenuItem
-                onClick={() => actions.onRename!(group.jid, group.name)}
-              >
-                <Pencil />
-                重命名{noun}
-              </DropdownMenuItem>
-            )}
-            {canModify && (
-              <>
-                {(canPin || actions.onRename) && <DropdownMenuSeparator />}
-                <DropdownMenuItem
-                  onClick={() => actions.onClearHistory(group.jid, displayName)}
-                >
-                  <RotateCcw />
-                  重建工作区
-                </DropdownMenuItem>
-              </>
-            )}
-            {!isHome && canModify && actions.onDelete && (
-              <DropdownMenuItem
-                variant="destructive"
-                onClick={() => actions.onDelete!(group.jid, group.name)}
-              >
-                <Trash2 />
-                删除{noun}
-              </DropdownMenuItem>
-            )}
-            {hasAgentItems && (
-              <>
-                {hasWorkspaceItems && <DropdownMenuSeparator />}
-                {actions.onCreateWorkspace && (
-                  <DropdownMenuItem
-                    onClick={() => actions.onCreateWorkspace!(agentId!)}
-                  >
-                    <FolderPlus />
-                    新建工作区
-                  </DropdownMenuItem>
-                )}
-                {actions.onOpenAgent && (
-                  <DropdownMenuItem
-                    onClick={() => actions.onOpenAgent!(agentId!)}
-                  >
-                    <Bot />
-                    智能体设置
-                  </DropdownMenuItem>
-                )}
-              </>
-            )}
-          </RowMenu>
-        )}
+        <WorkspaceRowMenu
+          group={group}
+          isHome={isHome}
+          displayName={displayName}
+          agentId={agentId}
+          actions={actions}
+          touch={touch}
+        />
       </div>
       {nested && (
         <AnimatePresence initial={false}>
@@ -759,6 +701,147 @@ const WorkspaceRow = memo(function WorkspaceRow({
   );
 });
 
+/** The home workspace shows a friendly default until the user renames it. */
+export function workspaceDisplayName(
+  group: GroupEntry,
+  isHome: boolean,
+  username: string | undefined,
+): string {
+  const isDefaultName =
+    !group.name || group.name === 'Main' || group.name === `${username} Home`;
+  return isHome && isDefaultName ? '我的工作区' : group.name;
+}
+
+/** Topic workspaces get their sessions from the channel; a session created
+ *  here is an extra Web-only one, and the label says so. */
+export function createSessionLabel(group: GroupEntry): string {
+  const isTopicWorkspace =
+    group.conversation_nav_mode === 'vertical_threads' ||
+    group.conversation_source === 'native_thread' ||
+    group.conversation_source === 'feishu_thread';
+  return isTopicWorkspace ? '新建 Web 会话' : '新建会话';
+}
+
+/**
+ * The ⋯ menu of a workspace row, or nothing when it would be empty. With
+ * `withCreateSession` it starts with 新建会话 (phones have no hover "+").
+ */
+export function WorkspaceRowMenu({
+  group,
+  isHome,
+  displayName,
+  agentId,
+  actions,
+  touch = false,
+  withCreateSession = false,
+}: {
+  group: GroupEntry;
+  isHome: boolean;
+  displayName: string;
+  /** Set when the row stands for a whole agent or one of its workspaces. */
+  agentId?: string;
+  actions: WorkspaceMenuActions;
+  touch?: boolean;
+  withCreateSession?: boolean;
+}) {
+  const canModify = !!group.can_modify;
+  const canPin = !isHome && !!actions.onTogglePin;
+  const hasWorkspaceItems = canPin || canModify;
+  const hasAgentItems =
+    !!agentId && (!!actions.onCreateWorkspace || !!actions.onOpenAgent);
+  const canCreateSession =
+    withCreateSession && canModify && !!actions.onCreateSession;
+  // Worktrees are a host feature, so only those who can run on the host see
+  // the option; the dialog explains when this workspace cannot have one.
+  const canHost = useAuthStore((s) => s.user?.role === 'admin');
+  const canCreateWorktreeSession =
+    canModify && canHost && !!actions.onCreateSession;
+  const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const newSessionMounted = useOpenedOnce(newSessionOpen);
+  // The row stands for its agent, so name the workspace in its actions.
+  const noun = agentId ? '工作区' : '';
+  if (!hasWorkspaceItems && !hasAgentItems) return null;
+  const create: MenuAction[] = [];
+  if (canCreateSession) {
+    create.push({
+      label: createSessionLabel(group),
+      icon: Plus,
+      onSelect: () => void actions.onCreateSession!(group),
+    });
+  }
+  if (canCreateWorktreeSession) {
+    create.push({
+      label: '新建独立 worktree 会话…',
+      icon: GitBranch,
+      onSelect: () => setNewSessionOpen(true),
+    });
+  }
+  const organize: MenuAction[] = [];
+  if (canPin) {
+    organize.push({
+      label: group.pinned_at ? '取消固定' : '固定',
+      icon: Pin,
+      onSelect: () => actions.onTogglePin!(group.jid),
+    });
+  }
+  if (canModify && actions.onRename) {
+    organize.push({
+      label: `重命名${noun}`,
+      icon: Pencil,
+      onSelect: () => actions.onRename!(group.jid, group.name),
+    });
+  }
+  const manage: MenuAction[] = [];
+  if (canModify) {
+    manage.push({
+      label: '重建工作区',
+      icon: RotateCcw,
+      onSelect: () => actions.onClearHistory(group.jid, displayName),
+    });
+    if (!isHome && actions.onDelete) {
+      manage.push({
+        label: `删除${noun}`,
+        icon: Trash2,
+        destructive: true,
+        onSelect: () => actions.onDelete!(group.jid, group.name),
+      });
+    }
+  }
+  const agent: MenuAction[] = [];
+  if (hasAgentItems && actions.onCreateWorkspace) {
+    agent.push({
+      label: '新建工作区',
+      icon: FolderPlus,
+      onSelect: () => actions.onCreateWorkspace!(agentId!),
+    });
+  }
+  if (hasAgentItems && actions.onOpenAgent) {
+    agent.push({
+      label: '智能体设置',
+      icon: Bot,
+      onSelect: () => actions.onOpenAgent!(agentId!),
+    });
+  }
+  const groups = [create, organize, manage, agent];
+  return (
+    <>
+      <RowMenu
+        label={`${displayName}的更多操作`}
+        touch={touch}
+        groups={groups}
+      />
+      {newSessionMounted && (
+        <NewSessionDialog
+          open={newSessionOpen}
+          groupJid={group.jid}
+          onClose={() => setNewSessionOpen(false)}
+          onCreate={(options) => actions.onCreateSession!(group, options)}
+        />
+      )}
+    </>
+  );
+}
+
 /** Hover-revealed icon buttons at the end of a row (+, delete and ⋯). */
 export const rowIconButtonClass =
   'grid size-6 shrink-0 cursor-pointer place-items-center rounded text-muted-foreground outline-none transition-opacity hover:bg-surface-hover hover:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring/40 aria-expanded:opacity-100 disabled:cursor-default';
@@ -771,7 +854,7 @@ function CreateSessionButton({
   onCreate,
 }: {
   label: string;
-  onCreate: () => Promise<void>;
+  onCreate: () => Promise<unknown>;
 }) {
   const [pending, setPending] = useState(false);
   return (
@@ -796,6 +879,28 @@ function CreateSessionButton({
   );
 }
 
+/** Menu actions as dropdown items, groups split by a separator. */
+export function MenuActionItems({ groups }: { groups: MenuAction[][] }) {
+  return groups
+    .filter((items) => items.length > 0)
+    .map((items, index) => (
+      <Fragment key={items[0].label}>
+        {index > 0 && <DropdownMenuSeparator />}
+        {items.map(({ label, icon: Icon, onSelect, disabled, destructive }) => (
+          <DropdownMenuItem
+            key={label}
+            disabled={disabled}
+            variant={destructive ? 'destructive' : 'default'}
+            onSelect={onSelect}
+          >
+            {Icon && <Icon />}
+            {label}
+          </DropdownMenuItem>
+        ))}
+      </Fragment>
+    ));
+}
+
 /**
  * Hover-revealed "more" menu; always visible on touch screens.
  *
@@ -803,24 +908,126 @@ function CreateSessionButton({
  * listeners that run on each keystroke anywhere in the app, and a long tree
  * holds one per row: with ~4,000 rows each key press in the composer cost
  * ~200ms at 4x CPU throttle. Until then a plain button stands in, opening the
- * menu from the pointer or keyboard the way the Radix trigger does.
+ * menu from the mouse or keyboard the way the Radix trigger does, and from a
+ * finger on click, so a scroll that starts on it never opens it.
+ *
+ * Its items are `groups` (or dropdown items as `children`). On a phone,
+ * `groups` open as a bottom action sheet instead of an anchored menu. `open`
+ * and `onOpenChange` let the row open it too (a long press).
  */
 export function RowMenu({
   label,
   touch = false,
+  groups,
+  open: openProp,
+  onOpenChange,
   children,
 }: {
   label: string;
   touch?: boolean;
-  children: ReactNode;
+  groups?: MenuAction[][];
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  children?: ReactNode;
 }) {
-  const [mounted, setMounted] = useState(false);
-  const [open, setOpen] = useState(false);
+  const [mountedState, setMounted] = useState(false);
+  const [openState, setOpenState] = useState(false);
+  const open = openProp ?? openState;
+  const setOpen = (next: boolean) => {
+    setOpenState(next);
+    onOpenChange?.(next);
+  };
   // Radix notices keyboard use through a document listener that only exists
   // once the menu is mounted, so on the first keyboard open it focused the
-  // menu itself instead of its first item. Move focus on once the content has
-  // mounted and Radix has focused it.
+  // menu itself instead of its first item. The mounted menu moves focus on.
   const openedByKeyboardRef = useRef(false);
+  const pointerTypeRef = useRef('');
+  // Touch rows get a 44px target around the 36px button.
+  const className = cn(
+    rowIconButtonClass,
+    touch
+      ? "relative size-9 before:absolute before:-inset-1 before:content-['']"
+      : revealOnRowHover,
+  );
+  const icon = <MoreHorizontal className="size-4" />;
+
+  if (mountedState || open) {
+    return (
+      <MountedRowMenu
+        label={label}
+        className={className}
+        icon={icon}
+        groups={groups}
+        open={open}
+        onOpenChange={setOpen}
+        openedByKeyboardRef={openedByKeyboardRef}
+      >
+        {children}
+      </MountedRowMenu>
+    );
+  }
+
+  const openMenu = (byKeyboard: boolean) => {
+    openedByKeyboardRef.current = byKeyboard;
+    setMounted(true);
+    setOpen(true);
+  };
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      aria-haspopup="menu"
+      aria-expanded={false}
+      onClick={(event) => {
+        event.stopPropagation();
+        // A mouse opened it on pointerdown already.
+        if (pointerTypeRef.current !== 'mouse') openMenu(false);
+      }}
+      onPointerDown={(event) => {
+        pointerTypeRef.current = event.pointerType;
+        if (event.pointerType !== 'mouse') return;
+        if (event.button !== 0 || event.ctrlKey) return;
+        event.preventDefault();
+        openMenu(false);
+      }}
+      onKeyDown={(event) => {
+        if (['Enter', ' ', 'ArrowDown'].includes(event.key)) {
+          event.preventDefault();
+          openMenu(true);
+        }
+      }}
+      className={className}
+    >
+      {icon}
+    </button>
+  );
+}
+
+/**
+ * RowMenu once used: a dropdown, or with `groups` on a phone a bottom action
+ * sheet. Only mounted menus ask whether this is a phone, so a long tree's
+ * rows add no media-query listeners.
+ */
+function MountedRowMenu({
+  label,
+  className,
+  icon,
+  groups,
+  open,
+  onOpenChange,
+  openedByKeyboardRef,
+  children,
+}: {
+  label: string;
+  className: string;
+  icon: ReactNode;
+  groups?: MenuAction[][];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  openedByKeyboardRef: React.RefObject<boolean>;
+  children?: ReactNode;
+}) {
+  const isPhone = useIsPhone();
   const [content, setContent] = useState<HTMLDivElement | null>(null);
   useEffect(() => {
     if (!content || !openedByKeyboardRef.current) return;
@@ -828,55 +1035,33 @@ export function RowMenu({
     content
       .querySelector<HTMLElement>('[role="menuitem"]:not([data-disabled])')
       ?.focus({ preventScroll: true });
-  }, [content]);
-  const className = cn(rowIconButtonClass, touch ? 'size-9' : revealOnRowHover);
-  const icon = <MoreHorizontal className="size-4" />;
-
-  if (!mounted) {
-    const openMenu = (byKeyboard: boolean) => {
-      openedByKeyboardRef.current = byKeyboard;
-      setMounted(true);
-      setOpen(true);
-    };
+  }, [content, openedByKeyboardRef]);
+  const trigger = (
+    <button
+      type="button"
+      onClick={(event) => event.stopPropagation()}
+      aria-label={label}
+      className={className}
+    >
+      {icon}
+    </button>
+  );
+  if (groups && isPhone) {
     return (
-      <button
-        type="button"
-        aria-label={label}
-        aria-haspopup="menu"
-        aria-expanded={false}
-        onClick={(event) => event.stopPropagation()}
-        onPointerDown={(event) => {
-          if (event.button !== 0 || event.ctrlKey) return;
-          event.preventDefault();
-          openMenu(false);
-        }}
-        onKeyDown={(event) => {
-          if (['Enter', ' ', 'ArrowDown'].includes(event.key)) {
-            event.preventDefault();
-            openMenu(true);
-          }
-        }}
-        className={className}
-      >
-        {icon}
-      </button>
+      <ActionSheet
+        open={open}
+        onOpenChange={onOpenChange}
+        title={label}
+        groups={groups}
+        trigger={trigger}
+      />
     );
   }
-
   return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          onClick={(event) => event.stopPropagation()}
-          aria-label={label}
-          className={className}
-        >
-          {icon}
-        </button>
-      </DropdownMenuTrigger>
+    <DropdownMenu open={open} onOpenChange={onOpenChange}>
+      <DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>
       <DropdownMenuContent ref={setContent} align="end" className="w-40">
-        {children}
+        {groups ? <MenuActionItems groups={groups} /> : children}
       </DropdownMenuContent>
     </DropdownMenu>
   );

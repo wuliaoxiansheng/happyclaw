@@ -22,6 +22,15 @@ describe('IM binding capability agreement', () => {
     );
   });
 
+  test('every connector that implements sendFile advertises file send', () => {
+    // WeChat (CDN upload) and WeCom (media upload) both deliver files.
+    expect(backend.wechat.supports_file_send).toBe(true);
+    expect(backend.wecom.supports_file_send).toBe(true);
+    expect(
+      Object.values(backend).every((caps) => caps.supports_file_send),
+    ).toBe(true);
+  });
+
   for (const [name, supportsThreads] of [
     ['backend', backendThreads],
     ['frontend', frontendThreads],

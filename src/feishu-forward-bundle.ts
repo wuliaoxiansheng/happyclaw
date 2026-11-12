@@ -1,6 +1,7 @@
 import { classifyFeishuError } from './feishu-errors.js';
 import { normalizeFeishuSender } from './feishu-intake-message.js';
 import type { ChannelContentLink } from './types.js';
+import { withTimeout } from './with-timeout.js';
 
 /**
  * Feishu emits "merged forward + note" as two physical messages. The note
@@ -86,33 +87,10 @@ function responseItems(response: unknown): FeishuMessageGetItem[] {
   return Array.isArray(items) ? items : [];
 }
 
-function toEpochMs(value: string | number | undefined): number {
+export function toEpochMs(value: string | number | undefined): number {
   const numeric = typeof value === 'number' ? value : Number(value ?? 0);
   if (!Number.isFinite(numeric) || numeric <= 0) return 0;
   return numeric < 1e12 ? Math.trunc(numeric * 1_000) : Math.trunc(numeric);
-}
-
-function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () =>
-        reject(
-          new Error(`Feishu forward lookup timed out after ${timeoutMs}ms`),
-        ),
-      timeoutMs,
-    );
-    timer.unref?.();
-    operation.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
 }
 
 function parseJsonObject(raw: string): Record<string, unknown> | undefined {
@@ -330,6 +308,7 @@ export class FeishuForwardBundleResolver {
         throw error;
       }),
       FEISHU_FORWARD_LOOKUP_TIMEOUT_MS,
+      'Feishu forward lookup',
     ).then((response) => {
       if (response === null) {
         return { definitive: true, fact: undefined } as const;

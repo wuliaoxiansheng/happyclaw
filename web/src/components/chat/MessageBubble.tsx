@@ -1,4 +1,4 @@
-import { useState, useMemo, memo, lazy, Suspense } from 'react';
+import { useState, useMemo, memo, lazy, Suspense, type ReactNode } from 'react';
 import {
   Copy,
   Check,
@@ -13,6 +13,11 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { IconButton } from '../common/IconButton';
@@ -33,11 +38,18 @@ import { ProcessCard, hasProcess } from './ProcessCard';
 import { LazyTurnTrace } from './LazyTurnTrace';
 import { MessageContextMenu } from './MessageContextMenu';
 import { ImageLightbox } from './ImageLightbox';
+import { CollapsibleUserText } from './CollapsibleUserText';
+import { InfoTip } from '../common/InfoTip';
+import { useIsPhone } from '../layout/phone';
+import { useLongPress } from '../../hooks/useLongPress';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { useStreamLayout } from '../../hooks/useStreamLayout';
 import { extractThinkingTitle } from '../../lib/thinking-text';
 import { normalizeInteractionMode } from '../../lib/interaction-mode';
-import { normalizeProcessVisibility } from '../../lib/process-visibility';
+import {
+  isProgressStep,
+  normalizeProcessVisibility,
+} from '../../lib/process-visibility';
 import { visibleSteps } from '../../lib/process-steps';
 import { resolveAgentDisplayIdentity } from '../../utils/agent-identity';
 import {
@@ -45,6 +57,10 @@ import {
   incompleteReplyNote,
 } from '../../lib/message-presentation';
 import { copyToClipboard } from '../../utils/clipboard';
+import {
+  AutomationOriginLink,
+  AutomationPromptText,
+} from '../automations/AutomationOrigin';
 import { toast } from 'sonner';
 import { getMessageDisplayTimestamp } from '../../lib/message-timeline';
 import {
@@ -54,7 +70,15 @@ import {
   parseTokenUsage,
 } from '../../lib/token-usage-presentation';
 import { WorkflowRunCard } from './WorkflowRunCard';
+import { formatTokens } from '../billing/utils';
 import type { WorkflowRunSnapshot } from '../../stream-event.types';
+
+/**
+ * A reply's text. On a phone it reads at 17/26, cindy's reply size; the
+ * Markdown root sets its own size, so this reaches it.
+ */
+export const REPLY_BODY_CLASS =
+  'max-w-none overflow-hidden phone:[&_[data-markdown-root]]:text-reply phone:[&_[data-markdown-root]]:leading-(--text-reply--line-height)';
 
 const ShareImageDialog = lazy(() =>
   import('./ShareImageDialog').then((m) => ({ default: m.ShareImageDialog })),
@@ -120,16 +144,21 @@ function formatShortTime(value: string): string {
     : `${date.getFullYear()}-${md} ${hm}`;
 }
 
-/** Parse and display token usage for AI messages */
-function TokenUsageDisplay({
-  tokenUsageJson,
-  workflowRuns = [],
-}: {
-  tokenUsageJson: string;
-  workflowRuns?: WorkflowRunSnapshot[];
-}) {
-  const usage = parseTokenUsage(tokenUsageJson);
+/**
+ * The usage of a reply: its one-line summary ("12.3K tokens · 4.2s") and, when
+ * there is more to say, the breakdown.
+ */
+interface TokenUsageView {
+  summary: ReactNode;
+  details: ReactNode | null;
+}
 
+/** A reply's usage, read once for both ways it is shown; `null` for none. */
+function tokenUsageView(
+  tokenUsageJson: string,
+  workflowRuns: WorkflowRunSnapshot[] = [],
+): TokenUsageView | null {
+  const usage = parseTokenUsage(tokenUsageJson);
   if (!usage) return null;
 
   // 主模型 = 费用最高的（即用户指定的模型），内部模型不向用户展示
@@ -145,72 +174,107 @@ function TokenUsageDisplay({
     usage,
     workflowRuns.map((run) => run.totalTokens),
   );
+  if (displayTotal === 0 && !usage.durationMs) return null;
 
-  const formatNum = (n: number): string => {
-    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-    return String(n);
-  };
-
-  const summaryContent = (
-    <span className="inline-flex cursor-default items-center gap-1.5 font-sans text-micro text-faint-foreground tabular-nums transition-colors hover:text-muted-foreground">
-      {displayTotal > 0 && <span>{formatNum(displayTotal)} tokens</span>}
+  const summary = (
+    <>
+      {displayTotal > 0 && <span>{formatTokens(displayTotal)} tokens</span>}
       {usage.durationMs ? (
         <>
           {displayTotal > 0 && <span className="opacity-60">·</span>}
           <span>{(usage.durationMs / 1000).toFixed(1)}s</span>
         </>
       ) : null}
+    </>
+  );
+  const details =
+    displayTotal > 0 || primary !== null ? (
+      <div className="text-xs space-y-0.5">
+        {primary && (
+          <div className="opacity-70 font-medium mb-1">
+            主模型：{primary[0]}
+          </div>
+        )}
+        {breakdown.totalTokens > 0 && (
+          <div>
+            输入 {formatTokens(breakdown.inputTokens)} / 输出{' '}
+            {formatTokens(breakdown.outputTokens)}
+          </div>
+        )}
+        {workflowTokens > 0 && (
+          <div className="opacity-70">
+            Workflow Agent 合计 {formatTokens(workflowTokens)}
+          </div>
+        )}
+        {(breakdown.cacheReadInputTokens > 0 ||
+          breakdown.cacheCreationInputTokens > 0 ||
+          breakdown.reasoningTokens > 0) && (
+          <div className="opacity-70">
+            缓存读取 {formatTokens(breakdown.cacheReadInputTokens)} / 缓存写入{' '}
+            {formatTokens(breakdown.cacheCreationInputTokens)} / 推理{' '}
+            {formatTokens(breakdown.reasoningTokens)}
+          </div>
+        )}
+        {primary && (
+          <div className="opacity-70">
+            主模型输入 {formatTokens(primary[1].inputTokens || 0)} / 输出{' '}
+            {formatTokens(primary[1].outputTokens || 0)}
+          </div>
+        )}
+      </div>
+    ) : null;
+  return { summary, details };
+}
+
+/** A reply's usage in its action row, the breakdown on hover. */
+function TokenUsageDisplay({
+  view,
+  className,
+}: {
+  view: TokenUsageView;
+  className?: string;
+}) {
+  const summaryContent = (
+    <span
+      className={cn(
+        'inline-flex cursor-default items-center gap-1.5 font-sans text-micro text-faint-foreground tabular-nums transition-colors hover:text-muted-foreground',
+        className,
+      )}
+    >
+      {view.summary}
     </span>
   );
-
-  if (displayTotal === 0 && !usage.durationMs) return null;
-
-  const hasDetails = displayTotal > 0 || primary !== null;
-
-  if (!hasDetails) {
-    return summaryContent;
-  }
+  if (!view.details) return summaryContent;
 
   return (
     <Tooltip>
       <TooltipTrigger asChild>{summaryContent}</TooltipTrigger>
       <TooltipContent side="bottom" align="start">
-        <div className="text-xs space-y-0.5">
-          {primary && (
-            <div className="opacity-70 font-medium mb-1">
-              主模型：{primary[0]}
-            </div>
-          )}
-          {breakdown.totalTokens > 0 && (
-            <div>
-              输入 {formatNum(breakdown.inputTokens)} / 输出{' '}
-              {formatNum(breakdown.outputTokens)}
-            </div>
-          )}
-          {workflowTokens > 0 && (
-            <div className="opacity-70">
-              Workflow Agent 合计 {formatNum(workflowTokens)}
-            </div>
-          )}
-          {(breakdown.cacheReadInputTokens > 0 ||
-            breakdown.cacheCreationInputTokens > 0 ||
-            breakdown.reasoningTokens > 0) && (
-            <div className="opacity-70">
-              缓存读取 {formatNum(breakdown.cacheReadInputTokens)} / 缓存写入{' '}
-              {formatNum(breakdown.cacheCreationInputTokens)} / 推理{' '}
-              {formatNum(breakdown.reasoningTokens)}
-            </div>
-          )}
-          {primary && (
-            <div className="opacity-70">
-              主模型输入 {formatNum(primary[1].inputTokens || 0)} / 输出{' '}
-              {formatNum(primary[1].outputTokens || 0)}
-            </div>
-          )}
-        </div>
+        {view.details}
       </TooltipContent>
     </Tooltip>
+  );
+}
+
+/** A phone's action row keeps the usage behind 「详情」, out of the row. */
+function TokenUsagePopover({ view }: { view: TokenUsageView }) {
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className="hidden h-11 cursor-pointer items-center rounded-md px-2 font-sans text-caption text-faint-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none phone:inline-flex"
+        >
+          详情
+        </button>
+      </PopoverTrigger>
+      <PopoverContent side="top" align="start" className="w-auto max-w-72">
+        <div className="mb-1 flex items-center gap-1.5 font-sans text-caption text-muted-foreground tabular-nums">
+          {view.summary}
+        </div>
+        {view.details}
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -228,11 +292,14 @@ export const MessageBubble = memo(
     agentAvatarColor,
   }: MessageBubbleProps) {
     const [copied, setCopied] = useState(false);
-    const [lightboxState, setLightboxState] = useState<{
-      images: string[];
-      index: number;
-    } | null>(null);
+    const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
     const [showShareDialog, setShowShareDialog] = useState(false);
+    // A phone opens the message's menu by a long press on it as well as by
+    // its 「⋯」; one menu, so both open the same sheet.
+    const isPhone = useIsPhone();
+    const [menuOpen, setMenuOpen] = useState(false);
+    const longPress = useLongPress(() => setMenuOpen(true));
+    const pressToOpenMenu = isPhone ? longPress : undefined;
     const currentUser = useAuthStore((s) => s.user);
     const { layout } = useStreamLayout();
     const appearance = useAuthStore((s) => s.appearance);
@@ -242,15 +309,7 @@ export const MessageBubble = memo(
       avatarUrl: agentAvatarUrl,
       avatarEmoji: agentAvatarEmoji,
       avatarColor: agentAvatarColor,
-      mainAvatarUrl: appearance?.aiAvatarUrl,
-      mainAvatarEmoji:
-        appearance?.aiAvatarMode === 'emoji'
-          ? appearance.aiAvatarEmoji
-          : undefined,
-      mainAvatarColor:
-        appearance?.aiAvatarMode === 'emoji'
-          ? appearance.aiAvatarColor
-          : undefined,
+      appearance,
     });
     const { mode: displayMode } = useDisplayMode();
     const thinkingTitle = useMemo(
@@ -262,8 +321,8 @@ export const MessageBubble = memo(
     );
     // What the server kept of a turn this tab did not stream, shown as the
     // same rows and loaded when one is opened. A proactive workspace shows
-    // only what its owner chose: nothing when hidden, no reasoning text at
-    // the activity level.
+    // only what its owner chose: the progress the Agent sent when hidden, no
+    // reasoning text at the activity level.
     const [openOnLoad, setOpenOnLoad] = useState<
       'thinking' | 'trace' | 'process' | null
     >(null);
@@ -282,33 +341,33 @@ export const MessageBubble = memo(
         ) === 'proactive',
     );
     const loadTurnTrace = useChatStore((s) => s.loadTurnTrace);
+    // At the hidden level only the progress the Agent sent is shown of what
+    // this tab holds of the process: the rest may have been read when the
+    // level was higher.
+    const processShown = process !== 'hidden';
     // The steps this tab holds were read for the workspace as it was then. The
     // caches are let go when its view changes; this is what shows meanwhile:
     // the steps as the workspace shows them now.
-    const shownSteps = useMemo(
-      () =>
-        replySteps && proactive
-          ? {
-              ...replySteps,
-              steps: replySteps.steps.map(withoutToolResults),
-            }
-          : replySteps,
-      [replySteps, proactive],
-    );
-    // At the hidden level none of what this tab holds of the process is shown:
-    // it may have been read when the level was higher.
-    const processShown = process !== 'hidden';
+    const shownSteps = useMemo(() => {
+      if (!replySteps || !proactive) return replySteps;
+      const steps = replySteps.steps.map(withoutToolResults);
+      return {
+        ...replySteps,
+        steps: processShown ? steps : steps.filter(isProgressStep),
+      };
+    }, [replySteps, proactive, processShown]);
     // Reasoning without a summary still says how long the model thought.
     const hasReasoning =
       processShown && (!!thinkingContent || (thinkingDurationMs ?? 0) >= 1000);
     // The timeline layout sums a reply up in the same card its streaming left
     // off with: one row, the steps in order behind it. A reply without steps
     // (an older turn) and the classic layout keep the reasoning and the trace
-    // as the two rows they always were.
+    // as the two rows they always were, unless the Agent sent progress: no
+    // other row holds it.
     const settledSteps =
-      processShown &&
-      layout === 'timeline' &&
       shownSteps &&
+      (layout === 'timeline' ||
+        (proactive && shownSteps.steps.some(isProgressStep))) &&
       hasProcess(visibleSteps(shownSteps.steps, process === 'full'))
         ? shownSteps
         : null;
@@ -318,18 +377,36 @@ export const MessageBubble = memo(
       (openOnLoad === 'process' && !!thinkingContent);
     const openTrace =
       openOnLoad === 'trace' || (openOnLoad === 'process' && !thinkingContent);
+    // A proactive turn's reply is announced before its trace is stored, at the
+    // turn's end: its row is held from the start, so the text does not move
+    // when the trace arrives (`traceAwaited` in the store).
+    const awaitingTrace = useChatStore(
+      (s) => s.traceAwaited[message.chat_jid] === message.id,
+    );
     const traceOnServer =
       message.is_from_me &&
-      !!message.has_trace &&
+      (!!message.has_trace || awaitingTrace) &&
       !!message.turn_id &&
-      processShown &&
       !hasReasoning &&
       !settledSteps &&
       !(traceEvents && traceEvents.length > 0);
     const isUser = !message.is_from_me;
     const presentedContent = getPresentedMessageContent(message);
-    const completedWorkflowRuns = message.workflow_runs?.filter(
-      (run) => run.status !== 'running',
+    // An automation's input names its automation above the bubble.
+    const automationOrigin =
+      isUser && message.source_kind === 'automation_prompt'
+        ? (message.automation ?? null)
+        : null;
+    const completedWorkflowRuns = useMemo(
+      () => message.workflow_runs?.filter((run) => run.status !== 'running'),
+      [message.workflow_runs],
+    );
+    const usageView = useMemo(
+      () =>
+        message.is_from_me && message.token_usage
+          ? tokenUsageView(message.token_usage, completedWorkflowRuns)
+          : null,
+      [message.is_from_me, message.token_usage, completedWorkflowRuns],
     );
     const presentedMessage =
       presentedContent === message.content
@@ -399,6 +476,7 @@ export const MessageBubble = memo(
           commentary={process === 'full'}
           thinkingText={process === 'full'}
           durationMs={thinkingDurationMs}
+          memoryKey={message.turn_id}
           defaultOpen={openOnLoad !== null}
           // Rebuilt steps are plausible, not exact: the reader who opens them
           // gets the server's, and keeps these if it has none.
@@ -423,19 +501,18 @@ export const MessageBubble = memo(
       }
     };
     const incomplete = incompleteReplyNote(message);
+    // Touch has no hover: there a tap on the badge says what it means.
     const incompleteBadge = incomplete && (
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span
-            tabIndex={0}
-            aria-label={`${incomplete.label}：${incomplete.detail}`}
-            className="inline-flex h-5 shrink-0 items-center rounded-md px-1.5 text-micro font-medium text-muted-foreground ring-1 ring-surface-border outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-          >
-            {incomplete.label}
-          </span>
-        </TooltipTrigger>
-        <TooltipContent>{incomplete.detail}</TooltipContent>
-      </Tooltip>
+      <InfoTip content={incomplete.detail}>
+        <button
+          type="button"
+          aria-label={`${incomplete.label}：${incomplete.detail}`}
+          data-hc-incomplete=""
+          className="relative inline-flex h-5 shrink-0 cursor-help items-center rounded-md px-1.5 text-micro font-medium text-muted-foreground ring-1 ring-surface-border outline-none focus-visible:ring-2 focus-visible:ring-ring/40 pointer-coarse:after:absolute pointer-coarse:after:-inset-x-1 pointer-coarse:after:-inset-y-3 pointer-coarse:after:content-['']"
+        >
+          {incomplete.label}
+        </button>
+      </InfoTip>
     );
 
     // Context overflow system message
@@ -537,11 +614,12 @@ export const MessageBubble = memo(
 
     const overlays = (
       <>
-        {lightboxState && (
+        {lightboxIndex !== null && (
           <ImageLightbox
-            images={lightboxState.images}
-            initialIndex={lightboxState.index}
-            onClose={() => setLightboxState(null)}
+            images={allImageSrcs}
+            names={images.map((img) => img.name)}
+            initialIndex={lightboxIndex}
+            onClose={() => setLightboxIndex(null)}
           />
         )}
         {showShareDialog && (
@@ -566,9 +644,7 @@ export const MessageBubble = memo(
             <button
               key={i}
               type="button"
-              onClick={() =>
-                setLightboxState({ images: allImageSrcs, index: i })
-              }
+              onClick={() => setLightboxIndex(i)}
               className="cursor-zoom-in overflow-hidden rounded-xl ring-1 ring-surface-border transition-shadow hover:ring-foreground/25"
             >
               <img
@@ -586,7 +662,7 @@ export const MessageBubble = memo(
         variant="ghost"
         size="icon-xs"
         aria-label="消息菜单"
-        className="text-muted-foreground pointer-coarse:size-10"
+        className="text-muted-foreground pointer-coarse:size-10 phone:size-11"
       >
         <Ellipsis />
       </Button>
@@ -643,11 +719,17 @@ export const MessageBubble = memo(
                 chatJid={message.chat_jid}
                 messageId={message.id}
                 onShareImage={isAI ? () => setShowShareDialog(true) : undefined}
+                open={menuOpen}
+                onOpenChange={setMenuOpen}
               >
                 {menuButton}
               </MessageContextMenu>
             </div>
           </div>
+
+          {automationOrigin && (
+            <AutomationOriginLink automation={automationOrigin} />
+          )}
 
           {/* Process: the settled card, or the reasoning and the trace */}
           {settledCard}
@@ -665,7 +747,9 @@ export const MessageBubble = memo(
             <LazyTurnTrace
               message={message}
               reasoning={process === 'full'}
+              stepsOnly={!processShown}
               onRequest={setOpenOnLoad}
+              pending={!message.has_trace}
             />
           )}
 
@@ -680,28 +764,34 @@ export const MessageBubble = memo(
 
           {/* Content — strip first-child top margin for consistent spacing */}
           {!hasOnlyImages && (
-            <div className="min-w-0 overflow-hidden [&>div>*:first-child]:!mt-0">
+            <div
+              className="min-w-0 overflow-hidden [&>div>*:first-child]:!mt-0"
+              {...pressToOpenMenu}
+            >
               {isAI ? (
                 <FinalMarkdown
                   content={presentedContent}
                   groupJid={markdownJid}
                   variant="chat"
                 />
+              ) : automationOrigin ? (
+                <AutomationPromptText
+                  content={presentedContent}
+                  className="text-foreground"
+                />
               ) : (
-                <p className="text-body-lg break-words whitespace-pre-wrap text-foreground">
-                  {presentedContent}
-                </p>
+                <CollapsibleUserText
+                  text={presentedContent}
+                  className="text-foreground"
+                />
               )}
             </div>
           )}
 
           {/* Token usage (compact mode) */}
-          {isAI && message.token_usage && (
+          {usageView && (
             <div className="mt-1">
-              <TokenUsageDisplay
-                tokenUsageJson={message.token_usage}
-                workflowRuns={completedWorkflowRuns}
-              />
+              <TokenUsageDisplay view={usageView} />
             </div>
           )}
 
@@ -712,38 +802,57 @@ export const MessageBubble = memo(
 
     // ── Chat mode (default): bubble-style layout ──
     if (isUser) {
+      const userMenu = (
+        <MessageContextMenu
+          content={presentedContent}
+          chatJid={message.chat_jid}
+          messageId={message.id}
+          align="end"
+          open={menuOpen}
+          onOpenChange={setMenuOpen}
+        >
+          {menuButton}
+        </MessageContextMenu>
+      );
       // User message: right-aligned
       return (
         <div className="group mb-5 flex justify-end">
-          <div className="flex max-w-[85%] min-w-0 flex-col items-end">
+          <div className="flex max-w-[85%] min-w-0 flex-col items-end phone:max-w-[86%]">
+            {automationOrigin && (
+              <AutomationOriginLink automation={automationOrigin} />
+            )}
             <div className="relative flex flex-col items-end">
               {renderImages(cn('justify-end', hasOnlyImages && 'mb-0'))}
               {!hasOnlyImages && (
-                <div className="rounded-[1.25rem] bg-muted px-4 py-2.5 text-foreground">
-                  <p className="text-body-lg break-words whitespace-pre-wrap">
-                    {presentedContent}
-                  </p>
+                <div
+                  className="rounded-[1.25rem] bg-muted px-4 py-2.5 text-foreground phone:rounded-xl phone:border phone:border-surface-border phone:bg-surface-raised phone:p-3"
+                  {...pressToOpenMenu}
+                >
+                  {automationOrigin ? (
+                    <AutomationPromptText content={presentedContent} />
+                  ) : (
+                    <CollapsibleUserText text={presentedContent} />
+                  )}
                 </div>
               )}
-              <div className="absolute top-1/2 -left-8 -translate-y-1/2 transition-opacity pointer-coarse:-left-11 lg:opacity-0 lg:group-hover:opacity-100 lg:focus-within:opacity-100 lg:has-[[aria-expanded=true]]:opacity-100">
-                <MessageContextMenu
-                  content={presentedContent}
-                  chatJid={message.chat_jid}
-                  messageId={message.id}
-                  align="end"
-                >
-                  {menuButton}
-                </MessageContextMenu>
-              </div>
+              {!isPhone && (
+                <div className="absolute top-1/2 -left-8 -translate-y-1/2 transition-opacity pointer-coarse:-left-11 lg:opacity-0 lg:group-hover:opacity-100 lg:focus-within:opacity-100 lg:has-[[aria-expanded=true]]:opacity-100">
+                  {userMenu}
+                </div>
+              )}
             </div>
-            {showTime && (
-              <span
-                className="mt-1 mr-1 text-micro text-faint-foreground opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100"
-                title={time}
-              >
-                {shortTime}
-              </span>
-            )}
+            {/* A phone has 「⋯」 below the bubble, with the time. */}
+            <div className="mt-1 mr-1 flex items-center phone:mt-0 phone:mr-0">
+              {showTime && (
+                <span
+                  className="text-micro text-faint-foreground opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100"
+                  title={time}
+                >
+                  {shortTime}
+                </span>
+              )}
+              {isPhone && <span className="inline-flex">{userMenu}</span>}
+            </div>
           </div>
           {overlays}
         </div>
@@ -754,8 +863,15 @@ export const MessageBubble = memo(
 
     return (
       <div className="group mb-6">
-        {/* Identity row: small avatar, name and time */}
-        <div className="mb-1.5 flex h-6 items-center gap-2">
+        {/* Identity row: small avatar, name and time. A phone shows the agent
+            in the header only, and the time in the action row; a proactive
+            workspace's messages keep theirs. */}
+        <div
+          className={cn(
+            'mb-1.5 flex h-6 items-center gap-2',
+            !proactive && 'phone:hidden',
+          )}
+        >
           <EmojiAvatar
             imageUrl={agentIdentity.imageUrl}
             emoji={agentIdentity.emoji}
@@ -791,7 +907,9 @@ export const MessageBubble = memo(
             <LazyTurnTrace
               message={message}
               reasoning={process === 'full'}
+              stepsOnly={!processShown}
               onRequest={setOpenOnLoad}
+              pending={!message.has_trace}
             />
           )}
 
@@ -804,7 +922,7 @@ export const MessageBubble = memo(
           {renderImages('mb-3')}
 
           {!hasOnlyImages && (
-            <div className="max-w-none overflow-hidden">
+            <div className={REPLY_BODY_CLASS} {...pressToOpenMenu}>
               <FinalMarkdown
                 content={presentedContent}
                 groupJid={markdownJid}
@@ -814,22 +932,28 @@ export const MessageBubble = memo(
           )}
         </div>
 
-        {/* Action row: usage summary always (faint), actions on hover */}
-        <div className="mt-1.5 flex h-7 items-center gap-1.5 pointer-coarse:h-10">
+        {/* Action row: usage summary always (faint), actions on hover. A
+            phone has the time here and the usage behind 「详情」. */}
+        <div className="mt-1.5 flex h-7 items-center gap-1.5 pointer-coarse:h-10 phone:h-11 phone:gap-0">
           {incompleteBadge}
-          {message.is_from_me && message.token_usage && (
-            <TokenUsageDisplay
-              tokenUsageJson={message.token_usage}
-              workflowRuns={completedWorkflowRuns}
-            />
+          {showTime && !proactive && (
+            <span
+              className="hidden pr-1 text-micro text-faint-foreground phone:inline"
+              title={time}
+            >
+              {shortTime}
+            </span>
           )}
-          <div className="flex items-center gap-0.5 transition-opacity lg:opacity-0 lg:group-hover:opacity-100 lg:focus-within:opacity-100 lg:has-[[aria-expanded=true]]:opacity-100">
+          {usageView && (
+            <TokenUsageDisplay view={usageView} className="phone:hidden" />
+          )}
+          <div className="flex items-center gap-0.5 transition-opacity lg:opacity-0 lg:group-hover:opacity-100 lg:focus-within:opacity-100 lg:has-[[aria-expanded=true]]:opacity-100 phone:gap-0">
             <IconButton
               label="复制消息"
               size="icon-xs"
               icon={copied ? <Check className="text-primary-text" /> : <Copy />}
               onClick={handleCopy}
-              className="text-muted-foreground pointer-coarse:size-10"
+              className="text-muted-foreground pointer-coarse:size-10 phone:size-11"
             />
             <IconButton
               label="生成分享图片"
@@ -843,10 +967,13 @@ export const MessageBubble = memo(
               chatJid={message.chat_jid}
               messageId={message.id}
               onShareImage={() => setShowShareDialog(true)}
+              open={menuOpen}
+              onOpenChange={setMenuOpen}
             >
               {menuButton}
             </MessageContextMenu>
           </div>
+          {usageView && <TokenUsagePopover view={usageView} />}
         </div>
 
         {overlays}
@@ -868,6 +995,7 @@ export const MessageBubble = memo(
     prev.message.timestamp === next.message.timestamp &&
     prev.message.delivery_updated_at === next.message.delivery_updated_at &&
     prev.message.delivery_status === next.message.delivery_status &&
+    prev.message.automation?.name === next.message.automation?.name &&
     prev.showTime === next.showTime &&
     prev.thinkingContent === next.thinkingContent &&
     prev.thinkingDurationMs === next.thinkingDurationMs &&

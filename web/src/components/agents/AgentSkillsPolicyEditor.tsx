@@ -1,6 +1,4 @@
-import { Check, Loader2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
-import { cn } from '@/lib/utils';
 import {
   AgentSubheading,
   ChoiceCardBody,
@@ -27,20 +25,9 @@ interface AgentSkillsPolicyEditorProps {
   loading?: boolean;
   error?: string | null;
   hostAvailable: boolean;
-  hostAutoSave?: boolean;
-  hostSaving?: boolean;
-  hostSaveStatus?: HostSkillSaveStatus;
-  onRetryHostSave?: () => void;
   managedError?: string | null;
   hostError?: string | null;
 }
-
-export type HostSkillSaveStatus =
-  | 'idle'
-  | 'saved'
-  | 'error'
-  | 'warning'
-  | 'uncertain';
 
 export function AgentSkillsPolicyEditor({
   managedPolicy,
@@ -54,10 +41,6 @@ export function AgentSkillsPolicyEditor({
   loading,
   error,
   hostAvailable,
-  hostAutoSave = false,
-  hostSaving,
-  hostSaveStatus = 'idle',
-  onRetryHostSave,
   managedError,
   hostError,
 }: AgentSkillsPolicyEditorProps) {
@@ -114,7 +97,6 @@ export function AgentSkillsPolicyEditor({
               label="宿主机 Skills 使用方式"
               value={hostPolicy.mode}
               onChange={onHostModeChange}
-              disabled={hostSaving}
               options={[
                 {
                   value: 'disabled',
@@ -142,80 +124,15 @@ export function AgentSkillsPolicyEditor({
                 onChange={onHostIdsChange}
                 loading={loading}
                 error={error}
-                disabled={hostSaving}
                 emptyText="未在 ~/.claude/skills 检测到有效 Skill"
               />
             )}
-            {hostError && <InlineError message={hostError} />}
-            {!hostError && (
-              <p
-                aria-live="polite"
-                className={cn(
-                  'flex min-h-5 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-caption',
-                  hostSaveStatus === 'error'
-                    ? 'text-error'
-                    : hostSaveStatus === 'warning' ||
-                        hostSaveStatus === 'uncertain'
-                      ? 'text-warning'
-                      : hostSaveStatus === 'saved'
-                        ? 'text-success'
-                        : 'text-muted-foreground',
-                )}
-              >
-                {hostSaving ? (
-                  <>
-                    <Loader2 className="size-3.5 animate-spin" />
-                    正在保存并应用宿主机 Skills…
-                  </>
-                ) : hostSaveStatus === 'saved' ? (
-                  <>
-                    <Check className="size-3.5" />
-                    已保存并生效；新会话会使用这项策略。
-                  </>
-                ) : hostSaveStatus === 'error' ? (
-                  <>
-                    保存失败，当前选择尚未生效。
-                    {onRetryHostSave && (
-                      <button
-                        type="button"
-                        className="font-medium underline underline-offset-2 hover:text-foreground"
-                        onClick={onRetryHostSave}
-                      >
-                        重试保存
-                      </button>
-                    )}
-                  </>
-                ) : hostSaveStatus === 'warning' ? (
-                  <>
-                    配置已保存，但工作区运行时清理未完成。
-                    {onRetryHostSave && (
-                      <button
-                        type="button"
-                        className="font-medium underline underline-offset-2 hover:text-foreground"
-                        onClick={onRetryHostSave}
-                      >
-                        重试清理
-                      </button>
-                    )}
-                  </>
-                ) : hostSaveStatus === 'uncertain' ? (
-                  <>
-                    连接中断，暂时无法确认服务端状态。
-                    {onRetryHostSave && (
-                      <button
-                        type="button"
-                        className="font-medium underline underline-offset-2 hover:text-foreground"
-                        onClick={onRetryHostSave}
-                      >
-                        重新确认并应用
-                      </button>
-                    )}
-                  </>
-                ) : hostAutoSave ? (
-                  '修改后会自动保存；“全部使用”也会自动包含以后新增的宿主机 Skills。'
-                ) : (
-                  '修改后需保存或创建智能体才会生效。'
-                )}
+            {hostError ? (
+              <InlineError message={hostError} />
+            ) : (
+              <p className="text-caption text-muted-foreground">
+                修改后点击“保存”生效；“全部使用”也会自动包含以后新增的宿主机
+                Skills。
               </p>
             )}
           </>
@@ -228,7 +145,7 @@ export function AgentSkillsPolicyEditor({
 
       <SkillSourceSection
         title="工作区 Skills"
-        description="随实际运行的工作区自动加载，不能在智能体级别固定选择。创建后可在“最终生效能力”中按工作区预览。"
+        description="随实际运行的工作区自动加载，不能在智能体级别固定选择；可在“最终生效能力”中按工作区预览。"
         badge="自动"
       />
     </div>

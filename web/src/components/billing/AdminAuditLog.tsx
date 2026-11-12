@@ -185,6 +185,7 @@ export default function AdminAuditLog() {
           ))}
         </NativeSelect>
         <Input
+          variant="code"
           value={userFilter}
           onChange={(e) => setUserFilter(e.target.value)}
           placeholder="用户 ID 筛选"

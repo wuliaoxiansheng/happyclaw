@@ -27,6 +27,24 @@ export interface CardMeta {
   toolCount?: number;
 }
 
+/** One AskUserQuestion question as the agent sent it. */
+export interface AskQuestionView {
+  question: string;
+  multiSelect?: boolean;
+  options?: Array<{ value?: string; label?: string }>;
+}
+
+/**
+ * Questions an AskUserQuestion call left open. The runner has no answer
+ * channel: the user's next message is the answer, and an option button sends
+ * that message on the clicker's behalf.
+ */
+export interface AskCardInput {
+  questions: AskQuestionView[];
+  /** False lists every option as text instead of buttons. */
+  buttons: boolean;
+}
+
 export interface AgentCardInput {
   /** Main reply body (markdown). Already untreated — builder applies Feishu markdown optimization. */
   text: string;
@@ -50,6 +68,8 @@ export interface AgentCardInput {
    * timezone. Omit (or 0) to skip the timestamp.
    */
   completedAtMs?: number;
+  /** Open AskUserQuestion questions, rendered after the answer. */
+  ask?: AskCardInput;
 }
 
 /** Opaque JSON shape for a Feishu v2 card. Consumers stringify it for the SDK. */

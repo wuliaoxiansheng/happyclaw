@@ -3,12 +3,16 @@ import {
   useContext,
   useEffect,
   useRef,
+  useState,
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
 import { AlertTriangle, CircleCheck, CircleX, Info } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { ListGroup } from '@/components/common/ListRow';
+import type { MenuAction } from '@/components/common/ResponsiveMenu';
+import { PhonePageHeader } from '@/components/layout/PhonePageHeader';
+import { useIsPhone } from '@/components/layout/phone';
 import { Skeleton } from '@/components/ui/skeleton';
 import { cn } from '@/lib/utils';
 
@@ -20,13 +24,31 @@ export const CapabilityActionsSlotContext = createContext<
   HTMLElement | null | undefined
 >(undefined);
 
-/** Renders a section's actions into the capabilities top bar. */
+/**
+ * Renders a section's actions into the capabilities top bar. On a phone the
+ * page is named in the app's top bar instead: `phoneAction` is its one
+ * primary action and `phoneMenu` goes behind ⋯.
+ */
 export function CapabilitySectionActions({
   children,
+  phoneAction,
+  phoneMenu = [],
 }: {
   children: ReactNode;
+  phoneAction?: ReactNode;
+  phoneMenu?: MenuAction[];
 }) {
   const slot = useContext(CapabilityActionsSlotContext);
+  const isPhone = useIsPhone();
+  if (isPhone && slot !== undefined) {
+    return (
+      <PhonePageHeader
+        title="能力库"
+        action={phoneAction}
+        menu={{ title: '能力库操作', groups: [phoneMenu] }}
+      />
+    );
+  }
   if (slot === undefined) {
     return <div className="flex items-center gap-1.5">{children}</div>;
   }
@@ -86,6 +108,26 @@ export const CapabilityPageNoteContext = createContext<ReactNode>(null);
 
 export function CapabilityNotice({ children }: { children: ReactNode }) {
   const pageNote = useContext(CapabilityPageNoteContext);
+  const isPhone = useIsPhone();
+  const [expanded, setExpanded] = useState(false);
+  // A phone's first screen keeps one line of it; a tap shows the rest.
+  if (isPhone && !expanded) {
+    return (
+      <button
+        type="button"
+        aria-expanded={false}
+        onClick={() => setExpanded(true)}
+        className="flex min-h-11 w-full items-center gap-2 rounded-lg bg-surface-hover px-3 text-left text-caption text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+      >
+        <Info
+          aria-hidden="true"
+          className="size-3.5 shrink-0 text-faint-foreground"
+        />
+        <span className="min-w-0 flex-1 truncate">{children}</span>
+        <span className="shrink-0 text-foreground">展开说明</span>
+      </button>
+    );
+  }
   return (
     <Callout>
       {pageNote && <p>{pageNote}</p>}
@@ -257,7 +299,7 @@ export function DetailPanel({
       className={cn(
         // `clip` rounds the corners without becoming a scroll container, so
         // the panel keeps its content height inside flex sheets.
-        'overflow-clip rounded-xl bg-surface-raised ring-1 ring-surface-border',
+        'overflow-clip rounded-xl bg-surface-raised ring-1 ring-surface-border [--md-table-bg:var(--surface-raised)]',
         className,
       )}
     >

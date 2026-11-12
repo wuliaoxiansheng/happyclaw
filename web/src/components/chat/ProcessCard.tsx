@@ -10,7 +10,7 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
-import { ChevronRight, Sparkles } from 'lucide-react';
+import { ChevronRight, Layers, Loader2 } from 'lucide-react';
 import { m } from 'motion/react';
 import { cn } from '@/lib/utils';
 import type {
@@ -19,12 +19,19 @@ import type {
 } from '../../stores/chat';
 import type { StreamingStep } from '../../lib/stream-steps';
 import {
+  LIVE_TIMELINE_ROWS,
   SETTLED_TIMELINE_ROWS,
+  describeWork,
+  describeWorkCounts,
   hasListedSteps,
   isQuestionStep,
-  summarizeSettled,
+  summarizedSteps,
   visibleSteps,
 } from '../../lib/process-steps';
+import {
+  rememberProcessOpen,
+  rememberedProcessOpen,
+} from '../../lib/process-open-memory';
 import {
   deriveHeadline,
   WAITING_HEADLINE,
@@ -33,12 +40,21 @@ import {
 import { formatRunElapsed } from '../../lib/run-phase';
 import { useSteadyValue } from '../../hooks/useSteadyValue';
 import { useAfterDelay, useTick } from '../../hooks/useTick';
+import { useIsPhone } from '../layout/phone';
+import { MemoryReceipts } from './MemoryReceipts';
 import { ModelWaitBody, modelWaitSeconds } from './ModelWaitRow';
 import {
   LATER_WAIT_DELAY_MS,
   ProcessTimeline,
   QuestionCards,
 } from './ProcessRows';
+import {
+  TOOL_STATE,
+  ToolStateIcon,
+  countToolStates,
+  describeProblems,
+  worstProblem,
+} from './tool-status';
 
 export interface ProcessCardProps {
   mode: 'live' | 'settled';
@@ -62,6 +78,16 @@ export interface ProcessCardProps {
   thinkingText?: boolean;
   /** Settled: the total time, for steps that carry no times of their own. */
   durationMs?: number;
+  /**
+   * Live: the answer is being written below. The process is over for now and
+   * folds to its one-line summary, as it will on the finished reply.
+   */
+  answering?: boolean;
+  /**
+   * The turn the card belongs to: the reader's open-or-closed choice is kept
+   * by it, so the finished reply's card is left as the live one was.
+   */
+  memoryKey?: string | null;
   /** Settled: start open (the reader asked for the steps). */
   defaultOpen?: boolean;
   onOpenChange?: (open: boolean) => void;
@@ -93,14 +119,14 @@ const ICON_CLASS = 'size-3.5 shrink-0';
 // ── the header ──────────────────────────────────────────────────────────
 
 interface ProcessHeaderProps {
-  mode: ProcessCardProps['mode'];
+  /** Live and at work: what it does now. Otherwise its one-line summary. */
+  working: boolean;
   steps: StreamingStep[];
   /** The model's request is out and nothing has come back (past its delay). */
   waiting: boolean;
   waitingSince?: number;
   thinkingText: boolean;
   durationMs?: number;
-  stepsDropped: number;
   open: boolean;
   /** The id of the window the header opens, when there is one. */
   bodyId?: string;
@@ -108,25 +134,23 @@ interface ProcessHeaderProps {
 }
 
 /**
- * The one row that is always there. Live, it says what the run is doing now
- * and for how long that step has gone on (the run's own time is the status
- * line's, and a second clock would disagree with it); settled, what it did. It
- * is the button that opens the rest, the whole row wide, never dependent on a
- * hover.
+ * The one row that is always there. At work, it says what the run is doing
+ * now, with how long the process has gone on in a monospace timer; folded (its
+ * answer is being written, or the reply is finished), "已工作 Xs" by a Layers
+ * icon, as in cindy. It is the button that opens the rest, the whole row wide,
+ * never dependent on a hover.
  */
 function ProcessHeader({
-  mode,
+  working,
   steps,
   waiting,
   waitingSince,
   thinkingText,
   durationMs,
-  stepsDropped,
   open,
   bodyId,
   onToggle,
 }: ProcessHeaderProps) {
-  const live = mode === 'live';
   const latest = deriveHeadline({
     steps,
     waiting,
@@ -144,8 +168,17 @@ function ProcessHeader({
     `${latest.source}|${latest.running}|${latest.startedAt}|${latest.text}`,
     HEADLINE_SETTLE_MS,
   );
-  // The time of what is going on, with the line that says what it is.
-  const startedAt = live && headline.running ? headline.startedAt : undefined;
+  // The process has gone on since its first step (or the wait before it): the
+  // earliest this card has seen, as steps dropped from the front of a long
+  // list must not move it.
+  const earliest = useRef<number | undefined>(undefined);
+  const firstAt = working
+    ? (summarizedSteps(steps)[0]?.at ?? waitingSince)
+    : undefined;
+  if (firstAt != null) {
+    earliest.current = Math.min(earliest.current ?? firstAt, firstAt);
+  }
+  const startedAt = working ? earliest.current : undefined;
   const now = useTick(startedAt != null);
   const seconds =
     startedAt != null
@@ -158,7 +191,11 @@ function ProcessHeader({
     shownOnce.current = true;
   }, []);
 
-  const running = live && headline.running;
+  const running = working && headline.running;
+  // Folded, the line also says whether anything went wrong, and out of how
+  // many calls: 「已工作 32s · 12 个工具 · 2 个失败」. Nothing when nothing did;
+  // opened, the counts under it say it.
+  const outcome = working || open ? null : foldedOutcome(steps);
   return (
     <button
       type="button"
@@ -167,16 +204,24 @@ function ProcessHeader({
       aria-controls={open ? bodyId : undefined}
       className="-mx-1.5 flex min-h-8 w-[calc(100%+0.75rem)] cursor-pointer items-center gap-2 rounded-md px-1.5 text-left text-label text-muted-foreground transition-colors hover:bg-surface-hover focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none pointer-coarse:min-h-10"
     >
-      <Sparkles
-        aria-hidden="true"
-        className={cn(
-          ICON_CLASS,
-          running
-            ? 'animate-pulse text-muted-foreground motion-reduce:animate-none'
-            : 'text-faint-foreground',
-        )}
-      />
-      {live ? (
+      {working ? (
+        <Loader2
+          aria-hidden="true"
+          className={cn(
+            ICON_CLASS,
+            'text-faint-foreground',
+            running && 'animate-spin motion-reduce:animate-none',
+          )}
+        />
+      ) : outcome ? (
+        <ToolStateIcon state={outcome.worst} />
+      ) : (
+        <Layers
+          aria-hidden="true"
+          className={cn(ICON_CLASS, 'text-faint-foreground')}
+        />
+      )}
+      {working ? (
         <span className="min-w-0 flex-1 overflow-hidden">
           <m.span
             key={headline.text}
@@ -197,11 +242,22 @@ function ProcessHeader({
         </span>
       ) : (
         <span className="min-w-0 flex-1 truncate tabular-nums">
-          {summarizeSettled(steps, durationMs, stepsDropped)}
+          {describeWork(steps, durationMs)}
+          {outcome && (
+            <>
+              {` · ${outcome.total} 个工具 · `}
+              <span
+                data-hc-work-problems=""
+                className={TOOL_STATE[outcome.worst].tone}
+              >
+                {outcome.problems}
+              </span>
+            </>
+          )}
         </span>
       )}
-      {live && seconds != null && seconds >= 1 && (
-        <span className="shrink-0 text-caption text-faint-foreground tabular-nums">
+      {working && seconds != null && seconds >= 1 && (
+        <span className="shrink-0 font-mono text-caption text-faint-foreground tabular-nums">
           {formatRunElapsed(seconds)}
         </span>
       )}
@@ -215,6 +271,15 @@ function ProcessHeader({
       />
     </button>
   );
+}
+
+/** What went wrong in a settled process, or `null` when nothing did. */
+function foldedOutcome(steps: readonly StreamingStep[]) {
+  const counts = countToolStates(summarizedSteps(steps), false);
+  const worst = worstProblem(counts);
+  if (!worst) return null;
+  const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+  return { worst, total, problems: describeProblems(counts).join(' · ') };
 }
 
 // ── the window ──────────────────────────────────────────────────────────
@@ -240,6 +305,7 @@ function ProcessWindow({
   live: boolean;
   children: ReactNode;
 }) {
+  const isPhone = useIsPhone();
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const following = useRef(true);
@@ -349,8 +415,12 @@ function ProcessWindow({
       data-scroll-fade={live && faded ? 'top' : undefined}
       data-hc-process-window=""
       className={cn(
-        'mt-0.5 ml-1.5 overflow-y-auto overscroll-contain',
-        live ? 'max-h-60 pointer-coarse:max-h-40' : 'max-h-[60vh]',
+        'mt-0.5 ml-1.5',
+        // A phone has no window in the conversation: the rows scroll with it
+        // and what is long in them folds (ClampedDetail).
+        !isPhone && 'overflow-y-auto overscroll-contain',
+        !isPhone &&
+          (live ? 'max-h-60 pointer-coarse:max-h-40' : 'max-h-[60vh]'),
       )}
     >
       <div ref={contentRef}>{children}</div>
@@ -469,11 +539,15 @@ export const ProcessCard = memo(function ProcessCard({
   commentary = true,
   thinkingText = true,
   durationMs,
+  answering = false,
+  memoryKey,
   defaultOpen,
   onOpenChange,
   className,
 }: ProcessCardProps) {
   const live = mode === 'live';
+  // At work: the run is producing steps, not yet the answer. Folded otherwise.
+  const working = live && !answering;
   const shown = useMemo(
     () => visibleSteps(steps, commentary),
     [steps, commentary],
@@ -482,34 +556,48 @@ export const ProcessCard = memo(function ProcessCard({
   const listed = hasProcess(shown);
   // A wait between tools shows only once it has lasted a moment.
   const waitVisible = useAfterDelay(
-    live && waiting,
+    working && waiting,
     hasContent ? LATER_WAIT_DELAY_MS : 0,
   );
-  // What the reader chose; until then the card follows its own state.
-  const [chosen, setChosen] = useState<boolean | undefined>(undefined);
+  // What the reader chose, for this card or for the one it replaces; until
+  // then the card follows its own state.
+  const [chosen, setChosen] = useState<boolean | undefined>(() =>
+    rememberedProcessOpen(memoryKey),
+  );
+  // The choice outlives this card: the reply that takes its place keeps it.
+  useEffect(() => {
+    if (chosen !== undefined) rememberProcessOpen(memoryKey, chosen);
+  }, [chosen, memoryKey]);
   const bodyId = useId();
   // A reader reading a row in the window has chosen to have it open: the card
-  // does not fold over them when its run ends.
+  // does not fold over them when its answer starts or its run ends.
   const keepOpen = useCallback(
     () => setChosen((current) => current ?? true),
     [],
   );
   const rootRef = useRef<HTMLDivElement>(null);
-  useFoldAnchor(rootRef, mode);
+  useFoldAnchor(rootRef, working ? 'live' : 'settled');
   if (!listed && !waitVisible) {
     // A question alone is the card the reader answers, with no process to open.
-    return live && shown.some(isQuestionStep) ? (
+    return shown.some(isQuestionStep) ? (
       <QuestionCards steps={shown} activeTools={activeTools} />
     ) : null;
   }
 
-  const open = chosen ?? (live ? true : (defaultOpen ?? false));
-  const showWindow = open;
+  const open = chosen ?? (working ? true : (defaultOpen ?? false));
   const toggle = () => {
     const next = !open;
     setChosen(next);
     onOpenChange?.(next);
   };
+  // At work and as it comes, the latest rows (cindy's five); all of them once
+  // the reader asked, or the process is over.
+  const maxRows =
+    working && chosen === undefined
+      ? LIVE_TIMELINE_ROWS
+      : SETTLED_TIMELINE_ROWS;
+  const counts =
+    open && !working ? describeWorkCounts(shown, stepsDropped) : '';
 
   const timeline = (
     <ProcessTimeline
@@ -519,10 +607,12 @@ export const ProcessCard = memo(function ProcessCard({
       taskStates={taskStates}
       thinkingText={thinkingText}
       live={live}
-      maxRows={live ? undefined : SETTLED_TIMELINE_ROWS}
-      titleInHeader={live}
+      maxRows={maxRows}
+      titleInHeader={working}
       onInteract={keepOpen}
-      bodyClassName={live ? 'max-h-36 pointer-coarse:max-h-24' : undefined}
+      thinkingMaxHeight={
+        working ? 'max-h-36 pointer-coarse:max-h-24' : undefined
+      }
       after={
         waitVisible ? (
           <WaitNote since={waitingSince} hasRows={listed} />
@@ -536,27 +626,36 @@ export const ProcessCard = memo(function ProcessCard({
       ref={rootRef}
       data-hc-process-card=""
       data-mode={mode}
+      data-folded={working ? undefined : ''}
       data-hc-model-wait={!listed && waitVisible ? '' : undefined}
       className={cn('mb-2 font-sans', className)}
     >
       <ProcessHeader
-        mode={mode}
+        working={working}
         steps={shown}
         waiting={waitVisible}
         waitingSince={waitingSince}
         thinkingText={thinkingText}
         durationMs={durationMs}
-        stepsDropped={stepsDropped}
         open={open}
-        bodyId={showWindow ? bodyId : undefined}
+        bodyId={open ? bodyId : undefined}
         onToggle={toggle}
       />
-      {showWindow && (
-        <ProcessWindow id={bodyId} live={live}>
+      {open && (
+        <ProcessWindow id={bodyId} live={working}>
+          {counts && (
+            <p
+              data-hc-work-counts=""
+              className="mb-1 text-caption text-faint-foreground"
+            >
+              {counts}
+            </p>
+          )}
           {timeline}
         </ProcessWindow>
       )}
-      {live && <QuestionCards steps={shown} activeTools={activeTools} />}
+      <QuestionCards steps={shown} activeTools={activeTools} />
+      <MemoryReceipts steps={shown} groupJid={groupJid} />
     </div>
   );
 });

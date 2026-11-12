@@ -31,7 +31,6 @@ import type {
   TextBasedChannel,
 } from 'discord.js';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
-import { notifyNewImMessage } from './message-notifier.js';
 import { logger } from './logger.js';
 import {
   saveDownloadedFile,
@@ -46,6 +45,20 @@ import {
   resolveAdmittedChannelRoute,
 } from './channel-admission.js';
 import { extractProviderTarget } from './channel-address.js';
+import {
+  groupSenderAdmission,
+  type ChannelCommandMention,
+  type GroupAudienceConnectOpts,
+  type GroupSenderAdmission,
+} from './im-group-audience.js';
+import {
+  existingControlTarget,
+  parseConnectorRuntimeControl,
+  projectChannelInbound,
+  runSessionBreak,
+  STEER_TARGET_MISSING_REPLY,
+  type ChannelFollowUpConnectOpts,
+} from './im-connector-follow-up.js';
 import {
   ExactAsyncIndicatorRegistry,
   processingIndicatorKey,
@@ -66,13 +79,52 @@ export function isUnsupportedDiscordGroupDm(type: ChannelType): boolean {
   return type === ChannelType.GroupDM;
 }
 
+/**
+ * The text of a guild message that structurally addresses the bot, without
+ * that address; null otherwise. The proof is a leading `<@botId>` token that
+ * Discord also resolved into `mentions.users` (not a reply ping, role or
+ * @everyone).
+ */
+export function discordAddressedText(
+  content: string,
+  mentionedUsers: { has(id: string): boolean },
+  botId: string | undefined,
+): string | null {
+  if (!botId || !mentionedUsers.has(botId)) return null;
+  const leading = content.match(/^\s*<@!?(\d+)>/);
+  return leading?.[1] === botId
+    ? content.slice(leading[0].length).trim()
+    : null;
+}
+
+/**
+ * Members a Discord command names, for `/allow` and `/disallow`. A user
+ * counts only when the content carries their `<@id>` token: a reply ping also
+ * lands in `mentions.users` but does not name anyone. Bots never count.
+ */
+export function discordCommandMentions(
+  content: string,
+  mentionedUsers: Iterable<{ id: string; bot?: boolean }>,
+): ChannelCommandMention[] {
+  const named = new Set(
+    [...content.matchAll(/<@!?(\d+)>/g)].map((match) => match[1]),
+  );
+  const mentions: ChannelCommandMention[] = [];
+  for (const user of mentionedUsers) {
+    if (!user.bot && named.has(user.id)) mentions.push({ imId: user.id });
+  }
+  return mentions;
+}
+
 // ─── Types ──────────────────────────────────────────────────────
 
 export interface DiscordConnectionConfig {
   botToken: string;
 }
 
-export interface DiscordConnectOpts {
+/** Group audience senders are Discord user ids. */
+export interface DiscordConnectOpts
+  extends ChannelFollowUpConnectOpts, GroupAudienceConnectOpts {
   onReady?: () => void;
   onNewChat: (jid: string, name: string) => void;
   isChatAuthorized?: (jid: string) => boolean;
@@ -86,9 +138,14 @@ export interface DiscordConnectOpts {
     chatJid: string,
     command: string,
     senderImId?: string,
+    mentions?: ChannelCommandMention[],
   ) => Promise<string | null>;
   resolveGroupFolder?: (jid: string) => string | undefined;
   resolveEffectiveChatJid?: (
+    chatJid: string,
+  ) => { effectiveJid: string; agentId: string | null } | null;
+  /** The route a chat already has; never creates one. */
+  lookupEffectiveChatJid?: (
     chatJid: string,
   ) => { effectiveJid: string; agentId: string | null } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
@@ -532,8 +589,15 @@ export function createDiscordConnection(
           return;
         }
 
+        // Guild text without mention tokens: <@123456> or <@!123456>.
+        const unmentionedContent = msg.content.replace(/<@!?\d+>/g, '').trim();
+
         // Guild channel: check group filtering (must check actual @mention first)
+        const audience: GroupSenderAdmission = isDM
+          ? 'admitted'
+          : groupSenderAdmission(opts, jid, senderImId, unmentionedContent);
         if (!isDM) {
+          if (audience === 'rejected') return;
           const isBotMentioned = connectedClient.user
             ? msg.mentions.has(connectedClient.user)
             : false;
@@ -569,21 +633,77 @@ export function createDiscordConnection(
         }
 
         // Extract content, stripping bot mentions
-        let content = msg.content;
-        if (!isDM && connectedClient.user) {
-          // Remove bot mention patterns: <@123456> or <@!123456>
-          content = content.replace(/<@!?\d+>/g, '').trim();
+        let content =
+          !isDM && connectedClient.user ? unmentionedContent : msg.content;
+        const inboundAttachments = collectDiscordInboundAttachments(msg);
+
+        const addressedText = isDM
+          ? msg.content.trim()
+          : discordAddressedText(
+              msg.content,
+              msg.mentions.users,
+              connectedClient.user?.id,
+            );
+        const runtimeControl = parseConnectorRuntimeControl({
+          commandText: addressedText ?? '',
+          eligible: addressedText !== null,
+          hasAttachments: inboundAttachments.length > 0,
+        });
+        // A runtime control acts on the Session the chat already has.
+        const lookup = opts.lookupEffectiveChatJid;
+        const controlTarget = () =>
+          existingControlTarget(
+            jid,
+            !!opts.resolveEffectiveChatJid,
+            lookup && (() => lookup(jid)),
+          );
+        if (runtimeControl?.kind === 'break') {
+          const reply = await runSessionBreak(opts.onSessionBreak, {
+            sourceJid: jid,
+            targetJid: controlTarget(),
+            senderImId,
+            chatType: isDM ? 'p2p' : 'group',
+          });
+          inboundLifecycle.assertCurrent(lease);
+          const channel = await resolveChannel(jid);
+          if (channel) {
+            for (const chunk of splitDiscordChunks(reply)) {
+              await channel.send(chunk);
+            }
+          }
+          return;
+        }
+        if (runtimeControl?.kind === 'steer' && !controlTarget()) {
+          inboundLifecycle.assertCurrent(lease);
+          const channel = await resolveChannel(jid);
+          if (channel) await channel.send(STEER_TARGET_MISSING_REPLY);
+          return;
+        }
+        const requestedFollowUpMode =
+          runtimeControl?.kind === 'steer' ? ('steer' as const) : undefined;
+        if (runtimeControl?.kind === 'steer') {
+          content = runtimeControl.text.replace(/<@!?\d+>/g, '').trim();
         }
 
         // Control commands may repair/change a binding, so consume them before
         // route validation. Attachment work deliberately stays after routing.
         const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/i);
-        if (slashMatch && opts.onCommand) {
+        if (slashMatch && opts.onCommand && !requestedFollowUpMode) {
           const cmdBody = (
             slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
           ).trim();
           try {
-            const reply = await opts.onCommand(jid, cmdBody, senderImId);
+            const reply = await opts.onCommand(
+              jid,
+              cmdBody,
+              senderImId,
+              isDM
+                ? []
+                : discordCommandMentions(
+                    msg.content,
+                    msg.mentions.users.values(),
+                  ),
+            );
             if (reply) {
               const channel = await resolveChannel(jid);
               if (channel) {
@@ -597,6 +717,8 @@ export function createDiscordConnection(
             return;
           }
         }
+        // Admitted only as `/owner_mention`, and not consumed as it.
+        if (audience === 'bootstrap') return;
 
         const resolvedRoute = resolveAdmittedChannelRoute(
           jid,
@@ -619,7 +741,7 @@ export function createDiscordConnection(
           mimeType: string;
         }[] = [];
 
-        for (const attachment of collectDiscordInboundAttachments(msg)) {
+        for (const attachment of inboundAttachments) {
           const contentType = attachment.contentType || '';
           const isImage = contentType.startsWith('image/');
           const attachUrl = attachment.url;
@@ -669,6 +791,7 @@ export function createDiscordConnection(
                     'discord',
                     filename,
                     buffer,
+                    targetJid,
                   );
                   inboundLifecycle.assertCurrent(lease);
                   if (!content) {
@@ -707,6 +830,7 @@ export function createDiscordConnection(
                     'discord',
                     attachName,
                     buffer,
+                    targetJid,
                   );
                   inboundLifecycle.assertCurrent(lease);
                   if (!content) {
@@ -771,9 +895,8 @@ export function createDiscordConnection(
             sourceJid: jid,
           },
         );
-
-        opts.onMessagePersisted?.(
-          targetJid,
+        const followUp = projectChannelInbound(
+          opts,
           {
             id,
             chat_jid: targetJid,
@@ -785,7 +908,10 @@ export function createDiscordConnection(
             attachments: attachmentsJson,
             is_from_me: false,
           },
-          agentRouting?.agentId ?? undefined,
+          {
+            agentId: agentRouting?.agentId ?? undefined,
+            requestedMode: requestedFollowUpMode,
+          },
         );
 
         // Exact-input ack reaction: install ownership before the async
@@ -819,7 +945,14 @@ export function createDiscordConnection(
           )
           .catch(() => {});
 
-        notifyNewImMessage();
+        if (!followUp.shouldStartTurn) {
+          // Released by the host when the active run ends.
+          logger.info(
+            { jid, targetJid, msgId, disposition: followUp.disposition },
+            'Discord message queued behind the active run',
+          );
+          return;
+        }
 
         if (agentRouting?.agentId) {
           opts.onAgentMessage?.(jid, agentRouting.agentId);
@@ -932,7 +1065,7 @@ export function createDiscordConnection(
           // Register HappyClaw slash commands as Discord Application Commands
           try {
             await readyClient.application.commands.set([
-              { name: 'clear', description: '清除当前对话的会话上下文' },
+              { name: 'clear', description: '清除绑定会话的上下文' },
               { name: 'list', description: '查看所有工作区和对话列表' },
               { name: 'status', description: '查看当前工作区/对话状态' },
               { name: 'recall', description: '总结最近的对话内容' },
@@ -1034,6 +1167,22 @@ export function createDiscordConnection(
             if (admission.kind === 'deny') {
               await interaction.editReply(
                 '此聊天尚未配对。请先在 Web 设置页生成配对码。',
+              );
+              return;
+            }
+            // A native command is consumed as a command, so the
+            // `/owner_mention` bootstrap is the only exception, as on text.
+            if (
+              !isDM &&
+              groupSenderAdmission(
+                opts,
+                jid,
+                interaction.user.id,
+                `/${cmdBody}`,
+              ) === 'rejected'
+            ) {
+              await interaction.editReply(
+                '⚠️ 本频道只响应指定成员，命令未执行。',
               );
               return;
             }

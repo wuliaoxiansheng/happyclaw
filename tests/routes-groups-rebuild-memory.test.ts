@@ -51,7 +51,8 @@ vi.mock('../src/web.js', () => ({
 }));
 
 const db = await import('../src/db.js');
-const { cancelTaskRunNow } = await import('../src/task-scheduler.js');
+const { setAutomationRuntimeService } =
+  await import('../src/automation-run-ledger.js');
 const memoryStore = await import('../src/memory-store.js');
 const ownerProfile = await import('../src/owner-profile-store.js');
 const webContext = await import('../src/web-context.js');
@@ -63,8 +64,9 @@ const stopGroup = vi.fn(async () => {});
 const pauseToken = { id: 1 };
 const pauseGroupsForMutation = vi.fn(() => pauseToken);
 const resumeGroupsAfterMutation = vi.fn();
-const cancelTaskRun = vi.fn((runId: string) => cancelTaskRunNow(runId));
-const waitForTaskRunsToStop = vi.fn(async () => true);
+const suspendWorkspace = vi.fn((_workspaceJid: string) => ['automation-1']);
+const restoreWorkspace = vi.fn();
+const onSessionDeleted = vi.fn();
 const sessions: Record<string, unknown> = {};
 
 beforeAll(() => {
@@ -74,7 +76,11 @@ beforeAll(() => {
 beforeEach(() => {
   vi.clearAllMocks();
   stopGroup.mockResolvedValue(undefined);
-  waitForTaskRunsToStop.mockResolvedValue(true);
+  setAutomationRuntimeService({
+    suspendWorkspace,
+    restoreWorkspace,
+    onSessionDeleted,
+  } as unknown as Parameters<typeof setAutomationRuntimeService>[0]);
   webContext.setWebDeps({
     getRegisteredGroups: () => db.getAllRegisteredGroups(),
     getSessions: () => sessions,
@@ -85,8 +91,6 @@ beforeEach(() => {
       pauseGroupsForMutation,
       resumeGroupsAfterMutation,
     },
-    cancelTaskRun,
-    waitForTaskRunsToStop,
   } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
 });
 
@@ -156,55 +160,6 @@ describe('POST /:jid/clear-history workspace rebuild', () => {
       onboarding: { state: 'completed' },
     });
 
-    const taskNextRun = new Date(Date.now() + 60_000).toISOString();
-    db.createTask({
-      id: 'rebuild-memory-task',
-      group_folder: FOLDER,
-      chat_jid: JID,
-      prompt: 'This task must move to the recycle bin.',
-      schedule_type: 'cron',
-      schedule_value: '0 9 * * *',
-      context_mode: 'group',
-      execution_type: 'agent',
-      execution_mode: 'container',
-      script_command: null,
-      next_run: taskNextRun,
-      status: 'active',
-      created_at: new Date().toISOString(),
-      created_by: 'alice',
-      notify_channels: null,
-    });
-    const task = db.getTaskById('rebuild-memory-task')!;
-    const activeRun = db.createTaskRun({
-      task,
-      triggerType: 'manual',
-      idempotencyKey: 'rebuild-active-run',
-    }).run;
-    const activeClaim = db.claimNextTaskRun(
-      'rebuild-delivered-worker',
-      60_000,
-    )!;
-    expect(activeClaim.id).toBe(activeRun.id);
-    expect(
-      db.markTaskRunExecutionStarted(
-        activeClaim.id,
-        activeClaim.lease_owner,
-        activeClaim.lease_token,
-      ),
-    ).toBe(true);
-    expect(
-      db.completeTaskRun(
-        activeClaim.id,
-        activeClaim.lease_owner,
-        activeClaim.lease_token,
-        {
-          status: 'delivered',
-          result: '已排队到源工作区，等待智能体执行',
-          notificationStatus: 'skipped',
-        },
-      ),
-    ).toBe(true);
-
     const workspaceDir = path.join(groupsDir, FOLDER);
     const legacyMemoryDir = path.join(root, 'memory', FOLDER);
     const persistentDir = path.join(root, 'extra');
@@ -227,8 +182,12 @@ describe('POST /:jid/clear-history workspace rebuild', () => {
       stopGroup.mock.invocationCallOrder[0],
     );
     expect(stopGroup).toHaveBeenCalledWith(JID, { force: true });
-    expect(cancelTaskRun).toHaveBeenCalledWith(activeRun.id);
-    expect(waitForTaskRunsToStop).toHaveBeenCalledWith([activeRun.id]);
+    // Automations pause before the runners stop and resume afterwards.
+    expect(suspendWorkspace).toHaveBeenCalledWith(JID);
+    expect(suspendWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
+      stopGroup.mock.invocationCallOrder[0],
+    );
+    expect(restoreWorkspace).toHaveBeenCalledWith(['automation-1']);
     expect(resumeGroupsAfterMutation).toHaveBeenCalledWith(pauseToken);
     expect(db.getRegisteredGroup(JID)).toBeDefined();
 
@@ -256,17 +215,6 @@ describe('POST /:jid/clear-history workspace rebuild', () => {
         revision: 0,
         firstWakeAt: null,
       },
-    });
-
-    expect(db.getTaskById(task.id)).toMatchObject({
-      id: task.id,
-      status: 'paused',
-      next_run: null,
-    });
-    expect(db.getTaskById(task.id)?.deleted_at).not.toBeNull();
-    expect(db.getTaskRunById(activeRun.id)).toMatchObject({
-      id: activeRun.id,
-      status: 'cancelled',
     });
 
     const raw = new Database(path.join(storeDir, 'messages.db'), {
@@ -307,7 +255,7 @@ describe('POST /:jid/clear-history workspace rebuild', () => {
     );
   });
 
-  test('rolls files, Memory and task definitions back when SQLite commit fails', async () => {
+  test('rolls files and Memory back and resumes automations when SQLite commit fails', async () => {
     const jid = 'web:rebuild-memory-rollback';
     const folder = 'rebuild-memory-rollback';
     db.setRegisteredGroup(jid, {
@@ -333,44 +281,6 @@ describe('POST /:jid/clear-history workspace rebuild', () => {
       },
     });
     const originalStore = memoryStore.getWorkspaceMemoryStore(jid)!;
-    const originalNextRun = new Date(Date.now() + 120_000).toISOString();
-    db.createTask({
-      id: 'rebuild-rollback-task',
-      group_folder: folder,
-      chat_jid: jid,
-      prompt: 'Restore this task if rebuild fails.',
-      schedule_type: 'cron',
-      schedule_value: '0 10 * * *',
-      context_mode: 'isolated',
-      execution_type: 'agent',
-      execution_mode: 'container',
-      script_command: null,
-      next_run: originalNextRun,
-      status: 'active',
-      created_at: new Date().toISOString(),
-      created_by: 'alice',
-      notify_channels: null,
-    });
-    db.createTask({
-      id: 'rebuild-rollback-parsing-task',
-      group_folder: folder,
-      chat_jid: jid,
-      prompt: 'An in-flight parser owns this revision.',
-      schedule_type: 'cron',
-      schedule_value: '0 0 * * *',
-      context_mode: 'isolated',
-      execution_type: 'agent',
-      execution_mode: 'container',
-      script_command: null,
-      next_run: null,
-      status: 'parsing',
-      created_at: new Date().toISOString(),
-      created_by: 'alice',
-      notify_channels: null,
-    });
-    const parsingRevision = db.getTaskById(
-      'rebuild-rollback-parsing-task',
-    )!.revision;
     const workspaceDir = path.join(groupsDir, folder);
     const sessionDir = path.join(root, 'sessions', folder);
     const ipcDir = path.join(root, 'ipc', folder);
@@ -407,16 +317,7 @@ describe('POST /:jid/clear-history workspace rebuild', () => {
     expect(
       memoryStore.getWorkspaceMemoryItem(jid, memory.item.id).item.content,
     ).toContain('preserve this Memory');
-    expect(db.getTaskById('rebuild-rollback-task')).toMatchObject({
-      status: 'active',
-      next_run: originalNextRun,
-      deleted_at: null,
-    });
-    expect(db.getTaskById('rebuild-rollback-parsing-task')).toMatchObject({
-      status: 'parsing',
-      revision: parsingRevision,
-      deleted_at: null,
-    });
+    expect(restoreWorkspace).toHaveBeenCalledWith(['automation-1']);
     for (const dir of [workspaceDir, sessionDir, ipcDir, legacyMemoryDir]) {
       expect(fs.readFileSync(path.join(dir, 'before.txt'), 'utf8')).toBe(dir);
       expect(

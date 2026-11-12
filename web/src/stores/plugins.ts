@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { extractErrorMessage } from '../utils/error';
 
 export interface PluginWarnings {
   missing: string[];
@@ -57,12 +58,14 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
   loadPlugins: async () => {
     set({ loading: true });
     try {
-      const data = await api.get<{ marketplaces: MarketplaceEntry[] }>('/api/plugins');
+      const data = await api.get<{ marketplaces: MarketplaceEntry[] }>(
+        '/api/plugins',
+      );
       set({ marketplaces: data.marketplaces, loading: false, error: null });
     } catch (err) {
       set({
         loading: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
   },
@@ -79,7 +82,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
     } catch (err) {
       set({
         scanning: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       throw err;
     }
@@ -87,11 +90,14 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
 
   toggleEnabled: async (pluginFullId, enabled) => {
     try {
-      await api.patch(`/api/plugins/enabled/${encodeURIComponent(pluginFullId)}`, { enabled });
+      await api.patch(
+        `/api/plugins/enabled/${encodeURIComponent(pluginFullId)}`,
+        { enabled },
+      );
       set({ error: null });
       await get().loadPlugins();
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
       throw err;
     }
   },
@@ -106,7 +112,7 @@ export const usePluginsStore = create<PluginsState>((set, get) => ({
       await get().loadPlugins();
       return { removedEnabled: result.removedEnabled };
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      set({ error: extractErrorMessage(err) });
       throw err;
     }
   },

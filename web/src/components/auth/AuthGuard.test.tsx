@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
     hasPermission: vi.fn(() => true),
     setupStatus: { needsSetup: true },
     user: { role: 'admin', must_change_password: false },
+    deploymentMode: undefined as string | undefined,
   },
   post: vi.fn(),
 }));
@@ -40,6 +41,7 @@ beforeEach(() => {
     authenticated: true,
     checking: false,
     initialized: true,
+    deploymentMode: undefined,
   });
   mocks.state.user = { role: 'admin', must_change_password: false };
   mocks.state.hasPermission.mockReturnValue(true);
@@ -65,13 +67,18 @@ async function renderAt(route: string) {
           <Route
             path="/setup/providers"
             element={
-              <AuthGuard requireAdmin>
+              <AuthGuard>
                 <SetupProvidersPage />
               </AuthGuard>
             }
           />
           <Route path="/setup" element={<div>initial setup page</div>} />
           <Route path="/login" element={<div>login page</div>} />
+          <Route path="/users" element={<AuthGuard>users page</AuthGuard>} />
+          <Route
+            path="/billing"
+            element={<AuthGuard>billing page</AuthGuard>}
+          />
           <Route
             path="/private"
             element={
@@ -107,7 +114,6 @@ describe('optional provider onboarding', () => {
     await act(async () => skip?.click());
     expect(container.textContent).toBe('chat page');
     expect(mocks.post).not.toHaveBeenCalled();
-    expect(mocks.state.setupStatus.needsSetup).toBe(true);
   });
 
   test('still requires authentication', async () => {
@@ -134,9 +140,43 @@ describe('optional provider onboarding', () => {
     expect(container.textContent).toBe('chat page');
   });
 
+  test('keeps read-only guests out of onboarding', async () => {
+    mocks.state.user.role = 'guest';
+    await renderAt('/setup/providers');
+    expect(container.textContent).toBe('chat page');
+  });
+
+  test('lets read-only guests open their own settings', async () => {
+    mocks.state.user.role = 'guest';
+    await renderAt('/settings');
+    expect(container.textContent).toBe('settings page');
+  });
+
   test('still checks permissions', async () => {
     mocks.state.hasPermission.mockReturnValue(false);
     await renderAt('/private');
     expect(container.textContent).toBe('chat page');
+  });
+});
+
+describe('single-user host mode', () => {
+  test.each(['/users', '/billing'])(
+    'redirects %s to settings',
+    async (route) => {
+      mocks.state.deploymentMode = 'single_user_host';
+      await renderAt(route);
+      expect(container.textContent).toBe('settings page');
+    },
+  );
+
+  test.each([
+    ['/users', 'users page'],
+    ['/billing', 'billing page'],
+  ])('multi_user (or an older server) still opens %s', async (route, page) => {
+    await renderAt(route);
+    expect(container.textContent).toBe(page);
+    mocks.state.deploymentMode = 'multi_user';
+    await renderAt(route);
+    expect(container.textContent).toBe(page);
   });
 });

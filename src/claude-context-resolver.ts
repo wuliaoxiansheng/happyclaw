@@ -1,8 +1,13 @@
 import fs from 'fs';
 import path from 'path';
 
+import {
+  CLAUDE_CREDENTIAL_SETTING_KEYS,
+  HAPPYCLAW_OWNED_CLAUDE_ENV_KEYS,
+} from './claude-provider-env.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 import type { RegisteredGroup } from './types.js';
+import { getRecordedWorkdir } from './workspace-dir.js';
 import {
   reconcileSessionSkills,
   resolveEffectiveSkills,
@@ -56,7 +61,11 @@ export interface ClaudeContextPlanArgs {
   mountUserSkills?: boolean;
   userSkillsDirOverride?: string;
   managedSkillPolicy?: ManagedSkillPolicy;
-  workspaceSkillsDirOverride?: string;
+  /**
+   * Project Skill directories, lowest precedence first (see
+   * resolveWorkspaceSkillRoots). Defaults to the workspace's own directory.
+   */
+  workspaceSkillRoots?: string[];
   pluginSkillLayers?: EffectiveSkillLayer[];
 }
 
@@ -72,7 +81,8 @@ export interface ClaudeContextPlan {
   builtinSkillsDir: string;
   projectSkillsDir: string;
   userSkillsDir?: string;
-  workspaceSkillsDir: string;
+  /** Project Skill directories, lowest precedence first. */
+  workspaceSkillRoots: string[];
   effectiveSkills: EffectiveSkillManifest;
   audit: ClaudeContextAudit;
 }
@@ -167,9 +177,16 @@ function mergeSettings(
 }
 
 /**
- * Load the complete native user settings layer in Claude Code precedence
- * order. The caller applies HappyClaw's required env and effective MCP policy
+ * Load the native user settings layer in Claude Code precedence order. The
+ * caller applies HappyClaw's required env and effective MCP policy
  * afterward, so enabling native context cannot bypass those explicit controls.
+ *
+ * The layer is written into the session's settings.json, which a container
+ * mounts read-write for the agent, and it outranks the process environment.
+ * So everything HappyClaw owns leaves it: provider routing and credentials,
+ * the session's effort, compaction and context
+ * (HAPPYCLAW_OWNED_CLAUDE_ENV_KEYS), and the settings that run a command for
+ * credentials. Everything else (hooks, permissions, other env) stays.
  */
 export function loadHostClaudeSettings(
   plan: ClaudeContextPlan,
@@ -185,6 +202,12 @@ export function loadHostClaudeSettings(
       // Invalid native settings are surfaced by Claude Code when used
       // directly. HappyClaw skips the invalid layer to keep startup usable.
     }
+  }
+  for (const key of CLAUDE_CREDENTIAL_SETTING_KEYS) delete merged[key];
+  if (isPlainRecord(merged.env)) {
+    const env = { ...merged.env };
+    for (const key of HAPPYCLAW_OWNED_CLAUDE_ENV_KEYS) delete env[key];
+    merged.env = env;
   }
   return merged;
 }
@@ -270,9 +293,14 @@ export function buildClaudeContextPlan(
       ? (args.userSkillsDirOverride ??
         path.join(args.dataDir, 'skills', ownerId))
       : undefined;
-  const workspaceSkillsDir =
-    args.workspaceSkillsDirOverride ??
-    path.join(args.dataDir, 'groups', args.group.folder, '.claude', 'skills');
+  const workspaceSkillRoots = args.workspaceSkillRoots ?? [
+    path.join(
+      getRecordedWorkdir(args.group.folder) ??
+        path.join(args.dataDir, 'groups', args.group.folder),
+      '.claude',
+      'skills',
+    ),
+  ];
   const hostClaudeRuntime = args.groupSessionsDir
     ? path.join(args.groupSessionsDir, 'CLAUDE.md')
     : undefined;
@@ -292,7 +320,10 @@ export function buildClaudeContextPlan(
       ...(userSkillsDir
         ? [{ source: 'managed' as const, root: userSkillsDir }]
         : []),
-      { source: 'workspace', root: workspaceSkillsDir },
+      ...workspaceSkillRoots.map((root) => ({
+        source: 'workspace' as const,
+        root,
+      })),
       ...(args.pluginSkillLayers ?? []),
     ],
     managedPolicy: args.managedSkillPolicy,
@@ -319,7 +350,7 @@ export function buildClaudeContextPlan(
     ...(externalSkillsDir ? { host: [externalSkillsDir] } : {}),
     project: [projectSkillsDir],
     ...(userSkillsDir ? { managed: [userSkillsDir] } : {}),
-    workspace: [workspaceSkillsDir],
+    workspace: workspaceSkillRoots,
     ...(args.pluginSkillLayers?.length
       ? {
           plugin: args.pluginSkillLayers.flatMap((layer) =>
@@ -454,7 +485,7 @@ export function buildClaudeContextPlan(
     builtinSkillsDir,
     projectSkillsDir,
     userSkillsDir,
-    workspaceSkillsDir,
+    workspaceSkillRoots,
     effectiveSkills,
     audit,
   };

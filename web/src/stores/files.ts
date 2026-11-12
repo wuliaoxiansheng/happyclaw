@@ -110,9 +110,58 @@ export function formatUploadRetryStatus(
   return null;
 }
 
+/** `/api/groups/:jid/<suffix>` in the workspace's current file scope. */
+export function workspaceFilesUrl(
+  jid: string,
+  suffix: string,
+  params?: URLSearchParams,
+): string {
+  const query = new URLSearchParams(params);
+  const agentId = useFileStore.getState().fileScope[jid];
+  if (agentId) query.set('agentId', agentId);
+  const search = query.toString();
+  return `/api/groups/${encodeURIComponent(jid)}/${suffix}${search ? `?${search}` : ''}`;
+}
+
+/** One directory level of a workspace (`dir` is workspace-relative). */
+export function listWorkspaceFiles(jid: string, dir: string) {
+  const params = new URLSearchParams();
+  if (dir) params.set('path', dir);
+  return api.get<{ files: FileEntry[]; currentPath: string }>(
+    workspaceFilesUrl(jid, 'files', params),
+  );
+}
+
+/**
+ * Workspace directory an upload of `file` lands in when the batch targets
+ * `basePath`: folder uploads keep their structure below it.
+ */
+function uploadTargetDir(basePath: string, file: File): string {
+  // For folder uploads, webkitRelativePath = "folderName/sub/file.txt"
+  const relativePath = file.webkitRelativePath;
+  const lastSlash = relativePath ? relativePath.lastIndexOf('/') : -1;
+  if (lastSlash <= 0) return basePath;
+  const dir = relativePath.substring(0, lastSlash);
+  return basePath ? `${basePath}/${dir}` : dir;
+}
+
+/** Workspace-relative path `file` is written to by an upload into `basePath`. */
+export function uploadedFilePath(basePath: string, file: File): string {
+  const dir = uploadTargetDir(basePath, file);
+  return dir ? `${dir}/${file.name}` : file.name;
+}
+
 interface FileState {
   files: Record<string, FileEntry[]>;
   currentPath: Record<string, string>;
+  /**
+   * The Runtime Session whose worktree a workspace's file panel, `@` picker
+   * and composer uploads use: a session with its own worktree runs there, so
+   * its files live there. Absent means the workspace directory.
+   */
+  fileScope: Record<string, string>;
+  /** Workspaces whose listing was requested, so a scope change refreshes it. */
+  listed: Record<string, true>;
   loading: boolean;
   uploading: boolean;
   uploadProgress: UploadProgress | null;
@@ -138,6 +187,11 @@ interface FileState {
     filePath: string,
     content: string,
   ) => Promise<boolean>;
+  /**
+   * Point the workspace's file views at a worktree session (or back at the
+   * workspace with null); a change restarts the listing at the root.
+   */
+  setFileScopeSession: (jid: string, agentId: string | null) => void;
 }
 
 export function toBase64Url(str: string): string {
@@ -152,6 +206,8 @@ export function toBase64Url(str: string): string {
 export const useFileStore = create<FileState>((set, get) => ({
   files: {},
   currentPath: {},
+  fileScope: {},
+  listed: {},
   loading: false,
   uploading: false,
   uploadProgress: null,
@@ -160,16 +216,18 @@ export const useFileStore = create<FileState>((set, get) => ({
   cancelUpload: () => activeUploadController?.abort(),
 
   loadFiles: async (jid: string, path?: string) => {
-    set({ loading: true, error: null });
+    set((s) => ({
+      loading: true,
+      error: null,
+      listed: s.listed[jid] ? s.listed : { ...s.listed, [jid]: true },
+    }));
     try {
       const targetPath =
         path !== undefined ? path : get().currentPath[jid] || '';
-      const params = new URLSearchParams();
-      if (targetPath) params.set('path', targetPath);
-
-      const data = await api.get<{ files: FileEntry[]; currentPath: string }>(
-        `/api/groups/${encodeURIComponent(jid)}/files?${params}`,
-      );
+      const scope = get().fileScope[jid];
+      const data = await listWorkspaceFiles(jid, targetPath);
+      // The listing belongs to a scope the panel already left.
+      if (get().fileScope[jid] !== scope) return;
 
       set((s) => ({
         files: { ...s.files, [jid]: data.files },
@@ -208,7 +266,7 @@ export const useFileStore = create<FileState>((set, get) => ({
 
     const targetBase =
       basePath !== undefined ? basePath : get().currentPath[jid] || '';
-    const apiUrl = `/api/groups/${encodeURIComponent(jid)}/files`;
+    const apiUrl = workspaceFilesUrl(jid, 'files');
     let uploadedBytes = 0;
     let requestStarted = false;
 
@@ -216,18 +274,7 @@ export const useFileStore = create<FileState>((set, get) => ({
       for (let i = 0; i < files.length; i++) {
         if (uploadController.signal.aborted) throw UPLOAD_CANCELLED;
         const file = files[i];
-
-        // For folder uploads, webkitRelativePath = "folderName/sub/file.txt"
-        // Extract directory portion to preserve structure
-        const relativePath = file.webkitRelativePath;
-        let uploadPath = targetBase;
-        if (relativePath) {
-          const lastSlash = relativePath.lastIndexOf('/');
-          if (lastSlash > 0) {
-            const dir = relativePath.substring(0, lastSlash);
-            uploadPath = targetBase ? `${targetBase}/${dir}` : dir;
-          }
-        }
+        const uploadPath = uploadTargetDir(targetBase, file);
 
         set({
           uploadProgress: {
@@ -353,9 +400,7 @@ export const useFileStore = create<FileState>((set, get) => ({
   deleteFile: async (jid: string, filePath: string) => {
     try {
       const encoded = toBase64Url(filePath);
-      await api.delete(
-        `/api/groups/${encodeURIComponent(jid)}/files/${encoded}`,
-      );
+      await api.delete(workspaceFilesUrl(jid, `files/${encoded}`));
 
       const currentPath = get().currentPath[jid] || '';
       await get().loadFiles(jid, currentPath);
@@ -370,7 +415,7 @@ export const useFileStore = create<FileState>((set, get) => ({
 
   createDirectory: async (jid: string, parentPath: string, name: string) => {
     try {
-      await api.post(`/api/groups/${encodeURIComponent(jid)}/directories`, {
+      await api.post(workspaceFilesUrl(jid, 'directories'), {
         path: parentPath,
         name,
       });
@@ -396,7 +441,7 @@ export const useFileStore = create<FileState>((set, get) => ({
     try {
       const encoded = toBase64Url(filePath);
       const data = await api.get<{ content: string }>(
-        `/api/groups/${encodeURIComponent(jid)}/files/content/${encoded}`,
+        workspaceFilesUrl(jid, `files/content/${encoded}`),
       );
       return data.content;
     } catch (err) {
@@ -407,13 +452,27 @@ export const useFileStore = create<FileState>((set, get) => ({
     }
   },
 
+  setFileScopeSession: (jid: string, agentId: string | null) => {
+    if ((get().fileScope[jid] ?? null) === agentId) return;
+    set((s) => {
+      const fileScope = { ...s.fileScope };
+      const files = { ...s.files };
+      const currentPath = { ...s.currentPath };
+      if (agentId) fileScope[jid] = agentId;
+      else delete fileScope[jid];
+      delete files[jid];
+      delete currentPath[jid];
+      return { fileScope, files, currentPath };
+    });
+    if (get().listed[jid]) void get().loadFiles(jid, '');
+  },
+
   saveFileContent: async (jid: string, filePath: string, content: string) => {
     try {
       const encoded = toBase64Url(filePath);
-      await api.put(
-        `/api/groups/${encodeURIComponent(jid)}/files/content/${encoded}`,
-        { content },
-      );
+      await api.put(workspaceFilesUrl(jid, `files/content/${encoded}`), {
+        content,
+      });
       return true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to save file';

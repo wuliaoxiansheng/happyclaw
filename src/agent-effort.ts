@@ -30,8 +30,8 @@ export function normalizeAgentEffort(value: unknown): AgentEffortLevel {
 
 /**
  * Resolve an Agent-owned SDK effort override. Undefined deliberately means
- * "inherit": keep the selected Provider's CLAUDE_CODE_EFFORT_LEVEL, or let the
- * SDK choose its model-aware default when the Provider does not define one.
+ * "inherit": the effort comes from the connection's model, or from what the
+ * Agent's binding is inherited from (resolveModelLaunch).
  */
 export function resolveAgentSdkEffort(
   policy: AgentProfileRuntimePolicy | undefined,
@@ -42,15 +42,24 @@ export function resolveAgentSdkEffort(
     : undefined;
 }
 
-/** Remove the Provider-level effort only when an Agent has an explicit value. */
-export function removeProviderEffortEnv(
+/**
+ * The effort lines of a launch's environment. With a connection the host
+ * decides (resolveModelLaunch): `launchEffort` replaces whatever the
+ * environment carries, and null (the model takes no effort) leaves none.
+ * Without a connection (`undefined`: the Workspace's own environment) an
+ * Agent's explicit effort, passed as the SDK option, replaces the
+ * environment's.
+ */
+export function applyLaunchEffortEnv(
   lines: string[],
-  effort: SdkAgentEffort | undefined,
+  agentEffort: SdkAgentEffort | undefined,
+  launchEffort: string | null | undefined,
 ): void {
-  if (!effort) return;
+  if (launchEffort === undefined && !agentEffort) return;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     if (lines[index]?.startsWith('CLAUDE_CODE_EFFORT_LEVEL=')) {
       lines.splice(index, 1);
     }
   }
+  if (launchEffort) lines.push(`CLAUDE_CODE_EFFORT_LEVEL=${launchEffort}`);
 }

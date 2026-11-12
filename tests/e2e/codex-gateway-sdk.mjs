@@ -61,6 +61,7 @@ let blockedFetches = 0;
 let modelsCatalogFetches = 0;
 let blockedProxyRequests = 0;
 let unexpectedHttpRequests = 0;
+let ignoredPortProbes = 0;
 let sdkStderrBytes = 0;
 let sdkFreshInputTokens = 0;
 let sdkCachedInputTokens = 0;
@@ -75,6 +76,17 @@ let cliVersion;
 function check(name, condition) {
   checks[name] = Boolean(condition);
   assert.ok(condition, name);
+}
+
+// Local tools that watch for new listening ports (an IDE's port forwarder, a
+// desktop agent such as jarvisd's `jarvis-ports`) send a bare `GET /` to each
+// one. Neither the CLI nor the gateway requests a root path, and a client
+// using the deny proxy sends absolute-form URLs or CONNECT, so such a request
+// is not network from the system under test.
+function isPortProbe(method, target) {
+  if (method !== 'GET' || target !== '/') return false;
+  ignoredPortProbes++;
+  return true;
 }
 
 async function listen(server) {
@@ -435,6 +447,11 @@ try {
   });
 
   const upstream = createServer(async (request, response) => {
+    if (isPortProbe(request.method, request.url)) {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
     try {
       assert.equal(request.method, 'POST');
       assert.equal(request.url, '/responses');
@@ -552,8 +569,8 @@ try {
   // The native CLI is a subprocess, so a parent fetch wrapper cannot constrain
   // it. Disable nonessential traffic and give it a rejecting HTTP(S) proxy;
   // only the explicitly configured loopback gateway bypasses that proxy.
-  const denyProxy = createServer((_request, response) => {
-    blockedProxyRequests++;
+  const denyProxy = createServer((request, response) => {
+    if (!isPortProbe(request.method, request.url)) blockedProxyRequests++;
     response.writeHead(403);
     response.end();
   });
@@ -588,7 +605,9 @@ try {
   });
   app.route(CODEX_GATEWAY_ROUTE, codexGatewayApp);
   app.notFound((context) => {
-    unexpectedHttpRequests++;
+    if (!isPortProbe(context.req.method, context.req.path)) {
+      unexpectedHttpRequests++;
+    }
     return context.json({ error: 'Unexpected gateway path' }, 404);
   });
   const gateway = await new Promise((resolve, reject) => {
@@ -847,15 +866,17 @@ try {
   abortController = new AbortController();
   timer = setTimeout(() => abortController.abort(), 60000);
   const pickedModel = 'gpt-6-astra';
+  // Every conversation is a session; its runner's grant names it.
   const conversation = {
     groupFolder: 'e2e-conversation',
-    sessionAgentId: null,
+    sessionAgentId: 'session-1',
   };
   // What a launch does for a pinned conversation: the picked effort is minted
   // into the runner's grant, the picked model becomes the runner's model.
   const pickLease = new CodexGatewayRunnerLease({
     kind: 'host',
-    ...conversation,
+    groupFolder: conversation.groupFolder,
+    agentId: conversation.sessionAgentId,
     sessionEffort: 'ultra',
   });
   overrideKey = resolveCodexGatewayLaunchConfig(
@@ -1016,6 +1037,7 @@ console.log(
       modelsCatalogFetches,
       blockedProxyRequests,
       unexpectedHttpRequests,
+      ignoredPortProbes,
     },
     conversationCliEffort: observedCliEffort ?? null,
     statuses: gatewayStreams.map(({ status, errorType }) => ({

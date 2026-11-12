@@ -95,7 +95,7 @@ describe('conversation reasoning effort on a grant', () => {
     const picked = issue({
       kind: 'container',
       groupFolder: 'folder',
-      sessionAgentId: 'agent',
+      agentId: 'agent',
       sessionEffort: 'ultra',
     });
     const none = issue({ kind: 'container', groupFolder: 'folder' });
@@ -110,7 +110,6 @@ describe('conversation reasoning effort on a grant', () => {
       kind: 'container',
       groupFolder: 'folder',
       agentId: null,
-      sessionAgentId: null,
       sessionEffort: 'low',
     });
     const mainHost = issue({ kind: 'host', groupFolder: 'folder' });
@@ -118,18 +117,11 @@ describe('conversation reasoning effort on a grant', () => {
       kind: 'container',
       groupFolder: 'folder',
       agentId: 'agent-1',
-      sessionAgentId: 'agent-1',
       sessionEffort: 'low',
     });
     const otherWorkspace = issue({
       kind: 'container',
       groupFolder: 'other',
-      sessionEffort: 'low',
-    });
-    const isolatedTask = issue({
-      kind: 'container',
-      groupFolder: 'folder',
-      taskRunId: 'run-1',
       sessionEffort: 'low',
     });
     const oneShot = issue({ kind: 'sdk-query' });
@@ -141,7 +133,6 @@ describe('conversation reasoning effort on a grant', () => {
     expect(effortOf(mainHost.token)).toBe('ultra');
     expect(effortOf(session.token)).toBe('low');
     expect(effortOf(otherWorkspace.token)).toBe('low');
-    expect(effortOf(isolatedTask.token)).toBe('low');
     expect(effortOf(oneShot.token)).toBeUndefined();
 
     // A Runtime Session is addressed by its own id; undefined clears the pick.
@@ -158,14 +149,7 @@ describe('conversation reasoning effort on a grant', () => {
       updateLiveSessionEffort({ groupFolder: 'nobody-home' }, 'high'),
     ).toBe(0);
 
-    for (const issued of [
-      main,
-      mainHost,
-      session,
-      otherWorkspace,
-      isolatedTask,
-      oneShot,
-    ]) {
+    for (const issued of [main, mainHost, session, otherWorkspace, oneShot]) {
       revokeCodexGatewayToken(issued.token);
     }
   });

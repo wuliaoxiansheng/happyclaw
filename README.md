@@ -14,7 +14,6 @@
 
 <p align="center">
   <a href="https://happyclaw.cc/"><img src="https://img.shields.io/badge/Website-happyclaw.cc-F97316?style=for-the-badge" alt="Website" /></a>
-  <a href="https://github.com/riba2534/happyclaw/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/riba2534/happyclaw/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI" /></a>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D20-339933?style=for-the-badge&logo=nodedotjs&logoColor=white" alt="Node.js" /></a>
   <img src="https://img.shields.io/badge/TypeScript-5.9-3178C6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript" />
   <a href="https://github.com/riba2534/happyclaw"><img src="https://img.shields.io/github/stars/riba2534/happyclaw?style=for-the-badge&color=f5a623" alt="GitHub Stars" /></a>
@@ -59,18 +58,18 @@ HappyClaw 不是一个简单的聊天 API Wrapper。智能体运行在真实的 
 
 ## 功能总览
 
-| 模块           | 主要能力                                                                                       |
-| -------------- | ---------------------------------------------------------------------------------------------- |
-| **智能体**     | 主 HappyClaw 对话式创建/编辑、自定义智能体、头像、结构化提示词、AI 优化、版本历史与恢复        |
-| **工作区**     | 智能体归属、宿主机/容器执行、独立目录、项目环境变量、项目 Claude 上下文、多会话                |
-| **能力治理**   | 用户 Skills、系统/用户 MCP、Claude Code Plugins 与最终生效预览；智能体工具权限完整开放         |
-| **消息渠道**   | 飞书、Telegram、QQ、钉钉、微信、企业微信、Discord、WhatsApp，多账号、扫码登录、工作区/会话绑定 |
-| **模型提供商** | Anthropic 官方与第三方兼容端点、多 Provider、轮询/加权/故障转移、健康检查、会话粘性            |
-| **定时任务**   | Cron、固定间隔、一次性任务，智能体/Script 执行，隔离上下文，幂等立即运行，通知重试             |
-| **记忆与文件** | Workspace Memory（事实、决策、经验、待跟进）、来源与修订、CAS 编辑、搜索、文件与终端           |
-| **用量与计费** | Token 分类统计、智能体/工作区/模型筛选、明细与 CSV 导出、订阅、余额、兑换码与配额              |
-| **运维与安全** | RBAC、邀请注册、登录设备、审计日志、运行监控、Docker 镜像管理、备份与安全恢复                  |
-| **客户端体验** | 实时流式输出、工具轨迹、Markdown/Mermaid/KaTeX、消息分享图片、响应式布局与 PWA                 |
+| 模块           | 主要能力                                                                                                                       |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| **智能体**     | 主 HappyClaw 对话式创建/编辑、自定义智能体、内置模板、复制与导入导出、头像、结构化提示词、AI 优化                              |
+| **工作区**     | 智能体归属、宿主机/容器执行、独立目录、项目环境变量、项目 Claude 上下文、多会话、会话级 git worktree、只读代码 Review          |
+| **能力治理**   | 用户 Skills、系统/用户 MCP、Claude Code Plugins 与最终生效预览；智能体工具权限完整开放                                         |
+| **消息渠道**   | 飞书、Telegram、QQ、钉钉、微信、企业微信、Discord、WhatsApp，多账号、扫码登录、工作区/会话绑定                                 |
+| **模型提供商** | Anthropic 官方、ChatGPT 订阅、20 余家厂商预设与自定义兼容端点，一个连接多个模型，轮询/加权/故障转移                            |
+| **自动化**     | 按计划在真实会话里运行一轮：绑定当前会话或新建会话，停止条件、安静模式、前置检查，失败去重通知，撞额度后自动继续               |
+| **记忆与文件** | Workspace Memory（事实、决策、经验、待跟进）、按相关性召回与常驻目录、非主人写入待确认、来源与修订、CAS 编辑、搜索、文件与终端 |
+| **用量与计费** | Token 分类统计、缓存命中率、智能体/工作区/模型筛选、明细与 CSV 导出、订阅、余额、兑换码与配额                                  |
+| **运维与安全** | RBAC、邀请注册、登录设备、审计日志、运行监控、Docker 镜像管理、备份与安全恢复                                                  |
+| **客户端体验** | 实时流式输出、工具轨迹、富文本输入框（列表、`/` 技能、`@` 文件、长文本折叠、排队）、Markdown/Mermaid/KaTeX、PWA                |
 
 ## 智能体优先工作模型
 
@@ -80,9 +79,8 @@ HappyClaw 使用统一的 `智能体 → Workspace → Runtime Session` 层级�
 智能体（身份、提示词、Skills、MCP）
 └── Workspace（项目目录、执行模式、环境变量、渠道挂载）
     ├── Workspace Memory（跨 Session 的事实、决策、经验、待跟进）
-    ├── Main Session（工作区主会话）
-    ├── Runtime Session（独立对话或渠道原生话题）
-    └── Scheduled Run（定时任务的普通或隔离运行）
+    ├── Runtime Session（独立对话或渠道原生话题，彼此平等，没有主会话）
+    └── Automation（自动化，每次运行都是某个会话里的一轮）
 ```
 
 - **内置 HappyClaw** 是不可删除的平台主 Agent，拥有代码级固定身份，理解
@@ -93,7 +91,7 @@ HappyClaw 使用统一的 `智能体 → Workspace → Runtime Session` 层级�
   onboarding lease，后续新 Session 或服务重启不会重复表演。清空称呼也不会重置
   onboarding。
 - **智能体** 保存长期身份和能力策略。主 HappyClaw 智能体始终存在，也可以创建代码审查、研究、运维等自定义智能体。
-- **对话式智能体构建器** 在主 HappyClaw 名下的所有 Workspace 主会话与普通 Runtime Session 中生效，允许用户多轮讨论需求、保存并预览智能体草稿，并在后续人类消息逐字回复一次性确认口令后创建或更新智能体；定时任务与 Sub-Agent 不能代替用户发布。
+- **对话式智能体构建器** 在主 HappyClaw 名下所有 Workspace 的 Runtime Session 中生效，允许用户多轮讨论需求、保存并预览智能体草稿，并在后续人类消息逐字回复一次性确认口令后创建或更新智能体；自动化运行与 Sub-Agent 不能代替用户发布。
 - **Home Workspace** 是不可删除的系统工作区，并永久归属内置 HappyClaw。
 - **自定义 Agent** 创建后没有隐式 Workspace、Session 或 Memory；用户需要显式
   新建 Workspace 或迁移一个非 Home Workspace，避免继承 HappyClaw 上下文。
@@ -111,11 +109,35 @@ HappyClaw 使用统一的 `智能体 → Workspace → Runtime Session` 层级�
 | **Host**      | 管理员授权的宿主机工作区   | 直接在指定本机目录运行，适合已有代码仓库和本机工具链      |
 | **Container** | 普通成员与需要隔离的工作区 | 在非 root Docker 容器中运行，使用独立工作目录和预装工具链 |
 
-普通成员不能把容器工作区降级为宿主机执行。Script 定时任务也只允许管理员在有权限的 Host 工作区运行。
+普通成员不能把容器工作区降级为宿主机执行。自动化的脚本和前置检查也只允许管理员在有权限的 Host 工作区运行。
 
 管理员可在 **设置 → 宿主机集成** 开启“管理员纯宿主机模式”。开启时，当前管理员拥有的
-工作区和定时任务会统一迁移为 Host，后续也不能再选择 Docker；普通成员继续使用 Docker
+工作区会统一迁移为 Host，后续也不能再选择 Docker；普通成员继续使用 Docker
 隔离。关闭开关只恢复混合模式的选择能力，不会自动迁回已有工作区。
+
+### 部署方式
+
+| 方式           | 适用                        | 行为                                                                                |
+| -------------- | --------------------------- | ----------------------------------------------------------------------------------- |
+| **单人宿主机** | 只有自己使用，不想装 Docker | 所有工作区都在宿主机运行；不调用 Docker、不拉镜像；关闭注册、用户、邀请、访客与计费 |
+| **多人**       | 需要邀请他人或容器隔离      | 现有行为：普通成员使用 Docker 隔离，管理员可选 Host 或 Container                    |
+
+首次访问的初始化向导会先问部署方式，之后可在 **设置 → 宿主机集成** 切换。还有其他启用中的
+账号（成员、管理员或访客）时不能切到单人宿主机，需要先停用它们。切到单人宿主机会把剩余的
+Docker 工作区迁移为 Host；切回多人只保存设置，注册、计费等恢复为原来的配置。单人宿主机
+模式下 Agent 可以访问宿主机的完整文件系统，只适合本人信任的部署；登录仍然需要。
+
+### 工作区目录
+
+新建的 Host 工作区（未指定自定义目录时）放在**工作区根目录**下的 `<根目录>/<文件夹>`，默认
+`~/happyclaw`，可在 **设置 → 宿主机集成** 或环境变量 `HAPPYCLAW_WORKSPACE_ROOT` 修改。
+工作区放在 HappyClaw 安装目录之外，Agent 不会读到安装目录里给开发者看的 `CLAUDE.md`。
+根目录位于安装目录里、上层目录有 `CLAUDE.md`、位于别的 git 仓库里或不可写时，会改用
+`~/happyclaw-workspaces` 并在设置页说明原因；这个目录也不能用时，新工作区暂时放在安装目录的
+`data/groups/<文件夹>`，设置页同样会显示。在设置里直接保存这样的路径会被拒绝。
+
+每个工作区记住自己的目录：修改根目录只影响之后新建的工作区。已有工作区和 Container 工作区
+仍在 `data/groups/<文件夹>`。
 
 ## 智能体与能力治理
 
@@ -125,9 +147,12 @@ HappyClaw 使用统一的 `智能体 → Workspace → Runtime Session` 层级�
 
 - 名称、头像和 Claude 原生 preset。
 - 身份、目标、工作方式和输出要求等结构化提示词。
-- AI 生成提示词、局部优化、版本记录和历史版本恢复。
+- AI 生成和局部优化提示词。
 - 托管 Claude 上下文或管理员宿主机 Claude 上下文。
 - 用户 Skills、HappyClaw MCP 与 Claude Code Plugins；智能体始终拥有完整工具权限。
+
+智能体可以从内置模板新建、复制，或导出为 JSON 再导入；导入时引用不到的 Skill 或 MCP
+会逐项列出，由用户确认去掉后再创建。
 
 配置页可以针对具体工作区预览最终生效能力，包括项目 `CLAUDE.md`、`.claude/skills`、项目 MCP、用户能力和同名覆盖来源。
 
@@ -144,7 +169,7 @@ HappyClaw 区分不同层级的能力来源：
 | **系统 MCP**            | 管理员维护，默认仅管理员可用，显式共享后普通成员才能使用          |
 | **Claude Code Plugins** | 系统 catalog 与用户启用状态分离，通过版本化运行快照加载           |
 
-内置 MCP 工具覆盖消息发送、定时任务、渠道查询、Skill 管理和记忆读写；实际开放的工具会根据用户权限、智能体策略、工作区模式和渠道上下文动态裁剪。
+内置 MCP 工具覆盖消息发送、自动化、渠道查询、Skill 管理和记忆读写；实际开放的工具会根据用户权限、智能体策略、工作区模式和渠道上下文动态裁剪。
 
 添加远端服务时，参见[远端 MCP 配置与排查](docs/REMOTE-MCP.md)，按步骤填写 HTTP/SSE
 URL 与 Headers、选择作用域，并在指定智能体的最终生效能力中确认来源。
@@ -169,7 +194,7 @@ URL 与 Headers、选择作用域，并在指定智能体的最终生效能力�
 
 渠道账号的凭据和扫码会话按用户、账号隔离。绑定规则为：
 
-1. 私聊和普通群绑定到工作区内的指定 Session，也可以选择主会话。
+1. 私聊和普通群绑定到工作区内的指定 Session；IM 里 `/bind <工作区>` 会新建一个 Session 并绑定。
 2. 飞书话题群、Telegram Forum 绑定到 Workspace，每个原生话题映射独立 Session。
 3. 未绑定或已经解绑的渠道保持静默；默认工作区和历史话题记录不会恢复绑定。
 
@@ -184,48 +209,57 @@ Bot 账号；Web 输入只在对应 Web Session 回复。多个渠道可以共�
 
 ## 模型与提供商
 
-HappyClaw 可以同时配置多个 Claude Provider，并为新会话按策略选择健康的 Provider。
+HappyClaw 可以同时配置多个模型连接。一个连接对应一份凭据和一个地址，可以提供多个模型。
+「设置 → 模型配置」只负责添加和维护连接；用哪个模型由智能体决定：主 HappyClaw 和每个
+智能体各有自己的默认模型和推理等级，聊天时还可以临时换成任何一个已添加的模型。
 
-| 类型               | 配置方式                                                               |
-| ------------------ | ---------------------------------------------------------------------- |
-| **Anthropic 官方** | Claude OAuth、一键登录、`setup-token` / `.credentials.json` 或 API Key |
-| **第三方兼容端点** | 填写 API Endpoint、Auth Token 和模型名称，可启用 1M 上下文             |
+点「添加模型连接」，向导会依次选择来源、连接、选择模型、测试并保存：
 
-第三方 Provider 会自动预填 Claude Code 兼容环境变量，包括主模型映射、上下文窗口、自动压缩、超时和非必要流量设置。高级设置会展示所有预填值，用户可以编辑、恢复默认值或增加自定义 Header 等环境变量。
+| 类型               | 配置方式                                                                                 |
+| ------------------ | ---------------------------------------------------------------------------------------- |
+| **Anthropic 官方** | Claude 订阅（OAuth、`setup-token` / `.credentials.json`）或 API Key                      |
+| **ChatGPT 订阅**   | 登录 ChatGPT，按账号可用的模型目录选择模型和推理力度                                     |
+| **厂商预设**       | DeepSeek、智谱 GLM、Kimi、MiniMax、阿里云百炼、火山、腾讯、OpenRouter 等，只需填 API Key |
+| **自定义兼容端点** | 填写地址和密钥，自动识别预设、判断认证方式、获取模型列表                                 |
 
-负载均衡支持：
+选择模型这一步可以搜索、全选或清空，并为每个模型设置上下文长度和可选的推理等级；
+能力表不认识的模型会按同系列推断，也可以手动声明。子代理和后台轻量调用默认跟随当前
+模型，也可以指定为本连接的另一个模型。上下文长度大于 200K 时，运行时自动给模型名加
+Claude Code 的 `[1m]` 开关，再按实际长度设置压缩窗口，模型名本身不需要改。
 
-- **Round Robin** — 在健康 Provider 之间轮询。
-- **Weighted Round Robin** — 按权重分配新会话。
-- **Failover** — 优先使用主 Provider，故障时切换。
-- **健康恢复** — 连续失败后暂时摘除，经过恢复窗口重新探测。
-- **会话粘性** — 已开始的会话保持 Provider 一致，避免上下文在模型之间漂移。
-- **默认模型** — 在模型配置页点击某个配置的「默认」，未手动选择模型的会话固定使用它，
-  不再参与上述分配；再次点击取消，恢复自动分配。对话页的模型选择器默认选中「默认」。
+环境变量只预填 `API_TIMEOUT_MS`、`CLAUDE_CODE_NO_FLICKER` 和
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`，可以修改或删除，也可以增加自定义 Header 等；
+没有保存的变量运行时不会注入。保存前会测试连接，密钥无效时不能保存；连接列表显示最近
+一次测试的结果。
 
-## 定时任务
+## 自动化
 
-定时任务使用与交互会话相同的智能体、工作区和执行策略：
+自动化按计划把一段提示词作为真实的一轮发进会话，用法与 cindy 的 Automations 一致。
+在聊天里直接说「每天 21 点检查新剧集，全部下完就停」，Agent 就会建一个绑定当前会话的
+自动化；也可以在 Web 的「自动化」页、会话菜单或 ⌘K 里创建。
 
-- **调度方式** — Cron、固定间隔和一次性时间点；间隔任务最短 60 秒。
-- **执行类型** — 智能体任务运行完整 Claude Agent；Script 任务直接执行 Shell。
-- **上下文模式** — `group` 注入工作区主会话；`isolated` 每次创建独立队列、Claude session 和 IPC 命名空间。
-- **立即运行** — Web、REST 和 MCP 共用幂等键与稳定 `runId`，网络重试不会重复执行。
-- **运行控制** — 支持暂停、恢复、编辑、停止当前运行、软删除和恢复任务。
-- **持久化历史** — 记录执行状态、耗时、结果、尝试次数、通知状态和错误。
-- **通知重试** — 执行结果和通知状态分离；通知失败只重试通知，不会重新执行任务。
-- **异常恢复** — 服务重启后通过持久化运行记录和租约识别、恢复或终止遗留任务。
+- **计划** — 每 N 分钟、每小时、每天、工作日、每周、每月（Cron 定时）、上次完成后
+  再等一段时间（相对间隔，至少 1 分钟）、一次，或只手动运行。
+- **运行会话** — 绑定已有会话（默认当前会话，回复回到它的来源，例如飞书话题）、每次
+  新建或持续会话；每次运行都能「打开会话」继续聊。
+- **结束** — 可写停止条件，Agent 每次运行先核实，满足后自己结束自动化；也可设结束时间。
+- **安静模式** — 检查没事不说话：没有变化的运行不通知；失败总是通知，同一错误只通知
+  一次，恢复后再通知一次。
+- **前置检查与脚本** — 管理员的 Host 工作区可加一条命令，退出码 0 执行、2 跳过（不耗
+  token）；也可以只运行脚本。
+- **可靠性** — 同一自动化不会重叠运行；服务停机期间错过的周期运行记为「已错过」，
+  不补跑；撞用量上限时排队等待自动继续。
 
-REST 接口和状态字段见 [API 文档](docs/API.md#任务)。
+REST 接口见 [API 文档](docs/API.md#自动化)。
 
 ## 快速开始
 
 ### 环境要求
 
 - macOS 或 Linux；Windows 推荐使用 WSL2。
-- [Node.js](https://nodejs.org/) 20 或更高版本，推荐使用 CI 同款 Node.js 24。
+- [Node.js](https://nodejs.org/) 20 或更高版本，推荐使用 Node.js 24。
 - npm 与 GNU Make。
-- [Docker](https://www.docker.com/)：普通成员和 Container 工作区需要；仅使用管理员 Host 工作区时可不安装。
+- [Docker](https://www.docker.com/)：多人部署（普通成员和 Container 工作区）需要；单人宿主机部署不需要安装。
 
 macOS 可以使用 [OrbStack](https://orbstack.dev/) 或 Docker Desktop，Linux 可以使用 Docker Engine。
 
@@ -239,13 +273,13 @@ cd happyclaw
 make start
 ```
 
-首次启动会自动安装三端依赖、编译后端/Web/Agent Runner，并在 Docker 可用时拉取最新的多架构智能体镜像。启动完成后打开：
+首次启动会自动安装三端依赖、编译后端/Web/Agent Runner，并在 Docker 可用时拉取最新的多架构智能体镜像（单人宿主机部署跳过；拉取失败只告警，不影响启动）。启动完成后打开：
 
 <http://localhost:3000>
 
 首次访问按照向导完成：
 
-1. 创建第一个管理员账户。
+1. 选择部署方式（单人宿主机或多人），并创建第一个管理员账户。
 2. 配置 Anthropic 官方账号或第三方 Claude 兼容 Provider。
 3. 可选添加飞书、Telegram、QQ、钉钉、微信、企业微信、Discord 或 WhatsApp 渠道账号。
 4. 进入工作台创建智能体、工作区和会话。
@@ -301,15 +335,15 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 
 ### Web 设置入口
 
-| 页面                    | 内容                                                  |
-| ----------------------- | ----------------------------------------------------- |
-| **设置 → 模型与提供商** | 官方/第三方 Provider、密钥、模型、1M 上下文和负载均衡 |
-| **设置 → 消息渠道**     | 渠道账号、扫码登录、连接状态和会话绑定                |
-| **设置 → 主 HappyClaw** | 默认智能体的 Skills 与 MCP                            |
-| **设置 → 执行与容量**   | 超时、并发、上下文窗口和运行限制                      |
-| **设置 → 宿主机集成**   | 管理员纯宿主机模式、Host 目录与 Claude 上下文来源     |
-| **设置 → 注册策略**     | 开放注册、邀请码注册或关闭注册                        |
-| **设置 → 用户与访问**   | 用户、权限、邀请码与审计日志                          |
+| 页面                    | 内容                                                                      |
+| ----------------------- | ------------------------------------------------------------------------- |
+| **设置 → 模型配置**     | 添加和维护模型连接、每个连接的模型、连接测试                              |
+| **设置 → 消息渠道**     | 渠道账号、扫码登录、连接状态和会话绑定                                    |
+| **设置 → 主 HappyClaw** | 默认智能体的 Skills 与 MCP                                                |
+| **设置 → 执行与容量**   | 超时、并发、上下文窗口和运行限制                                          |
+| **设置 → 宿主机集成**   | 部署方式、工作区根目录、管理员纯宿主机模式、Host 目录与 Claude 上下文来源 |
+| **设置 → 注册策略**     | 开放注册、邀请码注册或关闭注册                                            |
+| **设置 → 用户与访问**   | 用户、权限、邀请码与审计日志                                              |
 
 ### 可选环境变量
 
@@ -323,18 +357,26 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | `IDLE_TIMEOUT`                       | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
 | `STUCK_RUNNER_FORCE_RESTART_MINUTES` | `10`                              | IPC 债务强制恢复上限（整数分钟，范围 4–120；非法值回退默认）                       |
 | `ADMIN_HOST_ONLY_MODE`               | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
+| `HAPPYCLAW_DEPLOYMENT_MODE`          | `multi_user`                      | 部署方式：`multi_user` 或 `single_user_host`；Web 设置中保存过的值优先             |
+| `HAPPYCLAW_WORKSPACE_ROOT`           | `~/happyclaw`                     | 新建 Host 工作区的根目录；Web 设置中保存过的值优先                                 |
 | `MAX_CONCURRENT_CONTAINERS`          | `20`                              | 最大并发容器数                                                                     |
+| `CONTAINER_MEMORY_LIMIT`             | 不限制                            | 单个 Agent 容器内存上限，须带单位，如 `3g`；仅 Container 模式，见下文              |
 | `MAX_FILE_SIZE_MB`                   | `50`                              | Web 和 IM 入站文件大小上限                                                         |
 | `CORS_ALLOWED_ORIGINS`               | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                 |
 | `TRUST_PROXY`                        | `false`                           | 位于可信反向代理后时设为 `true`                                                    |
 | `TRUST_PROXY_HOPS`                   | `1`                               | `X-Forwarded-For` 中可信代理层数（Cloudflare 在 Caddy 之前时设为 `2`）             |
-| `TZ`                                 | 系统时区                          | 日志与定时任务时区（建议 IANA 名称，如 `Asia/Shanghai`）；无效值回退并告警         |
+| `TZ`                                 | 系统时区                          | 日志与自动化时区（建议 IANA 名称，如 `Asia/Shanghai`）；无效值回退并告警           |
 | `HTTPS_PROXY` / `HTTP_PROXY`         | 未设置                            | 独立配置 HTTPS/HTTP 出站代理；主进程与每个智能体容器都会使用，也接受对应的小写变量 |
 | `NO_PROXY`                           | 未设置                            | 独立配置不走代理的地址列表，也接受 `no_proxy`                                      |
+| `WEB_PUSH_SUBJECT`                   | 本项目 GitHub 地址                | Web Push 的 VAPID 联系地址，填本实例的 `mailto:` 或 `https://` 地址，见下文        |
 
 Provider 与渠道凭据建议只在 Web 设置中填写。它们使用 AES-256-GCM 加密存储，相关 API 只返回是否已配置，不返回密钥明文。
 
 容器代理值（包括 URL 中的用户名和密码）通过权限为 `0600` 的每容器运行时环境文件注入，不会出现在 `docker run` 参数或容器参数调试日志中。macOS 的 Docker Desktop/OrbStack 与 Windows Docker Desktop 会把代理 URL 中的 `localhost`、`127.0.0.1`、`::1` 改写为 `host.docker.internal`。Linux bridge 容器无法访问宿主机仅绑定在回环地址的代理；请将代理绑定到 Docker bridge 可达接口，并在代理变量中使用该接口的 IP 或 DNS 名称，否则容器会在启动前给出错误。
+
+Web 推送通知（设置 → 常规 → 推送通知）要求页面通过 HTTPS 访问（本机 `localhost` 除外），HTTP 局域网地址上浏览器不提供推送；iPhone 和 iPad 只有添加到主屏幕的应用能收到。服务器需要能访问浏览器的推送服务（`fcm.googleapis.com`、`web.push.apple.com`、`*.push.services.mozilla.com`、`*.notify.windows.com`），大陆部署通常要设置上面的 `HTTPS_PROXY`。推送签名密钥在 `data/config/web-push-vapid.json`，迁移或重装时随 `data/` 一起保留；丢失后所有设备需要重新开启推送。详见 [DEPLOYMENT.md](DEPLOYMENT.md) 第 7 节。
+
+`CONTAINER_MEMORY_LIMIT` 只对 Container 模式生效，Host 模式的 Runner 不受限。写法同 `docker run --memory`，必须带单位（如 `512m`、`1.5g`、`3GiB`），建议不低于 `256m`；纯数字或无法识别的值在启动时告警并按不限制处理。同一个值也设为 `--memory-swap`，容器不额外使用 swap；所有容器合计最多约 `MAX_CONCURRENT_CONTAINERS` × 该值。运行超过上限会被终止并照常重试，同一会话连续两次超限时提示用户本轮超过了内存上限，不会像未设上限时那样自动清空会话上下文。
 
 ### 运行数据
 
@@ -343,10 +385,11 @@ Provider 与渠道凭据建议只在 Web 设置中填写。它们使用 AES-256-
 ```text
 data/
 ├── db/messages.db     # SQLite 主数据库（含 Workspace Memory v2）
-├── config/            # 加密配置、密钥与系统设置
-├── groups/            # 工作区目录和项目文件
+├── config/            # 加密配置、密钥、系统设置与 Web 添加的存储源
+├── groups/            # 已有工作区与 Container 工作区的目录
+├── logs/              # 工作区根目录下工作区的运行日志
 ├── memory/            # 旧版文件记忆，仅供离线迁移/归档
-├── sessions/          # 主会话与 Runtime Session 的 Claude 数据
+├── sessions/          # 每个 Runtime Session 的 Claude 数据
 ├── ipc/               # Runner 输入、工具请求和回执
 ├── skills/            # 用户 Skills
 ├── builtin-skills/    # 固定版本内置 Skills 清单
@@ -355,7 +398,7 @@ data/
 └── extra/             # Container 工作区持久工具数据
 ```
 
-不要把 `data/` 提交到 Git。迁移实例时优先使用 `make backup` 和 `make restore`；恢复流程会检查归档路径、文件类型、符号链接、清单和数据库完整性。
+不要把 `data/` 提交到 Git。迁移实例时优先使用 `make backup` 和 `make restore`；恢复流程会检查归档路径、文件类型、符号链接、清单和数据库完整性。工作区根目录（默认 `~/happyclaw`）在 `data/` 之外，不在 `make backup` 范围内，需要单独备份。
 
 ## 系统架构
 
@@ -395,7 +438,7 @@ flowchart LR
 | **Web**          | React 19、Vite、Tailwind CSS、Radix UI、Zustand、原生 SVG 图表、xterm.js                                 |
 | **渠道**         | Feishu SDK、grammY、QQ Bot API、DingTalk Stream、企业微信智能机器人 SDK、Discord.js、Baileys、微信 iLink |
 | **隔离执行**     | Docker、非 root Node.js 容器、Chromium、常用开发与浏览器工具                                             |
-| **质量保障**     | TypeScript、Vitest、Prettier、GitHub Actions                                                             |
+| **质量保障**     | TypeScript、Vitest、Playwright、Prettier，合并前本地运行 `make check`                                    |
 
 ## 安全模型
 
@@ -405,8 +448,8 @@ HappyClaw 会执行代码和访问第三方消息平台，部署前请理解以�
 - Provider 与渠道密钥使用本机 AES-256-GCM 密钥加密，密钥文件权限限制为 `0600`。
 - REST、WebSocket、IM 命令和 MCP 工具分别执行身份、owner、角色与能力策略检查。
 - 普通成员固定使用 Container 模式；管理员 Host 模式只允许访问授权目录。
-- 智能体的通用代码与文件工具不提供全局只读模式；Skills 与 MCP 是否启用由用户显式选择。Workspace Memory 控制面是例外：定时任务与 Sub-Agent 只能读取，只有顶层交互式 Session 可以按 Workspace ACL 写入。
-- Script 定时任务只允许管理员在授权的 Host 工作区执行。
+- 智能体的通用代码与文件工具不提供全局只读模式；Skills 与 MCP 是否启用由用户显式选择。Workspace Memory 控制面是例外：自动化运行与群成员轮次只能提议（待主人确认），Sub-Agent 只能读取，只有顶层交互式 Session 可以按 Workspace ACL 写入。
+- 自动化的脚本与前置检查只允许管理员在授权的 Host 工作区执行。
 - Skill ZIP、文件上传、备份恢复和 Git 操作包含路径、符号链接、大小与目标校验。
 - 对公网开放时，建议使用 HTTPS 反向代理、强密码、关闭开放注册，并定期备份 `data/`。
 
@@ -482,17 +525,18 @@ happyclaw/
 └── data/                        # 本地运行数据，不进入 Git
 ```
 
-### CI 合并门槛
+### 合并门槛
 
-每个 Pull Request 都会执行：
+仓库不再运行 GitHub Actions CI（Agent 镜像发布仍在 GitHub Actions）。合并前在本地执行：
 
-1. 三端 `npm ci` 可复现安装。
-2. 改动文件格式检查。
-3. 共享事件类型一致性检查。
-4. 后端、Web 和 Agent Runner 类型检查。
-5. 全量 Vitest 测试。
-6. 三端生产构建。
-7. Agent Runner 自检。
+```bash
+make check
+```
+
+它依次运行：改动文件格式、生产依赖审计、共享文件副本一致性、三端类型检查（含 Prompt 与文档检查）、全量
+Vitest、三端生产构建、四个全栈冒烟测试、Web 浏览器 e2e（手机与桌面）、Agent Runner 自检和
+`git diff --check`，并打印每一步耗时。并行 worktree 用 `PLAYWRIGHT_PORT` 指定 e2e 端口。PR 的
+「验证」一节写明在哪个提交上跑过。
 
 ## 文档
 
@@ -529,7 +573,7 @@ Claude Code，并把实际版本写入
 <details>
 <summary><strong>可以使用第三方 Claude 兼容接口吗？</strong></summary>
 
-可以。在“设置 → 模型与提供商”选择第三方，只需填写 Endpoint、Auth Token 和模型名；1M 上下文及 Claude Code 兼容环境变量由系统预填，也允许在高级设置中编辑。
+可以。在“设置 → 模型配置”点“添加模型连接”：常见厂商直接选预设，只填 API Key；其他兼容接口选“自定义兼容地址”，填写地址和密钥后系统会识别认证方式、获取模型列表并测试连接。1M 上下文及 Claude Code 兼容环境变量由系统预填，也允许在连接设置中编辑。
 
 </details>
 
@@ -544,26 +588,6 @@ Claude Code，并把实际版本写入
 <summary><strong>如何修改服务端口？</strong></summary>
 
 生产模式运行 `WEB_PORT=8080 make start`。开发模式需要同时设置后端端口和 Vite 的 API/WebSocket 代理目标。
-
-</details>
-
-<details>
-<summary><strong>如何检查旧版本遗留的私聊挂载？</strong></summary>
-
-两类旧安装可能需要此工具：一是 #666 之前的受支持版本曾把 WhatsApp `@c.us`
-及 device `@c.us` 私聊留在 workspace main；二是曾在 #659 的 WhatsApp LID 分类
-修复之前单独部署或 cherry-pick #655/schema v73 的非正式安装。升级到当前版本后运行
-`make leftover-direct-mounts`。诊断严格只读，并且只接受当前 schema；发现残留或
-存在无法自动判定的 WhatsApp alias 路由冲突时以退出码 2 返回。为保证读取完整且绝不
-创建 SQLite sidecar，诊断前也必须先干净停止 HappyClaw。
-
-修复前还必须停止 launchd/systemd 等进程守护，然后运行
-`make leftover-direct-mounts APPLY=1`。修复会把可判定私聊迁到独立
-`channel_direct` session，并永久清除受污染 workspace main 的模型恢复资格和
-SDK/runtime session；不会创建备份，也不能安全撤销。工具若无法确认数据库无人占用，
-会拒绝执行。如果同一 WhatsApp canonical 用户的多个 alias 指向不同 owner、workspace
-或 session，工具会 fail closed；请按诊断输出人工解绑冲突 alias 后重试，不会自动猜测
-应保留哪条路由。
 
 </details>
 

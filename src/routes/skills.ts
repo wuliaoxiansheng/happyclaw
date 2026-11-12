@@ -16,11 +16,10 @@ import {
   withCapabilityScopeLocks,
 } from '../capability-lock.js';
 import {
-  CapabilityRuntimeCommitError,
+  capabilityRuntimeMutationFailure,
   mutateCapabilityAroundRuntimeQuiesce,
   repairCapabilityRuntimeSafetyBlock,
 } from '../capability-runtime-mutation.js';
-import { WorkspaceRuntimeQuiesceError } from '../agent-profile-runtime.js';
 import { getEffectiveExternalDir } from '../runtime-config.js';
 import {
   skillArchiveUploadBodyLimit,
@@ -33,6 +32,7 @@ import {
   importSkillsFromZip,
   installSkillDirectoriesTransactionally,
   runCommandWithDirectoryQuota,
+  SkillAlreadyExistsError,
   SkillUrlRefusedError,
 } from '../skill-import-service.js';
 import {
@@ -634,26 +634,6 @@ async function withUserSkillRuntimeMutation<T>(
   });
 }
 
-function skillRuntimeMutationFailure(error: unknown, action: string) {
-  if (error instanceof WorkspaceRuntimeQuiesceError) {
-    return {
-      error: error.persisted
-        ? `${action} was saved, but runtime cleanup failed; retry the request`
-        : `Failed to stop affected workspaces; ${action} was not saved`,
-      persisted: error.persisted,
-      retryable: true,
-    };
-  }
-  if (error instanceof CapabilityRuntimeCommitError) {
-    return {
-      error: `${action} has an uncertain commit outcome; retry the request to finish fail-closed cleanup`,
-      persisted: 'unknown',
-      retryable: true,
-    };
-  }
-  return null;
-}
-
 // --- Routes ---
 
 skillsRoutes.get('/', authMiddleware, (c) => {
@@ -787,7 +767,7 @@ skillsRoutes.post('/import/git', authMiddleware, async (c) => {
       invalidated_runtime_jids: runtimeResult.invalidatedRuntimeJids,
     });
   } catch (error) {
-    const runtimeFailure = skillRuntimeMutationFailure(
+    const runtimeFailure = capabilityRuntimeMutationFailure(
       error,
       'Git Skill import',
     );
@@ -796,7 +776,7 @@ skillsRoutes.post('/import/git', authMiddleware, async (c) => {
       error instanceof Error ? error.message : 'Git import failed';
     return c.json(
       { error: message },
-      message.startsWith('Skill already exists:') ? 409 : 400,
+      error instanceof SkillAlreadyExistsError ? 409 : 400,
     );
   }
 });
@@ -855,7 +835,7 @@ skillsRoutes.post(
         invalidated_runtime_jids: runtimeResult.invalidatedRuntimeJids,
       });
     } catch (error) {
-      const runtimeFailure = skillRuntimeMutationFailure(
+      const runtimeFailure = capabilityRuntimeMutationFailure(
         error,
         'ZIP Skill import',
       );
@@ -864,7 +844,7 @@ skillsRoutes.post(
         error instanceof Error ? error.message : 'ZIP import failed';
       return c.json(
         { error: message },
-        message.startsWith('Skill already exists:') ? 409 : 400,
+        error instanceof SkillAlreadyExistsError ? 409 : 400,
       );
     }
   },
@@ -984,7 +964,7 @@ skillsRoutes.patch('/:id', authMiddleware, async (c) => {
         invalidated_runtime_jids: result.invalidatedRuntimeJids,
       });
     } catch (error) {
-      const failure = skillRuntimeMutationFailure(error, 'Skill toggle');
+      const failure = capabilityRuntimeMutationFailure(error, 'Skill toggle');
       if (failure) return c.json(failure, 503);
       throw error;
     }
@@ -1082,7 +1062,7 @@ async function deleteSkillForUser(
         `Skill ${skillId} deletion cleanup`,
       );
     } catch (error) {
-      const failure = skillRuntimeMutationFailure(error, 'Skill deletion');
+      const failure = capabilityRuntimeMutationFailure(error, 'Skill deletion');
       return {
         success: false,
         error: failure?.error ?? 'Failed to repair Skill runtime cleanup',
@@ -1130,7 +1110,7 @@ async function deleteSkillForUser(
         invalidatedRuntimeJids: result.invalidatedRuntimeJids,
       };
     } catch (error) {
-      const failure = skillRuntimeMutationFailure(error, 'Skill deletion');
+      const failure = capabilityRuntimeMutationFailure(error, 'Skill deletion');
       return {
         success: false,
         error: failure?.error ?? 'Failed to delete Skill safely',
@@ -1219,7 +1199,10 @@ skillsRoutes.delete('/user-all', authMiddleware, async (c) => {
         invalidated_runtime_jids: result.invalidatedRuntimeJids,
       });
     } catch (error) {
-      const failure = skillRuntimeMutationFailure(error, 'Bulk Skill deletion');
+      const failure = capabilityRuntimeMutationFailure(
+        error,
+        'Bulk Skill deletion',
+      );
       if (failure) return c.json(failure, 503);
       throw error;
     }
@@ -1404,7 +1387,10 @@ async function installSkillForUser(
       invalidatedRuntimeJids: result.invalidatedRuntimeJids,
     };
   } catch (error) {
-    const failure = skillRuntimeMutationFailure(error, 'Skill installation');
+    const failure = capabilityRuntimeMutationFailure(
+      error,
+      'Skill installation',
+    );
     return {
       success: false,
       error: failure?.error ?? 'Failed to install Skill safely',
@@ -1465,7 +1451,10 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
         `Skill ${id} reinstall cleanup`,
       );
     } catch (error) {
-      const failure = skillRuntimeMutationFailure(error, 'Skill reinstall');
+      const failure = capabilityRuntimeMutationFailure(
+        error,
+        'Skill reinstall',
+      );
       if (failure) return c.json(failure, 503);
       throw error;
     }
@@ -1621,7 +1610,10 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
         invalidated_runtime_jids: runtimeResult.invalidatedRuntimeJids,
       });
     } catch (error) {
-      const failure = skillRuntimeMutationFailure(error, 'Skill reinstall');
+      const failure = capabilityRuntimeMutationFailure(
+        error,
+        'Skill reinstall',
+      );
       if (failure) return c.json(failure, 503);
       throw error;
     }

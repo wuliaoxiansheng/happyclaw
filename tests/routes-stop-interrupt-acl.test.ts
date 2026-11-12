@@ -91,6 +91,8 @@ function seedTestGroup(): void {
   } as any);
 }
 
+const interruptQuery = vi.fn(() => false);
+
 function asUser(userId: string, role: 'admin' | 'member' = 'member'): void {
   process.env.HAPPYCLAW_TEST_USER_ID = userId;
   process.env.HAPPYCLAW_TEST_USER_ROLE = role;
@@ -113,7 +115,7 @@ beforeAll(() => {
   webContext.setWebDeps({
     queue: {
       stopGroup: async () => {},
-      interruptQuery: () => false,
+      interruptQuery,
     },
   } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
 });
@@ -149,3 +151,11 @@ for (const route of ['/stop', '/interrupt'] as const) {
     });
   });
 }
+
+test("the owner's interrupt is an explicit stop, not a steer", async () => {
+  seedTestGroup();
+  asUser(OWNER_ID);
+  interruptQuery.mockClear();
+  expect((await post('/interrupt')).status).toBe(200);
+  expect(interruptQuery).toHaveBeenCalledWith(GROUP_JID, undefined, 'stop');
+});

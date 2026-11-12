@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { DATA_DIR, GROUPS_DIR } from './config.js';
+import { DATA_DIR } from './config.js';
 import {
   buildEffectiveMcpManifest,
   loadPluginMcpDefinitions,
@@ -22,6 +22,10 @@ import { resolveEffectiveSkills } from './effective-skill-resolver.js';
 import { pluginSkillLayers } from './effective-skill-resolver.js';
 import { loadUserPlugins } from './plugin-utils.js';
 import { resolveHostSkillPolicy } from './agent-profile-policy.js';
+import {
+  resolveWorkspaceProjectRoot,
+  resolveWorkspaceSkillRoots,
+} from './session-worktree.js';
 import {
   HOST_CLAUDE_NATIVE_DIRECTORIES,
   HOST_CLAUDE_NATIVE_FILES,
@@ -140,8 +144,9 @@ export function buildAgentCapabilityPreview(options: {
   const { profile, workspace } = options;
   const policy = profile.runtime_policy;
   const externalClaudeDir = getEffectiveExternalDir();
+  // The same project root and Skill directories a main-session run uses.
   const workspaceDir = workspace
-    ? path.join(GROUPS_DIR, workspace.group.folder)
+    ? resolveWorkspaceProjectRoot(workspace.group)
     : undefined;
   const hostContext = policy.context.source === 'host_claude';
   const hostSkillPolicy = resolveHostSkillPolicy(policy);
@@ -168,13 +173,11 @@ export function buildAgentCapabilityPreview(options: {
         source: 'managed',
         root: path.join(DATA_DIR, 'skills', profile.owner_user_id),
       },
-      ...(workspaceDir
-        ? [
-            {
-              source: 'workspace' as const,
-              root: path.join(workspaceDir, '.claude', 'skills'),
-            },
-          ]
+      ...(workspace
+        ? resolveWorkspaceSkillRoots(workspace.group).map((root) => ({
+            source: 'workspace' as const,
+            root,
+          }))
         : []),
       ...pluginSkillLayers(enabledPlugins),
     ],

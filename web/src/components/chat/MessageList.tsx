@@ -12,7 +12,6 @@ import { toast } from 'sonner';
 import { Message, useChatStore } from '../../stores/chat';
 import { MessageBubble } from './MessageBubble';
 import { StreamingDisplay } from './StreamingDisplay';
-import { EmojiAvatar } from '../common/EmojiAvatar';
 import { ErrorBoundary } from '../common';
 import {
   Loader2,
@@ -20,12 +19,15 @@ import {
   ChevronDown,
   AlertTriangle,
   Copy,
-  Code2,
   Zap,
-  BookOpen,
-  Wrench,
 } from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
+import { useFollowGlide } from '../../hooks/useFollowGlide';
+import {
+  layoutViewportHeight,
+  measureVisualViewport,
+} from '../../hooks/useVisualViewport';
+import { useIsPhone } from '../layout/phone';
 import { resolveSystemMessage } from '../../lib/system-message-registry';
 import {
   getPresentedMessageContent,
@@ -37,6 +39,7 @@ import {
 } from '../../lib/message-timeline';
 import { resolveAgentDisplayIdentity } from '../../utils/agent-identity';
 import { copyToClipboard } from '../../utils/clipboard';
+import { cn } from '@/lib/utils';
 import {
   formatChatDateLabel,
   localDayKey,
@@ -45,8 +48,11 @@ import {
   type ChatDateLabel,
 } from '../../lib/chat-date-label';
 import { useAuthStore } from '../../stores/auth';
-import { useShellStore } from '../../stores/shell';
 import type { InteractionMode } from '../../types';
+import type { WorkMode } from '../../work-items';
+import { sessionJidOf } from '../../lib/session-jid';
+import { DelegatedTaskCards } from './DelegatedTaskCards';
+import { lastPersonMessageAt } from '../../lib/multitask';
 
 interface MessageListProps {
   messages: Message[];
@@ -55,22 +61,20 @@ interface MessageListProps {
   onLoadMore: () => void;
   /** Increment to force scroll to bottom (e.g. after sending a message) */
   scrollTrigger?: number;
-  /** Current group JID — used to save/restore scroll position across group switches */
-  groupJid?: string;
+  /** The workspace of the session shown */
+  groupJid: string;
   /** Whether the agent is currently processing */
   isWaiting?: boolean;
-  /** If set, this MessageList is showing a sub-agent's messages */
-  agentId?: string;
-  /** Human-readable name of the active conversation for empty-state clarity */
-  contextLabel?: string;
+  /** The session shown */
+  agentId: string;
   /** Agent Profile identity for every conversation in this workspace */
   agentName?: string;
   agentAvatarUrl?: string | null;
   agentAvatarEmoji?: string | null;
   agentAvatarColor?: string | null;
   interactionMode?: InteractionMode;
-  /** Present when the viewer can send; empty-state starters then fill the composer. */
-  onSend?: (content: string) => void;
+  /** Multi-task: the tasks this session delegated follow the transcript. */
+  workMode?: WorkMode;
 }
 
 type FlatItem =
@@ -139,12 +143,9 @@ async function copyErrorText(text: string) {
   }
 }
 
-const quickPrompts = [
-  { icon: Code2, title: '分析代码', desc: '帮我阅读和分析一段代码的逻辑' },
-  { icon: Zap, title: '自动化脚本', desc: '编写一个自动化处理任务的脚本' },
-  { icon: BookOpen, title: '技术概念', desc: '用简单的语言解释一个技术概念' },
-  { icon: Wrench, title: '调试问题', desc: '帮我定位和修复一个 Bug' },
-];
+/** The floating jump buttons: 36px (44 on a phone), round and translucent over the chat. */
+const JUMP_BUTTON_CLASS =
+  'relative flex size-9 phone:size-11 cursor-pointer items-center justify-center rounded-full bg-surface-raised/80 text-muted-foreground shadow-menu ring-1 ring-surface-border backdrop-blur-sm transition-colors hover:text-foreground';
 
 // Memoized: ChatView re-renders for dialogs, panels and run status; the
 // transcript and composer only need to when their own props change.
@@ -157,42 +158,40 @@ export const MessageList = memo(function MessageList({
   groupJid,
   isWaiting,
   agentId,
-  contextLabel,
   agentName,
   agentAvatarUrl,
   agentAvatarEmoji,
   agentAvatarColor,
   interactionMode = 'assistant',
-  onSend,
+  workMode = 'single',
 }: MessageListProps) {
   const { mode: displayMode } = useDisplayMode();
-  const requestComposerDraft = useShellStore((s) => s.requestComposerDraft);
   const thinkingCache = useChatStore((s) => s.thinkingCache ?? {});
   const thinkingDurationCache = useChatStore(
     (s) => s.thinkingDurationCache ?? {},
   );
   const traceCache = useChatStore((s) => s.traceCache ?? {});
   const stepsCache = useChatStore((s) => s.stepsCache ?? {});
-  const hasWorkflowCard = useChatStore((state) => {
-    const current = agentId
-      ? state.agentStreaming[agentId]
-      : state.streaming[groupJid ?? ''];
-    return Object.values(current?.taskStates ?? {}).some(
+  const hasWorkflowCard = useChatStore((state) =>
+    Object.values(state.agentStreaming[agentId]?.taskStates ?? {}).some(
       (task) => task.taskType === 'local_workflow' && task.workflowRun,
-    );
-  });
+    ),
+  );
   // Spawn agents: selector returns stable reference (the agents array itself),
   // then useMemo filters for spawn kind. Direct .filter() in selector causes
   // infinite re-render because Zustand sees a new array reference every time.
-  const allAgentsForSpawn = useChatStore((s) =>
-    groupJid ? s.agents[groupJid] : undefined,
-  );
+  const allAgentsForSpawn = useChatStore((s) => s.agents[groupJid]);
+  const runtimeJid = sessionJidOf(groupJid, agentId);
+  // The /spawn agents this session started stream here until they report.
   const spawnAgents = useMemo(
     () =>
       (allAgentsForSpawn ?? []).filter(
-        (a) => a.kind === 'spawn' && a.status === 'running',
+        (a) =>
+          a.kind === 'spawn' &&
+          a.status === 'running' &&
+          a.spawned_from_jid === runtimeJid,
       ),
-    [allAgentsForSpawn],
+    [allAgentsForSpawn, runtimeJid],
   );
   const appearance = useAuthStore((state) => state.appearance);
   const agentIdentity = resolveAgentDisplayIdentity({
@@ -200,19 +199,17 @@ export const MessageList = memo(function MessageList({
     avatarUrl: agentAvatarUrl,
     avatarEmoji: agentAvatarEmoji,
     avatarColor: agentAvatarColor,
-    mainAvatarUrl: appearance?.aiAvatarUrl,
-    mainAvatarEmoji:
-      appearance?.aiAvatarMode === 'emoji'
-        ? appearance.aiAvatarEmoji
-        : undefined,
-    mainAvatarColor:
-      appearance?.aiAvatarMode === 'emoji'
-        ? appearance.aiAvatarColor
-        : undefined,
+    appearance,
   });
   const timelineMessages = useMemo(
     () => orderMessagesForTimeline(messages),
     [messages],
+  );
+  // Multi-task: an ended task stays below the transcript until the person
+  // writes again.
+  const personWroteAt = useMemo(
+    () => (workMode === 'multi' ? lastPersonMessageAt(timelineMessages) : 0),
+    [workMode, timelineMessages],
   );
   const today = useLocalToday();
   const parentRef = useRef<HTMLDivElement>(null);
@@ -252,14 +249,35 @@ export const MessageList = memo(function MessageList({
   // already pinned the reader again knows that event is layout.
   const resizePinRef = useRef<{ top: number; at: number } | null>(null);
   const lastScrollTopRef = useRef(0);
-  const isEmptyRef = useRef(timelineMessages.length === 0);
+  // The transcript's content; a pinned reader's streaming reply glides it up
+  // under the streaming cards' sticky identity rows.
+  const contentRef = useRef<HTMLDivElement>(null);
+  const streamCardsRef = useRef<HTMLDivElement>(null);
+  const followGlide = useFollowGlide(
+    parentRef,
+    contentRef,
+    streamCardsRef,
+    '[data-follow-sticky]',
+  );
 
-  const setPinned = useCallback((pinned: boolean) => {
-    if (scrollStateRef.current.autoScroll === pinned) return;
-    scrollStateRef.current.autoScroll = pinned;
-    setAutoScroll(pinned);
-    if (pinned) setUnseenCount(0);
-  }, []);
+  /** Ends a follow glide where it shows; its fold of scrollTop is layout. */
+  const settleGlide = useCallback(() => {
+    const top = followGlide.settle();
+    if (top === null) return false;
+    layoutScrollTopRef.current = top;
+    return true;
+  }, [followGlide]);
+
+  const setPinned = useCallback(
+    (pinned: boolean) => {
+      if (scrollStateRef.current.autoScroll === pinned) return;
+      scrollStateRef.current.autoScroll = pinned;
+      setAutoScroll(pinned);
+      if (pinned) setUnseenCount(0);
+      else settleGlide();
+    },
+    [settleGlide],
+  );
 
   // "回到顶部" only shows when there is somewhere to go. Recomputed on scroll
   // and on resize: content that fits the viewport never fires a scroll event.
@@ -475,12 +493,7 @@ export const MessageList = memo(function MessageList({
   // seeded with the block's measured height instead of the length estimate,
   // which overshot by 1.2–1.6x and rolled a pinned reader back a screen; a
   // reader scrolled into the reply keeps the row where the block was.
-  const runtimeJid = agentId
-    ? `${groupJid}#agent:${agentId}`
-    : (groupJid ?? '');
-  const hasLive = useChatStore((s) =>
-    agentId ? !!s.agentStreaming[agentId] : !!s.streaming[groupJid ?? ''],
-  );
+  const hasLive = useChatStore((s) => !!s.agentStreaming[agentId]);
   // The previous run's settled card is keyed by its run, and the live card
   // by the active run: the card that settles keeps its element (and DOM)
   // while the next queued run streams into a card of its own below it.
@@ -613,7 +626,9 @@ export const MessageList = memo(function MessageList({
       if (!item) return 100;
       switch (item.type) {
         case 'date':
-          return 48;
+          // Its 24px margins around a 16px line: a row inserted with the
+          // final above a pinned reader must not correct itself after.
+          return 64;
         case 'divider':
         case 'spawn':
         case 'error':
@@ -643,6 +658,7 @@ export const MessageList = memo(function MessageList({
     useFlushSync: false,
     scrollToFn: (offset, options, instance) => {
       layoutScrollTopRef.current = offset + (options.adjustments ?? 0);
+      followGlide.sync(layoutScrollTopRef.current);
       elementScroll(offset, options, instance);
     },
   });
@@ -663,6 +679,7 @@ export const MessageList = memo(function MessageList({
       const { scrollTop, scrollHeight, clientHeight } = parent;
       const movedUp = scrollTop < lastScrollTopRef.current - 1;
       lastScrollTopRef.current = scrollTop;
+      followGlide.sync(scrollTop);
       const layoutTop = layoutScrollTopRef.current;
       layoutScrollTopRef.current = null;
       const now = Date.now();
@@ -735,20 +752,22 @@ export const MessageList = memo(function MessageList({
         pinToBottom();
       }
     };
+    const scrollsUp = (event: KeyboardEvent) =>
+      event.key === 'PageUp' ||
+      event.key === 'ArrowUp' ||
+      event.key === 'Home' ||
+      (event.key === ' ' && event.shiftKey);
+    const grabsScrollbar = (event: PointerEvent) =>
+      event.target === parent && event.offsetX >= parent.clientWidth;
     const handleKeyDown = (event: KeyboardEvent) => {
       anchorHoldRef.current = null;
-      const scrollsUp =
-        event.key === 'PageUp' ||
-        event.key === 'ArrowUp' ||
-        event.key === 'Home' ||
-        (event.key === ' ' && event.shiftKey);
-      if (scrollsUp) releasePin(true);
+      if (scrollsUp(event)) releasePin(true);
       else endSettle();
     };
     const handlePointerDown = (event: PointerEvent) => {
       // Grabbing the scrollbar takes manual control; where it is dragged
       // decides the rest.
-      if (event.target === parent && event.offsetX >= parent.clientWidth) {
+      if (grabsScrollbar(event)) {
         anchorHoldRef.current = null;
         releasePin(false);
       }
@@ -772,6 +791,38 @@ export const MessageList = memo(function MessageList({
       }
     };
 
+    // Reader input that may leave the bottom takes over from a follow glide
+    // where the content shows, before the handlers below and before it
+    // scrolls natively. Input toward the bottom lets the glide carry on: a
+    // pinned reader has nowhere further to go, and folding the glide into
+    // scrollTop under it would read as scrolling up. A wheel up leaves the
+    // bottom at once, as during a smooth scroll.
+    const mayLeaveBottom = (event: Event) => {
+      switch (event.type) {
+        case 'wheel': {
+          const wheel = event as WheelEvent;
+          return wheel.deltaY < 0 && !wheel.ctrlKey;
+        }
+        case 'keydown':
+          return scrollsUp(event as KeyboardEvent);
+        case 'pointerdown':
+          return grabsScrollbar(event as PointerEvent);
+        default:
+          // touchstart: where the finger goes is not known yet.
+          return true;
+      }
+    };
+    const takeOverGlide = (event: Event) => {
+      if (!mayLeaveBottom(event) || !settleGlide()) return;
+      if (event.type === 'wheel') setPinned(false);
+    };
+    const takeOverEvents = ['wheel', 'touchstart', 'pointerdown', 'keydown'];
+    for (const type of takeOverEvents) {
+      parent.addEventListener(type, takeOverGlide, {
+        capture: true,
+        passive: true,
+      });
+    }
     parent.addEventListener('scroll', handleScroll);
     parent.addEventListener('scrollend', handleScrollEnd);
     parent.addEventListener('wheel', handleWheel, { passive: true });
@@ -782,6 +833,9 @@ export const MessageList = memo(function MessageList({
     parent.addEventListener('keydown', handleKeyDown);
     parent.addEventListener('pointerdown', handlePointerDown);
     return () => {
+      for (const type of takeOverEvents) {
+        parent.removeEventListener(type, takeOverGlide, { capture: true });
+      }
       parent.removeEventListener('scroll', handleScroll);
       parent.removeEventListener('scrollend', handleScrollEnd);
       parent.removeEventListener('wheel', handleWheel);
@@ -793,6 +847,7 @@ export const MessageList = memo(function MessageList({
       parent.removeEventListener('pointerdown', handlePointerDown);
     };
   }, [
+    followGlide,
     hasMore,
     loading,
     onLoadMore,
@@ -800,6 +855,7 @@ export const MessageList = memo(function MessageList({
     pinToBottom,
     releasePin,
     setPinned,
+    settleGlide,
     stopSmoothScroll,
     syncEdges,
   ]);
@@ -872,7 +928,6 @@ export const MessageList = memo(function MessageList({
   }, [flatMessages.length, virtualizer, timelineMessages.length]);
 
   useLayoutEffect(() => {
-    isEmptyRef.current = flatMessages.length === 0;
     syncEdges();
   }, [flatMessages.length, syncEdges]);
 
@@ -952,11 +1007,101 @@ export const MessageList = memo(function MessageList({
     committedTotalRef.current = totalSize + loadingRowHeightRef.current;
   });
 
+  // Whether a reply is streaming in, as of the last commit.
+  const streamingRef = useRef(hasStreaming);
+  /**
+   * Moves a pinned reader to the new bottom. A streaming reply's growth
+   * glides there instead of jumping a batch at a time; reduced motion, and
+   * the first page or a finished reply settling, jump.
+   */
+  const followBottom = useCallback(
+    (grew: boolean) => {
+      followGlide.follow(
+        grew &&
+          streamingRef.current &&
+          Date.now() >= settleUntilRef.current &&
+          !prefersReducedMotion(),
+      );
+    },
+    [followGlide],
+  );
+
+  const isPhone = useIsPhone();
+  const isPhoneRef = useRef(isPhone);
+  isPhoneRef.current = isPhone;
+  /**
+   * The bottom of what the reader sees moved up by `px` (a keyboard came up
+   * over it): the lines that were there stay in sight, the top gives way.
+   * Not for a reader at the bottom, who follows the end anyway.
+   */
+  const keepReadingAbove = useCallback((px: number) => {
+    const parent = parentRef.current;
+    if (!parent || scrollStateRef.current.autoScroll) return;
+    parent.scrollTop += px;
+  }, []);
+  // iOS does not resize the page for the keyboard: it covers it, and the dock
+  // and the list's bottom room grow by --keyboard-inset. Read here without a
+  // React render; a frame later, once that room is laid out.
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    if (!isPhone || !viewport) return;
+    const readInset = () =>
+      measureVisualViewport(layoutViewportHeight(), viewport).keyboardInset;
+    let inset = readInset();
+    let frame = 0;
+    const update = () => {
+      const next = readInset();
+      const grew = next - inset;
+      inset = next;
+      if (grew <= 0) return;
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => keepReadingAbove(grew));
+    };
+    viewport.addEventListener('resize', update);
+    viewport.addEventListener('scroll', update);
+    return () => {
+      viewport.removeEventListener('resize', update);
+      viewport.removeEventListener('scroll', update);
+      cancelAnimationFrame(frame);
+    };
+  }, [isPhone, keepReadingAbove]);
+  // Scrolling the conversation by hand puts the keyboard away (cindy's
+  // keyboardDismissMode): the reader is reading, not typing. A tap does not.
+  useEffect(() => {
+    const parent = parentRef.current;
+    if (!isPhone || !parent) return;
+    let startY: number | null = null;
+    const onTouchStart = (event: TouchEvent) => {
+      startY = event.touches[0]?.clientY ?? null;
+    };
+    const onTouchMove = (event: TouchEvent) => {
+      const y = event.touches[0]?.clientY;
+      if (startY === null || y === undefined || Math.abs(y - startY) < 10) {
+        return;
+      }
+      startY = null;
+      const active = document.activeElement;
+      if (
+        active instanceof HTMLElement &&
+        (active.isContentEditable ||
+          active.tagName === 'TEXTAREA' ||
+          active.tagName === 'INPUT')
+      ) {
+        active.blur();
+      }
+    };
+    parent.addEventListener('touchstart', onTouchStart, { passive: true });
+    parent.addEventListener('touchmove', onTouchMove, { passive: true });
+    return () => {
+      parent.removeEventListener('touchstart', onTouchStart);
+      parent.removeEventListener('touchmove', onTouchMove);
+    };
+  }, [isPhone]);
+
   // Keep a reader who is pinned to the bottom there while rows below grow
   // after their first measurement (images, Mermaid, late code highlighting),
   // while a row shrinks under a correction, and while the viewport shrinks
-  // (keyboard, a taller composer). The empty state reads from the top.
-  const contentRef = useRef<HTMLDivElement>(null);
+  // (keyboard, a taller composer).
   useEffect(() => {
     const content = contentRef.current;
     const parent = parentRef.current;
@@ -967,14 +1112,22 @@ export const MessageList = memo(function MessageList({
       const height = content.offsetHeight;
       const viewport = parent.clientHeight;
       const changed = height !== lastHeight || viewport < lastViewport;
+      // Only growth glides: a shrinking viewport (keyboard, a taller
+      // composer) moves the content up with it at once.
+      const grew = height > lastHeight && viewport >= lastViewport;
+      const shrunkBy = lastViewport - viewport;
       lastHeight = height;
       lastViewport = viewport;
       syncEdges();
-      if (!changed || isEmptyRef.current) return;
+      if (!changed) return;
       if (
         !scrollStateRef.current.autoScroll &&
         Date.now() > settleUntilRef.current
       ) {
+        // A reader up in the history keeps what they were reading: an
+        // Android keyboard shrinks the list from below, over the lines
+        // nearest the composer.
+        if (isPhoneRef.current && shrunkBy > 0) keepReadingAbove(shrunkBy);
         return;
       }
       if (Date.now() < smoothScrollUntilRef.current) {
@@ -985,12 +1138,15 @@ export const MessageList = memo(function MessageList({
         top: Math.max(0, parent.scrollHeight - parent.clientHeight),
         at: Date.now(),
       };
-      parent.scrollTop = parent.scrollHeight;
+      followBottom(grew);
     });
-    observer.observe(content);
+    // Border box: the content's bottom padding is the composer's height
+    // (--composer-dock-height), which changes on its own, e.g. when the
+    // lazily loaded composer replaces its placeholder.
+    observer.observe(content, { box: 'border-box' });
     observer.observe(parent);
     return () => observer.disconnect();
-  }, [scheduleSmoothCatchUp, syncEdges]);
+  }, [followBottom, keepReadingAbove, scheduleSmoothCatchUp, syncEdges]);
 
   // Place the swapped-in reply: a pinned reader lands on the bottom at once
   // (no animated catch-up); otherwise the row holds the block's place on
@@ -1036,16 +1192,15 @@ export const MessageList = memo(function MessageList({
   // can look like leaving the bottom. A reader pinned before the swap stays
   // pinned: the settle window keeps those scroll events from unpinning, and
   // the resize and safety-net passes pin again once the row has measured.
-  const wasStreamingRef = useRef(hasStreaming);
   useLayoutEffect(() => {
-    const finished = wasStreamingRef.current && !hasStreaming;
-    wasStreamingRef.current = hasStreaming;
+    const finished = streamingRef.current && !hasStreaming;
+    streamingRef.current = hasStreaming;
     if (!finished || !scrollStateRef.current.autoScroll) return;
     settleUntilRef.current = Math.max(settleUntilRef.current, Date.now() + 700);
   }, [hasStreaming]);
   // Auto-scroll when streaming content is active. Subscribes directly to the
   // chat store (no React re-render) and schedules a single rAF-coalesced
-  // scrollTo per animation frame, regardless of how many text_delta /
+  // follow per animation frame, regardless of how many text_delta /
   // thinking_delta updates land. This replaces the 100ms setInterval poll
   // (PR #455 era) which competed with smooth scrolls and caused 3-4 visible
   // jumps when the user scrolled to the bottom mid-stream.
@@ -1062,15 +1217,12 @@ export const MessageList = memo(function MessageList({
           scheduleSmoothCatchUp();
           return;
         }
-        if (!scrollStateRef.current.autoScroll) return;
-        const parent = parentRef.current;
-        if (!parent) return;
-        parent.scrollTo({ top: parent.scrollHeight });
+        if (scrollStateRef.current.autoScroll) followBottom(true);
       });
     };
 
     const readStreaming = (state: ReturnType<typeof useChatStore.getState>) =>
-      agentId ? state.agentStreaming[agentId] : state.streaming[groupJid ?? ''];
+      state.agentStreaming[agentId];
 
     let prevText = readStreaming(useChatStore.getState())?.partialText ?? '';
     let prevThinking =
@@ -1091,7 +1243,7 @@ export const MessageList = memo(function MessageList({
       unsubscribe();
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [hasStreaming, agentId, groupJid, scheduleSmoothCatchUp]);
+  }, [hasStreaming, agentId, groupJid, followBottom, scheduleSmoothCatchUp]);
 
   const scrollToTop = useCallback(() => {
     const parent = parentRef.current;
@@ -1120,335 +1272,299 @@ export const MessageList = memo(function MessageList({
     <div className="relative flex-1 overflow-hidden overflow-x-hidden">
       <div
         ref={parentRef}
-        className="h-full overflow-y-auto overflow-x-hidden pb-10"
+        // Room below the last row, unless a phone dock floating over the
+        // list already reserves it (--list-end-room, set by the dock).
+        className="h-full overflow-y-auto overflow-x-hidden pb-[var(--list-end-room,2.5rem)]"
       >
-        {/* The top inset sits on the content, not the scroller: a sticky
-            status row sticks inside the scroller's padding box, and with
-            the padding on the scroller 24px of text scrolled by above it. */}
-        <div
-          ref={contentRef}
-          className={
-            displayMode === 'compact'
-              ? 'mx-auto px-4 pt-6 min-w-0'
-              : 'mx-auto min-w-0 max-w-3xl px-4 pt-6 lg:px-6'
-          }
-        >
-          {loading && hasMore && (
-            <div ref={measureLoadingRow} className="flex justify-center py-4">
-              <Loader2
-                className="animate-spin text-muted-foreground"
-                size={18}
-              />
-            </div>
-          )}
-
+        {/* Clips the follow glide's translation of the content, which would
+            otherwise add scroll range below it. A clip, unlike hidden, is
+            not a scroll container: sticky rows still stick to the scroller. */}
+        <div className="overflow-y-clip">
+          {/* The top inset sits on the content, not the scroller: a sticky
+              status row sticks inside the scroller's padding box, and with
+              the padding on the scroller 24px of text scrolled by above it. */}
           <div
-            style={{
-              height: `${virtualizer.getTotalSize()}px`,
-              width: '100%',
-              position: 'relative',
-            }}
+            ref={contentRef}
+            className={cn(
+              // A phone's header and composer dock float over the list;
+              // ChatView and the dock publish how much of it they cover.
+              // The bottom room is on the content, not the scroller, so a
+              // taller dock re-pins a reader at the bottom like a taller row.
+              'mx-auto min-w-0 px-4 pt-[calc(1.5rem+var(--chat-top-inset,0px))] pb-[calc(var(--composer-dock-height,0px)+var(--composer-dock-lift,0px))]',
+              // Sticky rows (StreamingDisplay) stick below the header.
+              '[&_[data-follow-sticky]]:top-[var(--chat-top-inset,0px)]',
+              displayMode !== 'compact' && 'max-w-3xl lg:px-6',
+            )}
           >
-            {virtualizer.getVirtualItems().map((virtualItem) => {
-              const item = flatMessages[virtualItem.index];
-              if (!item) return null;
+            {loading && hasMore && (
+              <div ref={measureLoadingRow} className="flex justify-center py-4">
+                <Loader2
+                  className="animate-spin text-muted-foreground"
+                  size={18}
+                />
+              </div>
+            )}
 
-              if (item.type === 'date') {
-                return (
-                  <div
-                    key={virtualItem.key}
-                    ref={virtualizer.measureElement}
-                    data-index={virtualItem.index}
-                    style={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      width: '100%',
-                      transform: `translateY(${virtualItem.start}px)`,
-                    }}
-                  >
-                    <div className="my-6 flex items-center gap-3">
-                      <div className="h-px flex-1 bg-surface-border" />
-                      <span
-                        className="text-caption text-faint-foreground"
-                        title={item.title}
-                      >
-                        {item.content}
-                      </span>
-                      <div className="h-px flex-1 bg-surface-border" />
-                    </div>
-                  </div>
-                );
-              }
+            <div
+              style={{
+                height: `${virtualizer.getTotalSize()}px`,
+                width: '100%',
+                position: 'relative',
+              }}
+            >
+              {virtualizer.getVirtualItems().map((virtualItem) => {
+                const item = flatMessages[virtualItem.index];
+                if (!item) return null;
 
-              if (item.type === 'divider') {
-                return (
-                  <div
-                    key={virtualItem.key}
-                    ref={virtualizer.measureElement}
-                    data-index={virtualItem.index}
-                    style={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      width: '100%',
-                      transform: `translateY(${virtualItem.start}px)`,
-                    }}
-                  >
-                    <div className="my-6 flex items-center gap-3">
-                      <div className="h-px flex-1 bg-surface-border" />
-                      <span className="text-caption whitespace-pre-wrap text-muted-foreground">
-                        {item.content}
-                      </span>
-                      <div className="h-px flex-1 bg-surface-border" />
-                    </div>
-                  </div>
-                );
-              }
-
-              if (item.type === 'spawn') {
-                return (
-                  <div
-                    key={virtualItem.key}
-                    ref={virtualizer.measureElement}
-                    data-index={virtualItem.index}
-                    style={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      width: '100%',
-                      transform: `translateY(${virtualItem.start}px)`,
-                    }}
-                  >
-                    <div className="my-4 flex items-center gap-2">
-                      <span className="inline-flex h-7 max-w-full items-center gap-1.5 rounded-md bg-surface-raised px-2.5 text-caption text-muted-foreground ring-1 ring-surface-border">
-                        <Zap className="size-3.5 shrink-0 text-primary-text" />
-                        <span className="font-medium text-foreground">
-                          并行任务
-                        </span>
-                        <span className="text-faint-foreground">·</span>
-                        <span className="max-w-[400px] truncate">
+                if (item.type === 'date') {
+                  return (
+                    <div
+                      key={virtualItem.key}
+                      ref={virtualizer.measureElement}
+                      data-index={virtualItem.index}
+                      style={{
+                        position: 'absolute',
+                        top: 0,
+                        left: 0,
+                        width: '100%',
+                        transform: `translateY(${virtualItem.start}px)`,
+                      }}
+                    >
+                      <div className="my-6 flex items-center gap-3">
+                        <div className="h-px flex-1 bg-surface-border" />
+                        <span
+                          className="text-caption text-faint-foreground"
+                          title={item.title}
+                        >
                           {item.content}
                         </span>
-                      </span>
+                        <div className="h-px flex-1 bg-surface-border" />
+                      </div>
                     </div>
-                  </div>
-                );
-              }
+                  );
+                }
 
-              if (item.type === 'error') {
-                return (
-                  <div
-                    key={virtualItem.key}
-                    ref={virtualizer.measureElement}
-                    data-index={virtualItem.index}
-                    style={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      width: '100%',
-                      transform: `translateY(${virtualItem.start}px)`,
-                    }}
-                  >
-                    {/* Inline callout in the message column: long errors
-                        stay readable instead of squeezing between rules. */}
-                    <div className="my-4 flex items-start gap-2 rounded-lg bg-error/5 px-3 py-2 ring-1 ring-error/15">
-                      <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-error" />
-                      <div className="min-w-0 flex-1 text-caption leading-5">
-                        <span className="font-medium text-error">运行出错</span>
-                        <span className="ml-2 break-words whitespace-pre-wrap text-muted-foreground">
+                if (item.type === 'divider') {
+                  return (
+                    <div
+                      key={virtualItem.key}
+                      ref={virtualizer.measureElement}
+                      data-index={virtualItem.index}
+                      style={{
+                        position: 'absolute',
+                        top: 0,
+                        left: 0,
+                        width: '100%',
+                        transform: `translateY(${virtualItem.start}px)`,
+                      }}
+                    >
+                      <div className="my-6 flex items-center gap-3">
+                        <div className="h-px flex-1 bg-surface-border" />
+                        <span className="text-caption whitespace-pre-wrap text-muted-foreground">
                           {item.content}
+                        </span>
+                        <div className="h-px flex-1 bg-surface-border" />
+                      </div>
+                    </div>
+                  );
+                }
+
+                if (item.type === 'spawn') {
+                  return (
+                    <div
+                      key={virtualItem.key}
+                      ref={virtualizer.measureElement}
+                      data-index={virtualItem.index}
+                      style={{
+                        position: 'absolute',
+                        top: 0,
+                        left: 0,
+                        width: '100%',
+                        transform: `translateY(${virtualItem.start}px)`,
+                      }}
+                    >
+                      <div className="my-4 flex items-center gap-2">
+                        <span className="inline-flex h-7 max-w-full items-center gap-1.5 rounded-md bg-surface-raised px-2.5 text-caption text-muted-foreground ring-1 ring-surface-border">
+                          <Zap className="size-3.5 shrink-0 text-primary-text" />
+                          <span className="font-medium text-foreground">
+                            并行任务
+                          </span>
+                          <span className="text-faint-foreground">·</span>
+                          <span className="max-w-[400px] truncate">
+                            {item.content}
+                          </span>
                         </span>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => void copyErrorText(item.content)}
-                        className="-my-0.5 -mr-1.5 inline-flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 text-caption text-muted-foreground transition-colors hover:bg-error/10 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none pointer-coarse:h-10 pointer-coarse:px-2.5"
-                      >
-                        <Copy className="size-3.5" />
-                        复制错误
-                      </button>
                     </div>
+                  );
+                }
+
+                if (item.type === 'error') {
+                  return (
+                    <div
+                      key={virtualItem.key}
+                      ref={virtualizer.measureElement}
+                      data-index={virtualItem.index}
+                      style={{
+                        position: 'absolute',
+                        top: 0,
+                        left: 0,
+                        width: '100%',
+                        transform: `translateY(${virtualItem.start}px)`,
+                      }}
+                    >
+                      {/* Inline callout in the message column: long errors
+                          stay readable instead of squeezing between rules. */}
+                      <div className="my-4 flex items-start gap-2 rounded-lg bg-error/5 px-3 py-2 ring-1 ring-error/15">
+                        <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-error" />
+                        <div className="min-w-0 flex-1 text-caption leading-5">
+                          <span className="font-medium text-error">
+                            运行出错
+                          </span>
+                          <span className="ml-2 break-words whitespace-pre-wrap text-muted-foreground">
+                            {item.content}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void copyErrorText(item.content)}
+                          className="-my-0.5 -mr-1.5 inline-flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 text-caption text-muted-foreground transition-colors hover:bg-error/10 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none pointer-coarse:h-10 pointer-coarse:px-2.5"
+                        >
+                          <Copy className="size-3.5" />
+                          复制错误
+                        </button>
+                      </div>
+                    </div>
+                  );
+                }
+
+                const message = item.content;
+                const showTime = true;
+
+                return (
+                  <div
+                    key={virtualItem.key}
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      width: '100%',
+                      transform: `translateY(${virtualItem.start}px)`,
+                    }}
+                    ref={virtualizer.measureElement}
+                    data-index={virtualItem.index}
+                    data-message-id={message.id}
+                  >
+                    <ErrorBoundary>
+                      <MessageBubble
+                        message={message}
+                        showTime={showTime}
+                        thinkingContent={thinkingCache[message.id]}
+                        thinkingDurationMs={thinkingDurationCache[message.id]}
+                        traceEvents={traceCache[message.id]}
+                        replySteps={stepsCache[message.id]}
+                        agentName={agentIdentity.name}
+                        agentAvatarUrl={agentAvatarUrl}
+                        agentAvatarEmoji={agentAvatarEmoji}
+                        agentAvatarColor={agentAvatarColor}
+                      />
+                    </ErrorBoundary>
                   </div>
                 );
-              }
+              })}
+            </div>
 
-              const message = item.content;
-              const showTime = true;
-
-              return (
-                <div
-                  key={virtualItem.key}
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    left: 0,
-                    width: '100%',
-                    transform: `translateY(${virtualItem.start}px)`,
-                  }}
-                  ref={virtualizer.measureElement}
-                  data-index={virtualItem.index}
-                  data-message-id={message.id}
-                >
-                  <ErrorBoundary>
-                    <MessageBubble
-                      message={message}
-                      showTime={showTime}
-                      thinkingContent={thinkingCache[message.id]}
-                      thinkingDurationMs={thinkingDurationCache[message.id]}
-                      traceEvents={traceCache[message.id]}
-                      replySteps={stepsCache[message.id]}
-                      agentName={agentIdentity.name}
+            {/* The streaming cards: where the follow glide finds sticky rows. */}
+            <div ref={streamCardsRef}>
+              <div ref={streamingBlockRef} data-hc-streaming-block="">
+                {settledRunKey !== null && (
+                  <div
+                    key={`run:${settledRunKey}`}
+                    data-hc-stream-card="settled"
+                  >
+                    <StreamingDisplay
+                      groupJid={groupJid}
+                      isWaiting={false}
+                      agentId={agentId}
+                      senderName={agentIdentity.name}
                       agentAvatarUrl={agentAvatarUrl}
                       agentAvatarEmoji={agentAvatarEmoji}
                       agentAvatarColor={agentAvatarColor}
+                      interactionMode={interactionMode}
+                      settled
                     />
-                  </ErrorBoundary>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* In the scroll flow rather than an overlay, so a short viewport
-              (phone in landscape, keyboard up) can scroll to every starter.
-              The top inset subtracts the content's own pt-6. */}
-          {timelineMessages.length === 0 && !loading && (
-            <div
-              data-hc-empty-state
-              className={
-                displayMode === 'compact'
-                  ? 'mx-auto w-full max-w-3xl pt-[clamp(3rem,calc(14vh_-_1.5rem),7.5rem)] lg:px-6'
-                  : 'pt-[clamp(3rem,calc(14vh_-_1.5rem),7.5rem)]'
-              }
-            >
-              <div className="flex items-start gap-3">
-                <EmojiAvatar
-                  imageUrl={agentIdentity.imageUrl}
-                  emoji={agentIdentity.emoji}
-                  color={agentIdentity.color}
-                  fallbackChar={agentIdentity.fallbackChar}
-                  size="md"
-                  className="mt-0.5 !size-9 shrink-0 !text-base"
-                />
-                <div className="min-w-0 flex-1">
-                  <h2 className="text-title-lg text-foreground">
-                    {agentId ? '开始当前会话' : '开始主会话'}
-                  </h2>
-                  <p className="mt-1 max-w-2xl text-body text-muted-foreground">
-                    {agentId && contextLabel
-                      ? `“${contextLabel}”使用独立上下文。直接输入你的问题。`
-                      : `我是 ${agentIdentity.name}。直接输入你的问题，或从下面选择一个常用起点。`}
-                  </p>
+                  </div>
+                )}
+                <div
+                  key={
+                    liveRunKey && liveRunKey !== settledRunKey
+                      ? `run:${liveRunKey}`
+                      : 'live'
+                  }
+                  data-hc-stream-card="live"
+                >
+                  <StreamingDisplay
+                    groupJid={groupJid}
+                    isWaiting={!!isWaiting}
+                    agentId={agentId}
+                    senderName={agentIdentity.name}
+                    agentAvatarUrl={agentAvatarUrl}
+                    agentAvatarEmoji={agentAvatarEmoji}
+                    agentAvatarColor={agentAvatarColor}
+                    interactionMode={interactionMode}
+                  />
                 </div>
               </div>
 
-              {onSend && (
-                <div className="mt-6 grid gap-2.5 sm:grid-cols-2">
-                  {quickPrompts.map((prompt) => (
-                    <button
-                      key={prompt.title}
-                      onClick={() => requestComposerDraft(prompt.desc)}
-                      className="group min-h-16 cursor-pointer rounded-xl bg-surface-raised px-3.5 py-3 text-left ring-1 ring-surface-border transition-[background-color,box-shadow] hover:bg-surface-hover hover:ring-foreground/15 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none active:scale-[0.99]"
-                    >
-                      <div className="flex items-start gap-3">
-                        <prompt.icon
-                          className="mt-0.5 h-4.5 w-4.5 shrink-0 text-muted-foreground group-hover:text-foreground"
-                          strokeWidth={1.75}
-                        />
-                        <span className="min-w-0">
-                          <span className="block truncate text-body font-medium text-foreground">
-                            {prompt.title}
-                          </span>
-                          <span className="mt-0.5 block overflow-hidden text-caption text-ellipsis text-muted-foreground">
-                            {prompt.desc}
-                          </span>
-                        </span>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              )}
+              {/* Inline streaming for spawn agents — parallel tasks in same chat */}
+              {spawnAgents.map((a) => (
+                <StreamingDisplay
+                  key={a.id}
+                  groupJid={groupJid}
+                  isWaiting={true}
+                  agentId={a.id}
+                  senderName={a.name}
+                  agentAvatarUrl={agentAvatarUrl}
+                  agentAvatarEmoji={agentAvatarEmoji}
+                  agentAvatarColor={agentAvatarColor}
+                  interactionMode={interactionMode}
+                />
+              ))}
             </div>
-          )}
 
-          <div ref={streamingBlockRef} data-hc-streaming-block="">
-            {groupJid && settledRunKey !== null && (
-              <div key={`run:${settledRunKey}`} data-hc-stream-card="settled">
-                <StreamingDisplay
-                  groupJid={groupJid}
-                  isWaiting={false}
-                  agentId={agentId}
-                  senderName={agentIdentity.name}
-                  agentAvatarUrl={agentAvatarUrl}
-                  agentAvatarEmoji={agentAvatarEmoji}
-                  agentAvatarColor={agentAvatarColor}
-                  interactionMode={interactionMode}
-                  settled
-                />
-              </div>
-            )}
-            {groupJid && (
-              <div
-                key={
-                  liveRunKey && liveRunKey !== settledRunKey
-                    ? `run:${liveRunKey}`
-                    : 'live'
-                }
-                data-hc-stream-card="live"
-              >
-                <StreamingDisplay
-                  groupJid={groupJid}
-                  isWaiting={!!isWaiting}
-                  agentId={agentId}
-                  senderName={agentIdentity.name}
-                  agentAvatarUrl={agentAvatarUrl}
-                  agentAvatarEmoji={agentAvatarEmoji}
-                  agentAvatarColor={agentAvatarColor}
-                  interactionMode={interactionMode}
-                  stopHint
-                />
-              </div>
+            {workMode === 'multi' && (
+              <DelegatedTaskCards
+                groupJid={groupJid}
+                sessionId={agentId}
+                personWroteAt={personWroteAt}
+              />
             )}
           </div>
-
-          {/* Inline streaming for spawn agents — parallel tasks in same chat */}
-          {groupJid &&
-            !agentId &&
-            spawnAgents.map((a) => (
-              <StreamingDisplay
-                key={a.id}
-                groupJid={groupJid}
-                isWaiting={true}
-                agentId={a.id}
-                senderName={a.name}
-                agentAvatarUrl={agentAvatarUrl}
-                agentAvatarEmoji={agentAvatarEmoji}
-                agentAvatarColor={agentAvatarColor}
-                interactionMode={interactionMode}
-              />
-            ))}
         </div>
       </div>
 
       {/* Floating scroll buttons */}
       {showScrollButtons && (
-        <div className="absolute right-4 bottom-4 flex flex-col gap-1.5">
+        <div className="absolute right-4 bottom-[calc(1rem+var(--composer-dock-height,0px)+var(--composer-dock-lift,0px))] flex flex-col gap-1.5">
+          {/* A phone has only the jump to the bottom, as in cindy. */}
           {!atTop && (
             <button
               type="button"
               onClick={scrollToTop}
-              className="flex size-8 cursor-pointer items-center justify-center rounded-full bg-surface-raised text-muted-foreground shadow-menu ring-1 ring-surface-border transition-colors hover:text-foreground pointer-coarse:size-10"
+              className={cn(JUMP_BUTTON_CLASS, 'phone:hidden')}
               title="回到顶部"
               aria-label="回到顶部"
             >
-              <ChevronUp className="w-4 h-4" />
+              <ChevronUp className="size-4" />
             </button>
           )}
+          {/* After cindy: one translucent round button, with a dot once replies
+              arrived below the reader (the count is in its name). */}
           {!autoScroll && (
             <button
               type="button"
               onClick={scrollToBottom}
-              className="relative flex size-8 cursor-pointer items-center justify-center rounded-full bg-surface-raised text-muted-foreground shadow-menu ring-1 ring-surface-border transition-colors hover:text-foreground pointer-coarse:size-10"
+              className={JUMP_BUTTON_CLASS}
               title="回到底部"
               aria-label={
                 unseenCount > 0
@@ -1456,15 +1572,13 @@ export const MessageList = memo(function MessageList({
                   : '回到底部'
               }
             >
-              <ChevronDown className="w-4 h-4" />
+              <ChevronDown className="size-4" />
               {unseenCount > 0 && (
                 <span
                   aria-hidden="true"
-                  data-hc-unseen-count
-                  className="absolute -top-1.5 -right-1.5 h-4 min-w-4 rounded-full bg-primary px-1 text-center text-micro leading-4 font-medium text-primary-foreground tabular-nums ring-2 ring-background"
-                >
-                  {unseenCount > 99 ? '99+' : unseenCount}
-                </span>
+                  data-hc-unseen-dot
+                  className="absolute top-0.5 right-0.5 size-2 rounded-full bg-primary ring-2 ring-background"
+                />
               )}
             </button>
           )}

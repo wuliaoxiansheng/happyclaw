@@ -1,13 +1,7 @@
-export interface SimpleProvider {
-  id: string;
-  name: string;
-}
-
 interface ProviderSwitcherProps {
   groupFolder: string | null;
   currentProviderId: string | null;
   currentProviderName: string | null;
-  providers: SimpleProvider[];
 }
 
 export function ProviderSwitcher({
